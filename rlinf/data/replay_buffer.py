@@ -52,8 +52,33 @@ class TrajectoryCache:
         self._buffer: Optional[dict] = None
         self._traj_num_samples: Optional[int] = None
         self._traj_key_lengths: dict[int, dict] = {}
+        self._non_tensor_payloads: dict[int, dict] = {}
         self._last_slot = 0
         self._slot_to_id: dict[int, int] = {}
+
+    def _extract_non_tensor_payload(self, trajectory: dict) -> dict:
+        payload: dict = {}
+        for key, value in trajectory.items():
+            if isinstance(value, torch.Tensor):
+                continue
+            if isinstance(value, dict):
+                nested = self._extract_non_tensor_payload(value)
+                if nested:
+                    payload[key] = nested
+            else:
+                payload[key] = clone_dict_of_tensors(value)
+        return payload
+
+    def _merge_non_tensor_payload(self, dst: dict, src: dict) -> dict:
+        for key, value in src.items():
+            if isinstance(value, dict):
+                nested = dst.get(key, {})
+                if not isinstance(nested, dict):
+                    nested = {}
+                dst[key] = self._merge_non_tensor_payload(nested, value)
+            else:
+                dst[key] = clone_dict_of_tensors(value)
+        return dst
 
     def _get_key_lengths(self, trajectory: dict) -> dict:
         lengths: dict = {}
@@ -87,9 +112,9 @@ class TrajectoryCache:
                 shape = (total_samples, *value.shape[1:])
                 buffer[key] = torch.empty(shape, dtype=value.dtype, device=value.device)
             elif isinstance(value, dict):
-                buffer[key] = self._alloc_buffer_like(value, total_samples)
-            else:
-                buffer[key] = value
+                nested = self._alloc_buffer_like(value, total_samples)
+                if nested:
+                    buffer[key] = nested
         return buffer
 
     def _insert_into_buffer(self, trajectory: dict, buffer: dict, start: int) -> None:
@@ -97,10 +122,8 @@ class TrajectoryCache:
             if isinstance(value, torch.Tensor):
                 end = start + value.shape[0]
                 buffer[key][start:end] = value
-            elif isinstance(value, dict):
+            elif isinstance(value, dict) and key in buffer:
                 self._insert_into_buffer(value, buffer[key], start)
-            else:
-                buffer[key] = value
 
     def _slice_from_buffer(self, buffer: dict, slc: slice) -> dict:
         sliced: dict = {}
@@ -109,8 +132,6 @@ class TrajectoryCache:
                 sliced[key] = value[slc]
             elif isinstance(value, dict):
                 sliced[key] = self._slice_from_buffer(value, slc)
-            else:
-                sliced[key] = value
         return sliced
 
     def _slice_from_buffer_with_lengths(
@@ -129,8 +150,6 @@ class TrajectoryCache:
                 sliced[key] = self._slice_from_buffer_with_lengths(
                     value, start, nested_lengths
                 )
-            else:
-                sliced[key] = value
         return sliced
 
     def _copy_buffer_slice(
@@ -145,8 +164,6 @@ class TrajectoryCache:
                 dst_buffer[key][dst_slc] = value[src_slc]
             elif isinstance(value, dict):
                 self._copy_buffer_slice(value, dst_buffer[key], src_slc, dst_slc)
-            else:
-                dst_buffer[key] = value
 
     def _ensure_capacity(self, max_num_samples: int, trajectory: dict) -> None:
         if self._traj_num_samples is None:
@@ -185,7 +202,11 @@ class TrajectoryCache:
         slot = self.cache[trajectory_id]
         start = slot * self._traj_num_samples
         lengths = self._traj_key_lengths.get(trajectory_id)
-        return self._slice_from_buffer_with_lengths(self._buffer, start, lengths)
+        sliced = self._slice_from_buffer_with_lengths(self._buffer, start, lengths)
+        non_tensor_payload = self._non_tensor_payloads.get(trajectory_id, None)
+        if non_tensor_payload:
+            sliced = self._merge_non_tensor_payload(sliced, non_tensor_payload)
+        return sliced
 
     def get_buffer(self) -> Optional[dict]:
         return self._buffer
@@ -207,6 +228,7 @@ class TrajectoryCache:
                 if evict_id in self.cache:
                     self.cache.pop(evict_id, None)
                 self._traj_key_lengths.pop(evict_id, None)
+                self._non_tensor_payloads.pop(evict_id, None)
             self._slot_to_id[slot] = trajectory_id
             self.cache[trajectory_id] = slot
             self._last_slot = (self._last_slot + 1) % self.max_size
@@ -214,12 +236,18 @@ class TrajectoryCache:
         start = slot * self._traj_num_samples
         self._insert_into_buffer(trajectory, self._buffer, start)
         self._traj_key_lengths[trajectory_id] = key_lengths
+        non_tensor_payload = self._extract_non_tensor_payload(trajectory)
+        if non_tensor_payload:
+            self._non_tensor_payloads[trajectory_id] = non_tensor_payload
+        else:
+            self._non_tensor_payloads.pop(trajectory_id, None)
 
     def clear(self):
         self.cache.clear()
         self._buffer = None
         self._traj_num_samples = None
         self._traj_key_lengths.clear()
+        self._non_tensor_payloads.clear()
         self._last_slot = 0
         self._slot_to_id.clear()
 
@@ -260,11 +288,17 @@ class TrajectoryReplayBuffer:
         self.logger = get_logger()
 
         if not self.auto_save:
+            effective_cache_size = max(
+                int(cache_size),
+                int(sample_window_size),
+                1,
+            )
             self.logger.warning(
-                f"auto_save is disabled, enabling cache with size {sample_window_size}"
+                "auto_save is disabled, enabling cache with size "
+                f"{effective_cache_size}"
             )
             self.enable_cache = True
-            cache_size = sample_window_size
+            cache_size = effective_cache_size
 
         # Auto-save path (only used when auto_save is enabled)
         if self.auto_save:
@@ -524,6 +558,10 @@ class TrajectoryReplayBuffer:
                 key: self._reshape_flat_for_save(val, T, B)
                 for key, val in value.items()
             }
+        if isinstance(value, list) and len(value) == T * B:
+            if B == 1:
+                return list(value)
+            return [list(value[t * B : (t + 1) * B]) for t in range(T)]
         return value
 
     def close(self, wait: bool = True):
@@ -654,6 +692,15 @@ class TrajectoryReplayBuffer:
             if cached_ids:
                 cached_ids_tensor = torch.as_tensor(cached_ids, dtype=torch.long)
                 cached_mask = torch.isin(traj_ids_tensor, cached_ids_tensor)
+                if cache._non_tensor_payloads:
+                    non_tensor_cached_mask = torch.as_tensor(
+                        [
+                            int(tid) in cache._non_tensor_payloads
+                            for tid in traj_ids_tensor.tolist()
+                        ],
+                        dtype=torch.bool,
+                    )
+                    cached_mask = cached_mask & (~non_tensor_cached_mask)
             else:
                 cached_mask = torch.zeros_like(traj_ids_tensor, dtype=torch.bool)
         else:
@@ -685,9 +732,13 @@ class TrajectoryReplayBuffer:
             traj_offsets: dict[int, int] = {}
             cursor = 0
             for tid in miss_traj_ids:
-                model_weights_id = self._trajectory_index[tid]["model_weights_id"]
-                trajectory = self._load_trajectory(tid, model_weights_id)
-                flat_trajectory = self._flatten_trajectory(trajectory)
+                flat_trajectory = None
+                if cache is not None and tid in cache.cache:
+                    flat_trajectory = cache.get(tid)
+                if flat_trajectory is None:
+                    model_weights_id = self._trajectory_index[tid]["model_weights_id"]
+                    trajectory = self._load_trajectory(tid, model_weights_id)
+                    flat_trajectory = self._flatten_trajectory(trajectory)
                 miss_flats.append(flat_trajectory)
                 traj_offsets[tid] = cursor
                 cursor += self._trajectory_index[tid]["num_samples"]
@@ -714,6 +765,24 @@ class TrajectoryReplayBuffer:
         tensor_fields = trajectory.__dataclass_fields__.keys()
         traj_len = int(trajectory.rewards.shape[0])
 
+        def _flatten_batched_tensor(tensor: torch.Tensor) -> torch.Tensor:
+            if tensor.dim() < 2:
+                return tensor
+            leading = int(tensor.shape[0] * tensor.shape[1])
+            return tensor.reshape(leading, *tensor.shape[2:])
+
+        def _flatten_batched_sequence(value: list | tuple) -> list:
+            flat_sequence = list(value)
+            if not flat_sequence:
+                return flat_sequence
+            first = flat_sequence[0]
+            if isinstance(first, (list, tuple)):
+                merged: list = []
+                for element in flat_sequence:
+                    merged.extend(list(element))
+                return merged
+            return flat_sequence
+
         for field in tensor_fields:
             tensor = getattr(trajectory, field)
             if isinstance(tensor, torch.Tensor) and tensor.dim() >= 2:
@@ -728,25 +797,31 @@ class TrajectoryReplayBuffer:
                             extra, epoch_len + 1, *tensor.shape[1:]
                         )[:, 1:]
                         tensor = tensor.reshape(traj_len, *tensor.shape[2:])
-                flat[field] = tensor.reshape(-1, *tensor.shape[2:])
+                flat[field] = _flatten_batched_tensor(tensor)
 
         if trajectory.curr_obs:
             flat["curr_obs"] = {}
-            for key, tensor in trajectory.curr_obs.items():
-                if isinstance(tensor, torch.Tensor) and tensor.dim() >= 2:
-                    flat["curr_obs"][key] = tensor.reshape(-1, *tensor.shape[2:])
+            for key, value in trajectory.curr_obs.items():
+                if isinstance(value, torch.Tensor) and value.dim() >= 2:
+                    flat["curr_obs"][key] = _flatten_batched_tensor(value)
+                elif isinstance(value, (list, tuple)):
+                    flat["curr_obs"][key] = _flatten_batched_sequence(value)
 
         if trajectory.next_obs:
             flat["next_obs"] = {}
-            for key, tensor in trajectory.next_obs.items():
-                if isinstance(tensor, torch.Tensor) and tensor.dim() >= 2:
-                    flat["next_obs"][key] = tensor.reshape(-1, *tensor.shape[2:])
+            for key, value in trajectory.next_obs.items():
+                if isinstance(value, torch.Tensor) and value.dim() >= 2:
+                    flat["next_obs"][key] = _flatten_batched_tensor(value)
+                elif isinstance(value, (list, tuple)):
+                    flat["next_obs"][key] = _flatten_batched_sequence(value)
 
         if trajectory.forward_inputs:
             flat["forward_inputs"] = {}
-            for key, tensor in trajectory.forward_inputs.items():
-                if isinstance(tensor, torch.Tensor) and tensor.dim() >= 2:
-                    flat["forward_inputs"][key] = tensor.reshape(-1, *tensor.shape[2:])
+            for key, value in trajectory.forward_inputs.items():
+                if isinstance(value, torch.Tensor) and value.dim() >= 2:
+                    flat["forward_inputs"][key] = _flatten_batched_tensor(value)
+                elif isinstance(value, (list, tuple)):
+                    flat["forward_inputs"][key] = _flatten_batched_sequence(value)
 
         return flat
 
@@ -757,11 +832,15 @@ class TrajectoryReplayBuffer:
         for key, value in flat_trajectory.items():
             if isinstance(value, torch.Tensor):
                 chunk[key] = value[idx]
+            elif isinstance(value, list):
+                chunk[key] = value[idx]
             elif isinstance(value, dict):
                 nested = {}
-                for nested_key, tensor in value.items():
-                    if isinstance(tensor, torch.Tensor):
-                        nested[nested_key] = tensor[idx]
+                for nested_key, nested_value in value.items():
+                    if isinstance(nested_value, torch.Tensor):
+                        nested[nested_key] = nested_value[idx]
+                    elif isinstance(nested_value, list):
+                        nested[nested_key] = nested_value[idx]
                 if nested:
                     chunk[key] = nested
         return chunk
@@ -772,6 +851,8 @@ class TrajectoryReplayBuffer:
             if isinstance(value, torch.Tensor):
                 shape = (batch_size, *value.shape[1:])
                 batch[key] = torch.empty(shape, dtype=value.dtype, device=value.device)
+            elif isinstance(value, list):
+                batch[key] = [None] * batch_size
             elif isinstance(value, dict):
                 nested_batch = {}
                 for nested_key, nested_value in value.items():
@@ -782,6 +863,8 @@ class TrajectoryReplayBuffer:
                             dtype=nested_value.dtype,
                             device=nested_value.device,
                         )
+                    elif isinstance(nested_value, list):
+                        nested_batch[nested_key] = [None] * batch_size
                 if nested_batch:
                     batch[key] = nested_batch
         return batch
@@ -792,6 +875,8 @@ class TrajectoryReplayBuffer:
             if isinstance(value, torch.Tensor):
                 shape = (batch_size, *value.shape[1:])
                 batch[key] = torch.empty(shape, dtype=value.dtype, device=value.device)
+            elif isinstance(value, list):
+                batch[key] = [None] * batch_size
             elif isinstance(value, dict):
                 nested_batch = {}
                 for nested_key, nested_value in value.items():
@@ -802,6 +887,8 @@ class TrajectoryReplayBuffer:
                             dtype=nested_value.dtype,
                             device=nested_value.device,
                         )
+                    elif isinstance(nested_value, list):
+                        nested_batch[nested_key] = [None] * batch_size
                 if nested_batch:
                     batch[key] = nested_batch
         return batch
@@ -816,6 +903,11 @@ class TrajectoryReplayBuffer:
         for key, value in buffer.items():
             if isinstance(value, torch.Tensor):
                 batch[key][batch_indices] = value.index_select(0, buffer_indices)
+            elif isinstance(value, list):
+                for src_idx, dst_idx in zip(
+                    buffer_indices.tolist(), batch_indices.tolist(), strict=False
+                ):
+                    batch[key][dst_idx] = clone_dict_of_tensors(value[src_idx])
             elif isinstance(value, dict):
                 self._fill_batch_from_buffer_indices(
                     batch[key], value, buffer_indices, batch_indices
@@ -829,6 +921,8 @@ class TrajectoryReplayBuffer:
         for key in keys:
             if isinstance(flats[0][key], torch.Tensor):
                 out[key] = torch.cat([f[key] for f in flats], dim=0)
+            elif isinstance(flats[0][key], list):
+                out[key] = [item for f in flats for item in f[key]]
             elif isinstance(flats[0][key], dict):
                 nested_list = [f[key] for f in flats]
                 out[key] = self._concat_flat_trajectories(nested_list)
@@ -855,6 +949,8 @@ class TrajectoryReplayBuffer:
                 tensors = [chunk[key] for chunk in chunks if key in chunk]
                 if tensors:
                     batch[key] = torch.stack(tensors, dim=0)  # [B, ...]
+            elif isinstance(value, list):
+                batch[key] = [chunk[key] for chunk in chunks if key in chunk]
             elif isinstance(value, dict):
                 # Handle nested dicts (obs, forward_inputs)
                 nested_dicts = [chunk[key] for chunk in chunks if key in chunk]
@@ -875,6 +971,14 @@ class TrajectoryReplayBuffer:
                             nested_batch[nested_key] = torch.stack(
                                 nested_tensors, dim=0
                             )  # [B, ...]
+                            continue
+                        nested_lists = [
+                            d[nested_key]
+                            for d in nested_dicts
+                            if nested_key in d and isinstance(d[nested_key], list)
+                        ]
+                        if nested_lists:
+                            nested_batch[nested_key] = nested_lists
                     if nested_batch:
                         batch[key] = nested_batch
 

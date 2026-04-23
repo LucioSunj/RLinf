@@ -108,6 +108,8 @@ class IQLMLPPolicy(MLPPolicy):
             )
             self.actor_mean = nn.Linear(hidden_dims[-1], action_dim)
             self.state_dependent_std = state_dependent_std
+            if hasattr(self, "actor_logstd"):
+                delattr(self, "actor_logstd")
             if state_dependent_std:
                 self.actor_logstd = nn.Linear(hidden_dims[-1], action_dim)
             else:

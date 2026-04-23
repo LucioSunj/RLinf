@@ -31,6 +31,7 @@ from prismatic.vla.constants import (
 from transformers.generation import TopKLogitsWarper
 
 from rlinf.models.embodiment.base_policy import BasePolicy, ForwardType
+from rlinf.models.embodiment.modules.q_head import MultiQHead
 from rlinf.models.embodiment.modules.value_head import ValueHead
 from rlinf.utils.utils import (
     compute_entropy_from_logits,
@@ -46,11 +47,15 @@ class OpenVLAOFTForRLActionPrediction(OpenVLAOFTForActionPrediction, BasePolicy)
         num_action_chunks,
         add_value_head,
         max_prompt_length,
+        add_q_head=False,
     ) -> None:
         super().__init__(config)
 
         self.action_dim = action_dim
         self.num_action_chunks = num_action_chunks
+        self.flat_action_dim = self.action_dim * self.num_action_chunks
+        self.hidden_size = self.config.hidden_size
+        self.add_q_head = add_q_head or getattr(config, "add_q_head", False)
 
         self.unnorm_key = config.unnorm_key
         if (
@@ -63,7 +68,6 @@ class OpenVLAOFTForRLActionPrediction(OpenVLAOFTForActionPrediction, BasePolicy)
         )
 
         if add_value_head:
-            self.hidden_size = self.config.hidden_size
             output_dim = (
                 1 if self.config.value_type == "chunk_level" else self.num_action_chunks
             )
@@ -73,6 +77,14 @@ class OpenVLAOFTForRLActionPrediction(OpenVLAOFTForActionPrediction, BasePolicy)
                 output_dim=output_dim,
                 activation="gelu",
                 bias_last=False,
+            )
+
+        if self.add_q_head:
+            self.q_head = MultiQHead(
+                hidden_size=self.hidden_size,
+                action_feature_dim=self.flat_action_dim,
+                hidden_dims=[512, 256],
+                num_q_heads=getattr(config, "num_q_heads", 2),
             )
 
         self.max_prompt_length = max_prompt_length
@@ -201,6 +213,241 @@ class OpenVLAOFTForRLActionPrediction(OpenVLAOFTForActionPrediction, BasePolicy)
         )
 
         return actions
+
+    def _format_env_images(self, images: torch.Tensor) -> torch.Tensor:
+        if images.ndim == 4:
+            images = images.unsqueeze(1)
+        assert images.ndim == 5, f"Expected image tensor with 5 dims, got {images.shape}"
+        if images.shape[-1] == 3:
+            images = images.permute(0, 1, 4, 2, 3)
+        return images
+
+    def _build_pixel_values_from_obs(self, obs: dict[str, Any]) -> torch.Tensor:
+        device = next(self.parameters()).device
+        precision = next(self.parameters()).dtype
+        if "pixel_values" in obs:
+            return obs["pixel_values"].to(device=device, dtype=precision)
+
+        main_images = self._format_env_images(obs["main_images"])
+        all_images = [main_images]
+        if (
+            self.vision_backbone.get_num_images_in_input() > 1
+            and obs.get("wrist_images", None) is not None
+        ):
+            wrist_images = self._format_env_images(obs["wrist_images"])
+            all_images.extend(
+                [wrist_images[:, i : i + 1] for i in range(wrist_images.shape[1])]
+            )
+
+        pixel_values = self.input_processor.image_processor(
+            all_images[0], return_tensors="pt"
+        )["pixel_values"]
+        if len(all_images) > 1:
+            extra_pixel_values = [
+                self.input_processor.image_processor(image, return_tensors="pt")[
+                    "pixel_values"
+                ]
+                for image in all_images[1:]
+            ]
+            pixel_values = torch.cat([pixel_values] + extra_pixel_values, dim=1)
+        return pixel_values.to(device=device, dtype=precision)
+
+    def _prepare_policy_inputs(
+        self, obs: dict[str, Any]
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        device = next(self.parameters()).device
+        if "input_ids" in obs and "attention_mask" in obs:
+            input_ids = obs["input_ids"].to(device=device, dtype=torch.long)
+            attention_mask = obs["attention_mask"].to(device=device)
+            pixel_values = self._build_pixel_values_from_obs(obs)
+            return input_ids, attention_mask, pixel_values
+
+        task_descriptions = [
+            f"In: What action should the robot take to {t.lower()}?\nOut: "
+            for t in obs["task_descriptions"]
+        ]
+        main_images = self._format_env_images(obs["main_images"])
+        inputs = self.input_processor(
+            text=task_descriptions,
+            images={"images": main_images},
+            proprio_states=obs["states"],
+            padding="max_length",
+            max_length=self.max_prompt_length,
+        )
+        pixel_values = inputs["pixel_values"]
+        if (
+            self.vision_backbone.get_num_images_in_input() > 1
+            and obs.get("wrist_images", None) is not None
+        ):
+            wrist_images = self._format_env_images(obs["wrist_images"])
+            extra_pixel_values = []
+            for idx in range(wrist_images.shape[1]):
+                wrist_inputs = self.input_processor(
+                    text=task_descriptions,
+                    images={"images": wrist_images[:, idx : idx + 1]},
+                    proprio_states=obs["states"],
+                    padding="max_length",
+                    max_length=self.max_prompt_length,
+                )
+                extra_pixel_values.append(wrist_inputs["pixel_values"])
+            if extra_pixel_values:
+                pixel_values = torch.cat([pixel_values] + extra_pixel_values, dim=1)
+
+        return (
+            inputs["input_ids"].to(device=device, dtype=torch.long),
+            inputs["attention_mask"].to(device=device, dtype=torch.bool),
+            pixel_values.to(device=device, dtype=next(self.parameters()).dtype),
+        )
+
+    def _encode_policy_feature(
+        self, obs: dict[str, Any], detach_encoder: bool = False
+    ) -> torch.Tensor:
+        input_ids, attention_mask, pixel_values = self._prepare_policy_inputs(obs)
+
+        assert torch.all(input_ids[:, 0] == 1)
+        assert torch.all(attention_mask[:, 0] == 1)
+        assert torch.all(input_ids[:, -1] == 29871)
+        assert torch.all(attention_mask[:, -1] == 1)
+
+        input_ids, attention_mask = self._prepare_input_for_action_prediction(
+            input_ids, attention_mask.to(torch.long)
+        )
+        mm_embeddings, mm_attention_mask = self._build_embedding(
+            input_ids, attention_mask, pixel_values
+        )
+        multimodal_position_ids = mm_attention_mask.cumsum(dim=1) - 1
+        outputs = self.language_model(
+            input_ids=None,
+            attention_mask=mm_attention_mask,
+            position_ids=multimodal_position_ids,
+            past_key_values=None,
+            inputs_embeds=mm_embeddings,
+            labels=None,
+            use_cache=False,
+            output_attentions=False,
+            output_hidden_states=True,
+            return_dict=True,
+        )
+        last_hidden_states = outputs.hidden_states[-1]
+        action_hidden_states = last_hidden_states[:, -self.flat_action_dim - 1 : -1]
+        pooled_features = action_hidden_states.mean(dim=1).to(dtype=torch.float32)
+        if detach_encoder:
+            pooled_features = pooled_features.detach()
+        return pooled_features
+
+    def _normalize_actions(self, actions: torch.Tensor) -> torch.Tensor:
+        action_norm_stats = self._get_action_stats()
+
+        if ACTION_PROPRIO_NORMALIZATION_TYPE == NormalizationType.BOUNDS:
+            mask = action_norm_stats.get(
+                "mask", np.ones_like(action_norm_stats["min"], dtype=bool)
+            )
+            action_high, action_low = (
+                np.array(action_norm_stats["max"]),
+                np.array(action_norm_stats["min"]),
+            )
+        elif ACTION_PROPRIO_NORMALIZATION_TYPE == NormalizationType.BOUNDS_Q99:
+            mask = action_norm_stats.get(
+                "mask", np.ones_like(action_norm_stats["q01"], dtype=bool)
+            )
+            action_high, action_low = (
+                np.array(action_norm_stats["q99"]),
+                np.array(action_norm_stats["q01"]),
+            )
+        else:
+            raise ValueError("Unsupported action/proprio normalization type detected!")
+
+        flat_actions = actions.reshape(actions.shape[0], -1).to(dtype=torch.float32)
+        repeat_factor = flat_actions.shape[-1] // action_high.shape[0]
+        action_high_t = torch.as_tensor(
+            np.tile(action_high, repeat_factor),
+            device=flat_actions.device,
+            dtype=flat_actions.dtype,
+        )
+        action_low_t = torch.as_tensor(
+            np.tile(action_low, repeat_factor),
+            device=flat_actions.device,
+            dtype=flat_actions.dtype,
+        )
+        mask_t = torch.as_tensor(
+            np.tile(mask, repeat_factor),
+            device=flat_actions.device,
+            dtype=torch.bool,
+        )
+
+        normalized = flat_actions.clone()
+        denom = torch.clamp(action_high_t - action_low_t, min=1.0e-8)
+        normalized_masked = 2.0 * (flat_actions - action_low_t) / denom - 1.0
+        normalized[..., mask_t] = normalized_masked[..., mask_t]
+        return normalized.clamp(-1.0, 1.0)
+
+    def _continuous_actions_to_tokens(self, actions: torch.Tensor) -> torch.Tensor:
+        normalized_actions = self._normalize_actions(actions)
+        bin_centers = torch.as_tensor(
+            self.bin_centers,
+            device=normalized_actions.device,
+            dtype=normalized_actions.dtype,
+        )
+        distances = torch.abs(
+            normalized_actions.unsqueeze(-1) - bin_centers.view(1, 1, -1)
+        )
+        discretized = distances.argmin(dim=-1)
+        action_tokens = self.vocab_size - (discretized + 1)
+        return action_tokens.to(dtype=torch.long)
+
+    def _build_forward_inputs_from_obs_and_actions(
+        self, obs: dict[str, Any], actions: torch.Tensor
+    ) -> dict[str, torch.Tensor]:
+        input_ids, attention_mask, pixel_values = self._prepare_policy_inputs(obs)
+        return {
+            "input_ids": input_ids,
+            "attention_mask": attention_mask,
+            "pixel_values": pixel_values,
+            "action_tokens": self._continuous_actions_to_tokens(actions),
+        }
+
+    def iql_actor_forward(self, **kwargs) -> torch.Tensor:
+        obs = kwargs.get("observations", kwargs.get("obs"))
+        actions = kwargs.get("actions")
+        if obs is None or actions is None:
+            raise ValueError("IQL actor forward expects observations and actions.")
+
+        forward_inputs = self._build_forward_inputs_from_obs_and_actions(obs, actions)
+        outputs = self.default_forward(
+            forward_inputs=forward_inputs,
+            compute_logprobs=True,
+            compute_values=False,
+            temperature=float(kwargs.get("temperature", 1.0)),
+            top_k=int(kwargs.get("top_k", self.config.n_action_bins)),
+        )
+        return outputs["logprobs"].sum(dim=-1)
+
+    def iql_value_forward(self, **kwargs) -> torch.Tensor:
+        if not hasattr(self, "value_head"):
+            raise RuntimeError("IQL value forward requires add_value_head=True.")
+        obs = kwargs.get("observations", kwargs.get("obs"))
+        if obs is None:
+            raise ValueError("IQL value forward expects observations.")
+        values = self.value_head(
+            self._encode_policy_feature(
+                obs, detach_encoder=bool(kwargs.get("detach_encoder", False))
+            )
+        )
+        if values.ndim > 1 and values.shape[-1] != 1:
+            values = values.mean(dim=-1, keepdim=True)
+        return values.squeeze(-1)
+
+    def iql_critic_forward(self, **kwargs) -> torch.Tensor:
+        if not hasattr(self, "q_head"):
+            raise RuntimeError("IQL critic forward requires add_q_head=True.")
+        obs = kwargs.get("observations", kwargs.get("obs"))
+        actions = kwargs.get("actions")
+        if obs is None or actions is None:
+            raise ValueError("IQL critic forward expects observations and actions.")
+        detach_encoder = bool(kwargs.get("detach_encoder", True))
+        state_features = self._encode_policy_feature(obs, detach_encoder=detach_encoder)
+        action_features = actions.reshape(actions.shape[0], -1).to(dtype=torch.float32)
+        return self.q_head(state_features, action_features)
 
     @torch.no_grad()
     def predict_action_batch(
@@ -460,6 +707,12 @@ class OpenVLAOFTForRLActionPrediction(OpenVLAOFTForActionPrediction, BasePolicy)
     def forward(self, forward_type=ForwardType.DEFAULT, **kwargs):
         if forward_type == ForwardType.DEFAULT:
             return self.default_forward(**kwargs)
+        if forward_type == ForwardType.IQL_ACTOR:
+            return self.iql_actor_forward(**kwargs)
+        if forward_type == ForwardType.IQL_CRITIC:
+            return self.iql_critic_forward(**kwargs)
+        if forward_type == ForwardType.IQL_VALUE:
+            return self.iql_value_forward(**kwargs)
         else:
             raise NotImplementedError
 

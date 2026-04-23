@@ -19,6 +19,14 @@ from rlinf.scheduler.worker.worker import Worker
 
 def get_actor_worker(cfg: DictConfig) -> Worker:
     if cfg.actor.training_backend == "fsdp":
+        if (
+            cfg.runner.task_type == "offline_rl"
+            and cfg.algorithm.loss_type == "offline_iql"
+        ):
+            from .fsdp_offline_iql_policy_worker import FSDPOfflineIQLPolicy
+
+            return FSDPOfflineIQLPolicy
+
         from .fsdp_actor_worker import FSDPActor
 
         return FSDPActor

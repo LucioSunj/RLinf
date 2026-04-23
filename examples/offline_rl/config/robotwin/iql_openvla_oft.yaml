@@ -1,0 +1,130 @@
+# @package _global_
+
+defaults:
+  - /env/robotwin_place_empty_cup@env.train
+  - /env/robotwin_place_empty_cup@env.eval
+  - /model/openvla_oft@actor.model
+  - /training_backend/fsdp@actor.fsdp_config
+  - _self_
+
+hydra:
+  run:
+    dir: .
+  output_subdir: null
+  searchpath:
+    - file://${oc.env:EMBODIED_PATH}/examples/embodiment/config/
+
+cluster:
+  num_nodes: 1
+  component_placement:
+    actor,env,rollout: all
+
+runner:
+  task_type: offline_rl
+  logger:
+    log_path: "../results"
+    project_name: rlinf
+    experiment_name: "robotwin_iql_openvla_oft"
+    logger_backends: ["tensorboard"]
+
+  max_train_steps: 100000
+  eval_freq: 2000
+  save_freq: 10000
+  log_interval: 50
+  eval_episodes: 20
+  only_eval: False
+  resume_dir: null
+
+algorithm:
+  rollout_epoch: 1
+  eval_rollout_epoch: 1
+  loss_type: offline_iql
+
+  gamma: 0.99
+  tau: 5.0e-3
+  expectile: 0.7
+  temperature: 3.0
+
+  replay_buffer:
+    enable_cache: False
+    enable_preload: True
+    cache_size: 32
+    prefetch_size: 2
+    sample_window_size: 0
+    trajectory_format: "pt"
+
+data:
+  dataset_type: trajectory_replay
+  offline_dataset_path: "/path/to/robotwin/training_rlinf"
+  reward_scale: 1.0
+  reward_bias: 0.0
+  normalize_observations: False
+
+env:
+  group_name: "EnvGroup"
+
+rollout:
+  group_name: "RolloutGroup"
+  generation_backend: "huggingface"
+  enable_offload: False
+  pipeline_stage_num: 1
+  collect_transitions: True
+  collect_prev_infos: False
+
+  model:
+    model_path: ${actor.model.model_path}
+    precision: ${actor.model.precision}
+
+actor:
+  group_name: "ActorGroup"
+  training_backend: "fsdp"
+  micro_batch_size: 8
+  global_batch_size: 8
+  seed: 1234
+  enable_offload: False
+  use_fsdp_wrap: True
+  offline_torch_compile: False
+
+  model:
+    model_path: "/path/to/model/Openvla-oft-SFT-robotwin/"
+    model_type: "openvla_oft"
+    action_dim: 14
+    num_action_chunks: 5
+    max_prompt_length: 128
+    value_type: chunk_level
+    add_value_head: True
+    add_q_head: True
+    num_q_heads: 2
+    unnorm_key: "robotwin"
+    num_images_in_input: 3
+    policy_setup: "aloha"
+
+  optim:
+    lr: 3.0e-5
+    adam_beta1: 0.9
+    adam_beta2: 0.999
+    adam_eps: 1.0e-8
+    weight_decay: 0.01
+
+  critic_optim:
+    lr: 3.0e-4
+    adam_beta1: 0.9
+    adam_beta2: 0.999
+    adam_eps: 1.0e-8
+    weight_decay: 0.0
+
+  value_optim:
+    lr: 3.0e-4
+    adam_beta1: 0.9
+    adam_beta2: 0.999
+    adam_eps: 1.0e-8
+    weight_decay: 0.0
+
+  fsdp_config:
+    strategy: "fsdp"
+    sharding_strategy: "no_shard"
+    gradient_checkpointing: True
+    mixed_precision:
+      param_dtype: ${actor.model.precision}
+      reduce_dtype: ${actor.model.precision}
+      buffer_dtype: ${actor.model.precision}

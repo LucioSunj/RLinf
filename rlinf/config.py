@@ -132,6 +132,7 @@ SUPPORTED_TASK_TYPE = [
     "coding_online_rl",
     "sft",
     "offline",
+    "offline_rl",
 ]
 SUPPORTED_TRAINING_BACKENDS = ["megatron", "fsdp"]
 __all__ = ["build_config"]
@@ -1030,6 +1031,101 @@ def validate_offline_cfg(cfg: DictConfig) -> DictConfig:
     return cfg
 
 
+def validate_offline_rl_cfg(cfg: DictConfig) -> DictConfig:
+    SupportedModel(cfg.actor.model.model_type)
+    assert SupportedModel(cfg.actor.model.model_type) in EMBODIED_MODEL, (
+        f"offline_rl only supports embodied models, got {cfg.actor.model.model_type!r}."
+    )
+    assert cfg.algorithm.loss_type == "offline_iql", (
+        "offline_rl currently only supports algorithm.loss_type='offline_iql'."
+    )
+    assert cfg.actor.training_backend == "fsdp", (
+        "offline_rl currently only supports actor.training_backend='fsdp'."
+    )
+
+    offline_dataset_path = cfg.data.get(
+        "offline_dataset_path", cfg.data.get("offline_path", None)
+    )
+    assert offline_dataset_path is not None, (
+        "data.offline_dataset_path must be specified for offline_rl."
+    )
+    assert os.path.exists(offline_dataset_path), (
+        f"Offline dataset path does not exist: {offline_dataset_path}"
+    )
+
+    with open_dict(cfg):
+        cfg.data.offline_dataset_path = offline_dataset_path
+
+        cfg.runner.max_train_steps = int(
+            cfg.runner.get("max_train_steps", cfg.runner.get("max_steps", 0))
+        )
+        assert cfg.runner.max_train_steps > 0, (
+            "runner.max_train_steps must be greater than 0 for offline_rl."
+        )
+        cfg.runner.max_epochs = int(
+            cfg.runner.get("max_epochs", cfg.runner.max_train_steps)
+        )
+        cfg.runner.eval_freq = int(
+            cfg.runner.get("eval_freq", cfg.runner.get("val_check_interval", -1))
+        )
+        cfg.runner.save_freq = int(
+            cfg.runner.get("save_freq", cfg.runner.get("save_interval", -1))
+        )
+        cfg.runner.log_interval = int(cfg.runner.get("log_interval", 100))
+        cfg.runner.max_steps = cfg.runner.max_train_steps
+        cfg.runner.val_check_interval = cfg.runner.eval_freq
+        cfg.runner.save_interval = cfg.runner.save_freq
+        cfg.runner.local_update_steps = int(cfg.runner.get("local_update_steps", 1))
+        cfg.runner.weight_sync_interval = int(
+            cfg.runner.get("weight_sync_interval", 1)
+        )
+        cfg.runner.only_eval = bool(cfg.runner.get("only_eval", False))
+
+        cfg.algorithm.discount = cfg.algorithm.get(
+            "discount", cfg.algorithm.get("gamma", 0.99)
+        )
+        cfg.algorithm.gamma = cfg.algorithm.discount
+        cfg.algorithm.soft_target_update_rate = cfg.algorithm.get(
+            "soft_target_update_rate", cfg.algorithm.get("tau", 5.0e-3)
+        )
+        cfg.algorithm.tau = cfg.algorithm.soft_target_update_rate
+        cfg.algorithm.target_update_period = cfg.algorithm.get(
+            "target_update_period", cfg.algorithm.get("target_update_freq", 1)
+        )
+        cfg.algorithm.target_update_freq = cfg.algorithm.target_update_period
+
+        if cfg.env.get("train", None) is None:
+            cfg.env.train = OmegaConf.create(
+                OmegaConf.to_container(cfg.env.eval, resolve=True)
+            )
+
+    actor_global = int(cfg.actor.get("global_batch_size", 0))
+    actor_micro = int(cfg.actor.get("micro_batch_size", 0))
+    assert actor_global > 0, "offline_rl requires actor.global_batch_size > 0"
+    assert actor_micro > 0, "offline_rl requires actor.micro_batch_size > 0"
+    assert actor_global >= actor_micro, (
+        "actor.global_batch_size must be >= actor.micro_batch_size for offline_rl"
+    )
+
+    if cfg.runner.val_check_interval > 0 or cfg.runner.only_eval:
+        component_placement = HybridComponentPlacement(cfg, Cluster())
+        stage_num = cfg.rollout.pipeline_stage_num
+        env_world_size = component_placement.get_world_size("env")
+        assert cfg.env.eval.total_num_envs > 0, (
+            "Total number of parallel environments for evaluation must be greater than 0"
+        )
+        assert cfg.env.eval.total_num_envs % env_world_size == 0, (
+            "Total number of parallel environments for evaluation must be divisible by the number of environment processes"
+        )
+        assert cfg.env.eval.total_num_envs % env_world_size % stage_num == 0, (
+            "Total number of parallel environments for evaluation must be divisible by the number of environment processes and the number of pipeline stages"
+        )
+        assert cfg.env.eval.total_num_envs // env_world_size // stage_num > 0, (
+            "env.eval.total_num_envs // env_world_size // rollout.pipeline_stage_num must be greater than 0"
+        )
+    return cfg
+
+
 def validate_sft_cfg(cfg: DictConfig) -> DictConfig:
     assert cfg.actor.get("global_batch_size", None) is not None, (
         "the actor.global_batch_size is not set"
@@ -1183,6 +1279,8 @@ def validate_cfg(cfg: DictConfig) -> DictConfig:
     )
     if cfg.runner.task_type == "embodied":
         cfg = validate_embodied_cfg(cfg)
+    elif cfg.runner.task_type == "offline_rl":
+        cfg = validate_offline_rl_cfg(cfg)
     elif cfg.runner.task_type == "reasoning":
         cfg = validate_reasoning_cfg(cfg)
     elif cfg.runner.task_type == "coding_online_rl":
@@ -1195,7 +1293,7 @@ def validate_cfg(cfg: DictConfig) -> DictConfig:
     elif cfg.runner.task_type == "offline":
         cfg = validate_offline_cfg(cfg)
 
-    if cfg.runner.task_type != "sft":
+    if cfg.runner.task_type not in ("sft", "offline_rl"):
         if cfg.algorithm.adv_type in ("grpo", "grpo_dynamic", "reinpp_baseline"):
             assert cfg.algorithm.group_size > 1
 

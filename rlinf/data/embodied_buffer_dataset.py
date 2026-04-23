@@ -12,19 +12,168 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import os
+import pickle as pkl
 import queue
 import threading
 import time
-from typing import Any, Iterator, Optional
+from typing import Any, Callable, Iterator, Optional
 
 import torch
 from torch.utils.data import IterableDataset
 
+from rlinf.data.embodied_io_struct import Trajectory
 from rlinf.data.replay_buffer import TrajectoryReplayBuffer
 from rlinf.utils.logging import get_logger
 from rlinf.utils.nested_dict_process import concat_batch
 
 logger = get_logger()
+
+
+def _is_normalizable_obs_tensor(tensor: torch.Tensor) -> bool:
+    if not torch.is_tensor(tensor):
+        return False
+    if tensor.dtype not in (
+        torch.float16,
+        torch.float32,
+        torch.float64,
+        torch.bfloat16,
+    ):
+        return False
+    if tensor.ndim >= 3:
+        return False
+    return True
+
+
+def compute_observation_stats(
+    replay_buffer: TrajectoryReplayBuffer,
+    eps: float = 1e-6,
+) -> dict[str, dict[str, torch.Tensor]]:
+    stats: dict[str, dict[str, torch.Tensor]] = {}
+    trajectory_ids = list(getattr(replay_buffer, "_trajectory_id_list", []))
+
+    for trajectory_id in trajectory_ids:
+        flat_trajectory = None
+        if replay_buffer._flat_trajectory_cache is not None:
+            flat_trajectory = replay_buffer._flat_trajectory_cache.get(trajectory_id)
+
+        if flat_trajectory is None:
+            trajectory_info = replay_buffer._trajectory_index[trajectory_id]
+            model_weights_id = trajectory_info["model_weights_id"]
+            trajectory = replay_buffer._load_trajectory(trajectory_id, model_weights_id)
+            flat_trajectory = replay_buffer._flatten_trajectory(trajectory)
+
+        for obs_key in ("curr_obs", "next_obs"):
+            obs_dict = flat_trajectory.get(obs_key, None)
+            if not isinstance(obs_dict, dict):
+                continue
+
+            for key, value in obs_dict.items():
+                if not _is_normalizable_obs_tensor(value):
+                    continue
+
+                flattened = value.float().reshape(value.shape[0], -1)
+                if key not in stats:
+                    stats[key] = {
+                        "sum": flattened.sum(dim=0),
+                        "sum_sq": flattened.square().sum(dim=0),
+                        "count": torch.tensor(float(flattened.shape[0])),
+                        "shape": torch.tensor(list(value.shape[1:]), dtype=torch.long),
+                    }
+                else:
+                    stats[key]["sum"] += flattened.sum(dim=0)
+                    stats[key]["sum_sq"] += flattened.square().sum(dim=0)
+                    stats[key]["count"] += float(flattened.shape[0])
+
+    normalized_stats: dict[str, dict[str, torch.Tensor]] = {}
+    for key, entry in stats.items():
+        count = torch.clamp(entry["count"], min=1.0)
+        mean = entry["sum"] / count
+        var = torch.clamp(entry["sum_sq"] / count - mean.square(), min=0.0)
+        target_shape = tuple(entry["shape"].tolist())
+        normalized_stats[key] = {
+            "mean": mean.reshape(target_shape),
+            "std": torch.sqrt(var + eps).reshape(target_shape),
+        }
+    return normalized_stats
+
+
+def apply_observation_normalizer(
+    batch: dict[str, Any],
+    observation_stats: dict[str, dict[str, torch.Tensor]],
+) -> dict[str, Any]:
+    if not observation_stats:
+        return batch
+
+    for obs_key in ("curr_obs", "next_obs"):
+        obs_dict = batch.get(obs_key, None)
+        if not isinstance(obs_dict, dict):
+            continue
+
+        for key, stats in observation_stats.items():
+            if key not in obs_dict:
+                continue
+            tensor = obs_dict[key]
+            if not torch.is_tensor(tensor):
+                continue
+            mean = stats["mean"].to(device=tensor.device, dtype=tensor.dtype)
+            std = stats["std"].to(device=tensor.device, dtype=tensor.dtype)
+            obs_dict[key] = (tensor - mean) / std
+    return batch
+
+
+def _load_offline_trajectory_file(path: str) -> list[Trajectory]:
+    if path.endswith((".pt", ".pth")):
+        payload = torch.load(path, map_location="cpu", weights_only=False)
+    elif path.endswith(".pkl"):
+        with open(path, "rb") as file_obj:
+            payload = pkl.load(file_obj)
+    else:
+        raise ValueError(
+            f"Unsupported offline trajectory file format for '{path}'. "
+            "Supported formats: .pt, .pth, .pkl"
+        )
+
+    if isinstance(payload, Trajectory):
+        return [payload]
+    if isinstance(payload, list):
+        if not all(isinstance(item, Trajectory) for item in payload):
+            raise TypeError("Offline trajectory list must contain Trajectory objects.")
+        return payload
+    if isinstance(payload, dict):
+        for key in ("episodes", "trajectories", "data"):
+            value = payload.get(key, None)
+            if isinstance(value, list) and all(
+                isinstance(item, Trajectory) for item in value
+            ):
+                return value
+    raise TypeError(
+        "Offline trajectory payload must be a Trajectory, a list[Trajectory], "
+        "or a dict containing an 'episodes'/'trajectories' list."
+    )
+
+
+def _load_offline_trajectory_payload(path: str) -> list[Trajectory]:
+    if os.path.isdir(path):
+        trajectories: list[Trajectory] = []
+        supported_suffixes = (".pt", ".pth", ".pkl")
+        trajectory_files = []
+        for root, _, file_names in os.walk(path):
+            for file_name in sorted(file_names):
+                if file_name.endswith(supported_suffixes):
+                    trajectory_files.append(os.path.join(root, file_name))
+
+        if not trajectory_files:
+            raise ValueError(
+                f"No offline trajectory files were found in directory '{path}'. "
+                "Supported formats: .pt, .pth, .pkl"
+            )
+
+        for trajectory_file in trajectory_files:
+            trajectories.extend(_load_offline_trajectory_file(trajectory_file))
+        return trajectories
+
+    return _load_offline_trajectory_file(path)
 
 
 class ReplayBufferDataset(IterableDataset):
@@ -53,6 +202,7 @@ class ReplayBufferDataset(IterableDataset):
         batch_size: int,
         min_replay_buffer_size: int,
         min_demo_buffer_size: int,
+        batch_transform: Optional[Callable[[dict[str, Any]], dict[str, Any]]] = None,
         **kwargs: Any,
     ) -> None:
         """Initializes the ReplayBufferDataset.
@@ -75,6 +225,75 @@ class ReplayBufferDataset(IterableDataset):
         self.min_demo_buffer_size = min_demo_buffer_size
 
         self.batch_size = batch_size
+        self.batch_transform = batch_transform
+
+    @classmethod
+    def from_offline_path(
+        cls,
+        path: str,
+        *,
+        batch_size: int,
+        min_replay_buffer_size: int = 0,
+        min_demo_buffer_size: int = 0,
+        prefetch_size: int = 5,
+        seed: int = 1234,
+        enable_cache: bool = True,
+        cache_size: int = 5,
+        sample_window_size: int = 0,
+        trajectory_format: str = "pt",
+        state_normalizer: Optional[dict[str, dict[str, torch.Tensor]]] = None,
+        reward_scale: float = 1.0,
+        reward_bias: float = 0.0,
+        batch_transform: Optional[Callable[[dict[str, Any]], dict[str, Any]]] = None,
+    ) -> "ReplayBufferDataset":
+        metadata_path = os.path.join(path, "metadata.json")
+        index_path = os.path.join(path, "trajectory_index.json")
+        use_checkpoint = (
+            os.path.isdir(path)
+            and os.path.exists(metadata_path)
+            and os.path.exists(index_path)
+        )
+        trajectories = None
+        effective_enable_cache = bool(enable_cache)
+        if not use_checkpoint:
+            trajectories = _load_offline_trajectory_payload(path)
+            cache_size = max(int(cache_size), len(trajectories))
+            # Raw trajectory files do not carry replay-buffer checkpoint metadata, so
+            # samples must remain cache-backed after the initial load.
+            effective_enable_cache = True
+
+        replay_buffer = TrajectoryReplayBuffer(
+            seed=seed,
+            enable_cache=effective_enable_cache,
+            cache_size=cache_size,
+            sample_window_size=sample_window_size,
+            auto_save=False,
+            trajectory_format=trajectory_format,
+        )
+
+        if use_checkpoint:
+            replay_buffer.load_checkpoint(path)
+        else:
+            replay_buffer.add_trajectories(trajectories)
+
+        def _offline_batch_transform(batch: dict[str, Any]) -> dict[str, Any]:
+            if reward_scale != 1.0 or reward_bias != 0.0:
+                batch["rewards"] = batch["rewards"] * reward_scale + reward_bias
+            if state_normalizer is not None:
+                batch = apply_observation_normalizer(batch, state_normalizer)
+            if batch_transform is not None:
+                batch = batch_transform(batch)
+            return batch
+
+        return cls(
+            replay_buffer=replay_buffer,
+            demo_buffer=None,
+            batch_size=batch_size,
+            min_replay_buffer_size=min_replay_buffer_size,
+            min_demo_buffer_size=min_demo_buffer_size,
+            prefetch_size=prefetch_size,
+            batch_transform=_offline_batch_transform,
+        )
 
     def __iter__(self) -> Iterator[dict[str, torch.Tensor]]:
         """Returns an infinite iterator that yields batches.
@@ -103,6 +322,8 @@ class ReplayBufferDataset(IterableDataset):
                     batch = concat_batch(replay_batch, demo_batch)
                 else:
                     batch = self.replay_buffer.sample(self.batch_size)
+                if self.batch_transform is not None:
+                    batch = self.batch_transform(batch)
                 yield batch
 
     def close(self) -> None:
@@ -143,6 +364,7 @@ class PreloadReplayBufferDataset(ReplayBufferDataset):
         min_replay_buffer_size: int,
         min_demo_buffer_size: int,
         prefetch_size: int = 5,
+        batch_transform: Optional[Callable[[dict[str, Any]], dict[str, Any]]] = None,
     ) -> None:
         """Initializes the PreloadReplayBufferDataset.
 
@@ -167,6 +389,7 @@ class PreloadReplayBufferDataset(ReplayBufferDataset):
         self.min_demo_buffer_size = min_demo_buffer_size
 
         self.batch_size = batch_size
+        self.batch_transform = batch_transform
         self.prefetch_size = prefetch_size
         assert self.prefetch_size > 0, f"{self.prefetch_size=} must be greater than 0"
 
@@ -202,6 +425,8 @@ class PreloadReplayBufferDataset(ReplayBufferDataset):
                     batch = concat_batch(replay_batch, demo_batch)
                 else:
                     batch = self.replay_buffer.sample(self.batch_size)
+                if self.batch_transform is not None:
+                    batch = self.batch_transform(batch)
             else:
                 time.sleep(3)
                 continue
@@ -257,7 +482,7 @@ class PreloadReplayBufferDataset(ReplayBufferDataset):
         self._stop_event.set()
 
         thread_timeout = 10
-        if self.sample_thread.is_alive():
+        if self.sample_thread is not None and self.sample_thread.is_alive():
             self.sample_thread.join(timeout=thread_timeout)
             if self.sample_thread.is_alive():
                 logger.warning(
