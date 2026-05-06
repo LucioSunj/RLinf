@@ -23,9 +23,9 @@ def get_model(cfg: DictConfig, torch_dtype=None):
     import glob
 
     import openpi.shared.download as download
+    import openpi.shared.normalize as _normalize
     import openpi.transforms as transforms
     import safetensors
-    from openpi.training import checkpoints as _checkpoints
 
     from rlinf.models.embodiment.openpi.dataconfig import get_openpi_config
     from rlinf.models.embodiment.openpi.openpi_action_model import (
@@ -99,7 +99,7 @@ def get_model(cfg: DictConfig, torch_dtype=None):
         # that the policy is using the same normalization stats as the original training process.
         if data_config.asset_id is None:
             raise ValueError("Asset id is required to load norm stats.")
-        norm_stats = _checkpoints.load_norm_stats(checkpoint_dir, data_config.asset_id)
+        norm_stats = _load_norm_stats_from_checkpoint(checkpoint_dir, data_config.asset_id, _normalize)
     # wrappers
     repack_transforms = transforms.Group()
     default_prompt = None
@@ -124,3 +124,17 @@ def get_model(cfg: DictConfig, torch_dtype=None):
     )
 
     return model
+
+
+def _load_norm_stats_from_checkpoint(checkpoint_dir, asset_id, normalize_module):
+    candidates = [
+        os.path.join(checkpoint_dir, "assets", asset_id),
+        os.path.join(checkpoint_dir, asset_id),
+    ]
+    for norm_stats_dir in candidates:
+        if os.path.exists(os.path.join(norm_stats_dir, "norm_stats.json")):
+            return normalize_module.load(norm_stats_dir)
+    raise FileNotFoundError(
+        "Norm stats file not found. Tried: "
+        + ", ".join(os.path.join(path, "norm_stats.json") for path in candidates)
+    )

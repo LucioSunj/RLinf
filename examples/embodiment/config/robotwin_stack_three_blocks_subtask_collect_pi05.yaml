@@ -1,0 +1,96 @@
+defaults:
+  - model/pi0_5@actor.model
+  - _self_
+  - override hydra/job_logging: stdout
+
+hydra:
+  run:
+    dir: .
+  output_subdir: null
+  searchpath:
+    - file://${oc.env:EMBODIED_PATH}/config/
+
+collector:
+  dataset_root: /root/autodl-tmp/Robotwin-dataset/Stack_Three_Blocks/aloha-agilex_clean_50
+  subtask_manifest: ${collector.dataset_root}/subtask_segments.json
+  seed_path: ${collector.dataset_root}/seed.txt
+  output_dir: /root/autodl-tmp/Robotwin-dataset/Stack_Three_Blocks/subtask_rollouts/pi05_19000_rlinf_v0
+  episode_ids: [0, 1, 2]
+  subtask_ids: [0, 1, 2]
+  rollouts_per_subtask: 1
+  max_rollouts: null
+  action_chunk_size: 50
+  replay_chunk_size: 50
+  max_subtask_steps: null
+  prompt_split: seen
+  prompt_index: 0
+  center_crop: false
+  seed: 1234
+  model_mode: train
+  model_device: auto
+  compute_values: false
+  dry_run: false
+  overwrite_manifest: true
+  model_tag: pi05_stack_three_blocks_19000
+
+robotwin:
+  robotwin_python_path: /root/autodl-tmp/rlinf-openpi-calvin-venv/robotwin
+  assets_path: /root/RoboTwin
+  task_config:
+    task_name: stack_blocks_three
+    step_lim: 800
+    planner_backend: mplib
+    render_freq: 0
+    episode_num: 50
+    use_seed: false
+    save_freq: 15
+    embodiment: [aloha-agilex]
+    language_num: 100
+    domain_randomization:
+      random_background: false
+      cluttered_table: false
+      clean_background_rate: 1
+      random_head_camera_dis: 0
+      random_table_height: 0
+      random_light: false
+      crazy_random_light_rate: 0
+    camera:
+      head_camera_type: D435
+      wrist_camera_type: D435
+      collect_head_camera: true
+      collect_wrist_camera: true
+    data_type:
+      rgb: true
+      third_view: false
+      depth: false
+      pointcloud: false
+      observer: false
+      endpose: true
+      qpos: true
+      mesh_segmentation: false
+      actor_segmentation: false
+    pcd_down_sample_num: 1024
+    pcd_crop: true
+    save_path: /tmp/robotwin_subtask_collect
+    clear_cache_freq: 1
+    collect_data: false
+    eval_video_log: false
+
+actor:
+  model:
+    model_path: /root/autodl-tmp/robotwin-pi05-checkpoints/rlinf_converted/pi05_stack_three_blocks_19000
+    num_action_chunks: ${collector.action_chunk_size}
+    action_dim: 14
+    add_value_head: false
+    num_steps: 5
+    openpi:
+      config_name: pi05_aloha_stack_three_blocks_full
+      num_images_in_input: 3
+      noise_level: 0.3
+      action_chunk: ${collector.action_chunk_size}
+      num_steps: ${actor.model.num_steps}
+      train_expert_only: true
+      action_env_dim: ${actor.model.action_dim}
+      noise_method: flow_sde
+      add_value_head: ${actor.model.add_value_head}
+      detach_critic_input: true

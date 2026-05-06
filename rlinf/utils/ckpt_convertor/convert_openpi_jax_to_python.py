@@ -649,8 +649,13 @@ def convert_pi0_checkpoint(
         pi0_model, os.path.join(output_path, "model.safetensors")
     )
 
-    # Copy assets folder if it exists
-    assets_source = pathlib.Path(checkpoint_dir).parent / "assets"
+    # Copy assets folder if it exists. Fine-tuned OpenPI checkpoints usually keep
+    # assets beside params under the checkpoint directory; older layouts kept
+    # them beside the checkpoint directory.
+    checkpoint_path = pathlib.Path(checkpoint_dir)
+    assets_source = checkpoint_path / "assets"
+    if not assets_source.exists():
+        assets_source = checkpoint_path.parent / "assets"
     if assets_source.exists():
         assets_dest = pathlib.Path(output_path) / "assets"
         if assets_dest.exists():
