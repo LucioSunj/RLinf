@@ -287,7 +287,10 @@ class RoboTwinStackThreeSubtaskEnv:
 
     def _get_class_decorator(self):
         if self._class_decorator is None:
-            from robotwin.envs.vector_env import class_decorator
+            try:
+                from robotwin.envs.vector_env import class_decorator
+            except ModuleNotFoundError:
+                from script.collect_data import class_decorator
 
             self._class_decorator = class_decorator
         return self._class_decorator
@@ -353,11 +356,43 @@ class RoboTwinStackThreeSubtaskEnv:
             return
         assert self.expert_vectors is not None
         prefix_actions = self.expert_vectors[1 : segment.start_step + 1]
+        executed_total = 0
         for start in range(0, len(prefix_actions), self.replay_chunk_size):
             chunk = prefix_actions[start : start + self.replay_chunk_size]
             if len(chunk) == 0:
                 continue
-            self.task.gen_sparse_reward_data(chunk, action_type="qpos")
+            executed = self._execute_qpos_actions(
+                chunk, stop_on_subtask_success=False
+            )
+            executed_total += executed
+            if executed < len(chunk):
+                raise RuntimeError(
+                    "Failed to replay Robotwin expert prefix completely: "
+                    f"executed {executed_total}/{len(prefix_actions)} actions "
+                    f"before subtask start_step={segment.start_step}."
+                )
+
+    def _execute_qpos_actions(
+        self, actions: np.ndarray, *, stop_on_subtask_success: bool
+    ) -> int:
+        if self.task is None:
+            raise RuntimeError("reset must be called before executing actions")
+
+        actions = np.asarray(actions)
+        if actions.ndim != 2 or actions.shape[-1] != 14:
+            raise ValueError(f"Expected qpos actions [T, 14], got {actions.shape}")
+
+        executed = 0
+        for action in actions:
+            before_count = int(getattr(self.task, "take_action_cnt", 0))
+            self.task.take_action(action, action_type="qpos")
+            after_count = int(getattr(self.task, "take_action_cnt", before_count))
+            if after_count <= before_count:
+                break
+            executed += 1
+            if stop_on_subtask_success and self.check_subtask_success():
+                break
+        return executed
 
     def get_expert_action_chunk(self) -> torch.Tensor:
         if self.current_segment is None or self.expert_vectors is None:
@@ -398,13 +433,17 @@ class RoboTwinStackThreeSubtaskEnv:
         exec_len = min(chunk_len, remaining)
 
         if exec_len > 0:
-            self.task.gen_sparse_reward_data(actions_np[:exec_len], action_type="qpos")
-            self.elapsed_steps += exec_len
+            executed_len = self._execute_qpos_actions(
+                actions_np[:exec_len], stop_on_subtask_success=True
+            )
+            self.elapsed_steps += executed_len
+        else:
+            executed_len = 0
 
         success = self.check_subtask_success()
         truncation = (self.elapsed_steps >= self.max_steps) and not success
         terminal = success or truncation
-        terminal_idx = max(exec_len - 1, 0)
+        terminal_idx = max(executed_len - 1, 0)
 
         rewards = torch.zeros((1, chunk_len), dtype=torch.float32)
         terminations = torch.zeros((1, chunk_len), dtype=torch.bool)
