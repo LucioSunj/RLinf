@@ -217,7 +217,7 @@ def main(cfg) -> None:
 
     rollout_count = 0
     try:
-        for segment in segments:
+        for segment in segments: # 这里会顺序遍历从而将所有subtask都rollout一遍
             for rollout_idx in range(int(cfg.collector.rollouts_per_subtask)):
                 obs = env.reset(segment)
                 chunks: list[CollectedChunk] = []
