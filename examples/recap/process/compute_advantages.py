@@ -58,6 +58,9 @@ from rlinf.data.datasets.recap.utils import (
     load_return_stats_from_dataset,
     load_returns_sidecar,
 )
+from rlinf.data.datasets.recap.lerobot_compat import (
+    ensure_lerobot_column_indexing_compat,
+)
 from rlinf.models.embodiment.value_model.modeling_critic import ValueCriticModel
 
 logger = logging.getLogger(__name__)
@@ -369,6 +372,7 @@ def load_lerobot_dataset(
     logger.info(f"  Dataset path: {dataset_path}")
     logger.info(f"  FPS: {meta.fps}")
 
+    ensure_lerobot_column_indexing_compat()
     dataset = LeRobotDataset(
         str(dataset_path),
         download_videos=False,
@@ -407,10 +411,40 @@ def build_obs(
     Returns:
         Raw observation dict compatible with ValueCriticModel.infer()
     """
+    if robot_type in ("aloha", "robotwin_aloha"):
+        obs = {
+            "observation/image": to_numpy(sample["observation.images.cam_high"]),
+            "observation/wrist_image": np.stack(
+                [
+                    to_numpy(sample["observation.images.cam_left_wrist"]),
+                    to_numpy(sample["observation.images.cam_right_wrist"]),
+                ],
+                axis=0,
+            ),
+            "observation/state": to_numpy(sample["observation.state"]),
+        }
+        if "task" in sample:
+            obs["prompt"] = str(to_scalar(sample["task"]))
+        elif "task_index" in sample and tasks:
+            task_idx = int(to_scalar(sample["task_index"]))
+            if task_idx not in tasks:
+                raise ValueError(
+                    f"task_index {task_idx} not found in tasks dict. "
+                    f"Available task indices: {list(tasks.keys())}. "
+                    "Check that meta/tasks.jsonl is complete."
+                )
+            obs["prompt"] = tasks[task_idx]
+        else:
+            raise ValueError(
+                "Sample has neither 'task' nor 'task_index' field. "
+                "Cannot determine task prompt for value model inference."
+            )
+        return obs
+
     if robot_type not in KEY_MAPPINGS:
         raise ValueError(
             f"Unknown robot_type {robot_type!r}. "
-            f"Supported types: {list(KEY_MAPPINGS.keys())}. "
+            f"Supported types: {list(KEY_MAPPINGS.keys()) + ['aloha', 'robotwin_aloha']}. "
             "Add a new entry to KEY_MAPPINGS if this is a new robot type."
         )
     key_map = KEY_MAPPINGS[robot_type]

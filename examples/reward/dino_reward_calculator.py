@@ -1,26 +1,41 @@
+import numpy as np
 import torch
 import torch.nn.functional as F
 from PIL import Image
-import numpy as np
 from transformers import AutoImageProcessor, AutoModel
 
 
+DEFAULT_DINOV3_CHECKPOINT = (
+    "/home/lsk/long-horizon-manipulation/checkpoints/dinov3/extracted/facebook/"
+    "dinov3-vitb16-pretrain-lvd1689m"
+)
+
+
 class DINORewardCalculator:
-    def __init__(self, device="cuda" if torch.cuda.is_available() else "cpu", model_name="/root/autodl-tmp/checkpoints/dinov3/dinov3-vitl16-pretrain-lvd1689m"):
+    def __init__(
+        self,
+        device="cuda" if torch.cuda.is_available() else "cpu",
+        model_name=DEFAULT_DINOV3_CHECKPOINT,
+        local_files_only=True,
+    ):
         """
         初始化 DINOv3 奖励计算器
 
         依赖:
           - transformers >= 4.56.0
-          - 模型在 HuggingFace 上是 gated 访问,需要先在 model card 申请权限并登录
+          - 默认使用本机已验证的 DINOv3 ViT-B/16 HF checkpoint
 
         :param model_name: HuggingFace 上的 DINOv3 模型权重地址
         """
         self.device = device
         print(f"Loading DINO model ({model_name}) on {self.device}...")
 
-        self.processor = AutoImageProcessor.from_pretrained(model_name)
-        self.model = AutoModel.from_pretrained(model_name).to(self.device)
+        self.processor = AutoImageProcessor.from_pretrained(
+            model_name, local_files_only=local_files_only
+        )
+        self.model = AutoModel.from_pretrained(
+            model_name, local_files_only=local_files_only
+        ).to(self.device)
         self.model.eval()
 
     @staticmethod
@@ -48,11 +63,32 @@ class DINORewardCalculator:
         # DINOv3 的 HF 实现没有 pooler_output,从 last_hidden_state 取 [CLS] token
         # token 顺序: [CLS, register_tokens..., patch_tokens...],CLS 始终在 index 0
         outputs = self.model(**inputs)
-        embedding = outputs.last_hidden_state[:, 0]
+        embedding = getattr(outputs, "pooler_output", None)
+        if embedding is None:
+            embedding = outputs.last_hidden_state[:, 0]
 
         # L2 归一化 (单位超球面,便于距离计算)
         embedding = F.normalize(embedding, p=2, dim=1)
         return embedding
+
+    @torch.no_grad()
+    def get_embeddings_batched(self, images, batch_size=32):
+        """Batch DINO embeddings for a list of PIL/numpy RGB images."""
+        outputs = []
+        for start in range(0, len(images), batch_size):
+            outputs.append(self.get_embedding(images[start : start + batch_size]).cpu())
+        return torch.cat(outputs, dim=0) if outputs else torch.empty((0, 0))
+
+    @staticmethod
+    def reward_from_distance(l2_dist_sq, temperature=1.0):
+        return np.exp(-np.asarray(l2_dist_sq, dtype=np.float32) / float(temperature))
+
+    def compute_rewards_against_embedding(self, images, ref_embedding, temperature=1.0, batch_size=32):
+        """Compute DINO RBF rewards for many images against one normalized ref embedding."""
+        embeddings = self.get_embeddings_batched(images, batch_size=batch_size).to(ref_embedding.device)
+        l2_dist_sq = ((embeddings - ref_embedding) ** 2).sum(dim=1).cpu().numpy()
+        rewards = self.reward_from_distance(l2_dist_sq, temperature=temperature)
+        return rewards.astype(np.float32), l2_dist_sq.astype(np.float32)
 
     def compute_handoff_reward(self, current_img, expert_ref_img, temperature=1.0):
         """

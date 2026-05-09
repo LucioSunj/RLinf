@@ -35,6 +35,9 @@ from rlinf.data.datasets.recap.cfg_model import (
     CfgMixtureDataset,
     TokenizePromptWithGuidance,
 )
+from rlinf.data.datasets.recap.lerobot_compat import (
+    ensure_lerobot_column_indexing_compat,
+)
 from rlinf.data.datasets.recap.utils import (
     cast_image_features,
 )
@@ -167,17 +170,22 @@ class FSDPCfgWorker(FSDPSftWorker):
             data_path = ds_config["dataset_path"]
             episodes = ds_config.get("episodes")
             weight = ds_config.get("weight", 1.0)
+            prechunked_actions = bool(ds_config.get("prechunked_actions", False))
 
             dataset_meta = lerobot_dataset.LeRobotDatasetMetadata(data_path)
-            base_dataset = lerobot_dataset.LeRobotDataset(
-                data_path,
-                episodes=episodes,
-                delta_timestamps={
+            delta_timestamps = None
+            if not prechunked_actions:
+                delta_timestamps = {
                     key: [
                         t / dataset_meta.fps for t in range(config.model.action_horizon)
                     ]
                     for key in data_config.action_sequence_keys
-                },
+                }
+            ensure_lerobot_column_indexing_compat()
+            base_dataset = lerobot_dataset.LeRobotDataset(
+                data_path,
+                episodes=episodes,
+                delta_timestamps=delta_timestamps,
             )
 
             base_dataset.hf_dataset = cast_image_features(base_dataset.hf_dataset)
@@ -228,7 +236,8 @@ class FSDPCfgWorker(FSDPSftWorker):
             if self._rank == 0:
                 self.log_info(
                     f"Loaded dataset: {data_path} "
-                    f"({len(final_dataset)} samples, weight={weight})"
+                    f"({len(final_dataset)} samples, weight={weight}, "
+                    f"prechunked_actions={prechunked_actions})"
                 )
 
         combined_dataset = CfgMixtureDataset(

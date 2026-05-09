@@ -18,6 +18,8 @@ from __future__ import annotations
 
 import json
 import logging
+import importlib.util
+import sys
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterator, Optional
@@ -33,9 +35,8 @@ from lerobot.common.datasets.lerobot_dataset import (
 from openpi.transforms import DataTransformFn
 from torch.utils.data import Dataset
 
-from rlinf.models.embodiment.openpi.policies import franka_policy, libero_policy
-
 from .common import BaseDataLoaderImpl, ReCapMixtureDataset
+from .lerobot_compat import ensure_lerobot_column_indexing_compat
 from .utils import (
     decode_image_struct_batch,
     load_returns_sidecar,
@@ -49,6 +50,28 @@ _MODEL_TYPE_MAP = {
     "pi05": _openpi_model.ModelType.PI05,
     "pi0_fast": _openpi_model.ModelType.PI0_FAST,
 }
+
+
+def _load_openpi_policy_module(module_name: str):
+    cache_name = f"_rlinf_openpi_policy_{module_name}"
+    if cache_name in sys.modules:
+        return sys.modules[cache_name]
+
+    policy_path = (
+        Path(__file__).resolve().parents[3]
+        / "models"
+        / "embodiment"
+        / "openpi"
+        / "policies"
+        / f"{module_name}.py"
+    )
+    spec = importlib.util.spec_from_file_location(cache_name, policy_path)
+    if spec is None or spec.loader is None:
+        raise ImportError(f"Unable to load OpenPI policy module from {policy_path}")
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[cache_name] = module
+    spec.loader.exec_module(module)
+    return module
 
 _REPACK_KEYS = {
     "libero": {
@@ -76,6 +99,26 @@ _REPACK_KEYS = {
         "observation/wrist_image": "wrist_image",
         "observation/state": "state",
         "actions": "actions",
+        "prompt": "prompt",
+    },
+    "aloha": {
+        "images": {
+            "cam_high": "observation.images.cam_high",
+            "cam_left_wrist": "observation.images.cam_left_wrist",
+            "cam_right_wrist": "observation.images.cam_right_wrist",
+        },
+        "state": "observation.state",
+        "actions": "action",
+        "prompt": "prompt",
+    },
+    "robotwin_aloha": {
+        "images": {
+            "cam_high": "observation.images.cam_high",
+            "cam_left_wrist": "observation.images.cam_left_wrist",
+            "cam_right_wrist": "observation.images.cam_right_wrist",
+        },
+        "state": "observation.state",
+        "actions": "action",
         "prompt": "prompt",
     },
 }
@@ -206,6 +249,7 @@ class ValueDataset(Dataset):
         normalize_to_minus_one_zero: bool = True,
         max_samples: Optional[int] = None,
         tag: Optional[str] = None,
+        prechunked_actions: bool = False,
         episode_percentage: Optional[float] = None,
         shuffle_episodes: bool = False,
         episode_seed: int = 42,
@@ -237,9 +281,12 @@ class ValueDataset(Dataset):
                 f"No action key in dataset features: "
                 f"{list(self.dataset_meta.features.keys())}"
             )
-        delta_timestamps = {
-            action_key: [t / self.dataset_meta.fps for t in range(action_horizon)]
-        }
+        delta_timestamps = None
+        if not prechunked_actions:
+            delta_timestamps = {
+                action_key: [t / self.dataset_meta.fps for t in range(action_horizon)]
+            }
+        ensure_lerobot_column_indexing_compat()
         self._base = LeRobotDataset(
             local_path.name,
             root=local_path,
@@ -315,16 +362,21 @@ class ValueDataset(Dataset):
         transforms_list.append(_openpi_transforms.RepackTransform(repack_keys))
 
         if robot in ("libero", "libero_v2"):
+            libero_policy = _load_openpi_policy_module("libero_policy")
             transforms_list.append(
                 libero_policy.LiberoInputs(model_type=model_type_enum)
             )
         elif robot in ("franka", "franka_co_train"):
+            franka_policy = _load_openpi_policy_module("franka_policy")
             transforms_list.append(
                 franka_policy.FrankaEEInputs(
                     action_dim=action_dim,
                     model_type=model_type_enum,
                 )
             )
+        elif robot in ("aloha", "robotwin_aloha"):
+            aloha_policy = _load_openpi_policy_module("aloha_policy")
+            transforms_list.append(aloha_policy.AlohaInputs(adapt_to_pi=False))
 
         transforms_list.append(_openpi_transforms.InjectDefaultPrompt(default_prompt))
         transforms_list.append(_openpi_transforms.PadStatesAndActions(action_dim))

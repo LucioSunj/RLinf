@@ -212,6 +212,7 @@ class FSDPValueSftWorker(FSDPModelManager, Worker):
             "action_dim": data_cfg.get(
                 "action_dim", getattr(model_cfg, "action_dim", None)
             ),
+            "prechunked_actions": data_cfg.get("prechunked_actions", False),
             "robot_type": robot_type,
             "model_type": model_type,
         }
@@ -316,6 +317,9 @@ class FSDPValueSftWorker(FSDPModelManager, Worker):
                     "normalize_to_minus_one_zero", shared["normalize_to_minus_one_zero"]
                 ),
                 "action_dim": entry.get("action_dim", shared["action_dim"]),
+                "prechunked_actions": entry.get(
+                    "prechunked_actions", shared["prechunked_actions"]
+                ),
                 "split": "train",
                 "default_prompt": entry.get("default_prompt", None),
                 "max_samples": entry.get("max_samples", None),
@@ -411,6 +415,9 @@ class FSDPValueSftWorker(FSDPModelManager, Worker):
                 ),
                 split="val",
                 action_dim=eval_entry.get("action_dim", shared["action_dim"]),
+                prechunked_actions=eval_entry.get(
+                    "prechunked_actions", shared["prechunked_actions"]
+                ),
                 default_prompt=eval_entry.get("default_prompt", None),
                 max_samples=eval_max_samples,
                 tag=data_cfg.get("tag", None),
