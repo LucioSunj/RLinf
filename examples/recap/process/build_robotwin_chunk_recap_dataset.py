@@ -98,6 +98,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--temperature", type=float, default=1.0)
     parser.add_argument("--reference-window", type=int, default=1)
     parser.add_argument("--handoff-scale", type=float, default=5.0)
+    parser.add_argument(
+        "--handoff-start-fraction",
+        type=float,
+        default=0.0,
+        help=(
+            "Enable DINO handoff reward only for chunks whose midpoint progress "
+            "within the subtask is >= this fraction. Use 0.5 for the second half."
+        ),
+    )
     parser.add_argument("--step-penalty", type=float, default=-1.0)
     parser.add_argument("--success-reward", type=float, default=10.0)
     parser.add_argument("--failure-reward", type=float, default=-10.0)
@@ -437,6 +446,17 @@ def build_reference_embeddings(
     return refs
 
 
+def handoff_label_alpha(
+    chunk_index: int,
+    num_chunks: int,
+    handoff_start_fraction: float,
+) -> float:
+    if num_chunks <= 0:
+        return 0.0
+    chunk_midpoint_progress = (float(chunk_index) + 0.5) / float(num_chunks)
+    return 1.0 if chunk_midpoint_progress >= handoff_start_fraction else 0.0
+
+
 def score_chunks(
     calculator: DINORewardCalculator,
     chunks: list[ChunkRecord],
@@ -445,6 +465,7 @@ def score_chunks(
     batch_size: int,
     temperature: float,
     handoff_scale: float,
+    handoff_start_fraction: float,
     step_penalty: float,
     success_reward: float,
     failure_reward: float,
@@ -480,11 +501,14 @@ def score_chunks(
         task_reward = 0.0
         if chunk.terminal:
             task_reward = success_reward if chunk.success else failure_reward
+        handoff_alpha = handoff_label_alpha(
+            idx, len(chunks), float(handoff_start_fraction)
+        )
+        handoff_delta = 0.0
         handoff_reward = 0.0
         if reach_curr_values[idx] is not None and reach_next_values[idx] is not None:
-            handoff_reward = handoff_scale * (
-                reach_next_values[idx] - reach_curr_values[idx]
-            )
+            handoff_delta = reach_next_values[idx] - reach_curr_values[idx]
+            handoff_reward = handoff_alpha * handoff_scale * handoff_delta
         reward = float(step_penalty + handoff_reward + task_reward)
         rewards.append(reward)
         details.append(
@@ -507,6 +531,8 @@ def score_chunks(
                 "dino_l2_sq_curr": dist_curr_values[idx],
                 "dino_l2_sq_next": dist_next_values[idx],
                 "step_penalty": float(step_penalty),
+                "handoff_alpha": float(handoff_alpha),
+                "handoff_delta": float(handoff_delta),
                 "handoff_reward": float(handoff_reward),
                 "task_reward": float(task_reward),
                 "reward": reward,
@@ -682,6 +708,7 @@ def process_expert_dataset(
             batch_size=args.batch_size,
             temperature=args.temperature,
             handoff_scale=args.handoff_scale,
+            handoff_start_fraction=args.handoff_start_fraction,
             step_penalty=args.step_penalty,
             success_reward=args.success_reward,
             failure_reward=args.failure_reward,
@@ -729,6 +756,7 @@ def process_rollout_dataset(
             batch_size=args.batch_size,
             temperature=args.temperature,
             handoff_scale=args.handoff_scale,
+            handoff_start_fraction=args.handoff_start_fraction,
             step_penalty=args.step_penalty,
             success_reward=args.success_reward,
             failure_reward=args.failure_reward,
@@ -750,6 +778,8 @@ def process_rollout_dataset(
 
 def main() -> None:
     args = parse_args()
+    if not 0.0 <= float(args.handoff_start_fraction) <= 1.0:
+        raise ValueError("--handoff-start-fraction must be in [0, 1]")
     output_root, expert_output, rollout_output = resolve_outputs(args)
     image_shape = (args.image_height, args.image_width, 3)
 
@@ -837,6 +867,7 @@ def main() -> None:
             "temperature": args.temperature,
             "reference_window": args.reference_window,
             "handoff_scale": args.handoff_scale,
+            "handoff_start_fraction": args.handoff_start_fraction,
             "step_penalty": args.step_penalty,
             "success_reward": args.success_reward,
             "failure_reward": args.failure_reward,
