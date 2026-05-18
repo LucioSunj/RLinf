@@ -12,20 +12,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from __future__ import annotations
+
 import logging
 import os
 import pathlib
 from typing import Any
-
-import openpi.policies.policy as _policy
-import openpi.shared.download as download
-import openpi.transforms as transforms
-import safetensors
-from openpi.models_pytorch import pi0_pytorch
-from openpi.training import checkpoints as _checkpoints
-from openpi.training import config as _config
-
-from rlinf.models.embodiment.openpi.dataconfig import _CONFIGS_DICT
 
 
 def setup_logger(exp_name, log_dir):
@@ -41,22 +33,25 @@ def setup_logger(exp_name, log_dir):
     return logger
 
 
-def load_pytorch(train_config, weight_path: str):
+def load_pytorch(train_config: Any, weight_path: str):
+    import safetensors.torch
+    from openpi.models_pytorch import pi0_pytorch
+
     model = pi0_pytorch.PI0Pytorch(config=train_config.model)
     safetensors.torch.load_model(model, weight_path, strict=False)
     return model
 
 
 def create_trained_policy(
-    train_config: _config.TrainConfig,
+    train_config: Any,
     checkpoint_dir: pathlib.Path | str,
     *,
-    repack_transforms: transforms.Group | None = None,
+    repack_transforms: Any | None = None,
     sample_kwargs: dict[str, Any] | None = None,
     default_prompt: str | None = None,
-    norm_stats: dict[str, transforms.NormStats] | None = None,
+    norm_stats: dict[str, Any] | None = None,
     pytorch_device: str | None = None,
-) -> _policy.Policy:
+) -> Any:
     """Create a policy from a trained checkpoint.
 
     Args:
@@ -76,6 +71,11 @@ def create_trained_policy(
         The function automatically detects whether the model is PyTorch-based by checking for the
         presence of "model.safensors" in the checkpoint directory.
     """
+    import openpi.policies.policy as _policy
+    import openpi.shared.download as download
+    import openpi.transforms as transforms
+    from openpi.training import checkpoints as _checkpoints
+
     repack_transforms = repack_transforms or transforms.Group()
     checkpoint_dir = download.maybe_download(str(checkpoint_dir))
 
@@ -136,6 +136,8 @@ def create_trained_policy(
 
 # setup the policy
 def setup_policy(args):
+    from rlinf.models.embodiment.openpi.dataconfig import _CONFIGS_DICT
+
     config = _CONFIGS_DICT[args.config_name]
     policy = create_trained_policy(
         config,

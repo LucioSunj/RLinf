@@ -121,3 +121,30 @@ python toolkits/eval_scripts_openpi/calvin_eval.py \
     --video_temp_subsample 10
 ```
 
+### CALVIN Handoff Diagnostic (`calvin_handoff_diagnostic_eval.py`)
+
+This diagnostic evaluator compares next-skill success from a policy-generated
+terminal state with next-skill success after an oracle symbolic reset to the
+expected start state. It is intended to measure whether successful current
+subtasks leave terminal states that are bad handoff states for the next subtask.
+
+```bash
+python toolkits/eval_scripts_openpi/calvin_handoff_diagnostic_eval.py \
+    --exp_name calvin_pi05_handoff_diag \
+    --config_name pi05_calvin \
+    --pretrained_path /path/to/RLinf-Pi05-CALVIN-ABC-D-SFT \
+    --task_suite_name calvin_d \
+    --num_trials 1000 \
+    --max_steps_current 480 \
+    --max_steps_next 480 \
+    --action_chunk 5 \
+    --num_steps 5 \
+    --pair_positions all \
+    --num_save_videos 10
+```
+
+Outputs are written under `logs/<exp_name>/`:
+
+- `handoff_trials.jsonl`: one adjacent-pair diagnostic record per evaluated pair
+- `handoff_summary.json`: overall, per-position, per-current-task, and
+  per-next-task success rates plus handoff gaps
