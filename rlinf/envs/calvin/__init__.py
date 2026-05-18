@@ -14,17 +14,16 @@
 import pathlib
 from pathlib import Path
 
-import calvin_env
 import hydra
-from calvin_agent.evaluation.utils import get_env_state_for_initial_condition
 from omegaconf import OmegaConf
-
-from rlinf.envs.calvin.utils import get_sequences
 
 ENV_CFG_DIR = Path(__file__).parent / "calvin_cfg/"
 
 
 def _get_calvin_tasks_and_reward(num_sequences, task_suite_name="calvin_d"):
+    import calvin_env
+    from rlinf.envs.calvin.utils import get_sequences
+
     conf_dir = (
         pathlib.Path(calvin_env.__file__).absolute().parents[2]
         / "calvin_models"
@@ -103,6 +102,8 @@ class CalvinBenchmark:
         return self.eval_sequences[trial_id][1]
 
     def get_obs_for_initial_condition(self, init_states):
+        from calvin_agent.evaluation.utils import get_env_state_for_initial_condition
+
         robot_obs_list = []
         scene_obs_list = []
         for idx in range(len(init_states)):

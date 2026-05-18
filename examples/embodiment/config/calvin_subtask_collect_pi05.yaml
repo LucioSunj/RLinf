@@ -1,0 +1,66 @@
+defaults:
+  - model/pi0_5@actor.model
+  - _self_
+  - override hydra/job_logging: stdout
+
+hydra:
+  run:
+    dir: .
+  output_subdir: null
+  searchpath:
+    - file://${oc.env:EMBODIED_PATH}/config/
+
+collector:
+  data_root: /media/lsk/Elements/dataset/calvin/task_ABC_D
+  split: training
+  output_dir: /home/lsk/long-horizon-manipulation/dataset/calvin/task_ABC_D/subtask_rollouts/pi05_calvin_subtask_smoke
+  canonical_tasks: null
+  segment_indices: null
+  max_segments_per_task: 1
+  max_total_segments: null
+  rollouts_per_subtask: 1
+  action_chunk_size: 5
+  max_subtask_steps: 480
+  action_key: rel_actions
+  target_window_size: 8
+  next_window_size: 8
+  resolve_scene_from_scene_info: true
+  include_next_window_in_dense: true
+  seed: 1234
+  model_mode: train
+  model_device: auto
+  compute_values: false
+  dry_run: true
+  overwrite_manifest: true
+  model_tag: pi05_calvin_subtask
+
+calvin:
+  task_suite_name: calvin_abcd
+  scene: auto
+
+reward:
+  dense_beta: 0.2
+  dense_state_weight: 1.0
+  dense_visual_weight: 0.1
+  oracle_success_bonus: 1.0
+
+actor:
+  model:
+    model_path: /path/to/model/RLinf-Pi05-CALVIN-ABC-D-SFT
+    num_action_chunks: ${collector.action_chunk_size}
+    action_dim: 7
+    add_value_head: false
+    num_steps: 5
+    openpi:
+      config_name: pi05_calvin
+      num_images_in_input: 2
+      noise_level: 0.5
+      action_chunk: ${collector.action_chunk_size}
+      num_steps: ${actor.model.num_steps}
+      train_expert_only: true
+      action_env_dim: ${actor.model.action_dim}
+      noise_method: flow_sde
+      add_value_head: ${actor.model.add_value_head}
+      value_after_vlm: true
+      value_vlm_mode: mean_token
+      detach_critic_input: true
