@@ -131,6 +131,11 @@ def _register_builtin_models():
 
         return get_model(cfg, torch_dtype)
 
+    def _build_gate_policy(cfg: DictConfig, torch_dtype):
+        from rlinf.models.embodiment.gate_policy import get_model
+
+        return get_model(cfg, torch_dtype)
+
     register_model(
         SupportedModel.OPENVLA.value,
         _build_openvla,
@@ -230,6 +235,15 @@ def _register_builtin_models():
     register_model(
         SupportedModel.GR00T_N1D7.value,
         _build_gr00t_n1d7,
+        category="embodied",
+        force=True,
+    )
+    # Adaptive-prediction gate: a small 3-way categorical policy on a frozen WAM.
+    # Registered by literal name; register_model auto-extends SupportedModel +
+    # EMBODIED_MODEL, so no config.py enum edit is required.
+    register_model(
+        "gate_policy",
+        _build_gate_policy,
         category="embodied",
         force=True,
     )
