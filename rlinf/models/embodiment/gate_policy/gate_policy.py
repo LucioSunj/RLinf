@@ -221,10 +221,14 @@ class GatePolicy(nn.Module, BasePolicy):
             robot_chunks.append(out["action_chunk"])
             costs.append(out["cost"])
         chunk_actions = torch.stack([c.to(device) for c in robot_chunks], dim=0)  # [B, Ta, A_robot]
+        mode_cost = torch.tensor(costs, device=device, dtype=torch.float32).unsqueeze(-1)  # [B,1]
 
         forward_inputs = {
             "gate_input": gate_input,
             "action": mode_idx.long().unsqueeze(-1),  # trained action = mode, [B,1]
+            # carried in the buffer for the reward hook (-lambda*cost) and logging:
+            "mode": mode_idx.long().unsqueeze(-1),    # [B,1]
+            "mode_cost": mode_cost,                    # [B,1], cost(FULL)=1
         }
         if return_obs:
             forward_inputs["world_feat"] = world_feat
@@ -234,9 +238,9 @@ class GatePolicy(nn.Module, BasePolicy):
             "prev_logprobs": chunk_logprobs,
             "prev_values": chunk_values,
             "forward_inputs": forward_inputs,
-            # extras for reward (-lambda*cost) and mode-usage logging:
+            # convenience top-level mirrors for mode-usage logging:
             "mode": mode_idx.long(),
-            "mode_cost": torch.tensor(costs, device=device, dtype=torch.float32),
+            "mode_cost": mode_cost.squeeze(-1),
             "mode_logits": logits.detach(),
         }
         return chunk_actions, result
