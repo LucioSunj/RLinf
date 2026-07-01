@@ -24,6 +24,14 @@ gp = pytest.importorskip(
     reason="rlinf not importable in this environment",
 )
 GatePolicy = gp.GatePolicy
+obs_prep = pytest.importorskip(
+    "rlinf.models.embodiment.gate_policy.obs_preprocessor",
+    reason="gate obs preprocessor not importable in this environment",
+)
+reward_mod = pytest.importorskip(
+    "rlinf.models.embodiment.gate_policy.reward",
+    reason="gate reward helpers not importable in this environment",
+)
 from torch.distributions.categorical import Categorical  # noqa: E402
 
 
@@ -132,3 +140,40 @@ def test_value_head_required_for_values():
     assert torch.allclose(result["prev_values"], torch.zeros_like(result["prev_values"]))
     with pytest.raises(NotImplementedError):
         p.default_forward(result["forward_inputs"], compute_values=True)
+
+
+def test_robotwin_preprocessor_accepts_two_wrist_cameras_and_uses_prompt_template():
+    prompts = []
+
+    class _TextWAM:
+        def encode_prompt(self, prompt):
+            prompts.append(prompt)
+            return torch.zeros(1, 4, 8), torch.ones(1, 4, dtype=torch.bool)
+
+    prep = obs_prep.GateObsPreprocessor(_TextWAM(), "robotwin")
+    env_obs = {
+        "main_images": torch.zeros(2, 480, 640, 3, dtype=torch.uint8),
+        "wrist_images": torch.zeros(2, 2, 480, 640, 3, dtype=torch.uint8),
+        "states": torch.randn(2, 14),
+        "task_descriptions": ["pick block", "place cup"],
+    }
+    out = prep(env_obs)
+    assert out["input_image"].shape == (2, 3, 384, 320)
+    assert out["proprio"].shape == (2, 14)
+    assert out["context"].shape == (2, 4, 8)
+    assert prompts[0].startswith("A video recorded from a robot's point of view")
+    assert "pick block" in prompts[0]
+
+
+def test_gate_reward_cost_is_not_multiplied_by_action_horizon():
+    rewards = torch.zeros(2, 32)
+    mode_cost = torch.tensor([[1.0], [0.5]])
+    components = reward_mod.apply_gate_reward(
+        rewards=rewards,
+        mode_cost=mode_cost,
+        step=10,
+        lambda_cost=0.2,
+        lambda_warmup_steps=0,
+    )
+    chunk_total = components["total"].sum(dim=-1)
+    assert torch.allclose(chunk_total, torch.tensor([-0.2, -0.1]))

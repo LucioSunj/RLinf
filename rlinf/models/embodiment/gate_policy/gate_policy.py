@@ -221,6 +221,8 @@ class GatePolicy(nn.Module, BasePolicy):
             robot_chunks.append(out["action_chunk"])
             costs.append(out["cost"])
         chunk_actions = torch.stack([c.to(device) for c in robot_chunks], dim=0)  # [B, Ta, A_robot]
+        if hasattr(self.obs_preprocessor, "denormalize_actions"):
+            chunk_actions = self.obs_preprocessor.denormalize_actions(chunk_actions)
         mode_cost = torch.tensor(costs, device=device, dtype=torch.float32).unsqueeze(-1)  # [B,1]
 
         forward_inputs = {

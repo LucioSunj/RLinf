@@ -268,7 +268,7 @@ def get_model(cfg: DictConfig):
     ):
         model = model.to(Worker.torch_device_type)
 
-    if cfg.is_lora:
+    if cfg.get("is_lora", False):
         from peft import LoraConfig, PeftModel, get_peft_model
 
         if not hasattr(cfg, "lora_path") or cfg.lora_path is None:

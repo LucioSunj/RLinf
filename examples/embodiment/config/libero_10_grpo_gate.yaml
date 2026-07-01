@@ -99,6 +99,8 @@ rollout:
   model:
     model_type: gate_policy
     precision: ${actor.model.precision}
+    model_path: ${actor.model.model_path}
+    load_wam: True
 
 actor:
   group_name: "ActorGroup"
@@ -112,6 +114,9 @@ actor:
     model_type: gate_policy
     precision: "bf16"
     model_path: ""
+    is_lora: False
+    load_wam: False              # actor only recomputes gate logprobs; rollout owns frozen WAM
+    world_feat_dim: 48           # Wan2.2 VAE latent channel dim used by WAMModeAdapter
     # discrete mode is the policy-gradient action (one per chunk-step)
     action_dim: 1
     num_action_chunks: 1
@@ -125,9 +130,15 @@ actor:
     # frozen fast-wam dual-regime backbone (build/freeze in get_model)
     wam:
       configs_dir: ${oc.env:FASTWAM_CONFIGS}      # path to FastWAM/configs
+      suite: libero
       task: libero_metric_adaptive_joint_2cam224_1e-4
       backbone_kind: joint                         # "joint" or "idm"
       ckpt: /path/to/dual_regime_joint_checkpoint.pt
+      dataset_stats_path: /path/to/libero_dataset_stats.json
+      require_dataset_stats: True
+      load_text_encoder: True
+      world_feat_dim: ${actor.model.world_feat_dim}
+      action_dim: 7
       num_video_frames: 9
       action_horizon: 32
       k_lo: 4                     # TODO(make-variable): LATENT video-denoise steps

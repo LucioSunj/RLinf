@@ -33,6 +33,7 @@ from rlinf.data.embodied_io_struct import (
 from rlinf.envs import get_env_cls
 from rlinf.envs.action_utils import prepare_actions
 from rlinf.envs.wrappers import RecordVideo
+from rlinf.models.embodiment.gate_policy.reward import apply_gate_reward
 from rlinf.scheduler import Channel, Cluster, Worker
 from rlinf.utils.comm_mapping import CommMapper
 from rlinf.utils.distributed import masked_stats, normalize_from_stats
@@ -88,6 +89,7 @@ class EnvWorker(Worker):
             self.use_reward_model and not self.use_realworld_reward
         )
         self.env_infos_reward_keys = ("success", "episode", "final_info")
+        self._gate_reward_step = 0
         if self.use_external_reward_model:
             self.reward_weight = self.cfg.reward.get("reward_weight", 1.0)
             self.env_reward_weight = self.cfg.reward.get("env_reward_weight", 0.0)
@@ -128,16 +130,17 @@ class EnvWorker(Worker):
                 self.cfg.env.eval.total_num_envs // self._world_size // self.stage_num
             )
         self.n_train_chunk_steps = 0
+        self.env_steps_per_policy_action = self._env_steps_per_policy_action()
         if self.enable_train:
             self.n_train_chunk_steps = (
                 self.cfg.env.train.max_steps_per_rollout_epoch
-                // self.model_cfg.num_action_chunks
+                // self.env_steps_per_policy_action
             )
         self.n_eval_chunk_steps = 0
         if self.enable_eval:
             self.n_eval_chunk_steps = (
                 self.cfg.env.eval.max_steps_per_rollout_epoch
-                // self.model_cfg.num_action_chunks
+                // self.env_steps_per_policy_action
             )
         self.actor_split_num = (
             1 if not self.enable_train else self.get_actor_split_num()
@@ -155,6 +158,11 @@ class EnvWorker(Worker):
                 torch.zeros(self.eval_num_envs_per_stage, dtype=torch.bool)
                 for _ in range(self.stage_num)
             ]
+
+    def _env_steps_per_policy_action(self) -> int:
+        if str(self.model_cfg.model_type) == "gate_policy":
+            return int(self.model_cfg.wam.action_horizon)
+        return int(self.model_cfg.num_action_chunks)
 
     def init_worker(self):
         self.dst_rank_map = self._setup_dst_rank_map()
@@ -768,6 +776,7 @@ class EnvWorker(Worker):
         env_output: EnvOutput,
         bootstrap_values: torch.Tensor | None,
         reward_model_output: torch.Tensor | None,
+        forward_inputs: dict[str, Any] | None = None,
     ) -> torch.Tensor | None:
         rewards = env_output.rewards
         if rewards is None:
@@ -779,6 +788,25 @@ class EnvWorker(Worker):
                 self.env_reward_weight * rewards
                 + self.reward_weight * reward_model_output
             )
+
+        gate_reward_cfg = self.cfg.get("gate_reward", None)
+        if (
+            gate_reward_cfg is not None
+            and forward_inputs is not None
+            and "mode_cost" in forward_inputs
+        ):
+            components = apply_gate_reward(
+                rewards=rewards,
+                mode_cost=forward_inputs["mode_cost"],
+                step=self._gate_reward_step,
+                lambda_cost=float(gate_reward_cfg.get("lambda_cost", 0.0)),
+                lambda_warmup_steps=int(gate_reward_cfg.get("lambda_warmup_steps", 0)),
+                lambda_start=float(gate_reward_cfg.get("lambda_start", 0.0)),
+                w_success=float(gate_reward_cfg.get("w_success", 1.0)),
+                w_agreement=float(gate_reward_cfg.get("w_agreement", 0.0)),
+            )
+            rewards = components["total"]
+            self._gate_reward_step += 1
 
         adjusted_rewards = rewards.clone()
         if (
@@ -1158,7 +1186,10 @@ class EnvWorker(Worker):
                         input_channel, mode="train"
                     )
                     rewards = self.compute_bootstrap_rewards(
-                        env_output, rollout_result.bootstrap_values, reward_model_output
+                        env_output,
+                        rollout_result.bootstrap_values,
+                        reward_model_output,
+                        rollout_result.forward_inputs,
                     )
                     chunk_step_result = ChunkStepResult(
                         actions=rollout_result.forward_inputs.get("action", None),
@@ -1244,7 +1275,10 @@ class EnvWorker(Worker):
                         )
                 rollout_result = self.recv_rollout_results(input_channel, mode="train")
                 rewards = self.compute_bootstrap_rewards(
-                    env_output, rollout_result.bootstrap_values, reward_model_output
+                    env_output,
+                    rollout_result.bootstrap_values,
+                    reward_model_output,
+                    rollout_result.forward_inputs,
                 )
                 chunk_step_result = ChunkStepResult(
                     prev_values=(

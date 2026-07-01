@@ -31,6 +31,8 @@ from __future__ import annotations
 
 from typing import Optional
 
+import torch
+
 
 def gate_reward_components(
     *,
@@ -70,6 +72,61 @@ def lambda_cost_schedule(
         return float(lambda_max)
     frac = min(max(step / float(warmup_steps), 0.0), 1.0)
     return float(start) + (float(lambda_max) - float(start)) * frac
+
+
+def spread_mode_cost_over_reward_steps(
+    *,
+    mode_cost: torch.Tensor,
+    rewards: torch.Tensor,
+) -> torch.Tensor:
+    """Align per-decision mode cost to reward shape without multiplying by chunk length.
+
+    The embodied GRPO path with `reward_type=chunk_level` later sums rewards over the
+    last dimension. FastWAM gate emits one `mode_cost` per policy decision, while the
+    env returns one reward per executed robot action. Spread the scalar cost evenly
+    across those env rewards so the later sum contributes exactly one cost penalty.
+    """
+    cost = mode_cost.to(device=rewards.device, dtype=rewards.dtype)
+    while cost.ndim < rewards.ndim:
+        cost = cost.unsqueeze(-1)
+    if cost.shape == rewards.shape:
+        return cost
+    if cost.shape[:-1] == rewards.shape[:-1] and cost.shape[-1] == 1:
+        return cost.expand_as(rewards) / max(int(rewards.shape[-1]), 1)
+    return cost.expand_as(rewards)
+
+
+def apply_gate_reward(
+    *,
+    rewards: torch.Tensor,
+    mode_cost: torch.Tensor,
+    step: int,
+    lambda_cost: float,
+    lambda_warmup_steps: int,
+    lambda_start: float = 0.0,
+    w_success: float = 1.0,
+    w_agreement: float = 0.0,
+    agreement: Optional[torch.Tensor] = None,
+) -> dict[str, torch.Tensor]:
+    """Combine env rewards with the adaptive gate compute penalty."""
+    lam = lambda_cost_schedule(
+        step,
+        lambda_max=float(lambda_cost),
+        warmup_steps=int(lambda_warmup_steps),
+        start=float(lambda_start),
+    )
+    aligned_cost = spread_mode_cost_over_reward_steps(
+        mode_cost=mode_cost,
+        rewards=rewards,
+    )
+    return gate_reward_components(
+        success=rewards,
+        mode_cost=aligned_cost,
+        lambda_cost=lam,
+        agreement=agreement,
+        w_success=w_success,
+        w_agreement=w_agreement,
+    )
 
 
 # TODO(budget-constrained variant, clean hook — do NOT fully implement here):

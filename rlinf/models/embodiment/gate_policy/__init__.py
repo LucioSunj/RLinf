@@ -12,8 +12,23 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from pathlib import Path
+
 import torch
 from omegaconf import DictConfig
+
+
+def _is_none_like(value) -> bool:
+    return value is None or str(value).lower() in {"", "none", "null"}
+
+
+def _resolve_fastwam_path(value, *, fastwam_root: Path) -> Path | None:
+    if _is_none_like(value):
+        return None
+    path = Path(str(value)).expanduser()
+    if not path.is_absolute():
+        path = fastwam_root / path
+    return path.resolve()
 
 
 def build_wam_adapter(wam_cfg: DictConfig):
@@ -29,6 +44,7 @@ def build_wam_adapter(wam_cfg: DictConfig):
       cost_table_path (None), device ("cuda"), dtype ("bfloat16")
     """
     from hydra import compose, initialize_config_dir
+    from hydra.core.global_hydra import GlobalHydra
     from hydra.utils import instantiate
 
     from fastwam.adaptive_gate import WAMModeAdapter
@@ -36,8 +52,17 @@ def build_wam_adapter(wam_cfg: DictConfig):
     device = str(wam_cfg.get("device", "cuda"))
     dtype = getattr(torch, str(wam_cfg.get("dtype", "bfloat16")))
     configs_dir = str(wam_cfg.configs_dir)
+    fastwam_root = Path(configs_dir).expanduser().resolve().parent
+    if GlobalHydra.instance().is_initialized():
+        GlobalHydra.instance().clear()
     with initialize_config_dir(version_base="1.3", config_dir=configs_dir):
-        fcfg = compose(config_name="train", overrides=[f"task={wam_cfg.task}"])
+        fcfg = compose(
+            config_name="train",
+            overrides=[
+                f"task={wam_cfg.task}",
+                f"model.load_text_encoder={str(wam_cfg.get('load_text_encoder', True)).lower()}",
+            ],
+        )
     model = instantiate(fcfg.model, model_dtype=dtype, device=device)
     ckpt = wam_cfg.get("ckpt", None)
     if ckpt:
@@ -45,7 +70,7 @@ def build_wam_adapter(wam_cfg: DictConfig):
     model.eval()
     model.requires_grad_(False)  # WAM stays FROZEN; only the gate trains.
 
-    return WAMModeAdapter(
+    adapter = WAMModeAdapter(
         model,
         backbone_kind=str(wam_cfg.backbone_kind),
         num_video_frames=int(wam_cfg.get("num_video_frames", 9)),
@@ -56,17 +81,86 @@ def build_wam_adapter(wam_cfg: DictConfig):
         cost_source=wam_cfg.get("cost_source", None),
         default_seed=wam_cfg.get("default_seed", None),
     )
+    return adapter, fcfg, fastwam_root
+
+
+def build_fastwam_processor(fcfg: DictConfig, wam_cfg: DictConfig, *, fastwam_root: Path):
+    """Instantiate FastWAM's processor and attach dataset stats for norm conversion."""
+    from hydra.utils import instantiate
+
+    from fastwam.datasets.lerobot.utils.normalizer import load_dataset_stats_from_json
+
+    stats_path = _resolve_fastwam_path(
+        wam_cfg.get("dataset_stats_path", None),
+        fastwam_root=fastwam_root,
+    )
+    if stats_path is None:
+        stats_path = _resolve_fastwam_path(
+            fcfg.data.train.get("pretrained_norm_stats", None),
+            fastwam_root=fastwam_root,
+        )
+    if stats_path is None and not _is_none_like(wam_cfg.get("ckpt", None)):
+        ckpt_path = _resolve_fastwam_path(wam_cfg.get("ckpt"), fastwam_root=fastwam_root)
+        for parent in (ckpt_path.parent, ckpt_path.parent.parent):
+            candidate = parent / "dataset_stats.json"
+            if candidate.exists():
+                stats_path = candidate.resolve()
+                break
+
+    require_stats = bool(wam_cfg.get("require_dataset_stats", True))
+    if stats_path is None:
+        if require_stats:
+            raise FileNotFoundError(
+                "GatePolicy requires FastWAM dataset stats to normalize proprio and "
+                "denormalize actions. Set actor.model.wam.dataset_stats_path, or place "
+                "dataset_stats.json next to the checkpoint."
+            )
+        return None
+    if not stats_path.exists():
+        raise FileNotFoundError(f"FastWAM dataset stats not found: {stats_path}")
+
+    processor = instantiate(fcfg.data.train.processor)
+    processor.eval()
+    processor.set_normalizer_from_stats(load_dataset_stats_from_json(str(stats_path)))
+    return processor
 
 
 def get_model(cfg: DictConfig, torch_dtype=torch.bfloat16):
     from rlinf.models.embodiment.gate_policy.gate_policy import GatePolicy
 
-    adapter = build_wam_adapter(cfg.wam)
+    load_wam = bool(cfg.get("load_wam", True))
+    adapter = None
+    obs_preprocessor = None
+    world_feat_dim = cfg.get("world_feat_dim", None)
+    if load_wam:
+        adapter, fcfg, fastwam_root = build_wam_adapter(cfg.wam)
+        processor = build_fastwam_processor(fcfg, cfg.wam, fastwam_root=fastwam_root)
+        from fastwam.datasets.lerobot.robot_video_dataset import DEFAULT_PROMPT
+        from rlinf.models.embodiment.gate_policy.obs_preprocessor import (
+            make_gate_obs_preprocessor,
+        )
+
+        obs_preprocessor = make_gate_obs_preprocessor(
+            adapter.model,
+            suite=str(cfg.wam.get("suite", "libero")),
+            processor=processor,
+            prompt_template=DEFAULT_PROMPT,
+            device=str(cfg.wam.get("device", "cuda")),
+        )
+        world_feat_dim = adapter.world_feat_dim
+    if world_feat_dim is None:
+        world_feat_dim = cfg.wam.get("world_feat_dim", None)
+    if world_feat_dim is None:
+        raise ValueError(
+            "GatePolicy needs world_feat_dim when load_wam=false. Set "
+            "actor.model.world_feat_dim or actor.model.wam.world_feat_dim."
+        )
+
     gate_cfg = cfg.get("gate", {})
     hidden = tuple(gate_cfg.get("hidden_sizes", (256, 256)))
 
     policy = GatePolicy(
-        world_feat_dim=adapter.world_feat_dim,
+        world_feat_dim=int(world_feat_dim),
         proprio_dim=int(cfg.proprio_dim),
         num_modes=int(gate_cfg.get("num_modes", 3)),
         hidden_sizes=hidden,
@@ -74,6 +168,6 @@ def get_model(cfg: DictConfig, torch_dtype=torch.bfloat16):
         use_last_action=bool(gate_cfg.get("use_last_action", False)),
         activation=str(gate_cfg.get("activation", "tanh")),
         wam_adapter=adapter,
-        obs_preprocessor=None,  # wired by the env rollout (suite-specific)
+        obs_preprocessor=obs_preprocessor,
     )
     return policy

@@ -93,6 +93,8 @@ rollout:
   model:
     model_type: gate_policy
     precision: ${actor.model.precision}
+    model_path: ${actor.model.model_path}
+    load_wam: True
 
 actor:
   group_name: "ActorGroup"
@@ -106,6 +108,9 @@ actor:
     model_type: gate_policy
     precision: "bf16"
     model_path: ""
+    is_lora: False
+    load_wam: False              # actor only recomputes gate logprobs; rollout owns frozen WAM
+    world_feat_dim: 48           # Wan2.2 VAE latent channel dim used by WAMModeAdapter
     action_dim: 1
     num_action_chunks: 1
     add_value_head: False
@@ -117,9 +122,15 @@ actor:
       activation: tanh
     wam:
       configs_dir: ${oc.env:FASTWAM_CONFIGS}
+      suite: robotwin
       task: robotwin_metric_adaptive_joint_3cam_384_1e-4
       backbone_kind: joint
       ckpt: /path/to/dual_regime_joint_robotwin_checkpoint.pt
+      dataset_stats_path: /path/to/robotwin_dataset_stats.json
+      require_dataset_stats: True
+      load_text_encoder: True
+      world_feat_dim: ${actor.model.world_feat_dim}
+      action_dim: 14
       num_video_frames: 9        # TODO(verify): RoboTwin video frames
       action_horizon: 32         # TODO(verify): RoboTwin action chunk length
       k_lo: 4

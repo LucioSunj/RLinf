@@ -92,9 +92,10 @@ class MultiStepRolloutWorker(Worker):
         )
         self.enable_cuda_graph = cfg.rollout.get("enable_cuda_graph", False)
 
+        self.env_steps_per_policy_action = self._env_steps_per_policy_action()
         self.n_train_chunk_steps = (
             cfg.env.train.max_steps_per_rollout_epoch
-            // self.model_cfg.num_action_chunks
+            // self.env_steps_per_policy_action
             if self.enable_train
             else 0
         )
@@ -102,7 +103,7 @@ class MultiStepRolloutWorker(Worker):
         if self.enable_eval:
             self.n_eval_chunk_steps = (
                 cfg.env.eval.max_steps_per_rollout_epoch
-                // self.model_cfg.num_action_chunks
+                // self.env_steps_per_policy_action
             )
         self.collect_prev_infos = self.cfg.rollout.get("collect_prev_infos", True)
         self.version = 0
@@ -118,11 +119,20 @@ class MultiStepRolloutWorker(Worker):
             self.weight_syncer = WeightSyncer.create(weight_syncer_cfg)
             self._sync_weight_comm_options = self.weight_syncer.comm_options
 
+    def _env_steps_per_policy_action(self) -> int:
+        if str(self.model_cfg.model_type) == "gate_policy":
+            return int(self.model_cfg.wam.action_horizon)
+        return int(self.model_cfg.num_action_chunks)
+
     def init_worker(self):
-        rollout_model_config = copy.deepcopy(self.model_cfg)
+        rollout_model_config = OmegaConf.merge(
+            copy.deepcopy(self.model_cfg), self.cfg.rollout.model
+        )
         with open_dict(rollout_model_config):
             rollout_model_config.precision = self.cfg.rollout.model.precision
-            rollout_model_config.model_path = self.cfg.rollout.model.model_path
+            rollout_model_config.model_path = self.cfg.rollout.model.get(
+                "model_path", self.model_cfg.get("model_path", None)
+            )
 
         self.hf_model: BasePolicy = get_model(rollout_model_config)
 
@@ -293,6 +303,7 @@ class MultiStepRolloutWorker(Worker):
             SupportedModel.DREAMZERO,
             SupportedModel.CNN_POLICY,
             SupportedModel.CFG_MODEL,
+            SupportedModel("gate_policy"),
         ]:
             loss_type = self.algorithm_cfg.get("loss_type", "actor")
             if loss_type == "embodied_dagger":
