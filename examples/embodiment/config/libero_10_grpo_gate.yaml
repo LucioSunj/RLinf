@@ -133,7 +133,14 @@ actor:
       hidden_sizes: [256, 256]
       use_last_action: False     # TODO(optional): append last-mode one-hot / phase
       activation: tanh
-      # M3 (SFT -> RL): BC warm-start from examples/embodiment/train_gate_bc.py.
+      # Label-free collapse prevention (with entropy_bonus + lambda warmup this is
+      # the DEFAULT, zero-supervision training path): w.p. eps sample a uniform
+      # random mode in TRAIN rollouts; the mixture behavior logprob is recorded,
+      # so the GRPO ratio stays exact. Anneal via GatePolicy.set_explore_eps
+      # (runner hook) or keep a small constant.
+      explore_eps: 0.05
+      # OPTIONAL BC warm-start (self-generated oracle labels; NO human annotation,
+      # but still a supervised objective — leave off for the pure-RL gate).
       # bc_init_path loads the weights in get_model (covers rollout + eval-only);
       # runner.ckpt_path loads them into the actor. Set BOTH to the same file.
       bc_init_path: null

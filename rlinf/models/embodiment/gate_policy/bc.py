@@ -3,15 +3,17 @@
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
 
-"""BC (SFT) warm-start for the adaptive-prediction gate (M3).
+"""OPTIONAL BC (SFT) warm-start for the adaptive-prediction gate (M3).
 
-Trains the SAME `GatePolicy` the RL stage uses (via `GatePolicy.mode_logits`)
-with cross-entropy on self-supervised oracle mode labels generated from raw VLA
-data by `FastWAM/scripts/generate_gate_oracle_labels.py` — no human annotation,
-no simulator, no WAM at SFT time (the shards already carry the gate inputs
-`world_feat` + `proprio`).
+The gate's default training path is pure GRPO and consumes NO supervision (see
+adaptive_gate_README.md); nothing here is on that path. This module exists as
+an accelerator/ablation: it trains the SAME `GatePolicy` the RL stage uses
+(via `GatePolicy.mode_logits`) with cross-entropy on self-generated oracle mode
+labels from raw VLA data (`FastWAM/scripts/generate_gate_oracle_labels.py`) —
+no human annotation, no simulator, no WAM at SFT time (the shards already carry
+the gate inputs `world_feat` + `proprio`).
 
-Recipe (SFT -> RL):
+Recipe (optional SFT -> RL):
   1. fastwam: generate oracle-label shards (heavy, frozen WAM, once).
   2. here:    `train_gate_bc` -> a RAW GatePolicy state_dict on disk.
   3. GRPO:    point `runner.ckpt_path` (and/or `actor.model.gate.bc_init_path`)

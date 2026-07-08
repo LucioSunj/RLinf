@@ -167,13 +167,15 @@ def get_model(cfg: DictConfig, torch_dtype=torch.bfloat16):
         add_value_head=bool(cfg.get("add_value_head", True)),
         use_last_action=bool(gate_cfg.get("use_last_action", False)),
         activation=str(gate_cfg.get("activation", "tanh")),
+        explore_eps=float(gate_cfg.get("explore_eps", 0.0)),
         wam_adapter=adapter,
         obs_preprocessor=obs_preprocessor,
     )
 
-    # M3 (SFT -> RL): warm-start from a BC checkpoint and/or attach it as the
-    # frozen KL prior. `runner.ckpt_path` also loads BC weights into the actor;
-    # `bc_init_path` additionally covers the rollout instance and eval-only runs.
+    # OPTIONAL (off by default; the gate needs NO supervision): warm-start from a
+    # BC checkpoint and/or attach it as the frozen KL prior. `runner.ckpt_path`
+    # also loads BC weights into the actor; `bc_init_path` additionally covers
+    # the rollout instance and eval-only runs.
     bc_init_path = gate_cfg.get("bc_init_path", None)
     if not _is_none_like(bc_init_path):
         from rlinf.models.embodiment.gate_policy.bc import load_gate_bc_state

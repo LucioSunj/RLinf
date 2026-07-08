@@ -146,6 +146,46 @@ def test_value_head_required_for_values():
         p.default_forward(fi, compute_values=True)
 
 
+def test_explore_eps_records_mixture_behavior_logprobs():
+    """Label-free exploration: mu = (1-eps)*pi + eps*U; prev_logprobs must be mu's."""
+    p = _policy(explore_eps=0.6)
+    with torch.no_grad():  # strongly bias pi so the mixture visibly differs
+        p.logits_head.weight.zero_()
+        p.logits_head.bias.copy_(torch.tensor([10.0, 0.0, -10.0]))
+    obs = _obs(batch=16)
+    _, result = p.predict_action_batch(obs, mode="train")
+    with torch.no_grad():  # reference recompute (inference tensors can't join autograd)
+        wf = torch.stack([p.wam_adapter.encode_world_feat(obs["input_image"][i:i+1]) for i in range(16)], 0)
+        pi = Categorical(logits=p._logits(p._build_gate_input(wf, obs["proprio"]))).probs
+        mix = 0.4 * pi + 0.6 / 3.0
+        expected = torch.log(mix.gather(-1, result["mode"].clone().unsqueeze(-1)))
+    assert torch.allclose(result["prev_logprobs"], expected, atol=1e-5)
+
+
+def test_explore_eps_one_is_uniform_and_eval_ignores_it():
+    p = _policy(explore_eps=1.0)
+    _, result = p.predict_action_batch(_obs(batch=32), mode="train")
+    assert torch.allclose(
+        result["prev_logprobs"], torch.full_like(result["prev_logprobs"], torch.log(torch.tensor(1.0 / 3.0)))
+    )
+    # eval stays deterministic argmax regardless of eps
+    obs = _obs(batch=4)
+    _, r1 = p.predict_action_batch(obs, mode="eval")
+    _, r2 = p.predict_action_batch(obs, mode="eval")
+    assert torch.equal(r1["mode"], r2["mode"])
+
+
+def test_set_explore_eps_hook_validates():
+    p = _policy()
+    assert p.explore_eps == 0.0  # default: plain on-policy sampling
+    p.set_explore_eps(0.1)
+    assert p.explore_eps == 0.1
+    with pytest.raises(ValueError):
+        p.set_explore_eps(1.5)
+    with pytest.raises(ValueError):
+        p.set_explore_eps(-0.1)
+
+
 def test_robotwin_preprocessor_accepts_two_wrist_cameras_and_uses_prompt_template():
     prompts = []
 

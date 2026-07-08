@@ -32,10 +32,13 @@ Same module is used for joint and idm backbones (decided by the injected adapter
 `backbone_kind`) and identically in training (default_forward) and rollout
 (predict_action_batch) — one interface, per decision #2.
 
-M3 (SFT -> RL): `mode_logits` is the shared logits path BC training uses, so the
-warm-start optimizes exactly the RL architecture; `attach_bc_prior` keeps a frozen
-copy of the BC gate and `predict_action_batch` then emits per-decision
-KL(pi || pi_BC) into the rollout buffer for the reward hook (see `reward.py`).
+The gate trains WITHOUT supervision by default: pure GRPO on success - lambda*cost,
+stabilized label-free by the entropy bonus, the lambda warmup, the near-uniform
+logits init, and `explore_eps` (uniform-mixture rollout sampling with exact
+behavior logprobs). The BC warm-start + KL-to-BC prior (`mode_logits`,
+`attach_bc_prior`, `kl_to_prior`) are an OPTIONAL accelerator/ablation on
+self-generated oracle labels — everything about them defaults to off, and no
+training path requires them.
 
 # TODO(shape-reconcile): `chunk_actions` (robot, [B, Ta, A_robot]) differs from the
 #   trained action (mode, [B, 1]). RLinf's buffer/advantage path is validated for
@@ -81,6 +84,7 @@ class GatePolicy(nn.Module, BasePolicy):
         add_value_head: bool = True,
         use_last_action: bool = False,
         activation: str = "tanh",
+        explore_eps: float = 0.0,
         wam_adapter=None,
         obs_preprocessor=None,
     ):
@@ -89,6 +93,13 @@ class GatePolicy(nn.Module, BasePolicy):
         self.proprio_dim = int(proprio_dim)
         self.num_modes = int(num_modes)
         self.use_last_action = bool(use_last_action)
+        # Label-free collapse prevention: during TRAIN rollouts sample from the
+        # mixture (1-eps)*pi + eps*Uniform(modes) and record the MIXTURE logprob
+        # as the behavior logprob, so the PPO/GRPO ratio pi_theta/mu stays exact.
+        # Guarantees every GRPO group keeps contrast across modes even if pi
+        # momentarily collapses — no supervision/warm-start needed. Anneal via
+        # `set_explore_eps` (runner hook) or keep a small constant.
+        self.explore_eps = float(explore_eps)
         # Discrete mode is the policy-gradient action (one per chunk-step).
         self.action_dim = 1
         self.num_action_chunks = 1
@@ -158,7 +169,14 @@ class GatePolicy(nn.Module, BasePolicy):
         """
         return self._logits(self._build_gate_input(world_feat, proprio, last_mode_onehot))
 
-    # ----- KL-to-BC prior (M3) -------------------------------------------- #
+    def set_explore_eps(self, eps: float) -> None:
+        """Runner/rollout hook to anneal the uniform-mixture exploration rate."""
+        eps = float(eps)
+        if not 0.0 <= eps <= 1.0:
+            raise ValueError(f"explore_eps must be in [0, 1], got {eps}")
+        self.explore_eps = eps
+
+    # ----- KL-to-BC prior (optional; OFF by default) ----------------------- #
     @property
     def bc_prior(self) -> Optional[nn.Module]:
         return self._bc_prior_container[0] if self._bc_prior_container else None
@@ -274,8 +292,21 @@ class GatePolicy(nn.Module, BasePolicy):
         gate_input = self._build_gate_input(world_feat, proprio)
         logits = self._logits(gate_input)
         dist = Categorical(logits=logits)
-        mode_idx = dist.sample() if mode == "train" else torch.argmax(logits, dim=-1)
-        chunk_logprobs = dist.log_prob(mode_idx).unsqueeze(-1)  # [B,1]
+        eps = float(self.explore_eps) if mode == "train" else 0.0
+        if mode != "train":
+            mode_idx = torch.argmax(logits, dim=-1)
+            chunk_logprobs = dist.log_prob(mode_idx).unsqueeze(-1)  # [B,1]
+        elif eps > 0.0:
+            # behavior policy mu = (1-eps)*pi + eps*Uniform; record mu's logprob
+            # (NOT pi's) so the actor-side ratio pi_theta/mu is an exact
+            # importance weight that PPO/GRPO clipping handles.
+            mix_probs = (1.0 - eps) * dist.probs + eps / float(self.num_modes)
+            mix_dist = Categorical(probs=mix_probs)
+            mode_idx = mix_dist.sample()
+            chunk_logprobs = mix_dist.log_prob(mode_idx).unsqueeze(-1)  # [B,1]
+        else:
+            mode_idx = dist.sample()
+            chunk_logprobs = dist.log_prob(mode_idx).unsqueeze(-1)  # [B,1]
         chunk_values = (
             self.value_head(gate_input)
             if (self.add_value_head and calculate_values)

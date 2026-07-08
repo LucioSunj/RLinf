@@ -124,7 +124,10 @@ actor:
       hidden_sizes: [256, 256]
       use_last_action: False
       activation: tanh
-      # M3 (SFT -> RL): BC warm-start; set together with runner.ckpt_path.
+      # Label-free collapse prevention (default, zero-supervision path): uniform
+      # mixture sampling in TRAIN rollouts, exact behavior logprobs recorded.
+      explore_eps: 0.05
+      # OPTIONAL BC warm-start (self-generated labels; off = pure-RL gate).
       bc_init_path: null
       kl_prior:
         enabled: False           # emit per-decision KL(pi || pi_BC) in the rollout
