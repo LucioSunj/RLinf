@@ -60,13 +60,13 @@ class _StubAdapter:
         }
 
 
-def _policy(proprio_dim=5, **kw):
+def _policy(proprio_dim=5, add_value_head=True, **kw):
     return GatePolicy(
         world_feat_dim=_StubAdapter.world_feat_dim,
         proprio_dim=proprio_dim,
         num_modes=3,
         hidden_sizes=(16, 16),
-        add_value_head=True,
+        add_value_head=add_value_head,
         wam_adapter=_StubAdapter(),
         **kw,
     )
@@ -110,7 +110,10 @@ def test_default_forward_matches_categorical():
     p = _policy()
     obs = _obs(batch=3)
     _, result = p.predict_action_batch(obs, mode="train")
-    fi = result["forward_inputs"]
+    # predict_action_batch runs under inference_mode; in the real pipeline the
+    # buffer crosses a worker channel (fresh tensors). Mimic that here, else the
+    # grad-enabled value-head forward rejects inference tensors.
+    fi = {k: v.clone() for k, v in result["forward_inputs"].items()}
     out = p.default_forward(fi, compute_logprobs=True, compute_entropy=True, compute_values=True)
     assert out["logprobs"].shape == (3, 1)
     assert out["entropy"].shape == (3, 1)
@@ -138,8 +141,9 @@ def test_value_head_required_for_values():
     _, result = p.predict_action_batch(obs, mode="train", calculate_values=True)
     # with no value head, prev_values falls back to zeros (not an error)
     assert torch.allclose(result["prev_values"], torch.zeros_like(result["prev_values"]))
+    fi = {k: v.clone() for k, v in result["forward_inputs"].items()}  # see note above
     with pytest.raises(NotImplementedError):
-        p.default_forward(result["forward_inputs"], compute_values=True)
+        p.default_forward(fi, compute_values=True)
 
 
 def test_robotwin_preprocessor_accepts_two_wrist_cameras_and_uses_prompt_template():

@@ -170,4 +170,42 @@ def get_model(cfg: DictConfig, torch_dtype=torch.bfloat16):
         wam_adapter=adapter,
         obs_preprocessor=obs_preprocessor,
     )
+
+    # M3 (SFT -> RL): warm-start from a BC checkpoint and/or attach it as the
+    # frozen KL prior. `runner.ckpt_path` also loads BC weights into the actor;
+    # `bc_init_path` additionally covers the rollout instance and eval-only runs.
+    bc_init_path = gate_cfg.get("bc_init_path", None)
+    if not _is_none_like(bc_init_path):
+        from rlinf.models.embodiment.gate_policy.bc import load_gate_bc_state
+
+        state = load_gate_bc_state(str(bc_init_path))
+        arch_hint = (
+            f"gate BC init {bc_init_path} does not match the configured gate "
+            "architecture. Re-run train_gate_bc.py with the same "
+            "gate.hidden_sizes/activation/add_value_head."
+        )
+        try:
+            missing, unexpected = policy.load_state_dict(state, strict=False)
+        except RuntimeError as exc:  # same key, different shape (hidden_sizes drift)
+            raise ValueError(f"{arch_hint} ({exc})") from exc
+        # value-head keys may legitimately differ (BC w/o head -> PPO w/ head);
+        # anything else missing means an architecture mismatch with the BC run.
+        bad_missing = [k for k in missing if not k.startswith("value_head.")]
+        if bad_missing:
+            raise ValueError(f"{arch_hint} Missing keys: {bad_missing}.")
+        if missing or unexpected:
+            print(f"[gate_policy] BC init loaded with missing={missing} unexpected={unexpected}")
+
+    kl_cfg = gate_cfg.get("kl_prior", {}) or {}
+    if bool(kl_cfg.get("enabled", False)):
+        from rlinf.models.embodiment.gate_policy.bc import load_gate_bc_state
+
+        prior_path = kl_cfg.get("path", None)
+        if _is_none_like(prior_path):
+            prior_path = bc_init_path
+        if _is_none_like(prior_path):
+            raise ValueError(
+                "gate.kl_prior.enabled=True needs gate.kl_prior.path or gate.bc_init_path."
+            )
+        policy.attach_bc_prior(load_gate_bc_state(str(prior_path)))
     return policy

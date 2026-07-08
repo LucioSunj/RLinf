@@ -38,7 +38,7 @@ runner:
   val_check_interval: 40        # per-eval logs success + mean-cost + mode-usage
   save_interval: 40
   resume_dir: null
-  ckpt_path: null
+  ckpt_path: null                # M3: set to the train_gate_bc.py output for BC warm-start
 
 algorithm:
   normalize_advantages: True
@@ -68,6 +68,12 @@ gate_reward:
   lambda_warmup_steps: 200      # anneal lambda 0 -> lambda_cost (learn to act, then economize)
   lambda_start: 0.0
   w_agreement: 0.0              # optional dense agreement-with-FULL shaping (off by default)
+  # M3 KL-to-BC prior: -beta * KL(pi || pi_BC) per gate decision (needs
+  # gate.kl_prior.enabled). beta DECAYS start -> end: trust the BC prior early,
+  # wean off as RL takes over.
+  beta_kl_prior: 0.0            # e.g. 0.05 with a BC warm-start
+  beta_kl_prior_end: 0.0
+  beta_kl_prior_decay_steps: 200
 
 env:
   group_name: "EnvGroup"
@@ -127,6 +133,13 @@ actor:
       hidden_sizes: [256, 256]
       use_last_action: False     # TODO(optional): append last-mode one-hot / phase
       activation: tanh
+      # M3 (SFT -> RL): BC warm-start from examples/embodiment/train_gate_bc.py.
+      # bc_init_path loads the weights in get_model (covers rollout + eval-only);
+      # runner.ckpt_path loads them into the actor. Set BOTH to the same file.
+      bc_init_path: null
+      kl_prior:
+        enabled: False           # emit per-decision KL(pi || pi_BC) in the rollout
+        path: null               # defaults to bc_init_path
     # frozen fast-wam dual-regime backbone (build/freeze in get_model)
     wam:
       configs_dir: ${oc.env:FASTWAM_CONFIGS}      # path to FastWAM/configs

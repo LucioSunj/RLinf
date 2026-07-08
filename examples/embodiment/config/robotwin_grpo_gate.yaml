@@ -34,7 +34,7 @@ runner:
   val_check_interval: 40
   save_interval: 40
   resume_dir: null
-  ckpt_path: null
+  ckpt_path: null                # M3: set to the train_gate_bc.py output for BC warm-start
 
 algorithm:
   normalize_advantages: True
@@ -62,6 +62,10 @@ gate_reward:
   lambda_warmup_steps: 200
   lambda_start: 0.0
   w_agreement: 0.0
+  # M3 KL-to-BC prior (needs gate.kl_prior.enabled); beta decays start -> end.
+  beta_kl_prior: 0.0            # e.g. 0.05 with a BC warm-start
+  beta_kl_prior_end: 0.0
+  beta_kl_prior_decay_steps: 200
 
 env:
   group_name: "EnvGroup"
@@ -120,6 +124,11 @@ actor:
       hidden_sizes: [256, 256]
       use_last_action: False
       activation: tanh
+      # M3 (SFT -> RL): BC warm-start; set together with runner.ckpt_path.
+      bc_init_path: null
+      kl_prior:
+        enabled: False           # emit per-decision KL(pi || pi_BC) in the rollout
+        path: null               # defaults to bc_init_path
     wam:
       configs_dir: ${oc.env:FASTWAM_CONFIGS}
       suite: robotwin

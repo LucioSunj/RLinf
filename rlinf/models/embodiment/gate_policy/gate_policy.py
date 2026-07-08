@@ -32,6 +32,11 @@ Same module is used for joint and idm backbones (decided by the injected adapter
 `backbone_kind`) and identically in training (default_forward) and rollout
 (predict_action_batch) — one interface, per decision #2.
 
+M3 (SFT -> RL): `mode_logits` is the shared logits path BC training uses, so the
+warm-start optimizes exactly the RL architecture; `attach_bc_prior` keeps a frozen
+copy of the BC gate and `predict_action_batch` then emits per-decision
+KL(pi || pi_BC) into the rollout buffer for the reward hook (see `reward.py`).
+
 # TODO(shape-reconcile): `chunk_actions` (robot, [B, Ta, A_robot]) differs from the
 #   trained action (mode, [B, 1]). RLinf's buffer/advantage path is validated for
 #   policies where these coincide; confirm on-server that the discrete-mode logprob
@@ -40,15 +45,29 @@ Same module is used for joint and idm backbones (decided by the injected adapter
 """
 from __future__ import annotations
 
+import copy
 from typing import Optional
 
 import torch
 import torch.nn as nn
 from torch.distributions.categorical import Categorical
+from torch.distributions.kl import kl_divergence
 
 from rlinf.models.embodiment.base_policy import BasePolicy, ForwardType
 from rlinf.models.embodiment.modules.utils import get_act_func, layer_init
 from rlinf.models.embodiment.modules.value_head import ValueHead
+
+
+class _GatePriorHead(nn.Module):
+    """Frozen (backbone, logits_head) clone used as the KL-to-BC prior."""
+
+    def __init__(self, backbone: nn.Module, logits_head: nn.Module):
+        super().__init__()
+        self.backbone = backbone
+        self.logits_head = logits_head
+
+    def forward(self, gate_input: torch.Tensor) -> torch.Tensor:
+        return self.logits_head(self.backbone(gate_input))
 
 
 class GatePolicy(nn.Module, BasePolicy):
@@ -103,6 +122,10 @@ class GatePolicy(nn.Module, BasePolicy):
         # to already carry {input_image, proprio, context, context_mask}.
         self.obs_preprocessor = obs_preprocessor
         self.cuda_graph_manager = None
+        # Optional FROZEN BC prior (M3). Held in a plain list so it is NOT a
+        # registered submodule: state_dict()/FSDP wrapping/`runner.ckpt_path`
+        # strict loads stay exactly the BC-compatible gate keys.
+        self._bc_prior_container: list[nn.Module] = []
 
     # ----- helpers ------------------------------------------------------- #
     def _device(self) -> torch.device:
@@ -121,6 +144,58 @@ class GatePolicy(nn.Module, BasePolicy):
                 )
             parts.append(last_mode_onehot)
         return torch.cat(parts, dim=-1)
+
+    def mode_logits(
+        self,
+        world_feat: torch.Tensor,
+        proprio: torch.Tensor,
+        last_mode_onehot: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """Categorical mode logits from gate inputs [B, num_modes].
+
+        The single logits path shared by BC/SFT training (`gate_policy.bc`) and
+        the RL rollout, so warm-start and RL are architecturally identical.
+        """
+        return self._logits(self._build_gate_input(world_feat, proprio, last_mode_onehot))
+
+    # ----- KL-to-BC prior (M3) -------------------------------------------- #
+    @property
+    def bc_prior(self) -> Optional[nn.Module]:
+        return self._bc_prior_container[0] if self._bc_prior_container else None
+
+    def attach_bc_prior(self, state_dict: dict[str, torch.Tensor]) -> None:
+        """Attach a FROZEN copy of a BC-trained gate as the KL prior.
+
+        `state_dict` is a GatePolicy state dict (e.g. the artifact written by
+        `train_gate_bc.py`); only its `backbone.*`/`logits_head.*` keys are used,
+        so it also accepts checkpoints trained with a value head. The prior lives
+        OUTSIDE the module tree (see `_bc_prior_container`).
+        """
+        prior = _GatePriorHead(
+            copy.deepcopy(self.backbone), copy.deepcopy(self.logits_head)
+        )
+        filtered = {
+            k: v
+            for k, v in state_dict.items()
+            if k.startswith(("backbone.", "logits_head."))
+        }
+        if not filtered:
+            raise ValueError(
+                "BC prior state_dict has no `backbone.*`/`logits_head.*` keys; "
+                "expected a GatePolicy checkpoint from train_gate_bc.py."
+            )
+        prior.load_state_dict(filtered, strict=True)
+        prior.eval()
+        prior.requires_grad_(False)
+        self._bc_prior_container = [prior]
+
+    def _prior_logits(self, gate_input: torch.Tensor) -> torch.Tensor:
+        prior = self.bc_prior
+        prior_param = next(prior.parameters())
+        if prior_param.device != gate_input.device or prior_param.dtype != gate_input.dtype:
+            # not a registered submodule -> move lazily (kept for later calls)
+            prior.to(device=gate_input.device, dtype=gate_input.dtype)
+        return prior(gate_input)
 
     def preprocess_env_obs(self, env_obs):
         """Turn raw env_obs into the fastwam inputs the WAM consumes.
@@ -236,6 +311,14 @@ class GatePolicy(nn.Module, BasePolicy):
             forward_inputs["world_feat"] = world_feat
             forward_inputs["proprio"] = proprio
 
+        # M3: exact per-decision KL(pi || pi_BC), carried in the buffer for the
+        # reward hook (-beta * KL keeps early RL near the BC warm-start).
+        kl_to_prior = None
+        if self.bc_prior is not None:
+            prior_dist = Categorical(logits=self._prior_logits(gate_input))
+            kl_to_prior = kl_divergence(dist, prior_dist).unsqueeze(-1)  # [B,1]
+            forward_inputs["kl_to_prior"] = kl_to_prior
+
         result = {
             "prev_logprobs": chunk_logprobs,
             "prev_values": chunk_values,
@@ -245,6 +328,8 @@ class GatePolicy(nn.Module, BasePolicy):
             "mode_cost": mode_cost.squeeze(-1),
             "mode_logits": logits.detach(),
         }
+        if kl_to_prior is not None:
+            result["kl_to_prior"] = kl_to_prior.squeeze(-1)
         return chunk_actions, result
 
     def forward(self, forward_type=ForwardType.DEFAULT, **kwargs):
