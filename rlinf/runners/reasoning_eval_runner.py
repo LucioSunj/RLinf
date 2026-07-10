@@ -1,0 +1,165 @@
+# Copyright 2025 The RLinf Authors.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     https://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+import logging
+import typing
+from typing import Optional, Union
+
+import pandas as pd
+import torch
+from omegaconf.dictconfig import DictConfig
+from torch.utils.data import Dataset
+from torchdata.stateful_dataloader import StatefulDataLoader
+
+from Reinforcement_Learning.RLinf.rlinf.data.io_struct import RolloutRequest
+from Reinforcement_Learning.RLinf.rlinf.scheduler import Channel
+from Reinforcement_Learning.RLinf.rlinf.utils.data_iter_utils import split_list
+from Reinforcement_Learning.RLinf.rlinf.utils.distributed import ScopedTimer
+from Reinforcement_Learning.RLinf.rlinf.utils.metric_logger import MetricLogger
+from Reinforcement_Learning.RLinf.rlinf.utils.placement import ModelParallelEvalComponentPlacement
+from Reinforcement_Learning.RLinf.rlinf.utils.timers import Timer
+from Reinforcement_Learning.RLinf.rlinf.workers.reward.reward_worker import RewardWorker
+
+if typing.TYPE_CHECKING:
+    from Reinforcement_Learning.RLinf.rlinf.workers.rollout.sglang.sglang_worker import SGLangWorker
+    from Reinforcement_Learning.RLinf.rlinf.workers.rollout.vllm.vllm_worker import VLLMWorker
+
+logging.getLogger().setLevel(logging.INFO)
+
+
+class ReasoningEvalRunner:
+    """Runner for reasoning task RL evaluation."""
+
+    def __init__(
+        self,
+        cfg: DictConfig,
+        placement: ModelParallelEvalComponentPlacement,
+        val_dataset: Dataset,
+        rollout: Union["SGLangWorker", "VLLMWorker"],
+        reward: Optional[RewardWorker],
+    ):
+        """"""
+        self.cfg = cfg
+        self.component_placement = placement
+
+        # Workers
+        self.rollout = rollout
+        self.reward = reward
+
+        # Data channels
+        self.dataloader_channel = Channel.create("DataLoader")
+        self.rollout_channel = Channel.create("Rollout")
+        # Create a local channel (i.e., a channel that is different in every process)
+        # if inference is not a dedicated worker
+        if self.reward is not None:
+            self.reward_channel = Channel.create("Reward")
+        else:
+            self.reward_channel = self.rollout_channel
+
+        # Configurations
+        self.consumed_samples = 0
+        self.global_steps = 0
+
+        # Build dataloader and compute `max_steps`
+        self._build_dataloader(val_dataset)
+        self._set_max_steps()
+
+        # Wandb table
+        self.val_df = pd.DataFrame(columns=["step", "prompt", "response", "reward"])
+
+        # Timers
+        self.timer = ScopedTimer(reduction="max", sync_cuda=False)
+        self.run_timer = Timer(None)  # Timer that checks if we should stop training
+
+        self.metric_logger = MetricLogger(cfg)
+
+    def _build_dataloader(self, val_dataset, collate_fn=None):
+        """
+        Creates the train and validation dataloaders.
+        """
+        self.val_dataset = val_dataset
+        if collate_fn is None:
+            from Reinforcement_Learning.RLinf.rlinf.data.datasets import collate_fn
+
+        num_workers = self.cfg.data.num_workers
+
+        val_batch_size = (
+            self.cfg.data.val_rollout_batch_size
+        )  # Prefer config value if set
+        if val_batch_size is None:
+            val_batch_size = len(self.val_dataset)
+
+        self.val_dataloader = StatefulDataLoader(
+            dataset=self.val_dataset,
+            batch_size=val_batch_size,
+            num_workers=num_workers,
+            shuffle=self.cfg.data.get("validation_shuffle", True),
+            drop_last=False,
+            collate_fn=collate_fn,
+        )
+
+        assert len(self.val_dataloader) >= 1, "Validation dataloader is empty!"
+
+        logging.info(f"Size of val dataloader: {len(self.val_dataloader)}")
+
+    def init_rollout_workers(self):
+        """init rollout worker."""
+        self.rollout.init_worker().wait()
+
+    def init_actor_workers(self):
+        """init reward worker."""
+        if self.reward is not None:
+            self.reward.init_worker().wait()
+
+        assert self.cfg.runner.resume_dir is None, "resume_dir is not need in eval mode"
+
+    def init_workers(self):
+        self.init_rollout_workers()
+        self.init_actor_workers()
+
+    def _set_max_steps(self):
+        self.num_steps_per_epoch = len(self.val_dataloader)
+        self.max_steps = self.num_steps_per_epoch * self.cfg.runner.max_epochs
+
+        if (max_steps := self.cfg.runner.get("max_steps", -1)) >= 0:
+            self.max_steps = min(self.max_steps, max_steps)
+
+    @property
+    def epoch(self):
+        return self.global_steps // self.num_steps_per_epoch
+
+    def _put_batch(self, batch: dict[str, torch.Tensor], split_size=None):
+        prompt_ids = batch["prompt"].tolist()
+        lengths = batch["length"].tolist()
+        answers = batch["answer"]
+        image_data = batch["image_data"]
+        multi_modal_inputs = batch["multi_modal_inputs"]
+        prompt_ids = [ids[-pmp_len:] for ids, pmp_len in zip(prompt_ids, lengths)]
+        if split_size is None:
+            split_size = self.component_placement.rollout_dp_size
+
+        for input_ids, answers, image_data, multi_modal_inputs in zip(
+            split_list(prompt_ids, split_size, enforce_divisible_batch=False),
+            split_list(answers, split_size, enforce_divisible_batch=False),
+            split_list(image_data, split_size, enforce_divisible_batch=False),
+            split_list(multi_modal_inputs, split_size, enforce_divisible_batch=False),
+        ):
+            request = RolloutRequest(
+                n=self.cfg.algorithm.group_size,
+                input_ids=input_ids,
+                answers=answers,
+                image_data=image_data,
+                multi_modal_inputs=multi_modal_inputs,
+            )
+            self.dataloader_channel.put(request, async_op=True)
