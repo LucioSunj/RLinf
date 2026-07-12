@@ -1,4 +1,4 @@
-# Adaptive-prediction GATE on a FROZEN fast-wam, trained with GRPO on RoboTwin.
+# Binary UNCOND/IDM gate on a frozen dual-regime FastWAM, trained on RoboTwin.
 # Mirrors libero_10_grpo_gate.yaml; RoboTwin specifics marked. Swap the env default
 # (env/robotwin_*) for other RoboTwin tasks. Paths marked /path/to & ${oc.env:...}.
 # (PPO variant: see TODO — switch adv_type/loss_type + add_value_head.)
@@ -8,6 +8,7 @@ defaults:
   - training_backend/fsdp@actor.fsdp_config
   - weight_syncer/patch_syncer@weight_syncer
   - override hydra/job_logging: stdout
+  - _self_
 
 hydra:
   run:
@@ -58,14 +59,9 @@ algorithm:
 
 gate_reward:
   w_success: 1.0
-  lambda_cost: 0.05
+  lambda_cost: 0.05             # maximum all-IDM episode compute penalty
   lambda_warmup_steps: 200
   lambda_start: 0.0
-  w_agreement: 0.0
-  # M3 KL-to-BC prior (needs gate.kl_prior.enabled); beta decays start -> end.
-  beta_kl_prior: 0.0            # e.g. 0.05 with a BC warm-start
-  beta_kl_prior_end: 0.0
-  beta_kl_prior_decay_steps: 200
 
 env:
   group_name: "EnvGroup"
@@ -74,80 +70,117 @@ env:
     total_num_envs: 64
     reward_coef: ${algorithm.reward_coef}
     group_size: ${algorithm.group_size}
-    use_fixed_reset_state_ids: True
-    max_episode_steps: 480
-    max_steps_per_rollout_epoch: 480
+    # RoboTwin itself repeats one seed across each GRPO group; keep this false so
+    # finish_rollout refreshes groups instead of training forever on the first set.
+    use_fixed_reset_state_ids: False
+    seeds_path: ${oc.env:REPO_PATH}/rlinf/envs/robotwin/seeds/train_seeds.json
+    center_crop: False            # FastWAM deploy resizes uncropped camera frames
+    max_episode_steps: 200        # matches task_config.step_lim
+    # Nine fixed-width rollout decisions; EnvWorker executes only the remaining
+    # eight actions in the final decision and pads reward/done tensors to width 24.
+    max_steps_per_rollout_epoch: 216
+    task_config:
+      camera:
+        collect_head_camera: true
+        collect_wrist_camera: true   # FastWAM RoboTwin input requires both wrists
   eval:
     rollout_epoch: 1
-    total_num_envs: 100
+    # Periodic distributed validation subset, divisible by 1/2/4/8 ranks.
+    # Run the exact 100-trial benchmark separately on a compatible rank count.
+    total_num_envs: 96
     auto_reset: True
     ignore_terminations: True
-    max_episode_steps: 480
-    max_steps_per_rollout_epoch: 480
+    center_crop: False
+    max_episode_steps: 200
+    max_steps_per_rollout_epoch: 216  # final decision executes only 8 real actions
     group_size: 1
     is_eval: True
+    seeds_path: ${oc.env:REPO_PATH}/rlinf/envs/robotwin/seeds/eval_seeds.json
+    task_config:
+      camera:
+        collect_head_camera: true
+        collect_wrist_camera: true
 
 rollout:
   group_name: "RolloutGroup"
   generation_backend: "huggingface"
   recompute_logprobs: False
-  unnorm_key: robotwin          # TODO(verify): match the RoboTwin norm key
+  # Retained for RLinf's rollout schema; GatePolicy action conversion uses the
+  # exact FastWAM dataset_stats_path contract instead of this VLA norm key.
+  unnorm_key: robotwin
   enable_offload: False
   pipeline_stage_num: 1
   model:
     model_type: gate_policy
     precision: ${actor.model.precision}
     model_path: ${actor.model.model_path}
+    is_lora: False
     load_wam: True
+    world_feat_dim: ${actor.model.world_feat_dim}
+    text_feat_dim: ${actor.model.text_feat_dim}
+    action_dim: ${actor.model.action_dim}
+    num_action_chunks: ${actor.model.num_action_chunks}
+    add_value_head: ${actor.model.add_value_head}
+    proprio_dim: ${actor.model.proprio_dim}
+    gate: ${actor.model.gate}
+    wam: ${actor.model.wam}
 
 actor:
   group_name: "ActorGroup"
   training_backend: "fsdp"
-  micro_batch_size: 128
-  global_batch_size: 2048
+  micro_batch_size: 64
+  # ceil(200/24) * rollout_epoch(8) * envs(64) = 4608,
+  # exactly 9 global batches per rollout; 512 also supports 1/2/4/8 actor ranks.
+  global_batch_size: 512
   seed: 42
   enable_offload: False
 
   model:
     model_type: gate_policy
-    precision: "bf16"
+    precision: "fp32"
     model_path: ""
     is_lora: False
     load_wam: False              # actor only recomputes gate logprobs; rollout owns frozen WAM
-    world_feat_dim: 48           # Wan2.2 VAE latent channel dim used by WAMModeAdapter
+    world_feat_dim: 240
+    text_feat_dim: 64            # deterministic pooled instruction context
     action_dim: 1
     num_action_chunks: 1
     add_value_head: False
-    proprio_dim: 14              # RoboTwin states dim (TODO: verify against env)
+    proprio_dim: 14              # RoboTwin state dim; checked by WAM provenance
     gate:
-      num_modes: 3
+      num_modes: 2               # categorical order: UNCOND=0, IDM=1
       hidden_sizes: [256, 256]
-      use_last_action: False
       activation: tanh
+      force_mode: null            # eval-only smoke: 0=UNCOND, 1=IDM
+      allow_legacy_gate_checkpoint: False  # fail closed when .meta.json is missing
       # Label-free collapse prevention (default, zero-supervision path): uniform
-      # mixture sampling in TRAIN rollouts, exact behavior logprobs recorded.
-      explore_eps: 0.05
+      # mixture sampling in TRAIN rollouts; replay optimizes that same mixture.
+      explore_eps: 0.10
       # OPTIONAL BC warm-start (self-generated labels; off = pure-RL gate).
       bc_init_path: null
       kl_prior:
-        enabled: False           # emit per-decision KL(pi || pi_BC) in the rollout
+        enabled: False           # differentiable actor-side KL(pi || pi_BC)
         path: null               # defaults to bc_init_path
+        beta: 0.0
+        beta_end: 0.0
+        decay_steps: 200
     wam:
       configs_dir: ${oc.env:FASTWAM_CONFIGS}
       suite: robotwin
-      task: robotwin_metric_adaptive_joint_3cam_384_1e-4
-      backbone_kind: joint
-      ckpt: /path/to/dual_regime_joint_robotwin_checkpoint.pt
+      task: robotwin_dual_regime_fused_3cam_384_1e-4
+      backbone_kind: idm
+      ckpt: /path/to/dual_regime_idm_robotwin_checkpoint.pt
       dataset_stats_path: /path/to/robotwin_dataset_stats.json
       require_dataset_stats: True
-      load_text_encoder: True
-      world_feat_dim: ${actor.model.world_feat_dim}
+      allow_online_text_encoding: False
       action_dim: 14
-      num_video_frames: 9        # TODO(verify): RoboTwin video frames
-      action_horizon: 32         # TODO(verify): RoboTwin action chunk length
-      k_lo: 4
-      k_hi: 20
-      cost_table_path: /path/to/FastWAM/configs/adaptive_gate/wam_cost_robotwin_joint.yaml
+      num_video_frames: 9
+      context_len: 128
+      generation_horizon: 32
+      exec_horizon: 24
+      inference_steps: 20
+      default_seed: 0
+      cost_table_path: /path/to/FastWAM/configs/adaptive_gate/wam_cost_robotwin_idm.yaml
       device: cuda
       dtype: bfloat16
 

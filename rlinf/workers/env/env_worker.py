@@ -33,7 +33,10 @@ from rlinf.data.embodied_io_struct import (
 from rlinf.envs import get_env_cls
 from rlinf.envs.action_utils import prepare_actions
 from rlinf.envs.wrappers import RecordVideo
-from rlinf.models.embodiment.gate_policy.reward import apply_gate_reward
+from rlinf.models.embodiment.gate_policy.reward import (
+    apply_gate_reward,
+    lambda_cost_schedule,
+)
 from rlinf.scheduler import Channel, Cluster, Worker
 from rlinf.utils.comm_mapping import CommMapper
 from rlinf.utils.distributed import masked_stats, normalize_from_stats
@@ -50,6 +53,19 @@ from rlinf.utils.utils import (
     flatten_embodied_batch,
     pack_batch,
     preprocess_embodied_batch,
+)
+from rlinf.workers.env.gate_contract import (
+    PendingGateDecisions,
+    limit_gate_action_chunk_to_episode,
+    make_bootstrap_dones,
+    max_gate_decisions,
+    normalize_episode_mode_cost,
+    pad_gate_env_chunk,
+    rollout_decision_count,
+    slice_gate_action_chunk,
+    update_gate_eval_active_mask,
+    validate_gate_distribution_contract,
+    validate_gate_horizons,
 )
 from rlinf.workers.env.history_manager import HistoryManager
 
@@ -89,7 +105,10 @@ class EnvWorker(Worker):
             self.use_reward_model and not self.use_realworld_reward
         )
         self.env_infos_reward_keys = ("success", "episode", "final_info")
-        self._gate_reward_step = 0
+        # The runner broadcasts its checkpointed optimizer/update step before every
+        # rollout.  Gate reward schedules must use that clock rather than counting
+        # local environment decisions (which differs across ranks and horizons).
+        self.global_step = 0
         if self.use_external_reward_model:
             self.reward_weight = self.cfg.reward.get("reward_weight", 1.0)
             self.env_reward_weight = self.cfg.reward.get("env_reward_weight", 0.0)
@@ -131,13 +150,38 @@ class EnvWorker(Worker):
             )
         self.n_train_chunk_steps = 0
         self.env_steps_per_policy_action = self._env_steps_per_policy_action()
+        self.gate_max_decisions = None
         if self.enable_train:
+            if self._is_gate_policy():
+                self.gate_max_decisions = max_gate_decisions(
+                    max_episode_steps=self.cfg.env.train.max_episode_steps,
+                    exec_horizon=self.env_steps_per_policy_action,
+                )
+                train_decisions = rollout_decision_count(
+                    max_env_steps=self.cfg.env.train.max_steps_per_rollout_epoch,
+                    exec_horizon=self.env_steps_per_policy_action,
+                    rollout_epoch=self.rollout_epoch,
+                    total_num_envs=self.cfg.env.train.total_num_envs,
+                )
+                global_batch_size = int(self.cfg.actor.global_batch_size)
+                if train_decisions % global_batch_size != 0:
+                    raise ValueError(
+                        f"Gate rollout produces {train_decisions} decisions, not "
+                        f"divisible by actor.global_batch_size={global_batch_size}."
+                    )
             self.n_train_chunk_steps = (
                 self.cfg.env.train.max_steps_per_rollout_epoch
                 // self.env_steps_per_policy_action
             )
         self.n_eval_chunk_steps = 0
         if self.enable_eval:
+            if self._is_gate_policy():
+                rollout_decision_count(
+                    max_env_steps=self.cfg.env.eval.max_steps_per_rollout_epoch,
+                    exec_horizon=self.env_steps_per_policy_action,
+                    rollout_epoch=self.eval_rollout_epoch,
+                    total_num_envs=self.cfg.env.eval.total_num_envs,
+                )
             self.n_eval_chunk_steps = (
                 self.cfg.env.eval.max_steps_per_rollout_epoch
                 // self.env_steps_per_policy_action
@@ -145,6 +189,41 @@ class EnvWorker(Worker):
         self.actor_split_num = (
             1 if not self.enable_train else self.get_actor_split_num()
         )
+        if self._is_gate_policy():
+            if self.enable_eval and int(self.eval_rollout_epoch) != 1:
+                raise ValueError(
+                    "Gate evaluation supports exactly one episode per env slot "
+                    "(env.eval.rollout_epoch=1) so mode/cost metrics have an "
+                    "unambiguous episode denominator."
+                )
+            validate_gate_distribution_contract(
+                algorithm_group_size=int(self.cfg.algorithm.group_size),
+                env_group_size=(
+                    int(self.cfg.env.train.group_size)
+                    if self.enable_train
+                    else None
+                ),
+                train_total_envs=(
+                    int(self.cfg.env.train.total_num_envs)
+                    if self.enable_train
+                    else None
+                ),
+                eval_total_envs=(
+                    int(self.cfg.env.eval.total_num_envs)
+                    if self.enable_eval
+                    else None
+                ),
+                env_world_size=int(self._world_size),
+                rollout_world_size=int(
+                    self._component_placement.get_world_size("rollout")
+                ),
+                actor_world_size=int(
+                    self._component_placement.get_world_size("actor")
+                ),
+                stage_num=int(self.stage_num),
+                actor_split_num=int(self.actor_split_num),
+                use_training_pipeline=bool(self.use_training_pipeline),
+            )
         if self.use_training_pipeline and self.enable_train:
             self._init_pipeline_params()
 
@@ -160,9 +239,79 @@ class EnvWorker(Worker):
             ]
 
     def _env_steps_per_policy_action(self) -> int:
-        if str(self.model_cfg.model_type) == "gate_policy":
-            return int(self.model_cfg.wam.action_horizon)
+        if self._is_gate_policy():
+            exec_horizon = int(self.model_cfg.wam.exec_horizon)
+            generation_horizon = int(self.model_cfg.wam.generation_horizon)
+            return validate_gate_horizons(
+                generation_horizon=generation_horizon,
+                exec_horizon=exec_horizon,
+            )
         return int(self.model_cfg.num_action_chunks)
+
+    def _is_gate_policy(self) -> bool:
+        return str(self.model_cfg.model_type) == "gate_policy"
+
+    def set_global_step(self, global_step: int) -> None:
+        """Synchronize the reward-schedule clock with the checkpointed runner."""
+        self.global_step = int(global_step)
+
+    def _slice_gate_action_chunk(self, actions: torch.Tensor | np.ndarray):
+        """Execute only the configured prefix of the generated WAM action chunk."""
+        if not self._is_gate_policy():
+            return actions
+        return slice_gate_action_chunk(
+            actions,
+            generation_horizon=int(self.model_cfg.wam.generation_horizon),
+            exec_horizon=self.env_steps_per_policy_action,
+        )
+
+    @staticmethod
+    def _read_env_elapsed_steps(env):
+        """Find an elapsed-step tensor through optional Gym wrappers."""
+        current = env
+        seen: set[int] = set()
+        while current is not None and id(current) not in seen:
+            seen.add(id(current))
+            elapsed = getattr(current, "elapsed_steps", None)
+            if elapsed is not None:
+                return elapsed
+            current = getattr(current, "env", None)
+        return None
+
+    def _limit_gate_chunk_to_episode(self, actions, *, env, max_episode_steps: int):
+        if not self._is_gate_policy():
+            return actions
+        elapsed_steps = self._read_env_elapsed_steps(env)
+        if elapsed_steps is None:
+            raise RuntimeError(
+                "gate environments must expose per-slot `elapsed_steps` so the "
+                "final action chunk cannot overrun max_episode_steps."
+            )
+        return limit_gate_action_chunk_to_episode(
+            actions,
+            elapsed_steps=elapsed_steps,
+            max_episode_steps=max_episode_steps,
+        )
+
+    def _pad_gate_env_outputs(self, rewards, terminations, truncations):
+        if not self._is_gate_policy():
+            return rewards, terminations, truncations
+        target = self.env_steps_per_policy_action
+        return (
+            pad_gate_env_chunk(rewards, target_horizon=target),
+            pad_gate_env_chunk(
+                terminations, target_horizon=target, move_final_flag=True
+            ),
+            pad_gate_env_chunk(
+                truncations, target_horizon=target, move_final_flag=True
+            ),
+        )
+
+    def _env_action_shape(self) -> tuple[int, int]:
+        """Return the executed chunk length and robot action dimension."""
+        if self._is_gate_policy():
+            return self.env_steps_per_policy_action, int(self.model_cfg.wam.action_dim)
+        return int(self.model_cfg.num_action_chunks), int(self.model_cfg.action_dim)
 
     def init_worker(self):
         self.dst_rank_map = self._setup_dst_rank_map()
@@ -499,19 +648,31 @@ class EnvWorker(Worker):
         """
         This function is used to interact with the environment.
         """
+        chunk_actions = self._slice_gate_action_chunk(chunk_actions)
+        num_action_chunks, action_dim = self._env_action_shape()
         chunk_actions = prepare_actions(
             raw_chunk_actions=chunk_actions,
             env_type=self.cfg.env.train.env_type,
             model_type=self.model_cfg.model_type,
-            num_action_chunks=self.model_cfg.num_action_chunks,
-            action_dim=self.model_cfg.action_dim,
+            num_action_chunks=num_action_chunks,
+            action_dim=action_dim,
             policy=self.model_cfg.get("policy_setup", None),
             wm_env_type=self.cfg.env.train.get("wm_env_type", None),
+        )
+        chunk_actions = self._limit_gate_chunk_to_episode(
+            chunk_actions,
+            env=self.env_list[stage_id],
+            max_episode_steps=self.cfg.env.train.max_episode_steps,
         )
         env_info = {}
 
         obs_list, chunk_rewards, chunk_terminations, chunk_truncations, infos_list = (
             self.env_list[stage_id].chunk_step(chunk_actions)
+        )
+        chunk_rewards, chunk_terminations, chunk_truncations = (
+            self._pad_gate_env_outputs(
+                chunk_rewards, chunk_terminations, chunk_truncations
+            )
         )
         if isinstance(obs_list, (list, tuple)):
             extracted_obs = obs_list[-1] if obs_list else None
@@ -572,19 +733,29 @@ class EnvWorker(Worker):
         """
         This function is used to evaluate the environment.
         """
+        raw_actions = self._slice_gate_action_chunk(raw_actions)
+        num_action_chunks, action_dim = self._env_action_shape()
         chunk_actions = prepare_actions(
             raw_chunk_actions=raw_actions,
             env_type=self.cfg.env.eval.env_type,
             model_type=self.model_cfg.model_type,
-            num_action_chunks=self.model_cfg.num_action_chunks,
-            action_dim=self.model_cfg.action_dim,
+            num_action_chunks=num_action_chunks,
+            action_dim=action_dim,
             policy=self.model_cfg.get("policy_setup", None),
             wm_env_type=self.cfg.env.eval.get("wm_env_type", None),
         )
+        chunk_actions = self._limit_gate_chunk_to_episode(
+            chunk_actions,
+            env=self.eval_env_list[stage_id],
+            max_episode_steps=self.cfg.env.eval.max_episode_steps,
+        )
         env_info = {}
 
-        obs_list, _, chunk_terminations, chunk_truncations, infos_list = (
+        obs_list, chunk_rewards, chunk_terminations, chunk_truncations, infos_list = (
             self.eval_env_list[stage_id].chunk_step(chunk_actions)
+        )
+        _, chunk_terminations, chunk_truncations = self._pad_gate_env_outputs(
+            chunk_rewards, chunk_terminations, chunk_truncations
         )
         if isinstance(obs_list, (list, tuple)):
             extracted_obs = obs_list[-1] if obs_list else None
@@ -621,6 +792,10 @@ class EnvWorker(Worker):
         env_output = EnvOutput(
             obs=extracted_obs,
             final_obs=final_obs,
+            env_infos=infos if isinstance(infos, dict) else None,
+            dones=chunk_dones,
+            terminations=chunk_terminations,
+            truncations=chunk_truncations,
         )
         return env_output, env_info
 
@@ -777,6 +952,7 @@ class EnvWorker(Worker):
         bootstrap_values: torch.Tensor | None,
         reward_model_output: torch.Tensor | None,
         forward_inputs: dict[str, Any] | None = None,
+        metrics: dict[str, list[torch.Tensor]] | None = None,
     ) -> torch.Tensor | None:
         rewards = env_output.rewards
         if rewards is None:
@@ -797,16 +973,46 @@ class EnvWorker(Worker):
         ):
             components = apply_gate_reward(
                 rewards=rewards,
-                mode_cost=forward_inputs["mode_cost"],
-                step=self._gate_reward_step,
+                mode_cost=normalize_episode_mode_cost(
+                    forward_inputs["mode_cost"],
+                    max_episode_steps=self.cfg.env.train.max_episode_steps,
+                    exec_horizon=self.env_steps_per_policy_action,
+                ),
+                step=self.global_step,
                 lambda_cost=float(gate_reward_cfg.get("lambda_cost", 0.0)),
                 lambda_warmup_steps=int(gate_reward_cfg.get("lambda_warmup_steps", 0)),
                 lambda_start=float(gate_reward_cfg.get("lambda_start", 0.0)),
                 w_success=float(gate_reward_cfg.get("w_success", 1.0)),
-                w_agreement=float(gate_reward_cfg.get("w_agreement", 0.0)),
             )
             rewards = components["total"]
-            self._gate_reward_step += 1
+            if metrics is not None:
+                metric_mask = forward_inputs.get("_gate_valid_mask")
+                if isinstance(metric_mask, torch.Tensor):
+                    metric_mask = metric_mask.detach().reshape(-1).bool().cpu()
+                for name in ("success", "compute_penalty", "total"):
+                    value = components[name].detach().float()
+                    if value.ndim > 1:
+                        value = value.sum(dim=tuple(range(1, value.ndim)))
+                    value = value.reshape(-1).cpu()
+                    if isinstance(metric_mask, torch.Tensor):
+                        value = value[metric_mask]
+                    metrics[f"gate/reward_{name}"].append(
+                        value
+                    )
+                lam = lambda_cost_schedule(
+                    self.global_step,
+                    lambda_max=float(gate_reward_cfg.get("lambda_cost", 0.0)),
+                    warmup_steps=int(
+                        gate_reward_cfg.get("lambda_warmup_steps", 0)
+                    ),
+                    start=float(gate_reward_cfg.get("lambda_start", 0.0)),
+                )
+                lambda_values = torch.full(
+                    (rewards.shape[0],), lam, dtype=torch.float32
+                )
+                if isinstance(metric_mask, torch.Tensor):
+                    lambda_values = lambda_values[metric_mask]
+                metrics["gate/lambda_cost"].append(lambda_values)
 
         adjusted_rewards = rewards.clone()
         if (
@@ -1025,10 +1231,9 @@ class EnvWorker(Worker):
     @Worker.timer("env/bootstrap_step")
     def bootstrap_step(self) -> list[EnvOutput]:
         def get_zero_dones() -> torch.Tensor:
-            return (
-                torch.zeros((self.train_num_envs_per_stage,), dtype=bool)
-                .unsqueeze(1)
-                .repeat(1, self.model_cfg.num_action_chunks)
+            return make_bootstrap_dones(
+                batch_size=self.train_num_envs_per_stage,
+                exec_horizon=self.env_steps_per_policy_action,
             )
 
         env_outputs: list[EnvOutput] = []
@@ -1111,6 +1316,65 @@ class EnvWorker(Worker):
         for key, value in env_info.items():
             env_metrics.setdefault(key, []).append(value)
 
+    def record_gate_decision_metrics(
+        self,
+        env_metrics: dict[str, list],
+        forward_inputs: dict[str, Any] | None,
+        valid_mask: torch.Tensor | None = None,
+    ) -> None:
+        """Record one sample per gate decision for usage and compute accounting."""
+        if not self._is_gate_policy() or not forward_inputs:
+            return
+        mode = forward_inputs.get("mode")
+        mode_cost = forward_inputs.get("mode_cost")
+        valid = (
+            None
+            if valid_mask is None
+            else valid_mask.detach().reshape(-1).bool().cpu()
+        )
+        if isinstance(mode, torch.Tensor):
+            mode = mode.detach().reshape(-1).long().cpu()
+            if valid is None:
+                valid = torch.ones_like(mode, dtype=torch.bool)
+            if valid.shape != mode.shape:
+                raise ValueError(
+                    f"gate metric mask {tuple(valid.shape)} does not match modes "
+                    f"{tuple(mode.shape)}."
+                )
+            env_metrics["gate/mode_uncond_usage"].append(
+                (mode == 0).float()[valid]
+            )
+            env_metrics["gate/mode_idm_usage"].append((mode == 1).float()[valid])
+            group_size = int(self.cfg.algorithm.get("group_size", 1))
+            if group_size > 1 and mode.numel() % group_size == 0:
+                grouped = mode.reshape(-1, group_size)
+                valid_groups = valid.reshape(-1, group_size).all(dim=1)
+                # Binary-mode diversity is 1 when a group collapsed and 2 when
+                # it contains the contrast GRPO needs for an informative baseline.
+                diversity = 1 + (
+                    grouped.min(dim=1).values != grouped.max(dim=1).values
+                )
+                diversity = diversity[valid_groups]
+                env_metrics["gate/group_mode_diversity"].append(diversity.float())
+                env_metrics["gate/group_single_mode_ratio"].append(
+                    (diversity == 1).float()
+                )
+        if isinstance(mode_cost, torch.Tensor):
+            cost = mode_cost.detach().reshape(-1).float().cpu()
+            if valid is not None:
+                cost = cost[valid]
+            env_metrics["gate/mode_cost"].append(
+                cost
+            )
+        mode_entropy = forward_inputs.get("mode_entropy")
+        if isinstance(mode_entropy, torch.Tensor):
+            entropy = mode_entropy.detach().reshape(-1).float().cpu()
+            if valid is not None:
+                entropy = entropy[valid]
+            env_metrics["gate/mode_entropy"].append(
+                entropy
+            )
+
     def store_last_obs_and_intervened_info(self, env_output_list: list[EnvOutput]):
         self.last_obs_list = [env_output.obs for env_output in env_output_list]
         self.last_intervened_info_list = [
@@ -1150,6 +1414,26 @@ class EnvWorker(Worker):
         env_metrics = defaultdict(list)
 
         for epoch in range(self.rollout_epoch):
+            # Rewards in ``env_outputs`` were produced by the previously executed
+            # action. Keep that decision's cost explicitly; the rollout result
+            # received below already belongs to the next observation/action.
+            pending_gate_inputs = PendingGateDecisions(self.stage_num)
+            gate_episode_cost = (
+                [
+                    torch.zeros(self.train_num_envs_per_stage, dtype=torch.float32)
+                    for _ in range(self.stage_num)
+                ]
+                if self._is_gate_policy()
+                else []
+            )
+            gate_episode_done = (
+                [
+                    torch.zeros(self.train_num_envs_per_stage, dtype=torch.bool)
+                    for _ in range(self.stage_num)
+                ]
+                if self._is_gate_policy()
+                else []
+            )
             if epoch == 0 and self._prefetched_train_bootstrap is not None:
                 env_outputs = self._prefetched_train_bootstrap
                 self._prefetched_train_bootstrap = None
@@ -1163,7 +1447,10 @@ class EnvWorker(Worker):
 
                     env_output = env_outputs[stage_id]
                     curr_obs = env_output.obs
-                    if env_output.intervene_actions is not None:
+                    if (
+                        env_output.intervene_actions is not None
+                        and not self._is_gate_policy()
+                    ):
                         self.rollout_results[stage_id].update_last_actions(
                             env_output.intervene_actions,
                             env_output.intervene_flags,
@@ -1189,8 +1476,23 @@ class EnvWorker(Worker):
                         env_output,
                         rollout_result.bootstrap_values,
                         reward_model_output,
-                        rollout_result.forward_inputs,
+                        pending_gate_inputs.consume_reward(stage_id),
+                        metrics=env_metrics,
                     )
+                    gate_valid_mask = (
+                        ~gate_episode_done[stage_id]
+                        if self._is_gate_policy()
+                        else None
+                    )
+                    self.record_gate_decision_metrics(
+                        env_metrics,
+                        rollout_result.forward_inputs,
+                        valid_mask=gate_valid_mask,
+                    )
+                    # Entropy is logging-only; avoid carrying it through every
+                    # trajectory micro-batch after it has been recorded.
+                    if self._is_gate_policy():
+                        rollout_result.forward_inputs.pop("mode_entropy", None)
                     chunk_step_result = ChunkStepResult(
                         actions=rollout_result.forward_inputs.get("action", None),
                         prev_logprobs=(
@@ -1225,6 +1527,27 @@ class EnvWorker(Worker):
                     env_output, env_info = self.env_interact_step(
                         rollout_result.actions, stage_id
                     )
+                    if self._is_gate_policy():
+                        pending_gate_inputs.mark_executed(
+                            stage_id,
+                            {
+                                **rollout_result.forward_inputs,
+                                "_gate_valid_mask": gate_valid_mask,
+                            },
+                        )
+                        gate_episode_cost[stage_id] += (
+                            rollout_result.forward_inputs["mode_cost"]
+                            .detach()
+                            .reshape(-1)
+                            .float()
+                            .cpu()
+                            * gate_valid_mask.float()
+                            / float(self.gate_max_decisions)
+                        )
+                        if not self.cfg.env.train.auto_reset:
+                            gate_episode_done[stage_id] |= (
+                                env_output.dones.any(dim=1).detach().cpu()
+                            )
                     env_batch = env_output.to_dict()
                     self.send_env_batch(
                         rollout_channel,
@@ -1253,7 +1576,10 @@ class EnvWorker(Worker):
                         self.record_env_metrics(env_metrics, env_info)
             for stage_id in range(self.stage_num):
                 env_output = env_outputs[stage_id]
-                if env_output.intervene_actions is not None:
+                if (
+                    env_output.intervene_actions is not None
+                    and not self._is_gate_policy()
+                ):
                     self.rollout_results[stage_id].update_last_actions(
                         env_output.intervene_actions,
                         env_output.intervene_flags,
@@ -1278,7 +1604,8 @@ class EnvWorker(Worker):
                     env_output,
                     rollout_result.bootstrap_values,
                     reward_model_output,
-                    rollout_result.forward_inputs,
+                    pending_gate_inputs.consume_reward(stage_id),
+                    metrics=env_metrics,
                 )
                 chunk_step_result = ChunkStepResult(
                     prev_values=(
@@ -1290,6 +1617,10 @@ class EnvWorker(Worker):
                     rewards=rewards,
                 )
                 self.rollout_results[stage_id].append_step_result(chunk_step_result)
+                if self._is_gate_policy():
+                    env_metrics["gate/episode_normalized_cost"].append(
+                        gate_episode_cost[stage_id]
+                    )
                 if (
                     self.reward_mode == "history_buffer"
                     and self.history_reward_assign
@@ -1351,6 +1682,14 @@ class EnvWorker(Worker):
         eval_metrics = defaultdict(list)
 
         for eval_rollout_epoch in range(self.eval_rollout_epoch):
+            gate_active = (
+                [
+                    torch.ones(self.eval_num_envs_per_stage, dtype=torch.bool)
+                    for _ in range(self.stage_num)
+                ]
+                if self._is_gate_policy()
+                else []
+            )
             if not self.cfg.env.eval.auto_reset or eval_rollout_epoch == 0:
                 for stage_id in range(self.stage_num):
                     self.eval_env_list[stage_id].is_start = True
@@ -1372,6 +1711,11 @@ class EnvWorker(Worker):
                         {
                             "obs": env_batch["obs"],
                             "final_obs": env_batch["final_obs"],
+                            **(
+                                {"active_mask": gate_active[stage_id]}
+                                if self._is_gate_policy()
+                                else {}
+                            ),
                         },
                         mode="eval",
                     )
@@ -1388,6 +1732,18 @@ class EnvWorker(Worker):
                     for key, value in env_info.items():
                         eval_metrics[key].append(value)
 
+                    if self._is_gate_policy():
+                        episode_info = (
+                            env_output.env_infos.get("episode", {})
+                            if isinstance(env_output.env_infos, dict)
+                            else {}
+                        )
+                        gate_active[stage_id] = update_gate_eval_active_mask(
+                            gate_active[stage_id],
+                            success_once=episode_info.get("success_once"),
+                            dones=env_output.dones,
+                        )
+
                     if self.cfg.env.eval.auto_reset:
                         if (
                             eval_rollout_epoch == self.eval_rollout_epoch - 1
@@ -1403,6 +1759,11 @@ class EnvWorker(Worker):
                         {
                             "obs": env_batch["obs"],
                             "final_obs": env_batch["final_obs"],
+                            **(
+                                {"active_mask": gate_active[stage_id]}
+                                if self._is_gate_policy()
+                                else {}
+                            ),
                         },
                         mode="eval",
                     )

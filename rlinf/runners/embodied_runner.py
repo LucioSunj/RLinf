@@ -199,9 +199,18 @@ class EmbodiedRunner:
             output_channel=self.env_channel,
         )
         env_results = env_handle.wait()
-        rollout_handle.wait()
+        rollout_results = rollout_handle.wait()
         eval_metrics_list = [results for results in env_results if results is not None]
         eval_metrics = compute_evaluate_metrics(eval_metrics_list)
+        rollout_metrics_list = [
+            results for results in rollout_results if results
+        ]
+        if rollout_metrics_list:
+            rollout_metrics = compute_evaluate_metrics(rollout_metrics_list)
+            # This helper counts metric samples as trajectories. Preserve the
+            # environment's episode count instead of reporting gate decisions.
+            rollout_metrics.pop("num_trajectories", None)
+            eval_metrics.update(rollout_metrics)
         return eval_metrics
 
     def _log_ranked_metrics(
@@ -369,10 +378,33 @@ class EmbodiedRunner:
 
         env_results = env_handle.wait()
         env_results_list = [results for results in env_results if results is not None]
-        env_metrics = compute_evaluate_metrics(env_results_list)
+        task_env_results = [
+            {key: value for key, value in results.items() if not key.startswith("gate/")}
+            for results in env_results_list
+        ]
+        gate_env_results = [
+            {key: value for key, value in results.items() if key.startswith("gate/")}
+            for results in env_results_list
+        ]
+        env_metrics = compute_evaluate_metrics(
+            [results for results in task_env_results if results]
+        )
+        gate_metrics = compute_evaluate_metrics(
+            [results for results in gate_env_results if results]
+        )
+        # Gate arrays contain one sample per decision, not one per episode.
+        gate_metrics.pop("num_trajectories", None)
+        env_metrics.update(gate_metrics)
         env_metrics = {f"env/{k}": v for k, v in env_metrics.items()}
         ranked_env_results = [
-            {"rank": rank, "env": rank_metrics}
+            {
+                "rank": rank,
+                "env": {
+                    key: value
+                    for key, value in rank_metrics.items()
+                    if not key.startswith("gate/")
+                },
+            }
             for rank, rank_metrics in enumerate(env_results)
             if rank_metrics is not None
         ]
@@ -484,6 +516,7 @@ class EmbodiedRunner:
             # set global step
             self.actor.set_global_step(self.global_step)
             self.rollout.set_global_step(self.global_step)
+            self.env.set_global_step(self.global_step).wait()
 
             profiled_step = (
                 self.global_step
@@ -567,6 +600,7 @@ class EmbodiedRunner:
             # set global step
             self.actor.set_global_step(self.global_step)
             self.rollout.set_global_step(self.global_step)
+            self.env.set_global_step(self.global_step).wait()
 
             profiled_step = (
                 self.global_step

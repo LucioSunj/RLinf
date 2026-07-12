@@ -69,9 +69,14 @@ class EmbodiedEvalRunner:
             output_channel=self.env_channel,
         )
         env_results = env_handle.wait()
-        rollout_handle.wait()
+        rollout_results = rollout_handle.wait()
         eval_metrics_list = [results for results in env_results if results is not None]
         eval_metrics = compute_evaluate_metrics(eval_metrics_list)
+        rollout_metrics_list = [results for results in rollout_results if results]
+        if rollout_metrics_list:
+            rollout_metrics = compute_evaluate_metrics(rollout_metrics_list)
+            rollout_metrics.pop("num_trajectories", None)
+            eval_metrics.update(rollout_metrics)
         return eval_metrics
 
     def run(self):

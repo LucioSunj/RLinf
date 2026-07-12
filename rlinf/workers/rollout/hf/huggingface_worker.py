@@ -31,6 +31,7 @@ from rlinf.models.embodiment.base_policy import BasePolicy
 from rlinf.scheduler import Channel, Cluster, Worker
 from rlinf.utils.comm_mapping import CommMapper
 from rlinf.utils.placement import HybridComponentPlacement
+from rlinf.workers.env.gate_contract import validate_gate_horizons
 
 
 class MultiStepRolloutWorker(Worker):
@@ -121,7 +122,12 @@ class MultiStepRolloutWorker(Worker):
 
     def _env_steps_per_policy_action(self) -> int:
         if str(self.model_cfg.model_type) == "gate_policy":
-            return int(self.model_cfg.wam.action_horizon)
+            exec_horizon = int(self.model_cfg.wam.exec_horizon)
+            generation_horizon = int(self.model_cfg.wam.generation_horizon)
+            return validate_gate_horizons(
+                generation_horizon=generation_horizon,
+                exec_horizon=exec_horizon,
+            )
         return int(self.model_cfg.num_action_chunks)
 
     def init_worker(self):
@@ -137,7 +143,16 @@ class MultiStepRolloutWorker(Worker):
         self.hf_model: BasePolicy = get_model(rollout_model_config)
 
         if self.cfg.runner.get("ckpt_path", None):
-            model_dict = torch.load(self.cfg.runner.ckpt_path)
+            if str(rollout_model_config.model_type) == "gate_policy":
+                from rlinf.models.embodiment.gate_policy.bc import (
+                    load_gate_bc_state,
+                )
+
+                model_dict = load_gate_bc_state(
+                    str(self.cfg.runner.ckpt_path), expected_policy=self.hf_model
+                )
+            else:
+                model_dict = torch.load(self.cfg.runner.ckpt_path)
             self.hf_model.load_state_dict(model_dict)
 
         if self.cfg.rollout.get("expert_model", None):
@@ -470,15 +485,27 @@ class MultiStepRolloutWorker(Worker):
                 self.send_rollout_result(output_channel, rollout_result, mode="train")
         for _ in range(self.num_pipeline_stages):
             env_output = await self.recv_env_output(input_channel)
-            actions, result = self.predict(env_output["obs"])
-
-            rollout_result = RolloutResult(
-                actions=actions,
-                prev_values=result["prev_values"] if self.collect_prev_infos else None,
-                bootstrap_values=self.get_bootstrap_values(
-                    env_output.get("final_obs", None)
-                ),
-            )
+            if (
+                str(self.model_cfg.model_type) == "gate_policy"
+                and not bool(self.model_cfg.get("add_value_head", False))
+            ):
+                # GRPO needs only a terminal shape sentinel. Do not run an
+                # expensive WAM action for an action that will never be executed.
+                batch_size = self._infer_env_batch_size(env_output)
+                rollout_result = RolloutResult(
+                    prev_values=torch.zeros(batch_size, 1),
+                )
+            else:
+                actions, result = self.predict(env_output["obs"])
+                rollout_result = RolloutResult(
+                    actions=actions,
+                    prev_values=(
+                        result["prev_values"] if self.collect_prev_infos else None
+                    ),
+                    bootstrap_values=self.get_bootstrap_values(
+                        env_output.get("final_obs", None)
+                    ),
+                )
             self.send_rollout_result(output_channel, rollout_result, mode="train")
 
     @Worker.timer("rollout/generate")
@@ -503,19 +530,76 @@ class MultiStepRolloutWorker(Worker):
     async def evaluate(self, input_channel: Channel, output_channel: Channel):
         if self.enable_offload:
             self.reload_model()
+        gate_modes: list[torch.Tensor] = []
+        gate_costs: list[torch.Tensor] = []
+        gate_entropies: list[torch.Tensor] = []
+        gate_episode_costs: list[torch.Tensor] = []
         for _ in tqdm(
             range(self.eval_rollout_epoch),
             desc="Evaluating Rollout Epochs",
             disable=(self._rank != 0),
         ):
+            stage_episode_costs: list[torch.Tensor | None] = [
+                None for _ in range(self.num_pipeline_stages)
+            ]
             for _ in range(self.n_eval_chunk_steps):
-                for _ in range(self.num_pipeline_stages):
+                for stage_id in range(self.num_pipeline_stages):
                     env_output = await self.recv_env_output(input_channel, mode="eval")
-                    actions, _ = self.predict(env_output["obs"], mode="eval")
+                    actions, result = self.predict(env_output["obs"], mode="eval")
+                    if str(self.model_cfg.model_type) == "gate_policy":
+                        active = env_output.get("active_mask")
+                        if not isinstance(active, torch.Tensor):
+                            raise ValueError(
+                                "gate evaluation requires a per-environment active_mask"
+                            )
+                        active = active.detach().reshape(-1).bool().cpu()
+                        if isinstance(result.get("mode"), torch.Tensor):
+                            values = result["mode"].detach().reshape(-1).long().cpu()
+                            gate_modes.append(values[active])
+                        if isinstance(result.get("mode_cost"), torch.Tensor):
+                            values = result["mode_cost"].detach().reshape(-1).float().cpu()
+                            gate_costs.append(values[active])
+                            if stage_episode_costs[stage_id] is None:
+                                stage_episode_costs[stage_id] = torch.zeros_like(values)
+                            stage_episode_costs[stage_id] += values * active.float()
+                        if isinstance(result.get("mode_logits"), torch.Tensor):
+                            probs = torch.softmax(
+                                result["mode_logits"].detach().float(), dim=-1
+                            )
+                            values = (
+                                -(probs * probs.clamp_min(1e-12).log()).sum(dim=-1)
+                            ).reshape(-1).cpu()
+                            gate_entropies.append(values[active])
                     self.send_chunk_actions(output_channel, actions, mode="eval")
+            gate_episode_costs.extend(
+                cost for cost in stage_episode_costs if cost is not None
+            )
 
         if self.enable_offload:
             self.offload_model()
+        if not gate_modes:
+            return {}
+        modes = torch.cat(gate_modes)
+        metrics = {
+            "gate/mode_uncond_usage": (modes == 0).float(),
+            "gate/mode_idm_usage": (modes == 1).float(),
+        }
+        if gate_costs:
+            metrics["gate/mode_cost"] = torch.cat(gate_costs)
+        if gate_episode_costs:
+            episode_cost = torch.cat(gate_episode_costs)
+            metrics["gate/episode_total_cost"] = episode_cost
+            max_decisions = (
+                int(self.cfg.env.eval.max_episode_steps)
+                + int(self.env_steps_per_policy_action)
+                - 1
+            ) // int(self.env_steps_per_policy_action)
+            metrics["gate/episode_normalized_cost"] = (
+                episode_cost / float(max_decisions)
+            )
+        if gate_entropies:
+            metrics["gate/mode_entropy"] = torch.cat(gate_entropies)
+        return metrics
 
     def offload_model(self):
         if self.enable_cuda_graph:
@@ -603,6 +687,7 @@ class MultiStepRolloutWorker(Worker):
             for obs_batch in obs_batches
         ]
         final_obs_list = [obs_batch.get("final_obs", None) for obs_batch in obs_batches]
+        active_masks = [obs_batch.get("active_mask", None) for obs_batch in obs_batches]
 
         def _merge_obs_dicts(dicts: list[dict[str, Any]]) -> dict[str, Any]:
             merged: dict[str, Any] = {}
@@ -630,7 +715,16 @@ class MultiStepRolloutWorker(Worker):
             ]
             merged_final_obs = _merge_obs_dicts(final_obs_or_obs)
 
-        return {"obs": merged_obs, "final_obs": merged_final_obs}
+        merged_active = None
+        if any(mask is not None for mask in active_masks):
+            if not all(isinstance(mask, torch.Tensor) for mask in active_masks):
+                raise ValueError("active_mask must be present for every merged env shard")
+            merged_active = torch.cat(active_masks, dim=0).bool()
+        return {
+            "obs": merged_obs,
+            "final_obs": merged_final_obs,
+            "active_mask": merged_active,
+        }
 
     @Worker.timer("rollout/send_actions")
     def send_chunk_actions(

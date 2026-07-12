@@ -8,34 +8,27 @@
 Each term is computed and returned SEPARATELY (for per-component logging); the
 caller sums `total`. Terms (all configurable):
   - success         : terminal task success (sparse), from the env reward stream.
-  - compute_penalty : -lambda_cost * cost(mode), cost(FULL)=1 (from WAMModeAdapter).
-  - agreement       : OPTIONAL dense shaping = similarity between the chosen mode's
-                      action chunk and the FULL-mode action chunk at that step
-                      (reduces variance). Off by default.
-  - kl_prior        : OPTIONAL M3 term = -beta * KL(pi || pi_BC) per gate decision,
-                      keeping early RL near the BC warm-start (the embodied actor
-                      has no reference-model KL path, so the prior rides the reward
-                      stream). `kl_to_prior` is emitted by GatePolicy's rollout when
-                      `gate.kl_prior.enabled`; beta DECAYS over steps (trust the
-                      prior early, wean off as RL takes over).
+  - compute_penalty : -lambda_cost * normalized_cost(mode), with the EnvWorker
+                      dividing relative mode cost by maximum decisions per episode.
 
-WIRING (the one integration hook; validate on-server):
-  The gate's per-step `mode_cost` is surfaced by GatePolicy.predict_action_batch in
-  `result["forward_inputs"]["mode_cost"]`, so it persists in the rollout buffer.
-  Combine it with the env's success reward where the reward stream is assembled
-  (EnvWorker.compute_bootstrap_rewards or the embodied runner's reward assembly):
+The optional BC-prior KL is not part of this reward. GatePolicy computes an exact,
+differentiable KL and EmbodiedFSDPActor adds it directly to the actor objective.
 
-      comps = gate_reward_components(success=env_rewards, mode_cost=buf["mode_cost"],
-                                     lambda_cost=lam, agreement=optional_agreement, ...)
+WIRING:
+  The gate's per-decision `mode_cost` is surfaced by
+  GatePolicy.predict_action_batch in `result["forward_inputs"]["mode_cost"]` and
+  retained in the rollout buffer. EnvWorker aligns that decision with the reward
+  produced by its executed robot chunk, normalizes it by the maximum decisions per
+  episode, and applies:
+
+      comps = apply_gate_reward(rewards=env_rewards, mode_cost=normalized_cost,
+                                step=global_step, ...)
       rewards = comps["total"]
-      # log comps["success"], comps["compute_penalty"], comps["agreement"] separately
 
-  `lam` should follow `lambda_cost_schedule(global_step, ...)` (anneal up: learn to
-  act well first, then to economize).
+  `apply_gate_reward` uses `lambda_cost_schedule(global_step, ...)`, so the gate
+  learns task performance before the compute penalty reaches full strength.
 """
 from __future__ import annotations
-
-from typing import Optional
 
 import torch
 
@@ -45,27 +38,15 @@ def gate_reward_components(
     success,
     mode_cost,
     lambda_cost: float,
-    agreement=None,
     w_success: float = 1.0,
-    w_agreement: float = 0.0,
-    kl_to_prior=None,
-    beta_kl_prior: float = 0.0,
 ):
-    """Return {success, compute_penalty, [agreement], [kl_prior], total}. Works with
+    """Return {success, compute_penalty, total}. Works with
     floats or torch tensors / numpy arrays (broadcasting). Keep each component for
     logging; do NOT collapse upstream."""
     success_term = w_success * success
     compute_penalty = -float(lambda_cost) * mode_cost
     components = {"success": success_term, "compute_penalty": compute_penalty}
     total = success_term + compute_penalty
-    if agreement is not None and w_agreement != 0.0:
-        agreement_term = float(w_agreement) * agreement
-        components["agreement"] = agreement_term
-        total = total + agreement_term
-    if kl_to_prior is not None and beta_kl_prior != 0.0:
-        kl_term = -float(beta_kl_prior) * kl_to_prior
-        components["kl_prior"] = kl_term
-        total = total + kl_term
     components["total"] = total
     return components
 
@@ -84,23 +65,6 @@ def lambda_cost_schedule(
         return float(lambda_max)
     frac = min(max(step / float(warmup_steps), 0.0), 1.0)
     return float(start) + (float(lambda_max) - float(start)) * frac
-
-
-def kl_prior_schedule(
-    step: int,
-    *,
-    beta_start: float,
-    beta_end: float = 0.0,
-    decay_steps: int = 0,
-) -> float:
-    """Linear DECAY of the KL-to-BC weight from `beta_start` to `beta_end` over
-    `decay_steps`, then hold. Mirror image of `lambda_cost_schedule`: trust the
-    BC prior early (when the policy would otherwise collapse or thrash), then
-    wean off so RL can depart from the oracle where the env says otherwise."""
-    if decay_steps <= 0:
-        return float(beta_start)
-    frac = min(max(step / float(decay_steps), 0.0), 1.0)
-    return float(beta_start) + (float(beta_end) - float(beta_start)) * frac
 
 
 def spread_mode_cost_over_reward_steps(
@@ -134,19 +98,8 @@ def apply_gate_reward(
     lambda_warmup_steps: int,
     lambda_start: float = 0.0,
     w_success: float = 1.0,
-    w_agreement: float = 0.0,
-    agreement: Optional[torch.Tensor] = None,
-    kl_to_prior: Optional[torch.Tensor] = None,
-    beta_kl_prior: float = 0.0,
-    beta_kl_prior_end: float = 0.0,
-    beta_kl_prior_decay_steps: int = 0,
 ) -> dict[str, torch.Tensor]:
-    """Combine env rewards with the gate compute penalty (+ optional KL-to-BC).
-
-    `kl_to_prior` is the per-decision KL carried in the rollout buffer
-    (`forward_inputs["kl_to_prior"]`, [B,1]); like `mode_cost` it is spread over
-    the env reward steps so the later chunk-level sum applies it exactly once.
-    """
+    """Combine environment rewards with one compute penalty per gate decision."""
     lam = lambda_cost_schedule(
         step,
         lambda_max=float(lambda_cost),
@@ -157,28 +110,11 @@ def apply_gate_reward(
         mode_cost=mode_cost,
         rewards=rewards,
     )
-    aligned_kl = None
-    beta = 0.0
-    if kl_to_prior is not None and float(beta_kl_prior) != 0.0:
-        beta = kl_prior_schedule(
-            step,
-            beta_start=float(beta_kl_prior),
-            beta_end=float(beta_kl_prior_end),
-            decay_steps=int(beta_kl_prior_decay_steps),
-        )
-        aligned_kl = spread_mode_cost_over_reward_steps(
-            mode_cost=kl_to_prior,
-            rewards=rewards,
-        )
     return gate_reward_components(
         success=rewards,
         mode_cost=aligned_cost,
         lambda_cost=lam,
-        agreement=agreement,
         w_success=w_success,
-        w_agreement=w_agreement,
-        kl_to_prior=aligned_kl,
-        beta_kl_prior=beta,
     )
 
 

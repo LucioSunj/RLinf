@@ -1,8 +1,8 @@
-# Adaptive-prediction GATE on a FROZEN fast-wam, trained with GRPO on LIBERO-10.
+# Binary UNCOND/IDM gate on a frozen dual-regime FastWAM, trained on LIBERO-10.
 # (PPO variant: see TODO at the bottom — switch adv_type/loss_type + add_value_head.)
 #
 # Cloned from libero_10_grpo_openpi.yaml; the VLA actor/rollout model is replaced
-# by `gate_policy` (a tiny 3-way categorical on the frozen WAM). Paths marked
+# by `gate_policy` (a tiny binary categorical on the frozen WAM). Paths marked
 # /path/to/... and ${oc.env:...} must be set for your machine.
 defaults:
   - env/libero_10@env.train
@@ -10,6 +10,7 @@ defaults:
   - training_backend/fsdp@actor.fsdp_config
   - weight_syncer/patch_syncer@weight_syncer
   - override hydra/job_logging: stdout
+  - _self_
 
 hydra:
   run:
@@ -64,16 +65,9 @@ algorithm:
 # Combined at the reward-stream assembly hook (see adaptive_gate README §wiring).
 gate_reward:
   w_success: 1.0
-  lambda_cost: 0.05             # weight of -lambda*cost(mode); cost(FULL)=1
+  lambda_cost: 0.05             # maximum all-IDM episode compute penalty
   lambda_warmup_steps: 200      # anneal lambda 0 -> lambda_cost (learn to act, then economize)
   lambda_start: 0.0
-  w_agreement: 0.0              # optional dense agreement-with-FULL shaping (off by default)
-  # M3 KL-to-BC prior: -beta * KL(pi || pi_BC) per gate decision (needs
-  # gate.kl_prior.enabled). beta DECAYS start -> end: trust the BC prior early,
-  # wean off as RL takes over.
-  beta_kl_prior: 0.0            # e.g. 0.05 with a BC warm-start
-  beta_kl_prior_end: 0.0
-  beta_kl_prior_decay_steps: 200
 
 env:
   group_name: "EnvGroup"
@@ -87,11 +81,14 @@ env:
     max_steps_per_rollout_epoch: 480
   eval:
     rollout_epoch: 1
-    total_num_envs: 500
+    # Periodic distributed validation subset (divisible by 1/2/4/8 ranks).
+    # Run the exact 500-trial benchmark separately on a compatible rank count.
+    total_num_envs: 496
     auto_reset: True
     ignore_terminations: True
-    max_episode_steps: 480
-    max_steps_per_rollout_epoch: 480
+    # Match FastWAM's official LIBERO-10 evaluation horizon.
+    max_episode_steps: 700
+    max_steps_per_rollout_epoch: 700
     group_size: 1
     is_eval: True
 
@@ -106,64 +103,82 @@ rollout:
     model_type: gate_policy
     precision: ${actor.model.precision}
     model_path: ${actor.model.model_path}
+    is_lora: False
     load_wam: True
+    world_feat_dim: ${actor.model.world_feat_dim}
+    text_feat_dim: ${actor.model.text_feat_dim}
+    action_dim: ${actor.model.action_dim}
+    num_action_chunks: ${actor.model.num_action_chunks}
+    add_value_head: ${actor.model.add_value_head}
+    proprio_dim: ${actor.model.proprio_dim}
+    gate: ${actor.model.gate}
+    wam: ${actor.model.wam}
 
 actor:
   group_name: "ActorGroup"
   training_backend: "fsdp"
   micro_batch_size: 128
+  # 480/exec_horizon(10) * rollout_epoch(8) * envs(64) = 24576,
+  # exactly 12 global batches per rollout.
   global_batch_size: 2048
   seed: 42
   enable_offload: False
 
   model:
     model_type: gate_policy
-    precision: "bf16"
+    precision: "fp32"            # keep categorical logits/logprobs numerically stable
     model_path: ""
     is_lora: False
     load_wam: False              # actor only recomputes gate logprobs; rollout owns frozen WAM
-    world_feat_dim: 48           # Wan2.2 VAE latent channel dim used by WAMModeAdapter
+    world_feat_dim: 240          # spatially pooled 2x2 VAE grid + global statistics
+    text_feat_dim: 64            # deterministic pooled instruction context
     # discrete mode is the policy-gradient action (one per chunk-step)
     action_dim: 1
     num_action_chunks: 1
     add_value_head: False        # GRPO is critic-free; True only for the PPO variant
     proprio_dim: 8               # LIBERO states dim
     gate:
-      num_modes: 3
+      num_modes: 2               # categorical order: UNCOND=0, IDM=1
       hidden_sizes: [256, 256]
-      use_last_action: False     # TODO(optional): append last-mode one-hot / phase
       activation: tanh
+      force_mode: null            # eval-only smoke: 0=UNCOND, 1=IDM
+      allow_legacy_gate_checkpoint: False  # fail closed when .meta.json is missing
       # Label-free collapse prevention (with entropy_bonus + lambda warmup this is
       # the DEFAULT, zero-supervision training path): w.p. eps sample a uniform
-      # random mode in TRAIN rollouts; the mixture behavior logprob is recorded,
-      # so the GRPO ratio stays exact. Anneal via GatePolicy.set_explore_eps
+      # random mode in TRAIN rollouts. This mixture is the optimized policy and
+      # its per-sample epsilon is replayed, so the pre-update ratio is exactly 1.
+      # Anneal via GatePolicy.set_explore_eps
       # (runner hook) or keep a small constant.
-      explore_eps: 0.05
+      explore_eps: 0.10
       # OPTIONAL BC warm-start (self-generated oracle labels; NO human annotation,
       # but still a supervised objective — leave off for the pure-RL gate).
       # bc_init_path loads the weights in get_model (covers rollout + eval-only);
       # runner.ckpt_path loads them into the actor. Set BOTH to the same file.
       bc_init_path: null
       kl_prior:
-        enabled: False           # emit per-decision KL(pi || pi_BC) in the rollout
+        enabled: False           # differentiable actor-side KL(pi || pi_BC)
         path: null               # defaults to bc_init_path
+        beta: 0.0                # e.g. 0.05 with a BC warm-start
+        beta_end: 0.0
+        decay_steps: 200
     # frozen fast-wam dual-regime backbone (build/freeze in get_model)
     wam:
       configs_dir: ${oc.env:FASTWAM_CONFIGS}      # path to FastWAM/configs
       suite: libero
-      task: libero_metric_adaptive_joint_2cam224_1e-4
-      backbone_kind: joint                         # "joint" or "idm"
-      ckpt: /path/to/dual_regime_joint_checkpoint.pt
+      task: libero_dual_regime_fused_2cam224_1e-4
+      backbone_kind: idm
+      ckpt: /path/to/dual_regime_idm_checkpoint.pt
       dataset_stats_path: /path/to/libero_dataset_stats.json
       require_dataset_stats: True
-      load_text_encoder: True
-      world_feat_dim: ${actor.model.world_feat_dim}
+      allow_online_text_encoding: False
       action_dim: 7
       num_video_frames: 9
-      action_horizon: 32
-      k_lo: 4                     # TODO(make-variable): LATENT video-denoise steps
-      k_hi: 20                    # FULL video-denoise steps
-      cost_table_path: /path/to/FastWAM/configs/adaptive_gate/wam_cost_libero_joint.yaml
+      context_len: 128
+      generation_horizon: 32      # WAM output length
+      exec_horizon: 10            # environment prefix; one gate decision per 10 steps
+      inference_steps: 20         # complete solver for both UNCOND and IDM branches
+      default_seed: 0             # deterministic frozen-WAM conditional policy
+      cost_table_path: /path/to/FastWAM/configs/adaptive_gate/wam_cost_libero_idm.yaml
       device: cuda
       dtype: bfloat16
 

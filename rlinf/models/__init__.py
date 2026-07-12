@@ -238,7 +238,7 @@ def _register_builtin_models():
         category="embodied",
         force=True,
     )
-    # Adaptive-prediction gate: a small 3-way categorical policy on a frozen WAM.
+    # Adaptive-prediction gate: binary UNCOND/IDM policy on a frozen WAM.
     # Registered by literal name; register_model auto-extends SupportedModel +
     # EMBODIED_MODEL, so no config.py enum edit is required.
     register_model(

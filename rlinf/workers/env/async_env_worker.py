@@ -23,6 +23,12 @@ from rlinf.workers.env.env_worker import EnvWorker
 class AsyncEnvWorker(EnvWorker):
     def __init__(self, cfg: DictConfig):
         super().__init__(cfg)
+        if self._is_gate_policy():
+            raise ValueError(
+                "gate_policy currently supports only the synchronous EmbodiedRunner; "
+                "the async runner does not broadcast a synchronized reward-schedule "
+                "global step. Use examples/embodiment/run_embodiment.sh."
+            )
         self._interact_task: asyncio.Task = None
         assert not (self.train_enable_offload or self.eval_enable_offload), (
             "Offload not supported in AsyncEnvWorker"

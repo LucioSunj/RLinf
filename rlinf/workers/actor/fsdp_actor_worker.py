@@ -12,6 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import json
+import os
 import time
 from functools import partial
 from typing import Optional
@@ -982,6 +984,15 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
 
         self.enable_sft_co_train = cfg.actor.get("enable_sft_co_train", False)
         self.version = 0
+        self._gate_sidecar_metadata = None
+        if (
+            str(cfg.actor.model.model_type) == "gate_policy"
+            and not bool(cfg.actor.fsdp_config.get("save_full_model_weights", True))
+        ):
+            raise ValueError(
+                "GatePolicy requires actor.fsdp_config.save_full_model_weights=true "
+                "so evaluation weights and their provenance sidecar are saved together."
+            )
         if self.enable_sft_co_train:
             self._build_sft_data_loader()
 
@@ -1027,10 +1038,75 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
             model = super().model_provider_func()
 
         if self.cfg.runner.get("ckpt_path", None):
-            model_dict = torch.load(self.cfg.runner.ckpt_path)
+            if str(self.cfg.actor.model.model_type) == "gate_policy":
+                from rlinf.models.embodiment.gate_policy.bc import (
+                    load_gate_bc_state,
+                )
+
+                model_dict = load_gate_bc_state(
+                    str(self.cfg.runner.ckpt_path), expected_policy=model
+                )
+            else:
+                model_dict = torch.load(self.cfg.runner.ckpt_path)
             model.load_state_dict(model_dict)
 
+        if str(self.cfg.actor.model.model_type) == "gate_policy":
+            from rlinf.models.embodiment.gate_policy.bc import (
+                build_gate_policy_sidecar_metadata,
+            )
+
+            self._gate_sidecar_metadata = build_gate_policy_sidecar_metadata(model)
+
         return model
+
+    def save_checkpoint(self, save_path: str, step: int = 0) -> None:
+        """Save FSDP state and bind learned gate weights to their WAM contract."""
+        super().save_checkpoint(save_path, step)
+        if str(self.cfg.actor.model.model_type) != "gate_policy":
+            return
+        full_weights = os.path.join(
+            save_path, "model_state_dict", "full_weights.pt"
+        )
+        if torch.distributed.get_rank() == 0:
+            if not os.path.isfile(full_weights):
+                raise FileNotFoundError(
+                    "GatePolicy checkpoint was saved without full_weights.pt; "
+                    "evaluation requires actor.fsdp_config.save_full_model_weights=true."
+                )
+            from rlinf.models.embodiment.gate_policy.bc import (
+                save_gate_policy_sidecar,
+            )
+
+            metadata = dict(self._gate_sidecar_metadata or {})
+            metadata["step"] = int(step)
+            save_gate_policy_sidecar(full_weights, metadata)
+
+    def load_checkpoint(self, load_path: str) -> None:
+        """Reject a same-shaped resume checkpoint from another gate/WAM task."""
+        if str(self.cfg.actor.model.model_type) == "gate_policy":
+            sidecar_path = os.path.join(
+                load_path,
+                "model_state_dict",
+                "full_weights.pt.meta.json",
+            )
+            if not os.path.isfile(sidecar_path):
+                raise ValueError(
+                    f"GatePolicy resume checkpoint is missing {sidecar_path}."
+                )
+            with open(sidecar_path, encoding="utf-8") as handle:
+                actual = json.load(handle)
+            expected = self._gate_sidecar_metadata or {}
+            mismatches = {
+                key: (actual.get(key), expected.get(key))
+                for key in ("kind", "schema_version", "gate", "wam_provenance")
+                if actual.get(key) != expected.get(key)
+            }
+            if mismatches:
+                raise ValueError(
+                    "GatePolicy resume provenance does not match the configured "
+                    f"task/WAM contract: {mismatches}"
+                )
+        super().load_checkpoint(load_path)
 
     def get_rollout_state_dict(self) -> dict:
         return self.get_model_state_dict(cpu_offload=False, full_state_dict=False)
@@ -1476,6 +1552,25 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
             loss -= self.cfg.algorithm.entropy_bonus * entropy_loss
         metrics_data["actor/entropy_loss"] = entropy_loss.detach().item()
 
+        # Model-specific differentiable regularizers (the adaptive gate uses this
+        # for exact KL(pi || pi_BC)). These belong in the actor objective, not in
+        # a detached environment reward.
+        aux_loss = torch.tensor(0.0, device=loss.device, dtype=torch.float32)
+        if "aux_loss" in output_dict and not loss_kwargs["critic_warmup"]:
+            aux_values = output_dict["aux_loss"].float()
+            aux_loss = masked_mean(aux_values, mask=loss_mask)
+            loss = loss + aux_loss
+        metrics_data["actor/aux_loss"] = aux_loss.detach().item()
+        if "kl_to_prior" in output_dict:
+            kl_metric = masked_mean(
+                output_dict["kl_to_prior"].float(), mask=loss_mask
+            )
+            metrics_data["actor/kl_to_prior"] = kl_metric.detach().item()
+        if "kl_beta" in output_dict:
+            metrics_data["actor/kl_beta"] = float(
+                output_dict["kl_beta"].detach().float().item()
+            )
+
         if self.enable_sft_co_train:
             self._train_sft_epoch(metrics_data, loss)
 
@@ -1491,8 +1586,11 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
         Set the global step for the model, if needed.
         """
         self.version = global_step
-        if hasattr(self.model, "set_global_step"):
-            self.model.set_global_step(global_step)
+        step_model = self.model
+        if not hasattr(step_model, "set_global_step") and hasattr(step_model, "module"):
+            step_model = step_model.module
+        if hasattr(step_model, "set_global_step"):
+            step_model.set_global_step(global_step)
 
     def finish_global_batch(self, metrics: dict[str, list[float]]) -> None:
         self.torch_platform.empty_cache()

@@ -1,163 +1,186 @@
-# Adaptive-prediction gate (RLinf side)
+# Binary adaptive world-model gate (RLinf side)
 
-An RL-trained controller that, per action-chunk step, picks how much forward-
-prediction compute a **frozen** fast-wam world-action model spends:
-**SKIP** (reactive) / **LATENT** (few video-denoise steps) / **FULL** (full schedule).
-fast-wam stays frozen; **only the gate trains**.
+The controller makes one binary decision per executed action chunk:
 
-This complements the fast-wam side (`FastWAM/docs/adaptive_gate.md`): `WAMModeAdapter`
-+ FLOPs profiler + cost. Here we add the gate policy, reward, and RL configs.
+- **UNCOND (0):** reactive FastWAM action inference from the current frame.
+- **IDM (1):** complete future generation followed by the IDM action path.
 
-## Pieces (this repo)
+The same frozen dual-regime FastWAM serves both choices. Only the small categorical
+gate is optimized. There is no low-step "latent" mode: solver quality is no longer
+confounded with the question of whether future prediction is useful.
+
+## Implementation
 
 | file | role |
 |---|---|
-| `rlinf/models/embodiment/gate_policy/gate_policy.py` | `GatePolicy` — 3-way categorical over {SKIP,LATENT,FULL} on a frozen `WAMModeAdapter`; `mode_logits` shared by BC+RL; KL-to-BC prior |
-| `rlinf/models/embodiment/gate_policy/__init__.py` | `get_model` + `build_wam_adapter` (build/freeze the dual-regime WAM, wrap it); BC init + prior wiring |
-| `rlinf/models/embodiment/gate_policy/obs_preprocessor.py` | env_obs → fast-wam inputs (image/proprio/text), per suite |
-| `rlinf/models/embodiment/gate_policy/reward.py` | multi-component reward: success, `-λ·cost`, optional agreement, `-β·KL(π‖π_BC)`; λ/β schedules |
-| `rlinf/models/embodiment/gate_policy/bc.py` | M3 BC (SFT) warm-start: oracle-label dataset + weighted-CE trainer + ckpt IO |
-| `examples/embodiment/train_gate_bc.py` | M3 standalone SFT CLI (no Ray/simulator/WAM needed) |
-| `rlinf/models/__init__.py` | registers `gate_policy` |
-| `examples/embodiment/config/libero_10_grpo_gate.yaml` | GRPO on LIBERO-10 |
-| `examples/embodiment/config/robotwin_grpo_gate.yaml` | GRPO on RoboTwin |
-| `tests/unit_tests/test_gate_policy.py` | gate-policy unit tests (stub adapter) |
-| `tests/unit_tests/test_gate_bc.py` | BC trainer / KL-prior / reward-KL unit tests |
-
-Same gate works for **both** backbones (`wam.backbone_kind: joint|idm`) and is used
-identically in training and rollout (one interface).
+| `rlinf/models/embodiment/gate_policy/gate_policy.py` | binary policy over UNCOND/IDM; spatial world feature + proprio + task text |
+| `rlinf/models/embodiment/gate_policy/__init__.py` | builds and freezes the dual-regime IDM model; checkpoint validation |
+| `rlinf/models/embodiment/gate_policy/obs_preprocessor.py` | suite image layout, normalization, cached text features and action conversion |
+| `rlinf/models/embodiment/gate_policy/reward.py` | `success - lambda * relative_compute_cost` and lambda schedule |
+| `rlinf/workers/env/env_worker.py` | execution-horizon slicing, reward/cost alignment and gate metrics |
+| `rlinf/models/embodiment/gate_policy/bc.py` | optional oracle-label BC warm-start |
+| `examples/embodiment/config/*_grpo_gate.yaml` | LIBERO and RoboTwin GRPO recipes |
 
 ## Prerequisites
 
-1. A **dual-regime** fast-wam checkpoint (`MetricAdaptiveFastWAMJoint` or
-   `MetricAdaptiveFastWAM`) — the vanilla base checkpoint is SKIP-only. Train one
-   with the dual-regime recipe (`FastWAM/docs/metric_adaptive*.md`).
-2. `pip install -e FastWAM` so `import fastwam.adaptive_gate` works inside RLinf.
-3. Profile the per-mode cost table (fast-wam side):
-   ```bash
-   cd FastWAM && python scripts/profile_wam_modes.py \
-     --task libero_metric_adaptive_joint_2cam224_1e-4 --backbone-kind joint \
-     --out configs/adaptive_gate/wam_cost_libero_joint.yaml
-   ```
-4. Set env vars in the config: `FASTWAM_CONFIGS` → `FastWAM/configs`; fill the
-   `wam.ckpt` / `wam.cost_table_path` paths.
-
-## Two integration hooks (validate on-server)
-
-These cross worker boundaries and need a running cluster to validate:
-
-1. **obs preprocessor injection.** The rollout must set the gate's preprocessor so
-   it can turn raw env_obs into fast-wam inputs:
-   ```python
-   from rlinf.models.embodiment.gate_policy.obs_preprocessor import make_gate_obs_preprocessor
-   policy.obs_preprocessor = make_gate_obs_preprocessor(policy.wam_adapter.model, suite="libero")
-   ```
-   Wire this where the rollout worker builds/holds the policy (huggingface rollout
-   worker). Verify the image layout/normalization matches the fast-wam eval pipeline.
-
-2. **cost → reward stream.** The env reward is success-only; the gate's per-step
-   `mode_cost` is carried in the rollout buffer (`forward_inputs["mode_cost"]`).
-   Combine at the reward-assembly point (`EnvWorker.compute_bootstrap_rewards` or the
-   embodied runner) using `gate_policy.reward.gate_reward_components`, anneal λ with
-   `lambda_cost_schedule`, and log each component + the **mode-usage distribution**
-   separately (`env/<component>`, `rollout/mode_usage`).
-
-3. **shape-reconcile (STEP-0 #8).** The trained action is the discrete mode (`[B,1]`,
-   `action_dim=1`, `num_action_chunks=1`) while `chunk_actions` is the robot chunk.
-   Confirm the categorical logprob flows through the GRPO actor unchanged; if not,
-   register a small categorical `policy_loss`.
-
-## Training the gate: ZERO supervision (default path)
-
-The gate needs no labels, no demonstrations, no annotation — plain GRPO on
-`success − λ·cost(mode)`. Stability without a warm-start comes from four
-label-free mechanisms (all on by default in the gate configs):
-
-1. `algorithm.entropy_bonus > 0` — keeps the per-state mode distribution alive;
-2. `gate_reward.lambda_warmup_steps` — λ anneals 0 → λ_max (act well first,
-   economize later; prevents early all-SKIP collapse);
-3. small logits-head init — near-uniform mode prior at step 0;
-4. `gate.explore_eps` — w.p. ε a TRAIN rollout samples a uniform-random mode.
-   The mixture behavior logprob `(1−ε)·π + ε/3` is recorded as `prev_logprobs`,
-   so the GRPO ratio `π_θ/μ` stays an exact importance weight. This guarantees
-   each GRPO group (same reset init) keeps contrast across modes even if π
-   momentarily collapses. Anneal via `GatePolicy.set_explore_eps` (runner hook)
-   or leave a small constant.
+1. Train an IDM dual-regime checkpoint with
+   `libero_dual_regime_fused_2cam224_1e-4` or
+   `robotwin_dual_regime_fused_3cam_384_1e-4`. A vanilla UNCOND-only checkpoint is
+   always rejected. `allow_legacy_checkpoint` is only for an older, manually
+   verified dual-regime checkpoint that predates provenance metadata.
+2. Install FastWAM into the RLinf environment and set `FASTWAM_CONFIGS` to the
+   absolute `FastWAM/configs` directory.
+3. Precompute FastWAM text embeddings. Online text encoding is disabled by default
+   so the large text encoder is not retained on the rollout GPU.
+4. Profile the two modes and set `wam.cost_table_path`:
 
 ```bash
-bash examples/embodiment/run_embodiment.sh libero_10_grpo_gate   # that's all
+cd FastWAM
+python scripts/profile_wam_modes.py \
+  --task libero_dual_regime_fused_2cam224_1e-4 \
+  --backbone-kind idm \
+  --ckpt /path/to/dual_regime_idm_checkpoint.pt \
+  --out configs/adaptive_gate/wam_cost_libero_idm.yaml
 ```
 
-## Optional: BC warm-start + KL prior (ablation / accelerator — OFF by default)
+## Horizon contract
 
-If you want a faster start or an "oracle vs learned" ablation, a supervised
-warm-start can be built WITHOUT annotation: the "which mode was necessary
-here?" labels are self-generated by comparing each mode's action against the
-raw VLA dataset's ground-truth chunk (cheapest sufficient mode; see
-`FastWAM/docs/adaptive_gate.md` §oracle). These labels are also the project's
-offline ANALYSIS tool — their distribution over states is direct evidence of
-when prediction helps, independent of any training use. The pure-RL gate above
-never consumes them.
+The WAM generates `wam.generation_horizon: 32` robot actions, but the environment
+executes only the configured prefix:
+
+- LIBERO: `wam.exec_horizon: 10`
+- RoboTwin: `wam.exec_horizon: 24`
+
+There is still exactly one categorical action and one logprob (`[B,1]`) per gate
+decision. The environment returns 10 or 24 step rewards/dones; `chunk_level`
+reward processing sums those into the return for that one decision. Bootstrap
+dones use the same execution horizon, so trajectory tensors remain stackable.
+Gate environments must expose per-slot `elapsed_steps`, and all slots in a vector
+batch must share one episode clock; the worker fails closed otherwise rather than
+silently overrunning a horizon or mixing asynchronous GRPO decisions.
+
+The compute cost is charged to the action that was actually executed, including
+the final action in a rollout. Lambda uses the runner's checkpointed global update
+step, not a worker-local environment-call counter, so warmup is synchronized and
+resume-safe.
+
+`lambda_cost` is an episode-level compute-budget weight. Each decision contributes
+`-lambda_cost * cost(mode) / ceil(max_episode_steps / exec_horizon)`, so even an
+all-IDM maximum-length episode pays at most `lambda_cost`; reward scale does not
+silently change with the replanning horizon. Logs include raw per-decision mean
+cost and `episode_normalized_cost` (the sum of those normalized contributions).
+
+## Zero-supervision training
+
+The default objective is pure GRPO on `success - lambda * cost(mode)`. Stabilizers
+are the entropy bonus, near-uniform initialization, lambda warmup and uniform-
+mixture exploration. With `explore_eps=epsilon`, the training policy itself is
+`mu=(1-epsilon) * pi + epsilon * Uniform(2)`. Each sample stores epsilon; actor
+replay recomputes the same `mu`, so the probability ratio is exactly one before an
+optimizer update rather than treating samples from `mu` as if they came from `pi`.
+
+Finite groups are not guaranteed to contain both modes. Monitor these metrics:
+even with the configured `epsilon=0.10`, a fully collapsed policy still produces
+an all-primary-mode group with probability `0.95^8`, about 66.3%.
+
+- `env/gate/mode_uncond_usage`, `env/gate/mode_idm_usage`
+- `env/gate/mode_cost`, `env/gate/mode_entropy`
+- `eval/gate/episode_total_cost`, `eval/gate/episode_normalized_cost`
+- `env/gate/group_mode_diversity`, `env/gate/group_single_mode_ratio`
+- `env/gate/reward_success`, `env/gate/reward_compute_penalty`
+- `env/gate/reward_total`, `env/gate/lambda_cost`
+
+Evaluation logs the two mode-usage rates, mean cost and entropy under the greedy
+gate. These metrics use an active-episode mask, so decisions after first success
+are not counted even when the environment continues to a fixed horizon. LIBERO-10
+uses the official 700-step evaluation horizon. RoboTwin configs use separate
+train/eval seed files, enable both wrist cameras, disable the base environment's
+center crop, and run nine 24-action decisions for the 200-step limit (the final
+decision executes only the remaining eight actions). The environment reward/done
+tensors are right-padded back to width 24, preserving RLinf's fixed rollout shape
+without sending actions beyond the episode limit.
 
 ```bash
-# 1. (fast-wam, GPU, heavy — once) oracle-label shards from the raw VLA dataset
-cd FastWAM && python scripts/generate_gate_oracle_labels.py \
-  --task libero_metric_adaptive_joint_2cam224_1e-4 --backbone-kind joint \
-  --ckpt /path/to/dual_regime_joint.pt --dataset-stats /path/to/dataset_stats.json \
-  --stride 20 --exec-horizon 10 --out data/gate_oracle/libero_joint
-
-# 2. (here, minutes, standalone) BC warm-start of the SAME GatePolicy the RL uses
-cd RLinf && python examples/embodiment/train_gate_bc.py \
-  --labels 'FastWAM/data/gate_oracle/libero_joint/shard_*.pt' \
-  --out ckpts/gate_bc_libero_joint.pt --epochs 30 --device cuda
-# watch: val accuracy, per-mode recall, pred-vs-oracle mean cost
-
-# 3. GRPO from the BC init (+ optional KL-to-BC prior, decays to 0):
-#    runner.ckpt_path:                 ckpts/gate_bc_libero_joint.pt
-#    actor.model.gate.bc_init_path:    ckpts/gate_bc_libero_joint.pt
-#    actor.model.gate.kl_prior.enabled: True
-#    gate_reward.beta_kl_prior: 0.05   # beta_kl_prior_decay_steps anneals it away
-```
-
-The reward-side `-β·KL(π‖π_BC)` keeps early exploration near the BC prior (the
-embodied actor has no reference-model KL path, so the prior rides the reward
-stream — exact categorical KL, computed in the rollout and carried in
-`forward_inputs["kl_to_prior"]`); β decays so RL can overrule the oracle where
-the environment disagrees.
-
-## Launch stages
-
-```bash
-# 0. (fast-wam) profile cost table   -> see Prerequisites
-# 0.5 oracle labels + BC warm-start  -> see M3 recipe above
-# 1. GRPO on LIBERO
+cd RLinf
 bash examples/embodiment/run_embodiment.sh libero_10_grpo_gate
-# 2. GRPO on RoboTwin
 bash examples/embodiment/run_embodiment.sh robotwin_grpo_gate
-# 3. multi-setting eval (in-domain + held-out/OOD): per-setting success + mode-usage
-#    (use runner.val_check_interval / evaluations/; log mode-usage per split)
 ```
 
-## Collapse-prevention (configured; all label-free unless marked)
+The configured rollout sizes are exactly divisible by their global batches:
+LIBERO yields `480/10 * 8 * 64 = 24576` decisions with batch 2048. RoboTwin yields
+`ceil(200/24) * 8 * 64 = 4608` decisions with batch 512.
 
-- entropy bonus on the mode distribution (`algorithm.entropy_bonus`, set > 0).
-- λ-annealing (`gate_reward.lambda_warmup_steps`): act well first, then economize.
-- small logits-head init (near-uniform mode prior at start) — in `GatePolicy`.
-- `gate.explore_eps` uniform-mixture rollout sampling (exact behavior logprobs).
-- OPTIONAL (supervised by self-generated labels; off by default): BC warm-start
-  (`train_gate_bc.py`) + decaying KL-to-BC prior (`gate.kl_prior` +
-  `gate_reward.beta_kl_prior`). Hook left in `reward.py` for a
-  budget-constrained (E[cost] ≤ B) variant.
+## Evaluation-only
 
-## Status
+`rollout.model` contains the complete gate and WAM configuration rather than only
+rollout overrides, so `runner.only_eval: true` does not depend on actor-side model
+merging. Set `runner.ckpt_path` to the gate state dict, retain `load_wam: true`, and
+provide the checkpoint, dataset stats, cached text embeddings and cost table.
 
-- M1 (fast-wam): WAMModeAdapter + profiler + cost — done.
-- M2 part 1: gate policy + registration + unit tests — done.
-- M2 part 2: obs preprocessor + reward module + GRPO configs (LIBERO+RoboTwin)
-  + README — done; the two integration hooks above need on-server wiring.
-- M3: zero-supervision default path hardened (`explore_eps`); PLUS optional
-  oracle labels (fast-wam side, doubling as offline analysis) + BC warm-start +
-  KL-to-BC prior + unit tests — done (code-complete; runs need data + GPU).
-- Next: forced-mode smoke test (always-SKIP / always-FULL end-to-end), then M4
-  (GRPO training + collapse/OOD checks; PPO config).
+RL training writes evaluation weights to
+`<checkpoint>/actor/model_state_dict/full_weights.pt` and writes required provenance
+beside them as `full_weights.pt.meta.json`. Keep the two files together. Loading is
+fail-closed when the sidecar is missing or when its task, WAM checkpoint ID,
+dataset-stats SHA, feature layout, dtype, context length, solver depth, or horizons
+do not match. `gate.allow_legacy_gate_checkpoint=true` is only an escape hatch for
+an old checkpoint that has been verified manually.
+
+Before learned-gate evaluation, run both forced-mode end-to-end smoke tests. The
+same setting is shared by `actor.model.gate` and the interpolated
+`rollout.model.gate`:
+
+```bash
+python evaluations/eval_embodied_agent.py \
+  --config-path "$(pwd)/examples/embodiment/config" \
+  --config-name libero_10_grpo_gate \
+  runner.only_eval=true runner.ckpt_path=/path/to/gate.pt \
+  actor.model.gate.force_mode=0
+
+python evaluations/eval_embodied_agent.py \
+  --config-path "$(pwd)/examples/embodiment/config" \
+  --config-name libero_10_grpo_gate \
+  runner.only_eval=true runner.ckpt_path=/path/to/gate.pt \
+  actor.model.gate.force_mode=1
 ```
+
+Mode `0` is always-UNCOND and mode `1` is always-IDM. Repeat with the RoboTwin
+config after the LIBERO smoke.
+
+## Optional BC and KL prior
+
+Oracle labels remain an optional analysis/warm-start path; they are not required
+by GRPO. They are an offline action-agreement proxy based on error against the
+dataset action chunk, not a closed-loop success oracle or a performance upper
+bound. Generate labels with both modes and the same execution horizon, then train
+the identical binary GatePolicy with `train_gate_bc.py`.
+
+When a BC prior is enabled, KL regularization is applied as a differentiable actor
+auxiliary loss, not as a detached environment reward:
+
+```yaml
+actor:
+  model:
+    gate:
+      bc_init_path: /path/to/gate_bc.pt
+      kl_prior:
+        enabled: true
+        path: /path/to/gate_bc.pt
+        beta: 0.05
+        beta_end: 0.0
+        decay_steps: 200
+```
+
+The actor's synchronized global step drives the KL decay. Keep the BC architecture
+(`world_feat_dim`, `text_feat_dim`, hidden sizes and activation) identical to the
+RL configuration.
+
+## Remaining runtime validation
+
+The CPU contract tests cover horizons, trajectory shapes, final-action cost,
+reward alignment, active-eval masking and distributed GRPO group boundaries.
+Periodic validation uses 496 LIBERO or 96 RoboTwin environments for clean 1/2/4/8
+rank sharding; exact 500/100-trial reporting needs a separate compatible layout.
+Before a long run, still perform a real
+GPU two-mode smoke test (forced UNCOND and forced IDM) in each simulator, then a
+short distributed rollout to validate memory use and measured cost on the target
+hardware.
