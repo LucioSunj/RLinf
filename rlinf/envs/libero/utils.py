@@ -14,6 +14,7 @@
 
 """Utils for evaluating policies in LIBERO simulation environments."""
 
+import importlib
 import math
 import os
 from typing import TYPE_CHECKING, Union
@@ -49,14 +50,17 @@ if libero_type == "pro":
 
 elif libero_type == "plus":
     try:
-        import liberoplus.liberoplus.benchmark as benchmark
-        from liberoplus.liberoplus.benchmark import Benchmark
-    except ImportError:
-        print(
-            "[Utils] Warning: LIBERO_TYPE=plus but 'liberoplus' not found. Falling back to 'libero'."
-        )
-        import libero.libero.benchmark as benchmark
-        from libero.libero.benchmark import Benchmark
+        package = os.environ.get("LIBERO_PLUS_IMPORT_MODULE", "libero")
+        if "." in package:
+            core = package
+        else:
+            core = "libero.libero" if package == "libero" else f"{package}.{package}"
+        benchmark = importlib.import_module(f"{core}.benchmark")
+        Benchmark = benchmark.Benchmark
+    except ImportError as exc:
+        raise ImportError(
+            f"LIBERO_TYPE=plus could not import the frozen checkout via {core!r}"
+        ) from exc
 
 else:
     try:

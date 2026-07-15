@@ -69,6 +69,19 @@ gate_reward:
   lambda_warmup_steps: 200      # anneal lambda 0 -> lambda_cost (learn to act, then economize)
   lambda_start: 0.0
 
+# Interior-budget runs enable this and set their preregistered target usage q.
+gate_diagnostics:
+  # E5 launchers set a per-run SHA256 identifier and bind it into checkpoints,
+  # cumulative diagnostics, run manifests and checkpoint evidence registrations.
+  evidence_run_id: null
+  collapse:
+    enabled: False
+    target_idm_usage: null
+    patience: 3
+    low_threshold: 0.05
+    high_threshold: 0.95
+    budget_error_threshold: 0.15
+
 env:
   group_name: "EnvGroup"
   train:
@@ -142,6 +155,32 @@ actor:
       hidden_sizes: [256, 256]
       activation: tanh
       force_mode: null            # eval-only smoke: 0=UNCOND, 1=IDM
+      # Evaluation-only control; training still samples the learned gate.
+      eval_policy:
+        kind: learned             # learned/forced/episode_mixture/bernoulli/random_k/manifest/periodic_k/phase_heuristic
+        seed: 0
+        max_decisions: 70         # 700 env steps / 10 executed actions
+        mode: null                # forced: 0=UNCOND, 1=IDM
+        p_idm: null               # episode_mixture / bernoulli
+        k: null                   # exact Random-K / periodic-K, in [0,70]
+        manifest_path: null       # immutable per-episode 70-slot schedules
+        expected_checkpoint_sha256: null
+        expected_episode_manifest_sha256: null
+        idm_phases: [contact_alignment]
+        trace_path: null          # null writes canonical JSONL below the run dir
+      # Evaluation-only FastWAM mechanism intervention. This remains outside the
+      # production WAMMode={UNCOND,IDM} action space and fails in train rollouts.
+      eval_control:
+        kind: null                # valid_idm/no_read/repeat_current/shuffled/extra_compute
+        profile_path: null        # separate profile from FastWAM/profile_wam_controls.py
+        cost_metric: latency_ms   # latency_ms or flops from that control profile
+        require_compute_matched: True
+        wam_seed: 0               # frozen-WAM sampling seed, recorded in trace
+        donor_seed: 0             # deterministic shuffled-bank selector seed
+        donor_bank_path: null     # required only for shuffled
+        expected_donor_wam_seed: 0
+        capture_donor_dir: null   # valid_idm only: write bank-ready decision artifacts
+        capture_overwrite: False
       allow_legacy_gate_checkpoint: False  # fail closed when .meta.json is missing
       # Label-free collapse prevention (with entropy_bonus + lambda warmup this is
       # the DEFAULT, zero-supervision training path): w.p. eps sample a uniform
@@ -177,6 +216,7 @@ actor:
       generation_horizon: 32      # WAM output length
       exec_horizon: 10            # environment prefix; one gate decision per 10 steps
       inference_steps: 20         # complete solver for both UNCOND and IDM branches
+      sigma_shift: null           # optional shared video/action schedule shift override
       default_seed: 0             # deterministic frozen-WAM conditional policy
       cost_table_path: /path/to/FastWAM/configs/adaptive_gate/wam_cost_libero_idm.yaml
       device: cuda

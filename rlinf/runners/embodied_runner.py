@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import json
 import logging
 import os
 import queue
@@ -116,6 +117,56 @@ class EmbodiedRunner:
         self.enable_per_worker_metric_log = bool(
             self.cfg.runner.get("per_worker_log", False)
         )
+        self.gate_collapse_tracker = None
+        self.is_gate_policy = (
+            str(self.cfg.actor.model.model_type) == "gate_policy"
+        )
+        collapse_cfg = (
+            self.cfg.get("gate_diagnostics", {}).get("collapse", {}) or {}
+        )
+        if (
+            self.is_gate_policy
+            and bool(collapse_cfg.get("enabled", False))
+        ):
+            from rlinf.models.embodiment.gate_policy.diagnostics import (
+                BudgetCollapseTracker,
+            )
+
+            target = collapse_cfg.get("target_idm_usage", None)
+            if target is None:
+                raise ValueError(
+                    "gate_diagnostics.collapse.enabled=true requires an interior "
+                    "target_idm_usage"
+                )
+            self.gate_collapse_tracker = BudgetCollapseTracker(
+                target_idm_usage=float(target),
+                patience=int(collapse_cfg.get("patience", 3)),
+                low_threshold=float(collapse_cfg.get("low_threshold", 0.05)),
+                high_threshold=float(collapse_cfg.get("high_threshold", 0.95)),
+                budget_error_threshold=float(
+                    collapse_cfg.get("budget_error_threshold", 0.15)
+                ),
+            )
+        self.gate_diagnostics_latest = None
+        if self.is_gate_policy:
+            from rlinf.models.embodiment.gate_policy.diagnostics import (
+                new_gate_diagnostics_state,
+            )
+
+            target = collapse_cfg.get("target_idm_usage", None)
+            evidence_run_id = self.cfg.get("gate_diagnostics", {}).get(
+                "evidence_run_id", None
+            )
+            self.gate_diagnostics_latest = new_gate_diagnostics_state(
+                seed=int(self.cfg.actor.get("seed", 0)),
+                target_idm_usage=None if target is None else float(target),
+                evidence_run_id=evidence_run_id,
+            )
+        self.gate_diagnostics_run_path = os.path.join(
+            self.cfg.runner.logger.log_path,
+            self.cfg.runner.logger.experiment_name,
+            "gate_diagnostics.json",
+        )
 
         # Async logging setup
         self.stop_logging = False
@@ -180,8 +231,67 @@ class EmbodiedRunner:
         assert os.path.exists(actor_checkpoint_path), (
             f"resume_dir {actor_checkpoint_path} does not exist."
         )
+        checkpoint_name = os.path.basename(os.path.normpath(str(resume_dir)))
+        if not checkpoint_name.startswith("global_step_"):
+            raise ValueError(
+                "runner.resume_dir must end in global_step_<integer>, got "
+                f"{resume_dir!r}"
+            )
+        try:
+            resume_step = int(checkpoint_name.removeprefix("global_step_"))
+        except ValueError as exc:
+            raise ValueError(
+                "runner.resume_dir must end in global_step_<integer>, got "
+                f"{resume_dir!r}"
+            ) from exc
+        collapse_path = os.path.join(resume_dir, "gate_collapse_state.json")
+        if self.gate_collapse_tracker is not None:
+            from rlinf.models.embodiment.gate_policy.diagnostics import (
+                load_collapse_state,
+            )
+
+            if not os.path.isfile(collapse_path):
+                raise FileNotFoundError(
+                    "collapse tracking is enabled but the resume checkpoint has "
+                    f"no state file: {collapse_path}"
+                )
+            load_collapse_state(collapse_path, self.gate_collapse_tracker)
+        elif (
+            self.gate_diagnostics_latest is not None
+            and os.path.exists(collapse_path)
+        ):
+            raise ValueError(
+                "Gate resume checkpoint contains collapse state but collapse "
+                "tracking is disabled in the current config"
+            )
+        if self.gate_diagnostics_latest is not None:
+            from rlinf.models.embodiment.gate_policy.diagnostics import (
+                validate_gate_diagnostics_state,
+            )
+
+            diagnostics_path = os.path.join(resume_dir, "gate_diagnostics.json")
+            if not os.path.isfile(diagnostics_path):
+                raise FileNotFoundError(
+                    "Gate resume checkpoint has no run-level diagnostics state: "
+                    f"{diagnostics_path}"
+                )
+            with open(diagnostics_path, encoding="utf-8") as handle:
+                diagnostics = json.load(handle)
+            expected_target = self.gate_diagnostics_latest.get("target_idm_usage")
+            self.gate_diagnostics_latest = validate_gate_diagnostics_state(
+                diagnostics,
+                seed=int(self.cfg.actor.get("seed", 0)),
+                target_idm_usage=expected_target,
+                evidence_run_id=self.cfg.get("gate_diagnostics", {}).get(
+                    "evidence_run_id", None
+                ),
+                step=resume_step,
+                group_size=int(self.cfg.algorithm.group_size),
+                tracker=self.gate_collapse_tracker,
+            )
+        # Validate all runner-owned resume state before mutating actor weights.
         self.actor.load_checkpoint(actor_checkpoint_path).wait()
-        self.global_step = int(resume_dir.split("global_step_")[-1])
+        self.global_step = resume_step
 
     def update_rollout_weights(self):
         rollout_handle: Handle = self.rollout.sync_model_from_actor()
@@ -200,6 +310,66 @@ class EmbodiedRunner:
         )
         env_results = env_handle.wait()
         rollout_results = rollout_handle.wait()
+        gate_trace_records = None
+        if str(self.cfg.rollout.model.model_type) == "gate_policy":
+            from rlinf.models.embodiment.gate_policy.eval_trace import (
+                TRACE_RECORDS_KEY,
+                merge_gate_eval_traces,
+                write_gate_eval_jsonl,
+            )
+
+            env_trace_records = [
+                record
+                for result in env_results
+                if result is not None
+                for record in result.pop(TRACE_RECORDS_KEY, [])
+            ]
+            rollout_trace_records = [
+                record
+                for result in rollout_results
+                if result
+                for record in result.pop(TRACE_RECORDS_KEY, [])
+            ]
+            eval_policy_cfg = self.cfg.rollout.model.gate.get(
+                "eval_policy", {}
+            ) or {}
+            max_decisions = int(eval_policy_cfg.get("max_decisions", 70))
+            gate_trace_records = merge_gate_eval_traces(
+                env_records=env_trace_records,
+                rollout_records=rollout_trace_records,
+                expected_max_decisions=max_decisions,
+            )
+            method = (
+                str(gate_trace_records[0]["method"])
+                if gate_trace_records
+                else str(eval_policy_cfg.get("kind", "learned"))
+            )
+            configured_path = eval_policy_cfg.get("trace_path", None)
+            if configured_path is None or str(configured_path).lower() in {
+                "",
+                "none",
+                "null",
+            }:
+                trace_path = os.path.join(
+                    self.cfg.runner.logger.log_path,
+                    self.cfg.runner.logger.experiment_name,
+                    "gate_eval_traces",
+                    f"{method}_step_{self.global_step:06d}.jsonl",
+                )
+            else:
+                trace_path = str(configured_path).format(
+                    step=self.global_step, method=method
+                )
+                if not trace_path.endswith(".jsonl"):
+                    trace_path = os.path.join(
+                        trace_path,
+                        f"{method}_step_{self.global_step:06d}.jsonl",
+                    )
+            write_gate_eval_jsonl(trace_path, gate_trace_records)
+            self.logger.info(
+                f"Wrote {len(gate_trace_records)} canonical gate evaluation "
+                f"traces to {trace_path}"
+            )
         eval_metrics_list = [results for results in env_results if results is not None]
         eval_metrics = compute_evaluate_metrics(eval_metrics_list)
         rollout_metrics_list = [
@@ -252,6 +422,55 @@ class EmbodiedRunner:
             for key, values in merged_metrics.items()
             if values
         }
+
+    def _update_gate_diagnostics(
+        self,
+        *,
+        step: int,
+        actor_rollout_metrics: list[dict] | None = None,
+        eval_metrics: dict | None = None,
+    ) -> None:
+        payload = self.gate_diagnostics_latest
+        if payload is None:
+            return
+        if actor_rollout_metrics is not None:
+            from rlinf.models.embodiment.gate_policy.diagnostics import (
+                accumulate_grpo_gate_diagnostics,
+            )
+
+            accumulate_grpo_gate_diagnostics(
+                payload,
+                step=int(step),
+                rank_metrics=actor_rollout_metrics,
+                group_size=int(self.cfg.algorithm.group_size),
+            )
+        if eval_metrics is not None:
+            from rlinf.models.embodiment.gate_policy.diagnostics import (
+                update_gate_eval_diagnostics,
+            )
+
+            usage = eval_metrics.get("gate/mode_idm_usage")
+            if usage is None:
+                raise KeyError("Gate evaluation diagnostics require IDM usage")
+            eval_metrics.update(
+                update_gate_eval_diagnostics(
+                    payload,
+                    idm_usage=usage,
+                    tracker=self.gate_collapse_tracker,
+                )
+            )
+
+    def _write_gate_diagnostics(self, path: str | None = None) -> None:
+        if self.gate_diagnostics_latest is None:
+            return
+        from rlinf.models.embodiment.gate_policy.diagnostics import (
+            write_gate_diagnostics,
+        )
+
+        write_gate_diagnostics(
+            self.gate_diagnostics_run_path if path is None else path,
+            self.gate_diagnostics_latest,
+        )
 
     def _process_ranked_numeric_results(
         self, results: list[dict], metric_field: str
@@ -313,7 +532,9 @@ class EmbodiedRunner:
         training_metrics = [result.get("training_metrics", {}) for result in results]
         return rollout_metrics, training_metrics
 
-    def _maybe_eval_and_checkpoint(self, step: int) -> dict:
+    def _maybe_eval_and_checkpoint(
+        self, step: int, actor_rollout_metrics: list[dict] | None = None
+    ) -> dict:
         run_val, save_model, _ = check_progress(
             self.global_step,
             self.max_steps,
@@ -323,13 +544,23 @@ class EmbodiedRunner:
             run_time_exceeded=False,
         )
 
+        self._update_gate_diagnostics(
+            step=self.global_step,
+            actor_rollout_metrics=actor_rollout_metrics,
+        )
         eval_metrics = {}
         if run_val:
             with self.timer("eval"):
                 self.update_rollout_weights()
                 eval_metrics = self.evaluate()
+                self._update_gate_diagnostics(
+                    step=self.global_step,
+                    eval_metrics=eval_metrics,
+                )
                 eval_metrics = {f"eval/{k}": v for k, v in eval_metrics.items()}
                 self.metric_logger.log(data=eval_metrics, step=step)
+
+        self._write_gate_diagnostics()
 
         if save_model:
             self._save_checkpoint()
@@ -573,7 +804,9 @@ class EmbodiedRunner:
                     env_bootstrap_handle.wait()
 
                 self.global_step += 1
-                eval_metrics = self._maybe_eval_and_checkpoint(_step)
+                eval_metrics = self._maybe_eval_and_checkpoint(
+                    _step, actor_rollout_metrics
+                )
 
             if profiled_step is not None:
                 self._close_profiling_window(profiled_step)
@@ -653,7 +886,9 @@ class EmbodiedRunner:
                     env_bootstrap_handle.wait()
 
                 self.global_step += 1
-                eval_metrics = self._maybe_eval_and_checkpoint(_step)
+                eval_metrics = self._maybe_eval_and_checkpoint(
+                    _step, actor_rollout_metrics
+                )
 
             if profiled_step is not None:
                 self._close_profiling_window(profiled_step)
@@ -683,6 +918,18 @@ class EmbodiedRunner:
         actor_save_path = os.path.join(base_output_dir, "actor")
         os.makedirs(actor_save_path, exist_ok=True)
         self.actor.save_checkpoint(actor_save_path, self.global_step).wait()
+        if self.gate_collapse_tracker is not None:
+            from rlinf.models.embodiment.gate_policy.diagnostics import (
+                write_collapse_state,
+            )
+
+            write_collapse_state(
+                os.path.join(base_output_dir, "gate_collapse_state.json"),
+                self.gate_collapse_tracker,
+            )
+        self._write_gate_diagnostics(
+            os.path.join(base_output_dir, "gate_diagnostics.json")
+        )
 
     def set_max_steps(self):
         self.num_steps_per_epoch = 1

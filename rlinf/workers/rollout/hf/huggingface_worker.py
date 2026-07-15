@@ -530,6 +530,24 @@ class MultiStepRolloutWorker(Worker):
     async def evaluate(self, input_channel: Channel, output_channel: Channel):
         if self.enable_offload:
             self.reload_model()
+        gate_trace_builder = None
+        if str(self.model_cfg.model_type) == "gate_policy":
+            from rlinf.models.embodiment.gate_policy.eval_trace import (
+                RolloutGateTraceBuilder,
+                gate_state_dict_sha256,
+            )
+
+            gate_trace_builder = RolloutGateTraceBuilder(
+                method=self.hf_model.effective_eval_method,
+                max_decisions=self.hf_model.effective_eval_max_decisions,
+                selector_provenance=self.hf_model.effective_eval_provenance(),
+                gate_checkpoint_sha256=gate_state_dict_sha256(
+                    self.hf_model.state_dict()
+                ),
+                wam_checkpoint_sha256=getattr(
+                    self.hf_model, "wam_checkpoint_sha256", None
+                ),
+            )
         gate_modes: list[torch.Tensor] = []
         gate_costs: list[torch.Tensor] = []
         gate_entropies: list[torch.Tensor] = []
@@ -545,14 +563,33 @@ class MultiStepRolloutWorker(Worker):
             for _ in range(self.n_eval_chunk_steps):
                 for stage_id in range(self.num_pipeline_stages):
                     env_output = await self.recv_env_output(input_channel, mode="eval")
-                    actions, result = self.predict(env_output["obs"], mode="eval")
-                    if str(self.model_cfg.model_type) == "gate_policy":
+                    is_gate_policy = str(self.model_cfg.model_type) == "gate_policy"
+                    predict_obs = env_output["obs"]
+                    if is_gate_policy:
                         active = env_output.get("active_mask")
                         if not isinstance(active, torch.Tensor):
                             raise ValueError(
                                 "gate evaluation requires a per-environment active_mask"
                             )
                         active = active.detach().reshape(-1).bool().cpu()
+                        gate_context = predict_obs.get("gate_context")
+                        if not isinstance(gate_context, dict):
+                            raise ValueError(
+                                "gate evaluation requires obs.gate_context for "
+                                "matched-budget trace provenance"
+                            )
+                        gate_context = {**gate_context, "_active_mask": active}
+                        predict_obs = {**predict_obs, "gate_context": gate_context}
+                    actions, result = self.predict(predict_obs, mode="eval")
+                    if is_gate_policy:
+                        gate_trace_builder.add_batch(
+                            context=gate_context,
+                            modes=result["mode"],
+                            costs=result["mode_cost"],
+                            active_mask=active,
+                            reserved_modes=result.get("reserved_modes"),
+                            control_artifacts=result.get("control_artifacts"),
+                        )
                         if isinstance(result.get("mode"), torch.Tensor):
                             values = result["mode"].detach().reshape(-1).long().cpu()
                             gate_modes.append(values[active])
@@ -599,6 +636,12 @@ class MultiStepRolloutWorker(Worker):
             )
         if gate_entropies:
             metrics["gate/mode_entropy"] = torch.cat(gate_entropies)
+        if gate_trace_builder is not None:
+            from rlinf.models.embodiment.gate_policy.eval_trace import (
+                TRACE_RECORDS_KEY,
+            )
+
+            metrics[TRACE_RECORDS_KEY] = gate_trace_builder.records()
         return metrics
 
     def offload_model(self):
@@ -702,6 +745,13 @@ class MultiStepRolloutWorker(Worker):
                     merged[key] = torch.cat(values, dim=0)
                 elif isinstance(first_non_none, list):
                     merged[key] = [item for sublist in values for item in sublist]
+                elif isinstance(first_non_none, dict):
+                    if not all(isinstance(value, dict) for value in values):
+                        raise ValueError(
+                            f"nested obs field {key!r} must be present as a dict "
+                            "for every merged environment shard"
+                        )
+                    merged[key] = _merge_obs_dicts(values)
                 else:
                     merged[key] = values
             return merged

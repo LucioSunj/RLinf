@@ -12,7 +12,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import importlib
 import multiprocessing
+import os
 import warnings
 from multiprocessing import connection
 from typing import Any, Callable, Optional, Union
@@ -20,6 +22,11 @@ from typing import Any, Callable, Optional, Union
 import gym
 import numpy as np
 
+from rlinf.envs.libero.gate_phase import evaluate_worker_gate_phase
+from rlinf.envs.libero.gate_snapshot import (
+    capture_worker_snapshot,
+    restore_worker_snapshot,
+)
 from rlinf.envs.libero.utils import get_libero_type
 from rlinf.envs.venv import (
     BaseVectorEnv,
@@ -47,12 +54,18 @@ if libero_type == "pro":
 
 elif libero_type == "plus":
     try:
-        from liberoplus.liberoplus.envs import OffScreenRenderEnv
+        package = os.environ.get("LIBERO_PLUS_IMPORT_MODULE", "libero")
+        if "." in package:
+            core = package
+        else:
+            core = "libero.libero" if package == "libero" else f"{package}.{package}"
+        OffScreenRenderEnv = importlib.import_module(
+            f"{core}.envs"
+        ).OffScreenRenderEnv
     except ImportError as e:
-        print(
-            f"[Venv] Warning: LIBERO_TYPE=plus but import failed ({e}). Falling back to standard libero..."
-        )
-        from libero.libero.envs import OffScreenRenderEnv
+        raise ImportError(
+            f"LIBERO_TYPE=plus could not import the frozen checkout via {core!r}"
+        ) from e
 
 else:
     try:
@@ -153,6 +166,16 @@ def _worker(
             elif cmd == "set_init_state":
                 obs = env.set_init_state(data)
                 p.send(obs)
+            elif cmd == "capture_gate_snapshot":
+                p.send(capture_worker_snapshot(env))
+            elif cmd == "restore_gate_snapshot":
+                p.send(restore_worker_snapshot(env, data))
+            elif cmd == "evaluate_gate_phase":
+                p.send(
+                    evaluate_worker_gate_phase(
+                        env, data["callback_spec"], data["context"]
+                    )
+                )
             elif cmd == "reconfigure":
                 env.close()
                 seed = data.pop("seed")
@@ -193,6 +216,23 @@ class ReconfigureSubprocEnvWorker(SubprocEnvWorker):
         self.parent_remote.send(["reconfigure", env_fn_param])
         return self.parent_remote.recv()
 
+    def capture_gate_snapshot(self):
+        self.parent_remote.send(["capture_gate_snapshot", None])
+        return self.parent_remote.recv()
+
+    def restore_gate_snapshot(self, snapshot):
+        self.parent_remote.send(["restore_gate_snapshot", snapshot])
+        return self.parent_remote.recv()
+
+    def evaluate_gate_phase(self, callback_spec, context):
+        self.parent_remote.send(
+            [
+                "evaluate_gate_phase",
+                {"callback_spec": callback_spec, "context": context},
+            ]
+        )
+        return self.parent_remote.recv()
+
 
 class ReconfigureSubprocEnv(SubprocVectorEnv):
     def __init__(self, env_fns: list[Callable[[], gym.Env]], **kwargs: Any) -> None:
@@ -209,3 +249,39 @@ class ReconfigureSubprocEnv(SubprocVectorEnv):
 
         for j, i in enumerate(id):
             self.workers[i].reconfigure_env_fn(env_fns[j])
+
+    def capture_gate_snapshots(self, id=None):
+        """Capture selected worker envs synchronously at a chunk boundary."""
+        self._assert_is_not_closed()
+        ids = self._wrap_id(id)
+        if self.is_async:
+            self._assert_id(ids)
+        return [self.workers[i].capture_gate_snapshot() for i in ids]
+
+    def restore_gate_snapshots(self, snapshots, id=None):
+        """Restore selected workers and return their verified raw observations."""
+        self._assert_is_not_closed()
+        ids = self._wrap_id(id)
+        if self.is_async:
+            self._assert_id(ids)
+        if len(snapshots) != len(ids):
+            raise ValueError(
+                f"expected {len(ids)} LIBERO snapshots, got {len(snapshots)}"
+            )
+        return [
+            self.workers[i].restore_gate_snapshot(snapshots[j])
+            for j, i in enumerate(ids)
+        ]
+
+    def evaluate_gate_phases(self, callback_spec, contexts, id=None):
+        """Evaluate pre-treatment phase predicates inside selected workers."""
+        self._assert_is_not_closed()
+        ids = self._wrap_id(id)
+        if self.is_async:
+            self._assert_id(ids)
+        if len(contexts) != len(ids):
+            raise ValueError(f"expected {len(ids)} phase contexts, got {len(contexts)}")
+        return [
+            self.workers[i].evaluate_gate_phase(callback_spec, contexts[j])
+            for j, i in enumerate(ids)
+        ]

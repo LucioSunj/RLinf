@@ -14,6 +14,7 @@
 
 import asyncio
 import gc
+import hashlib
 from collections import defaultdict
 from typing import Any, Literal
 
@@ -150,6 +151,13 @@ class EnvWorker(Worker):
             )
         self.n_train_chunk_steps = 0
         self.env_steps_per_policy_action = self._env_steps_per_policy_action()
+        if self._is_gate_policy():
+            # Suite-native observations use this to expose a decision index in
+            # gate_context. Keep it tied to the actually executed chunk prefix.
+            if train_env_cfg is not None:
+                train_env_cfg.gate_exec_horizon = self.env_steps_per_policy_action
+            if eval_env_cfg is not None:
+                eval_env_cfg.gate_exec_horizon = self.env_steps_per_policy_action
         self.gate_max_decisions = None
         if self.enable_train:
             if self._is_gate_policy():
@@ -182,6 +190,21 @@ class EnvWorker(Worker):
                     rollout_epoch=self.eval_rollout_epoch,
                     total_num_envs=self.cfg.env.eval.total_num_envs,
                 )
+                expected_eval_decisions = max_gate_decisions(
+                    max_episode_steps=self.cfg.env.eval.max_episode_steps,
+                    exec_horizon=self.env_steps_per_policy_action,
+                )
+                configured_eval_decisions = int(
+                    self.model_cfg.gate.get("eval_policy", {}).get(
+                        "max_decisions", expected_eval_decisions
+                    )
+                )
+                if configured_eval_decisions != expected_eval_decisions:
+                    raise ValueError(
+                        "gate.eval_policy.max_decisions must match the full "
+                        "evaluation horizon: "
+                        f"{configured_eval_decisions} vs {expected_eval_decisions}"
+                    )
             self.n_eval_chunk_steps = (
                 self.cfg.env.eval.max_steps_per_rollout_epoch
                 // self.env_steps_per_policy_action
@@ -277,6 +300,82 @@ class EnvWorker(Worker):
                 return elapsed
             current = getattr(current, "env", None)
         return None
+
+    @staticmethod
+    def _read_env_attr(env, name: str):
+        current = env
+        seen: set[int] = set()
+        while current is not None and id(current) not in seen:
+            seen.add(id(current))
+            value = getattr(current, name, None)
+            if value is not None:
+                return value
+            current = getattr(current, "env", None)
+        return None
+
+    def _ensure_gate_context(self, obs: dict[str, Any], env) -> dict[str, Any]:
+        """Return obs with immutable per-slot identity for eval scheduling/traces."""
+        if not self._is_gate_policy():
+            return obs
+        if not isinstance(obs, dict):
+            raise ValueError("gate observations must be dictionaries")
+        if isinstance(obs.get("gate_context"), dict):
+            return obs
+        elapsed = self._read_env_elapsed_steps(env)
+        reset_ids = self._read_env_attr(env, "reset_state_ids")
+        if elapsed is None or reset_ids is None:
+            raise RuntimeError(
+                "gate environments must expose elapsed_steps and reset_state_ids "
+                "or provide obs.gate_context"
+            )
+        elapsed = torch.as_tensor(elapsed).detach().cpu().reshape(-1).long()
+        reset_ids = torch.as_tensor(reset_ids).detach().cpu().reshape(-1).long()
+        if elapsed.numel() != reset_ids.numel():
+            raise ValueError("gate context elapsed/reset batch sizes do not match")
+        batch = elapsed.numel()
+        task_ids_raw = self._read_env_attr(env, "task_ids")
+        task_ids = (
+            torch.full((batch,), -1, dtype=torch.long)
+            if task_ids_raw is None
+            else torch.as_tensor(task_ids_raw).detach().cpu().reshape(-1).long()
+        )
+        task_name = self._read_env_attr(env, "task_name")
+        descriptions = obs.get("task_descriptions")
+        if isinstance(descriptions, list) and len(descriptions) == batch:
+            tasks = [str(value) for value in descriptions]
+        else:
+            tasks = [str(task_name or "unknown")] * batch
+        env_seed = self._read_env_attr(env, "seed")
+        uids = []
+        for index in range(batch):
+            identity = "|".join(
+                (
+                    str(task_name or tasks[index]),
+                    str(int(task_ids[index])),
+                    str(int(reset_ids[index])),
+                    str(env_seed),
+                )
+            )
+            uids.append(hashlib.sha256(identity.encode("utf-8")).hexdigest()[:24])
+        obs["gate_context"] = {
+            "episode_uid": uids,
+            "decision_index": elapsed // self.env_steps_per_policy_action,
+            "elapsed_steps": elapsed,
+            "task_id": task_ids,
+            "trial_id": torch.full((batch,), -1, dtype=torch.long),
+            "reset_state_id": reset_ids,
+            "factor": ["unknown"] * batch,
+            "level": ["unknown"] * batch,
+            "perturbation_id": ["unknown"] * batch,
+            "episode_manifest_sha256": [""] * batch,
+            "phase": ["unknown"] * batch,
+            "phase_reliable": torch.zeros(batch, dtype=torch.bool),
+            "env_seed": reset_ids.clone(),
+            "task_description": tasks,
+            "base_task": tasks,
+            "asset_ids": [[] for _ in range(batch)],
+        }
+        return obs
 
     def _limit_gate_chunk_to_episode(self, actions, *, env, max_episode_steps: int):
         if not self._is_gate_policy():
@@ -1412,6 +1511,9 @@ class EnvWorker(Worker):
             for _ in range(self.stage_num)
         ]
         env_metrics = defaultdict(list)
+        self._pipeline_gate_diagnostics: dict[str, list[torch.Tensor]] = defaultdict(
+            list
+        )
 
         for epoch in range(self.rollout_epoch):
             # Rewards in ``env_outputs`` were produced by the previously executed
@@ -1651,6 +1753,9 @@ class EnvWorker(Worker):
             self.rollout_results = []
             gc.collect()
 
+        for key, values in self._pipeline_gate_diagnostics.items():
+            env_metrics[key].extend(values)
+
         for key, value in env_metrics.items():
             env_metrics[key] = torch.cat(value, dim=0).contiguous().cpu()
 
@@ -1680,6 +1785,19 @@ class EnvWorker(Worker):
 
     def evaluate(self, input_channel: Channel, rollout_channel: Channel):
         eval_metrics = defaultdict(list)
+        gate_trace_builder = None
+        gate_contexts: list[dict[str, Any] | None] = [
+            None for _ in range(self.stage_num)
+        ]
+        if self._is_gate_policy():
+            from rlinf.models.embodiment.gate_policy.eval_trace import (
+                EnvGateTraceBuilder,
+            )
+
+            eval_selector_cfg = self.model_cfg.gate.get("eval_policy", {}) or {}
+            gate_trace_builder = EnvGateTraceBuilder(
+                max_decisions=int(eval_selector_cfg.get("max_decisions", 70))
+            )
 
         for eval_rollout_epoch in range(self.eval_rollout_epoch):
             gate_active = (
@@ -1697,6 +1815,12 @@ class EnvWorker(Worker):
                         self.eval_num_envs_per_stage, dtype=torch.bool
                     )
                     extracted_obs, infos = self.eval_env_list[stage_id].reset()
+                    if self._is_gate_policy():
+                        extracted_obs = self._ensure_gate_context(
+                            extracted_obs, self.eval_env_list[stage_id]
+                        )
+                        gate_contexts[stage_id] = extracted_obs["gate_context"]
+                        gate_trace_builder.register_batch(gate_contexts[stage_id])
                     env_output = EnvOutput(
                         obs=extracted_obs,
                         final_obs=(
@@ -1738,9 +1862,31 @@ class EnvWorker(Worker):
                             if isinstance(env_output.env_infos, dict)
                             else {}
                         )
+                        success_once = episode_info.get("success_once")
+                        if (
+                            success_once is None
+                            and isinstance(env_output.env_infos, dict)
+                            and isinstance(
+                                env_output.env_infos.get("final_info"), dict
+                            )
+                        ):
+                            final_episode = env_output.env_infos[
+                                "final_info"
+                            ].get("episode", {})
+                            success_once = final_episode.get("success_once")
+                        context_before_action = gate_contexts[stage_id]
+                        if context_before_action is None:
+                            raise RuntimeError(
+                                "missing gate context for evaluation action"
+                            )
+                        gate_trace_builder.update_after_step(
+                            context_before_action=context_before_action,
+                            success_once=success_once,
+                            active_before_action=gate_active[stage_id],
+                        )
                         gate_active[stage_id] = update_gate_eval_active_mask(
                             gate_active[stage_id],
-                            success_once=episode_info.get("success_once"),
+                            success_once=success_once,
                             dones=env_output.dones,
                         )
 
@@ -1754,6 +1900,11 @@ class EnvWorker(Worker):
                         if eval_step == self.n_eval_chunk_steps - 1:
                             continue
                     env_batch = env_output.to_dict()
+                    if self._is_gate_policy():
+                        env_batch["obs"] = self._ensure_gate_context(
+                            env_batch["obs"], self.eval_env_list[stage_id]
+                        )
+                        gate_contexts[stage_id] = env_batch["obs"]["gate_context"]
                     self.send_env_batch(
                         rollout_channel,
                         {
@@ -1775,6 +1926,12 @@ class EnvWorker(Worker):
 
         for key, value in eval_metrics.items():
             eval_metrics[key] = torch.cat(value, dim=0).contiguous().cpu()
+        if gate_trace_builder is not None:
+            from rlinf.models.embodiment.gate_policy.eval_trace import (
+                TRACE_RECORDS_KEY,
+            )
+
+            eval_metrics[TRACE_RECORDS_KEY] = gate_trace_builder.records()
 
         return eval_metrics
 
@@ -1826,7 +1983,28 @@ class EnvWorker(Worker):
             rewards_lower_bound=self.cfg.algorithm.get("rewards_lower_bound", None),
             rewards_upper_bound=self.cfg.algorithm.get("rewards_upper_bound", None),
         )
-        return self.compute_advantages_and_returns(batch)
+        batch = self.compute_advantages_and_returns(batch)
+        if (
+            self._is_gate_policy()
+            and str(self.cfg.algorithm.adv_type) == "grpo"
+        ):
+            from rlinf.models.embodiment.gate_policy.diagnostics import (
+                compute_grpo_group_diagnostics,
+            )
+
+            metrics = compute_grpo_group_diagnostics(
+                rewards=batch["rewards"],
+                dones=batch["dones"],
+                advantages=batch["advantages"],
+                loss_mask=batch.get("loss_mask"),
+                group_size=int(self.cfg.algorithm.group_size),
+                reward_type=str(self.cfg.algorithm.reward_type),
+            )
+            for key, value in metrics.items():
+                self._pipeline_gate_diagnostics[key].append(
+                    torch.tensor([value], dtype=torch.float32)
+                )
+        return batch
 
     def pack_pipeline_micro_batches(
         self, batch: dict[str, torch.Tensor], actor_rank: int

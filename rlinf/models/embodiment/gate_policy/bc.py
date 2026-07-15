@@ -28,6 +28,7 @@ sidecar for provenance. Construct the BC policy with the SAME `hidden_sizes` /
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import math
 import os
@@ -40,6 +41,290 @@ import torch.nn.functional as F
 
 # Keys the BC stage needs from each oracle-label shard record.
 BC_DATA_KEYS = ("world_feat", "proprio", "text_feat", "label")
+
+
+def _sha256_file(path: str) -> str:
+    digest = hashlib.sha256()
+    with open(path, "rb") as handle:
+        for block in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(block)
+    return digest.hexdigest()
+
+
+def _none_like(value: Any) -> bool:
+    return value is None or str(value).strip().lower() in {"", "none", "null"}
+
+
+def _config_float(
+    value: Any,
+    *,
+    name: str,
+    minimum: float | None = None,
+    maximum: float | None = None,
+) -> float:
+    if isinstance(value, bool):
+        raise ValueError(f"{name} must be numeric, not boolean")
+    result = float(value)
+    if not math.isfinite(result):
+        raise ValueError(f"{name} must be finite")
+    if minimum is not None and result < minimum:
+        raise ValueError(f"{name} must be >= {minimum}")
+    if maximum is not None and result > maximum:
+        raise ValueError(f"{name} must be <= {maximum}")
+    return result
+
+
+def _config_int(value: Any, *, name: str, minimum: int = 0) -> int:
+    numeric = _config_float(value, name=name)
+    if not math.isclose(numeric, round(numeric), abs_tol=1e-9):
+        raise ValueError(f"{name} must be an integer")
+    result = int(round(numeric))
+    if result < minimum:
+        raise ValueError(f"{name} must be >= {minimum}")
+    return result
+
+
+def build_gate_training_provenance(cfg: Mapping[str, Any]) -> dict[str, Any]:
+    """Bind an RL Gate checkpoint to its initialization and training contract."""
+    actor_cfg = cfg.get("actor", {}) or {}
+    model_cfg = actor_cfg.get("model", {}) or {}
+    gate_cfg = model_cfg.get("gate", {}) or {}
+    runner_cfg = cfg.get("runner", {}) or {}
+    reward_cfg = cfg.get("gate_reward", {}) or {}
+    algorithm_cfg = cfg.get("algorithm", {}) or {}
+    optim_cfg = actor_cfg.get("optim", {}) or {}
+    collapse_cfg = (
+        (cfg.get("gate_diagnostics", {}) or {}).get("collapse", {}) or {}
+    )
+    evidence_run_id = (cfg.get("gate_diagnostics", {}) or {}).get(
+        "evidence_run_id", None
+    )
+    if evidence_run_id is not None:
+        evidence_run_id = str(evidence_run_id)
+        if len(evidence_run_id) != 64 or any(
+            char not in "0123456789abcdef" for char in evidence_run_id
+        ):
+            raise ValueError(
+                "gate_diagnostics.evidence_run_id must be a lowercase SHA256 identifier"
+            )
+
+    runner_init = runner_cfg.get("ckpt_path", None)
+    gate_init = gate_cfg.get("bc_init_path", None)
+    init_paths = [
+        os.path.realpath(os.path.abspath(str(path)))
+        for path in (runner_init, gate_init)
+        if not _none_like(path)
+    ]
+    if len(set(init_paths)) > 1:
+        raise ValueError(
+            "runner.ckpt_path and actor.model.gate.bc_init_path must identify "
+            "the same Gate initialization checkpoint"
+        )
+
+    initialization: dict[str, Any] = {
+        "kind": "scratch",
+        "checkpoint_sha256": None,
+        "sidecar_sha256": None,
+    }
+    if init_paths:
+        init_path = init_paths[0]
+        if not os.path.isfile(init_path):
+            raise FileNotFoundError(
+                f"Gate initialization checkpoint does not exist: {init_path}"
+            )
+        sidecar_path = init_path + ".meta.json"
+        if not os.path.isfile(sidecar_path):
+            raise ValueError(
+                "Gate RL training provenance requires an initialization sidecar: "
+                f"{sidecar_path}"
+            )
+        try:
+            with open(sidecar_path, encoding="utf-8") as handle:
+                sidecar = json.load(handle)
+        except (OSError, json.JSONDecodeError) as exc:
+            raise ValueError(
+                f"invalid Gate initialization sidecar {sidecar_path}: {exc}"
+            ) from exc
+        source_kind = sidecar.get("kind") if isinstance(sidecar, dict) else None
+        if source_kind not in {"gate_bc", "gate_uplift", "gate_rl"}:
+            raise ValueError(
+                f"unsupported Gate initialization sidecar kind {source_kind!r}"
+            )
+        initialization = {
+            "kind": str(source_kind),
+            "checkpoint_sha256": _sha256_file(init_path),
+            "sidecar_sha256": _sha256_file(sidecar_path),
+        }
+
+    kl_cfg = gate_cfg.get("kl_prior", {}) or {}
+    kl_enabled = bool(kl_cfg.get("enabled", False))
+    kl_path = kl_cfg.get("path", None)
+    if kl_enabled and _none_like(kl_path):
+        kl_path = gate_init
+    kl_checkpoint_sha256 = None
+    if kl_enabled:
+        if _none_like(kl_path) or not os.path.isfile(str(kl_path)):
+            raise FileNotFoundError(
+                f"enabled Gate KL prior is unavailable: {kl_path!r}"
+            )
+        kl_checkpoint_sha256 = _sha256_file(str(kl_path))
+
+    target = collapse_cfg.get("target_idm_usage", None)
+    target = (
+        None
+        if target is None
+        else _config_float(
+            target, name="target_idm_usage", minimum=0.0, maximum=1.0
+        )
+    )
+    lambda_cost = _config_float(
+        reward_cfg.get("lambda_cost", 0.0), name="lambda_cost", minimum=0.0
+    )
+    return {
+        "schema_version": 1,
+        # Kept at top level because sweep validators use these as run coordinates.
+        "seed": int(actor_cfg.get("seed", 0)),
+        "target_idm_usage": target,
+        "evidence_run_id": evidence_run_id,
+        "lambda_cost": lambda_cost,
+        "adv_type": str(algorithm_cfg.get("adv_type", "")),
+        "collapse": {
+            "enabled": bool(collapse_cfg.get("enabled", False)),
+            "patience": _config_int(
+                collapse_cfg.get("patience", 3),
+                name="collapse.patience",
+                minimum=1,
+            ),
+            "low_threshold": _config_float(
+                collapse_cfg.get("low_threshold", 0.05),
+                name="collapse.low_threshold",
+                minimum=0.0,
+                maximum=1.0,
+            ),
+            "high_threshold": _config_float(
+                collapse_cfg.get("high_threshold", 0.95),
+                name="collapse.high_threshold",
+                minimum=0.0,
+                maximum=1.0,
+            ),
+            "budget_error_threshold": _config_float(
+                collapse_cfg.get("budget_error_threshold", 0.15),
+                name="collapse.budget_error_threshold",
+                minimum=0.0,
+            ),
+        },
+        "initialization": initialization,
+        "objective": {
+            "loss_type": str(algorithm_cfg.get("loss_type", "")),
+            "reward_type": str(algorithm_cfg.get("reward_type", "")),
+            "group_size": _config_int(
+                algorithm_cfg.get("group_size", 1), name="group_size", minimum=1
+            ),
+            "normalize_advantages": bool(
+                algorithm_cfg.get("normalize_advantages", False)
+            ),
+            "update_epoch": _config_int(
+                algorithm_cfg.get("update_epoch", 1),
+                name="update_epoch",
+                minimum=1,
+            ),
+            "entropy_bonus": _config_float(
+                algorithm_cfg.get("entropy_bonus", 0.0),
+                name="entropy_bonus",
+                minimum=0.0,
+            ),
+            "clip_ratio_low": _config_float(
+                algorithm_cfg.get("clip_ratio_low", 0.0),
+                name="clip_ratio_low",
+                minimum=0.0,
+            ),
+            "clip_ratio_high": _config_float(
+                algorithm_cfg.get("clip_ratio_high", 0.0),
+                name="clip_ratio_high",
+                minimum=0.0,
+            ),
+        },
+        "batching": {
+            "micro_batch_size": _config_int(
+                actor_cfg.get("micro_batch_size", 1),
+                name="micro_batch_size",
+                minimum=1,
+            ),
+            "global_batch_size": _config_int(
+                actor_cfg.get("global_batch_size", 1),
+                name="global_batch_size",
+                minimum=1,
+            ),
+        },
+        "optimizer": {
+            "lr": _config_float(
+                optim_cfg.get("lr", 0.0), name="optimizer.lr", minimum=0.0
+            ),
+            "adam_beta1": _config_float(
+                optim_cfg.get("adam_beta1", 0.9),
+                name="optimizer.adam_beta1",
+                minimum=0.0,
+                maximum=1.0,
+            ),
+            "adam_beta2": _config_float(
+                optim_cfg.get("adam_beta2", 0.999),
+                name="optimizer.adam_beta2",
+                minimum=0.0,
+                maximum=1.0,
+            ),
+            "adam_eps": _config_float(
+                optim_cfg.get("adam_eps", 1e-8),
+                name="optimizer.adam_eps",
+                minimum=0.0,
+            ),
+            "weight_decay": _config_float(
+                optim_cfg.get("weight_decay", 0.0),
+                name="optimizer.weight_decay",
+                minimum=0.0,
+            ),
+            "clip_grad": _config_float(
+                optim_cfg.get("clip_grad", 0.0),
+                name="optimizer.clip_grad",
+                minimum=0.0,
+            ),
+        },
+        "reward": {
+            "w_success": _config_float(
+                reward_cfg.get("w_success", 1.0), name="w_success"
+            ),
+            "lambda_start": _config_float(
+                reward_cfg.get("lambda_start", 0.0),
+                name="lambda_start",
+                minimum=0.0,
+            ),
+            "lambda_cost": lambda_cost,
+            "lambda_warmup_steps": _config_int(
+                reward_cfg.get("lambda_warmup_steps", 0),
+                name="lambda_warmup_steps",
+            ),
+        },
+        "explore_eps": _config_float(
+            gate_cfg.get("explore_eps", 0.0),
+            name="explore_eps",
+            minimum=0.0,
+            maximum=1.0,
+        ),
+        "kl_prior": {
+            "enabled": kl_enabled,
+            "checkpoint_sha256": kl_checkpoint_sha256,
+            "beta": _config_float(
+                kl_cfg.get("beta", 0.0), name="kl_prior.beta", minimum=0.0
+            ),
+            "beta_end": _config_float(
+                kl_cfg.get("beta_end", 0.0),
+                name="kl_prior.beta_end",
+                minimum=0.0,
+            ),
+            "decay_steps": _config_int(
+                kl_cfg.get("decay_steps", 0), name="kl_prior.decay_steps"
+            ),
+        },
+    }
 
 
 def _mode_names(mode_order) -> list[str]:
@@ -611,6 +896,7 @@ def _resolve_expected_bc_provenance(policy, *, checkpoint_path: str) -> dict[str
         "dataset_stats_fingerprint": provenance.get("dataset_stats_fingerprint"),
         "num_video_frames": provenance.get("num_video_frames"),
         "inference_steps": provenance.get("inference_steps"),
+        "solver_fingerprint": provenance.get("solver_fingerprint"),
         "context_len": provenance.get("context_len"),
         "model_dtype": provenance.get("model_dtype"),
         "exec_horizon": provenance.get("exec_horizon"),
@@ -618,7 +904,11 @@ def _resolve_expected_bc_provenance(policy, *, checkpoint_path: str) -> dict[str
     }
     missing_semantics = []
     for key, value in required_semantics.items():
-        if key in {"dataset_stats_fingerprint", "model_dtype"}:
+        if key in {
+            "dataset_stats_fingerprint",
+            "model_dtype",
+            "solver_fingerprint",
+        }:
             if not isinstance(value, str) or not value:
                 missing_semantics.append(key)
             continue
@@ -642,6 +932,7 @@ def _resolve_expected_bc_provenance(policy, *, checkpoint_path: str) -> dict[str
         ),
         "num_video_frames": int(required_semantics["num_video_frames"]),
         "inference_steps": int(required_semantics["inference_steps"]),
+        "solver_fingerprint": str(required_semantics["solver_fingerprint"]),
         "context_len": int(required_semantics["context_len"]),
         "model_dtype": str(required_semantics["model_dtype"]),
         "exec_horizon": int(required_semantics["exec_horizon"]),
@@ -695,9 +986,47 @@ def save_gate_policy_sidecar(path: str, metadata: Mapping[str, Any]) -> str:
     if metadata.get("kind") != "gate_rl":
         raise ValueError("learned GatePolicy sidecar must have kind='gate_rl'")
     sidecar_path = path + ".meta.json"
-    with open(sidecar_path, "w", encoding="utf-8") as handle:
-        json.dump(dict(metadata), handle, indent=2, default=str)
+    temporary_path = sidecar_path + ".tmp"
+    with open(temporary_path, "w", encoding="utf-8") as handle:
+        json.dump(dict(metadata), handle, indent=2, sort_keys=True, allow_nan=False)
+        handle.write("\n")
+    os.replace(temporary_path, sidecar_path)
     return sidecar_path
+
+
+def validate_gate_rl_resume_metadata(
+    actual: Mapping[str, Any],
+    expected: Mapping[str, Any],
+    *,
+    expected_step: int | None = None,
+) -> None:
+    """Fail closed when a resumed RL Gate changes lineage or objective."""
+    if not isinstance(actual, Mapping) or not isinstance(expected, Mapping):
+        raise ValueError("GatePolicy resume provenance must be a JSON object")
+    fields = (
+        "kind",
+        "schema_version",
+        "gate",
+        "wam_provenance",
+        "training",
+    )
+    mismatches = {
+        key: (actual.get(key), expected.get(key))
+        for key in fields
+        if actual.get(key) != expected.get(key)
+    }
+    if mismatches:
+        raise ValueError(
+            "GatePolicy resume provenance does not match the configured "
+            f"task/WAM/training contract: {mismatches}"
+        )
+    if expected_step is not None and _config_int(
+        actual.get("step", -1), name="GatePolicy sidecar step"
+    ) != _config_int(expected_step, name="resume checkpoint step"):
+        raise ValueError(
+            "GatePolicy sidecar step does not match the resume checkpoint "
+            f"directory: {actual.get('step')!r} != {expected_step}"
+        )
 
 
 def validate_gate_bc_sidecar(path: str, policy) -> Optional[dict[str, Any]]:
@@ -726,9 +1055,9 @@ def validate_gate_bc_sidecar(path: str, policy) -> Optional[dict[str, Any]]:
     except (OSError, json.JSONDecodeError) as exc:
         raise ValueError(f"{sidecar_path}: invalid Gate BC metadata: {exc}") from exc
     kind = meta.get("kind") if isinstance(meta, dict) else None
-    if kind not in {"gate_bc", "gate_rl"}:
+    if kind not in {"gate_bc", "gate_rl", "gate_uplift"}:
         raise ValueError(
-            f"{sidecar_path}: expected kind='gate_bc' or 'gate_rl' metadata"
+            f"{sidecar_path}: expected gate_bc/gate_uplift/gate_rl metadata"
         )
     gate_meta = meta.get("gate")
     if not isinstance(gate_meta, dict):
@@ -817,6 +1146,7 @@ def validate_gate_bc_sidecar(path: str, policy) -> Optional[dict[str, Any]]:
         ),
         "num_video_frames": int(shard_meta["num_video_frames"]),
         "inference_steps": int(shard_meta["inference_steps"]),
+        "solver_fingerprint": str(shard_meta["solver_fingerprint"]),
         "context_len": int(shard_meta["context_len"]),
         "model_dtype": str(shard_meta["model_dtype"]),
         "exec_horizon": int(shard_meta["exec_horizon"]),
@@ -832,6 +1162,118 @@ def validate_gate_bc_sidecar(path: str, policy) -> Optional[dict[str, Any]]:
             f"{sidecar_path}: gate/WAM feature provenance does not match the online "
             f"gate (actual, expected): {shard_mismatches}"
         )
+    if kind == "gate_uplift":
+        expected_wam_sha = getattr(policy, "wam_checkpoint_sha256", None)
+        actual_wam_sha = shard_meta.get("ckpt_file_sha256")
+        if (
+            not isinstance(expected_wam_sha, str)
+            or not expected_wam_sha
+            or actual_wam_sha != expected_wam_sha
+        ):
+            raise ValueError(
+                f"{sidecar_path}: uplift WAM file SHA does not match the "
+                f"configured checkpoint: {actual_wam_sha!r} != {expected_wam_sha!r}"
+            )
+        paired = meta.get("paired_provenance")
+        if not isinstance(paired, dict):
+            raise ValueError(
+                f"{sidecar_path}: gate_uplift metadata is missing paired_provenance"
+            )
+        required_paired = {
+            "schema": "paired-v1",
+            "target": "helpful",
+            "enabled_features": ["world", "proprio", "text"],
+            "manifest_split": "train",
+            "continuation_mode": "uncond",
+            "reference_policy_mix": ["uncond", "idm", "random_0.5"],
+            "reference_policy_assignment": "balanced_shuffled_v1",
+            "sensitivity_fraction": 0.2,
+        }
+        paired_missing = [
+            key
+            for key in (
+                "schema",
+                "paired_dataset_fingerprint",
+                "splits_sha256",
+                "episode_manifest_sha256",
+                "heldout_test_manifest_sha256",
+                "libero_plus_commit",
+                "manifest_split",
+                "snapshot_schema",
+                "continuation_mode",
+                "reference_policy_mix",
+                "reference_policy_assignment",
+                "reference_assignment_manifest_sha256",
+                "reference_assignment_sha256",
+                "logical_composite_source_fingerprint",
+                "collector_seed",
+                "max_reference_decisions",
+                "max_branch_decisions",
+                "sensitivity_fraction",
+                "target",
+                "enabled_features",
+                "num_samples",
+                "num_trajectories",
+                "folds",
+            )
+            if key not in paired
+        ]
+        if paired_missing:
+            raise ValueError(
+                f"{sidecar_path}: paired_provenance is missing {paired_missing}"
+            )
+        mismatched_paired = {
+            key: (paired.get(key), expected)
+            for key, expected in required_paired.items()
+            if paired.get(key) != expected
+        }
+        if mismatched_paired:
+            raise ValueError(
+                f"{sidecar_path}: uplift target/features are not deployable "
+                f"(actual, expected): {mismatched_paired}"
+            )
+        for key in (
+            "paired_dataset_fingerprint",
+            "splits_sha256",
+            "episode_manifest_sha256",
+            "heldout_test_manifest_sha256",
+            "reference_assignment_manifest_sha256",
+            "reference_assignment_sha256",
+            "libero_plus_commit",
+            "manifest_split",
+            "snapshot_schema",
+        ):
+            if not isinstance(paired[key], str) or not paired[key]:
+                raise ValueError(
+                    f"{sidecar_path}: paired_provenance.{key} must be non-empty"
+                )
+        logical_fingerprint = paired["logical_composite_source_fingerprint"]
+        if logical_fingerprint is not None and (
+            not isinstance(logical_fingerprint, str)
+            or len(logical_fingerprint) != 64
+            or any(
+                character not in "0123456789abcdef"
+                for character in logical_fingerprint
+            )
+        ):
+            raise ValueError(
+                f"{sidecar_path}: paired_provenance.logical_composite_source_fingerprint "
+                "must be null or a lowercase SHA256"
+            )
+        for key in (
+            "collector_seed",
+            "max_reference_decisions",
+            "num_samples",
+            "num_trajectories",
+            "folds",
+            "max_branch_decisions",
+        ):
+            minimum = 0 if key == "collector_seed" else 1
+            if int(paired[key]) < minimum:
+                raise ValueError(
+                    f"{sidecar_path}: paired_provenance.{key} must be "
+                    f"{'non-negative' if minimum == 0 else 'positive'}"
+                )
     return meta
 
 

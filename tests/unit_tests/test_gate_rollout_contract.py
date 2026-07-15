@@ -228,6 +228,9 @@ def test_gate_configs_encode_verified_horizon_and_camera_contracts():
     assert libero["env"]["eval"]["total_num_envs"] == 496
     assert libero["env"]["eval"]["max_episode_steps"] == 700
     assert libero["env"]["eval"]["max_steps_per_rollout_epoch"] == 700
+    assert libero["actor"]["model"]["gate"]["eval_policy"]["kind"] == "learned"
+    assert libero["actor"]["model"]["gate"]["eval_policy"]["max_decisions"] == 70
+    assert libero["gate_diagnostics"]["collapse"]["enabled"] is False
 
     for split in ("train", "eval"):
         env = robotwin["env"][split]
@@ -237,6 +240,7 @@ def test_gate_configs_encode_verified_horizon_and_camera_contracts():
         assert env["task_config"]["camera"]["collect_wrist_camera"] is True
     assert robotwin["actor"]["model"]["wam"]["generation_horizon"] == 32
     assert robotwin["actor"]["model"]["wam"]["exec_horizon"] == 24
+    assert robotwin["actor"]["model"]["gate"]["eval_policy"]["max_decisions"] == 9
     assert robotwin["actor"]["micro_batch_size"] == 64
     assert robotwin["actor"]["global_batch_size"] == 512
     assert robotwin["env"]["train"]["use_fixed_reset_state_ids"] is False

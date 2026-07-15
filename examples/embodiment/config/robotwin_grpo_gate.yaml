@@ -63,6 +63,16 @@ gate_reward:
   lambda_warmup_steps: 200
   lambda_start: 0.0
 
+gate_diagnostics:
+  evidence_run_id: null
+  collapse:
+    enabled: False
+    target_idm_usage: null
+    patience: 3
+    low_threshold: 0.05
+    high_threshold: 0.95
+    budget_error_threshold: 0.15
+
 env:
   group_name: "EnvGroup"
   train:
@@ -152,6 +162,30 @@ actor:
       hidden_sizes: [256, 256]
       activation: tanh
       force_mode: null            # eval-only smoke: 0=UNCOND, 1=IDM
+      eval_policy:
+        kind: learned
+        seed: 0
+        max_decisions: 9          # ceil(200 env steps / 24 executed actions)
+        mode: null
+        p_idm: null
+        k: null
+        manifest_path: null
+        expected_checkpoint_sha256: null
+        expected_episode_manifest_sha256: null
+        idm_phases: [contact_alignment]
+        trace_path: null
+      # Evaluation-only mechanism controls; never extend production WAMMode.
+      eval_control:
+        kind: null                # valid_idm/no_read/repeat_current/shuffled/extra_compute
+        profile_path: null
+        cost_metric: latency_ms
+        require_compute_matched: True
+        wam_seed: 0
+        donor_seed: 0
+        donor_bank_path: null
+        expected_donor_wam_seed: 0
+        capture_donor_dir: null
+        capture_overwrite: False
       allow_legacy_gate_checkpoint: False  # fail closed when .meta.json is missing
       # Label-free collapse prevention (default, zero-supervision path): uniform
       # mixture sampling in TRAIN rollouts; replay optimizes that same mixture.
@@ -179,6 +213,7 @@ actor:
       generation_horizon: 32
       exec_horizon: 24
       inference_steps: 20
+      sigma_shift: null
       default_seed: 0
       cost_table_path: /path/to/FastWAM/configs/adaptive_gate/wam_cost_robotwin_idm.yaml
       device: cuda

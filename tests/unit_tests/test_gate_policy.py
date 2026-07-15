@@ -206,6 +206,37 @@ def test_force_mode_is_eval_only_for_end_to_end_smoke(forced):
         policy.predict_action_batch(_obs(batch=1), mode="train")
 
 
+def test_eval_policy_random_k_uses_gate_context_but_never_changes_training():
+    policy = _policy(
+        eval_policy={"kind": "random_k", "max_decisions": 70, "k": 13, "seed": 5}
+    )
+    # Non-learned selectors are evaluation controls, not behavior policies.
+    policy.predict_action_batch(_obs(batch=1), mode="train")
+
+    obs = _obs(batch=2)
+    obs["gate_context"] = {
+        "episode_uid": ["same-episode", "same-episode"],
+        "decision_index": torch.tensor([0, 69]),
+    }
+    _, result = policy.predict_action_batch(obs, mode="eval")
+    schedule = policy.eval_mode_selector.schedule_for("same-episode")
+    assert result["mode"].tolist() == [schedule[0], schedule[69]]
+    assert result["reserved_modes"].shape == (2, 70)
+    assert result["eval_policy_method"] == "random_k"
+    assert all(
+        isinstance(value, torch.Tensor)
+        for value in result["forward_inputs"].values()
+    )
+
+
+def test_legacy_force_mode_rejects_conflicting_eval_policy():
+    with pytest.raises(ValueError, match="conflicts"):
+        _policy(
+            force_mode=0,
+            eval_policy={"kind": "forced", "mode": 1, "max_decisions": 70},
+        )
+
+
 def test_actor_side_kl_is_differentiable_and_uses_global_step_schedule():
     policy = _policy(
         add_value_head=False,

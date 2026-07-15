@@ -177,6 +177,11 @@ def build_wam_adapter(wam_cfg: DictConfig):
         num_video_frames=int(wam_cfg.get("num_video_frames", 9)),
         generation_horizon=int(wam_cfg.get("generation_horizon", 32)),
         inference_steps=int(wam_cfg.get("inference_steps", 20)),
+        sigma_shift=(
+            None
+            if _is_none_like(wam_cfg.get("sigma_shift", None))
+            else float(wam_cfg.get("sigma_shift"))
+        ),
         context_len=actual_context_len,
         dataset_stats_fingerprint=stats_fingerprint,
         cost_table_path=None if cost_table_path is None else str(cost_table_path),
@@ -304,6 +309,8 @@ def get_model(cfg: DictConfig, torch_dtype=torch.bfloat16):
         activation=str(gate_cfg.get("activation", "tanh")),
         explore_eps=float(gate_cfg.get("explore_eps", 0.0)),
         force_mode=gate_cfg.get("force_mode", None),
+        eval_policy=gate_cfg.get("eval_policy", None),
+        eval_control=gate_cfg.get("eval_control", None),
         allow_legacy_gate_checkpoint=bool(
             gate_cfg.get("allow_legacy_gate_checkpoint", False)
         ),
@@ -313,6 +320,9 @@ def get_model(cfg: DictConfig, torch_dtype=torch.bfloat16):
         wam_adapter=adapter,
         obs_preprocessor=obs_preprocessor,
     )
+    eval_policy_cfg = gate_cfg.get("eval_policy", {}) or {}
+    trace_path = eval_policy_cfg.get("trace_path", None)
+    policy.eval_trace_path = None if _is_none_like(trace_path) else str(trace_path)
 
     wam_cfg = cfg.get("wam", {}) or {}
     configs_value = wam_cfg.get("configs_dir", None)
@@ -321,6 +331,18 @@ def get_model(cfg: DictConfig, torch_dtype=torch.bfloat16):
         if not _is_none_like(configs_value)
         else Path.cwd()
     )
+    if policy.eval_control_kind is not None and adapter is not None:
+        from rlinf.models.embodiment.gate_policy.control_eval import (
+            build_eval_control_runtime,
+        )
+
+        policy.attach_eval_control_runtime(
+            build_eval_control_runtime(
+                gate_cfg.get("eval_control", None),
+                adapter=adapter,
+                fastwam_root=fastwam_root_for_profile,
+            )
+        )
     profile_path = _resolve_fastwam_path(
         wam_cfg.get("cost_table_path", None),
         fastwam_root=fastwam_root_for_profile,
@@ -358,6 +380,22 @@ def get_model(cfg: DictConfig, torch_dtype=torch.bfloat16):
             if adapter is not None
             else loaded_profile_meta.get("ckpt_fingerprint")
         )
+    wam_ckpt_path = _resolve_fastwam_path(
+        wam_cfg.get("ckpt", None), fastwam_root=fastwam_root_for_profile
+    )
+    policy.wam_checkpoint_sha256 = (
+        _sha256_file(wam_ckpt_path)
+        if wam_ckpt_path is not None and wam_ckpt_path.is_file()
+        else None
+    )
+    if policy.eval_mode_selector.kind == "manifest":
+        declared = str(policy.eval_mode_selector.source_checkpoint_sha256)
+        actual = policy.wam_checkpoint_sha256
+        if actual is None or declared != actual:
+            raise ValueError(
+                "mode schedule manifest was not registered for the configured "
+                f"WAM checkpoint: declared={declared}, actual={actual}"
+            )
     policy.bc_expected_provenance = {
         "task": None
         if _is_none_like(wam_cfg.get("task", None))
@@ -367,6 +405,11 @@ def get_model(cfg: DictConfig, torch_dtype=torch.bfloat16):
         "dataset_stats_fingerprint": stats_fingerprint,
         "num_video_frames": int(wam_cfg.get("num_video_frames", 9)),
         "inference_steps": int(wam_cfg.get("inference_steps", 20)),
+        "solver_fingerprint": (
+            getattr(adapter, "solver_fingerprint", None)
+            if adapter is not None
+            else loaded_profile_meta.get("solver_fingerprint")
+        ),
         "context_len": int(
             getattr(adapter, "context_len", wam_cfg.get("context_len", 128))
         ),

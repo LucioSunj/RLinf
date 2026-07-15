@@ -1052,10 +1052,14 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
 
         if str(self.cfg.actor.model.model_type) == "gate_policy":
             from rlinf.models.embodiment.gate_policy.bc import (
+                build_gate_training_provenance,
                 build_gate_policy_sidecar_metadata,
             )
 
             self._gate_sidecar_metadata = build_gate_policy_sidecar_metadata(model)
+            self._gate_sidecar_metadata["training"] = (
+                build_gate_training_provenance(self.cfg)
+            )
 
         return model
 
@@ -1093,19 +1097,37 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
                 raise ValueError(
                     f"GatePolicy resume checkpoint is missing {sidecar_path}."
                 )
-            with open(sidecar_path, encoding="utf-8") as handle:
-                actual = json.load(handle)
-            expected = self._gate_sidecar_metadata or {}
-            mismatches = {
-                key: (actual.get(key), expected.get(key))
-                for key in ("kind", "schema_version", "gate", "wam_provenance")
-                if actual.get(key) != expected.get(key)
-            }
-            if mismatches:
+            try:
+                with open(sidecar_path, encoding="utf-8") as handle:
+                    actual = json.load(handle)
+            except (OSError, json.JSONDecodeError) as exc:
                 raise ValueError(
-                    "GatePolicy resume provenance does not match the configured "
-                    f"task/WAM contract: {mismatches}"
+                    f"GatePolicy resume checkpoint has invalid provenance: {exc}"
+                ) from exc
+            expected = self._gate_sidecar_metadata or {}
+            from rlinf.models.embodiment.gate_policy.bc import (
+                validate_gate_rl_resume_metadata,
+            )
+
+            checkpoint_dir_name = os.path.basename(
+                os.path.dirname(os.path.normpath(load_path))
+            )
+            if not checkpoint_dir_name.startswith("global_step_"):
+                raise ValueError(
+                    "GatePolicy resume actor path must live under a "
+                    "global_step_<integer> directory"
                 )
+            try:
+                expected_step = int(
+                    checkpoint_dir_name.removeprefix("global_step_")
+                )
+            except ValueError as exc:
+                raise ValueError(
+                    "GatePolicy resume actor path has an invalid checkpoint step"
+                ) from exc
+            validate_gate_rl_resume_metadata(
+                actual, expected, expected_step=expected_step
+            )
         super().load_checkpoint(load_path)
 
     def get_rollout_state_dict(self) -> dict:
@@ -1288,6 +1310,24 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
             self.rollout_batch.update({"loss_mask_sum": kwargs["loss_mask_sum"]})
 
         rollout_metrics = compute_rollout_metrics(self.rollout_batch)
+        if (
+            str(self.cfg.actor.model.model_type) == "gate_policy"
+            and str(self.cfg.algorithm.adv_type) == "grpo"
+        ):
+            from rlinf.models.embodiment.gate_policy.diagnostics import (
+                compute_grpo_group_diagnostics,
+            )
+
+            rollout_metrics.update(
+                compute_grpo_group_diagnostics(
+                    rewards=self.rollout_batch["rewards"],
+                    dones=self.rollout_batch["dones"],
+                    advantages=self.rollout_batch["advantages"],
+                    loss_mask=self.rollout_batch.get("loss_mask"),
+                    group_size=int(self.cfg.algorithm.group_size),
+                    reward_type=str(self.cfg.algorithm.reward_type),
+                )
+            )
         return rollout_metrics
 
     def _build_sft_data_loader(self):

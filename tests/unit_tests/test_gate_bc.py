@@ -377,6 +377,108 @@ def _install_sidecar_fastwam_stub(monkeypatch):
     return adaptive
 
 
+def _training_cfg(*, checkpoint=None):
+    gate = {
+        "bc_init_path": checkpoint,
+        "explore_eps": 0.1,
+        "kl_prior": {
+            "enabled": checkpoint is not None,
+            "path": checkpoint,
+            "beta": 0.05,
+            "beta_end": 0.0,
+            "decay_steps": 200,
+        },
+    }
+    return {
+        "actor": {"seed": 13, "model": {"gate": gate}},
+        "runner": {"ckpt_path": checkpoint},
+        "algorithm": {
+            "adv_type": "grpo",
+            "loss_type": "actor",
+            "reward_type": "chunk_level",
+            "group_size": 8,
+            "normalize_advantages": True,
+            "update_epoch": 2,
+            "entropy_bonus": 0.01,
+        },
+        "gate_reward": {
+            "w_success": 1.0,
+            "lambda_start": 0.0,
+            "lambda_cost": 0.05,
+            "lambda_warmup_steps": 200,
+        },
+        "gate_diagnostics": {
+            "collapse": {"enabled": True, "target_idm_usage": 0.5}
+        },
+    }
+
+
+def test_gate_training_provenance_binds_init_objective_and_budget(tmp_path):
+    scratch_cfg = _training_cfg()
+    scratch_cfg["gate_diagnostics"]["evidence_run_id"] = "a" * 64
+    scratch = bc.build_gate_training_provenance(scratch_cfg)
+    assert scratch["seed"] == 13
+    assert scratch["target_idm_usage"] == 0.5
+    assert scratch["evidence_run_id"] == "a" * 64
+    assert scratch["collapse"]["enabled"] is True
+    assert scratch["initialization"]["kind"] == "scratch"
+    assert scratch["objective"]["group_size"] == 8
+    assert scratch["reward"]["lambda_warmup_steps"] == 200
+
+    checkpoint = tmp_path / "uplift.pt"
+    checkpoint.write_bytes(b"checkpoint")
+    (tmp_path / "uplift.pt.meta.json").write_text(
+        '{"kind":"gate_uplift","schema_version":1}', encoding="utf-8"
+    )
+    provenance = bc.build_gate_training_provenance(
+        _training_cfg(checkpoint=str(checkpoint))
+    )
+    assert provenance["initialization"]["kind"] == "gate_uplift"
+    assert len(provenance["initialization"]["checkpoint_sha256"]) == 64
+    assert provenance["kl_prior"]["checkpoint_sha256"] == (
+        provenance["initialization"]["checkpoint_sha256"]
+    )
+
+    other = tmp_path / "other.pt"
+    other.write_bytes(b"other")
+    bad = _training_cfg(checkpoint=str(checkpoint))
+    bad["runner"]["ckpt_path"] = str(other)
+    with pytest.raises(ValueError, match="same Gate initialization"):
+        bc.build_gate_training_provenance(bad)
+
+    invalid_run_id = _training_cfg()
+    invalid_run_id["gate_diagnostics"]["evidence_run_id"] = "not-a-sha"
+    with pytest.raises(ValueError, match="evidence_run_id"):
+        bc.build_gate_training_provenance(invalid_run_id)
+
+
+def test_gate_rl_resume_metadata_rejects_changed_training_contract():
+    expected = {
+        "kind": "gate_rl",
+        "schema_version": 1,
+        "step": 20,
+        "gate": {"hidden_sizes": [16, 16]},
+        "wam_provenance": {"ckpt_fingerprint": "w" * 64},
+        "training": {"seed": 3, "target_idm_usage": 0.5},
+    }
+    bc.validate_gate_rl_resume_metadata(dict(expected), expected)
+    bc.validate_gate_rl_resume_metadata(
+        dict(expected), expected, expected_step=20
+    )
+    changed = {
+        **expected,
+        "training": {"seed": 4, "target_idm_usage": 0.5},
+    }
+    with pytest.raises(ValueError, match="training contract"):
+        bc.validate_gate_rl_resume_metadata(changed, expected)
+    with pytest.raises(ValueError, match="JSON object"):
+        bc.validate_gate_rl_resume_metadata([], expected)
+    with pytest.raises(ValueError, match="sidecar step"):
+        bc.validate_gate_rl_resume_metadata(
+            dict(expected), expected, expected_step=19
+        )
+
+
 def _valid_bc_metadata(policy, adaptive):
     policy.bc_expected_provenance = {
         "task": "unit_task",
@@ -385,6 +487,7 @@ def _valid_bc_metadata(policy, adaptive):
         "dataset_stats_fingerprint": "unit_stats_sha256",
         "num_video_frames": 9,
         "inference_steps": 20,
+        "solver_fingerprint": "unit_solver_sha256",
         "context_len": 128,
         "model_dtype": "torch.bfloat16",
         "exec_horizon": 10,
@@ -406,6 +509,7 @@ def _valid_bc_metadata(policy, adaptive):
             "dataset_stats_fingerprint": "unit_stats_sha256",
             "num_video_frames": 9,
             "inference_steps": 20,
+            "solver_fingerprint": "unit_solver_sha256",
             "context_len": 128,
             "model_dtype": "torch.bfloat16",
             "exec_horizon": 10,
@@ -489,6 +593,7 @@ def test_bc_sidecar_resolves_expected_wam_from_cost_profile(tmp_path, monkeypatc
         "dataset_stats_fingerprint": "unit_stats_sha256",
         "num_video_frames": 9,
         "inference_steps": 20,
+        "solver_fingerprint": "unit_solver_sha256",
         "context_len": 128,
         "model_dtype": "torch.bfloat16",
         "exec_horizon": 10,

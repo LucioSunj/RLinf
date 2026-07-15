@@ -48,6 +48,15 @@ import torch.nn as nn
 from torch.distributions.categorical import Categorical
 from torch.distributions.kl import kl_divergence
 
+from rlinf.models.embodiment.gate_policy.control_eval import (
+    configured_control_kind,
+)
+from rlinf.models.embodiment.gate_policy.mode_selectors import (
+    ForcedModeSelector,
+    ModeSelection,
+    build_eval_mode_selector,
+    normalize_gate_context,
+)
 from rlinf.models.embodiment.gate_policy.obs_preprocessor import pool_text_context
 
 from rlinf.models.embodiment.base_policy import BasePolicy, ForwardType
@@ -80,6 +89,9 @@ class GatePolicy(nn.Module, BasePolicy):
         activation: str = "tanh",
         explore_eps: float = 0.0,
         force_mode: Optional[int] = None,
+        eval_policy=None,
+        eval_control=None,
+        eval_control_runtime=None,
         allow_legacy_gate_checkpoint: bool = False,
         kl_prior_beta: float = 0.0,
         kl_prior_beta_end: float = 0.0,
@@ -120,6 +132,46 @@ class GatePolicy(nn.Module, BasePolicy):
             raise ValueError("force_mode must be null, 0 (UNCOND), or 1 (IDM)")
         if self.force_mode not in (None, 0, 1):
             raise ValueError("force_mode must be null, 0 (UNCOND), or 1 (IDM)")
+        self.eval_mode_selector = build_eval_mode_selector(eval_policy)
+        self.eval_control_kind = configured_control_kind(eval_control)
+        self.eval_control_runtime = eval_control_runtime
+        if self.eval_control_kind is not None:
+            if self.force_mode is not None:
+                raise ValueError(
+                    "gate.force_mode cannot be combined with gate.eval_control"
+                )
+            if self.eval_mode_selector.kind != "learned":
+                raise ValueError(
+                    "gate.eval_control owns the evaluation intervention and cannot "
+                    "be combined with a non-learned gate.eval_policy"
+                )
+            if (
+                self.eval_control_runtime is not None
+                and self.eval_control_runtime.kind != self.eval_control_kind
+            ):
+                raise ValueError(
+                    "configured eval-control kind does not match its runtime: "
+                    f"{self.eval_control_kind!r} vs "
+                    f"{self.eval_control_runtime.kind!r}"
+                )
+        if self.force_mode is not None:
+            if self.eval_mode_selector.kind != "learned":
+                configured_mode = getattr(self.eval_mode_selector, "mode", None)
+                if not (
+                    self.eval_mode_selector.kind == "forced"
+                    and configured_mode == self.force_mode
+                ):
+                    raise ValueError(
+                        "legacy gate.force_mode conflicts with gate.eval_policy; "
+                        "prefer eval_policy.kind=forced"
+                    )
+            self.eval_mode_selector = ForcedModeSelector(
+                mode=self.force_mode,
+                max_decisions=self.eval_mode_selector.max_decisions,
+                seed=self.eval_mode_selector.seed,
+            )
+        self.eval_trace_path: Optional[str] = None
+        self.wam_checkpoint_sha256: Optional[str] = None
         self.allow_legacy_gate_checkpoint = bool(allow_legacy_gate_checkpoint)
         # Discrete mode is the policy-gradient action (one per chunk-step).
         self.action_dim = 1
@@ -260,6 +312,84 @@ class GatePolicy(nn.Module, BasePolicy):
     def set_global_step(self, global_step: int) -> None:
         """Set the optimizer/global runner step used by the KL decay schedule."""
         self.global_step = max(int(global_step), 0)
+
+    @property
+    def effective_eval_method(self) -> str:
+        if self.eval_control_kind is not None:
+            return f"control:{self.eval_control_kind}"
+        return self.eval_mode_selector.kind
+
+    @property
+    def effective_eval_max_decisions(self) -> int:
+        return int(self.eval_mode_selector.max_decisions)
+
+    def effective_eval_provenance(self) -> dict:
+        if self.eval_control_kind is None:
+            return self.eval_mode_selector.provenance()
+        if self.eval_control_runtime is None:
+            raise RuntimeError(
+                "evaluation control is configured but its FastWAM runtime was not "
+                "loaded; evaluation requires rollout.model.load_wam=true"
+            )
+        return {
+            **self.eval_control_runtime.provenance(),
+            "max_decisions": self.effective_eval_max_decisions,
+        }
+
+    def attach_eval_control_runtime(self, runtime) -> None:
+        if self.eval_control_kind is None:
+            raise ValueError(
+                "cannot attach an evaluation-control runtime when "
+                "gate.eval_control.kind is null"
+            )
+        if runtime is None or runtime.kind != self.eval_control_kind:
+            actual = None if runtime is None else runtime.kind
+            raise ValueError(
+                "configured eval-control kind does not match its runtime: "
+                f"{self.eval_control_kind!r} vs {actual!r}"
+            )
+        self.eval_control_runtime = runtime
+
+    def _select_eval_control(
+        self,
+        logits: torch.Tensor,
+        gate_context,
+    ) -> ModeSelection:
+        runtime = self.eval_control_runtime
+        if runtime is None:
+            raise RuntimeError(
+                "evaluation control is configured but its FastWAM runtime was not "
+                "loaded; evaluation requires rollout.model.load_wam=true"
+            )
+        normalized = normalize_gate_context(
+            gate_context,
+            batch_size=int(logits.shape[0]),
+            device=logits.device,
+            max_decisions=self.effective_eval_max_decisions,
+            # The runtime validates phase only for active shuffled samples. This
+            # lets fixed-horizon reference inference continue after absorption.
+            require_phase=False,
+        )
+        branch_mode = int(runtime.branch_mode)
+        modes = torch.full(
+            (int(logits.shape[0]),),
+            branch_mode,
+            device=logits.device,
+            dtype=torch.long,
+        )
+        reserved_modes = torch.full(
+            (int(logits.shape[0]), self.effective_eval_max_decisions),
+            branch_mode,
+            device=logits.device,
+            dtype=torch.long,
+        )
+        return ModeSelection(
+            modes=modes,
+            method=self.effective_eval_method,
+            episode_uids=normalized.episode_uids,
+            decision_indices=normalized.decision_indices,
+            reserved_modes=reserved_modes,
+        )
 
     def current_kl_beta(self) -> float:
         if self.kl_prior_decay_steps <= 0:
@@ -404,16 +534,21 @@ class GatePolicy(nn.Module, BasePolicy):
         mode="train",
         **kwargs,
     ):
-        if self.wam_adapter is None:
-            raise RuntimeError(
-                "GatePolicy.wam_adapter is not set (inject the frozen WAMModeAdapter)."
-            )
         if mode not in ("train", "eval"):
             raise ValueError(f"mode must be `train` or `eval`, got {mode!r}")
+        if self.eval_control_kind is not None and mode == "train":
+            raise RuntimeError(
+                "gate.eval_control is evaluation-only and cannot be used in a "
+                "training rollout"
+            )
         if self.force_mode is not None and mode == "train":
             raise RuntimeError(
                 "force_mode is evaluation-only; training with forced modes "
                 "would invalidate the stored behavior logprob."
+            )
+        if self.wam_adapter is None:
+            raise RuntimeError(
+                "GatePolicy.wam_adapter is not set (inject the frozen WAMModeAdapter)."
             )
         device = self._device()
         inputs = self.preprocess_env_obs(env_obs)
@@ -439,13 +574,19 @@ class GatePolicy(nn.Module, BasePolicy):
         logits = self._logits(gate_input)
         eps = float(self.explore_eps) if mode == "train" else 0.0
         base_dist, policy_dist = self._policy_distributions(logits, eps)
-        if self.force_mode is not None:
-            mode_idx = torch.full(
-                (batch,), self.force_mode, device=logits.device, dtype=torch.long
+        selection = None
+        if mode == "eval":
+            gate_context = (
+                env_obs.get("gate_context")
+                if isinstance(env_obs, dict)
+                else None
             )
-            chunk_logprobs = base_dist.log_prob(mode_idx).unsqueeze(-1).float()
-        elif mode != "train":
-            mode_idx = torch.argmax(logits, dim=-1)
+            selection = (
+                self._select_eval_control(logits, gate_context)
+                if self.eval_control_kind is not None
+                else self.eval_mode_selector.select(logits, gate_context)
+            )
+            mode_idx = selection.modes
             chunk_logprobs = base_dist.log_prob(mode_idx).unsqueeze(-1).float()
         else:
             mode_idx = policy_dist.sample()
@@ -457,18 +598,32 @@ class GatePolicy(nn.Module, BasePolicy):
         )
 
         # Run the frozen WAM in the chosen mode per env -> robot action chunk + cost.
-        robot_chunks, costs = [], []
+        robot_chunks, costs, control_artifacts = [], [], []
         for i in range(batch):
-            out = self.wam_adapter.act(
-                input_image=input_image[i : i + 1],
-                mode=int(mode_idx[i].item()),
-                proprio=proprio[i : i + 1] if proprio.ndim == 2 else None,
-                context=context[i : i + 1],
-                context_mask=context_mask[i : i + 1],
-                encoded_state=encoded_states[i],
-            )
+            common = {
+                "input_image": input_image[i : i + 1],
+                "proprio": proprio[i : i + 1] if proprio.ndim == 2 else None,
+                "context": context[i : i + 1],
+                "context_mask": context_mask[i : i + 1],
+                "encoded_state": encoded_states[i],
+            }
+            if self.eval_control_kind is not None:
+                out = self.eval_control_runtime.act(
+                    self.wam_adapter,
+                    **common,
+                    gate_context=gate_context,
+                    batch_index=i,
+                )
+            else:
+                out = self.wam_adapter.act(
+                    mode=int(mode_idx[i].item()),
+                    **common,
+                )
             robot_chunks.append(out["action_chunk"])
             costs.append(out["cost"])
+            control_artifacts.append(
+                dict(out.get("aux", {})).get("donor_artifact")
+            )
         # FastWAM returns decoded robot chunks on CPU. Keep them there: action
         # denormalization/gripper conversion is CPU work and the rollout channel
         # ultimately sends CPU tensors to the environment. Only gate features and
@@ -506,6 +661,25 @@ class GatePolicy(nn.Module, BasePolicy):
             "mode_cost": mode_cost.squeeze(-1),
             "mode_logits": logits.detach().float(),
         }
+        if selection is not None:
+            result.update(
+                {
+                    "eval_policy_method": selection.method,
+                    "eval_policy_provenance": self.effective_eval_provenance(),
+                    "reserved_modes": (
+                        None
+                        if selection.reserved_modes is None
+                        else selection.reserved_modes.detach().cpu()
+                    ),
+                    "schedule_decision_index": (
+                        None
+                        if selection.decision_indices is None
+                        else selection.decision_indices.detach().cpu()
+                    ),
+                }
+            )
+        if self.eval_control_kind is not None:
+            result["control_artifacts"] = control_artifacts
         return chunk_actions, result
 
     def forward(self, forward_type=ForwardType.DEFAULT, **kwargs):

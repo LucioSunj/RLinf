@@ -9,6 +9,16 @@ max_steps_per_rollout_epoch: 512
 max_episode_steps: 512 # max episode steps for truncation
 use_fixed_reset_state_ids: True
 use_ordered_reset_state_ids: False
+# Frozen LIBERO-Plus manifests. Leave null outside adaptive-gate experiments;
+# declaring the keys here keeps launchers on normal Hydra overrides (no `+key`).
+episode_manifest_path: null
+test_episode_manifest_path: null
+gate_exec_horizon: null
+# Dotted task-specific callback evaluated only from the current pre-action state.
+gate_phase_fn: null
+# Official LIBERO-Plus exports the benchmark as `libero`. A nonstandard checkout
+# must set the same value in LIBERO_PLUS_IMPORT_MODULE before Python starts.
+libero_import_module: null
 
 use_rel_reward: True
 reward_coef: 5.0
