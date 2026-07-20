@@ -73,6 +73,6 @@ merge_plus_suite_traces "${PLUS_FULL_MANIFEST}" "${TRACE}" \
 if [[ "${DRY_RUN}" -eq 0 ]]; then
     require_file "${TRACE}"
 fi
-run_command python "${DECISION_TOOL}" p0 --check uplift_bc_only_trace_complete \
+run_command python "${DECISION_TOOL}" contract --check uplift_bc_only_trace_complete \
     --evidence "${TRACE}" --out "${RUN_DIR}/decision.json"
 write_full_run_manifest "${RUN_DIR}/run_manifest.json"

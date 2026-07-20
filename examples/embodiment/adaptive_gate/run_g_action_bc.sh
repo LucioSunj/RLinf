@@ -44,6 +44,6 @@ if [[ "${DRY_RUN}" -eq 0 ]]; then
     require_file "${OUT}"
     require_file "${OUT}.meta.json"
 fi
-run_command python "${DECISION_TOOL}" p0 --check g_action_bc_contract \
+run_command python "${DECISION_TOOL}" contract --check g_action_bc_contract \
     --evidence "${OUT}.meta.json" --out "${RUN_DIR}/decision.json"
 write_full_run_manifest "${RUN_DIR}/run_manifest.json"

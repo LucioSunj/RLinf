@@ -88,7 +88,7 @@ if [[ "${DRY_RUN}" -eq 0 ]]; then
     require_file "${OUT}.oof.pt"
     require_file "${DIFFICULTY_OUT}"
 fi
-run_command python "${DECISION_TOOL}" p0 \
+run_command python "${DECISION_TOOL}" contract \
     --check gate_uplift_and_difficulty_crossfit_contract \
     --evidence "${OUT}.meta.json" --out "${RUN_DIR}/decision.json"
 write_full_run_manifest "${RUN_DIR}/run_manifest.json"

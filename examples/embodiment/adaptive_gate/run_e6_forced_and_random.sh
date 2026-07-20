@@ -156,6 +156,6 @@ if [[ "${DRY_RUN}" -eq 0 ]]; then
     require_file "${INDEX}"
 fi
 run_command python "${TRACE_INDEX_TOOL}" validate --index "${INDEX}"
-run_command python "${DECISION_TOOL}" p0 --check e6_forced_and_matched_random_complete \
+run_command python "${DECISION_TOOL}" contract --check e6_forced_and_matched_random_complete \
     --evidence "${INDEX}" --out "${RUN_DIR}/decision.json"
 write_full_run_manifest "${RUN_DIR}/run_manifest.json"

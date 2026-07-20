@@ -48,6 +48,6 @@ for override in "${CONFIG_OVERRIDES[@]}"; do
     CMD+=(--config-override "${override}")
 done
 run_command "${CMD[@]}"
-run_command python "${DECISION_TOOL}" p0 --check libero_plus_snapshot_roundtrip \
+run_command python "${DECISION_TOOL}" contract --check libero_plus_snapshot_roundtrip \
     --evidence "${PAIRED_TRAIN_MANIFEST}" --out "${RUN_DIR}/decision.json"
 write_full_run_manifest "${RUN_DIR}/run_manifest.json"

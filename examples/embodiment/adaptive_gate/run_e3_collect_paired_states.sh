@@ -130,7 +130,7 @@ VALIDATE_CMD=(
     --summary-out "${RUN_DIR}/paired_validation.json"
 )
 run_command "${VALIDATE_CMD[@]}"
-run_command python "${DECISION_TOOL}" p0 \
+run_command python "${DECISION_TOOL}" contract \
     --check paired_v1_collection_contract \
     --evidence "${RUN_DIR}/paired_validation.json" \
     --out "${RUN_DIR}/decision.json"
