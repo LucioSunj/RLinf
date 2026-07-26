@@ -65,8 +65,20 @@ from typing import Any, Mapping
 __test__ = False
 
 #: Schema of the committed disjointness audit consumed by
-#: :func:`assert_disjoint_audit`.  Produced by the stage-2 asset-split tool.
-DISJOINT_AUDIT_SCHEMA = "stage2-disjoint-audit-v1"
+#: :func:`assert_disjoint_audit`.  This is the PREREGISTERED producer contract
+#: emitted by the outer repo's ``scripts/stage2/split_plus_assets.py audit``
+#: subcommand and documented in ``docs/stage2/DEV_SET.md``; the lane-D work
+#: order explicitly forbids inventing a different schema here.  Locked by a
+#: drift test in ``tests/unit_tests/test_test_set_guard.py``.
+DISJOINT_AUDIT_SCHEMA = "dev-test-disjoint-audit-v1"
+
+#: Fully qualified name of the validator the audit producer runs for every
+#: manifest pair, recorded verbatim in each ``pairs`` row.  An audit whose rows
+#: were produced by anything else is not evidence of disjointness on the
+#: preregistered dimensions.  Locked to the real function by a drift test.
+DISJOINT_AUDIT_VALIDATOR = (
+    "rlinf.envs.libero.episode_manifest.validate_manifest_disjoint"
+)
 
 #: Environment half of the two-key final-evaluation lock.
 FINAL_EVAL_ENV_VAR = "STAGE2_FINAL_EVAL"
@@ -83,12 +95,14 @@ TEST_SPLIT = "test"
 #: Every split ``load_frozen_episode_manifest`` is allowed to return.
 KNOWN_SPLITS = frozenset(TRAINING_SPLITS | {TEST_SPLIT})
 
-#: Dimension keys a disjointness audit must report, mirroring the keys returned
-#: by ``rlinf.envs.libero.episode_manifest.validate_manifest_disjoint``.  The two
-#: are locked together by a drift test in
-#: ``tests/unit_tests/test_test_set_guard.py``; if a dimension is ever added to
-#: the validator, that test fails and previously written audits stop being
-#: accepted here rather than silently passing with an unchecked dimension.
+#: Preregistered dimension coverage of ``validate_manifest_disjoint``.  The
+#: ``dev-test-disjoint-audit-v1`` payload does not enumerate dimensions - its
+#: coverage comes from the producer invoking the validator itself - so this
+#: constant locks the VALIDATOR's coverage via a drift test in
+#: ``tests/unit_tests/test_test_set_guard.py``.  If the validator's coverage
+#: ever changes, that test fails, forcing an explicit schema/coverage review
+#: instead of previously written audits silently becoming weaker (or stronger)
+#: than what was preregistered.
 REQUIRED_AUDIT_DIMENSIONS = frozenset(
     {"env_seed", "reset_state", "perturbation_id", "asset_id"}
 )
@@ -218,22 +232,14 @@ def assert_training_manifest(
     )
 
 
-def _audit_side(
-    record: Mapping[str, Any], key: str, *, context: str
-) -> Mapping[str, Any]:
-    side = record.get(key)
-    if not isinstance(side, Mapping):
-        raise HeldOutSplitError(
-            f"{context}: disjointness audit is missing the {key!r} object"
-        )
-    return side
-
-
-def _audit_text(side: Mapping[str, Any], key: str, *, context: str, where: str) -> str:
-    value = side.get(key)
+def _audit_entry_text(
+    entry: Mapping[str, Any], key: str, *, context: str, name: str
+) -> str:
+    value = entry.get(key)
     if not isinstance(value, str) or not value:
         raise HeldOutSplitError(
-            f"{context}: disjointness audit {where}.{key} must be a non-empty string"
+            f"{context}: disjointness audit manifests[{name!r}].{key} must be "
+            "a non-empty string"
         )
     return value
 
@@ -244,14 +250,23 @@ def assert_disjoint_audit(
     *,
     context: str,
 ) -> dict[str, Any]:
-    """Validate a committed disjointness audit against the manifest in hand.
+    """Validate a committed ``dev-test-disjoint-audit-v1`` record.
 
     ``LiberoEnv`` recomputes disjointness inline whenever it drives the
     simulator, so this function exists for the paths that do not: offline label,
     uplift, and reporting tools that consume a frozen manifest without ever
     constructing an environment.  It verifies that the audit really pertains to
-    *this* manifest and that it covers every dimension the validator checks
-    today, so a stale or mismatched record cannot be passed off as evidence.
+    *this* manifest and that the producer found it disjoint from the frozen
+    held-out manifest, so a stale or mismatched record cannot be passed off as
+    evidence.
+
+    The payload shape is the producer's, verbatim (outer repo,
+    ``scripts/stage2/split_plus_assets.py audit``): top-level ``schema``,
+    ``libero_plus_commit``, ``manifests`` (name -> ``{path, file_sha256, split,
+    episodes}``), ``pairs`` (rows with ``primary``/``heldout`` manifest names,
+    ``validator``, ``status`` of ``"disjoint"`` or ``"OVERLAP"``, and ``detail``
+    that is ``null`` exactly when the pair is disjoint), and ``ok`` which the
+    producer sets to true only when NO pair overlapped.
 
     Identity is keyed on ``file_sha256`` rather than ``sha256``: for a per-suite
     partition ``sha256`` is deliberately the *parent* manifest's hash, so it
@@ -266,8 +281,7 @@ def assert_disjoint_audit(
         The parsed audit record.
 
     Raises:
-        HeldOutSplitError: On any schema, identity, coverage, or
-            non-empty-intersection failure.
+        HeldOutSplitError: On any schema, identity, commit, or overlap failure.
     """
     try:
         record = json.loads(Path(audit_path).read_text(encoding="utf-8"))
@@ -286,80 +300,155 @@ def assert_disjoint_audit(
             f"{context}: disjointness audit schema must be "
             f"{DISJOINT_AUDIT_SCHEMA!r}, got {record.get('schema')!r}"
         )
-
-    train_side = _audit_side(record, "train_manifest", context=context)
-    test_side = _audit_side(record, "test_manifest", context=context)
-
-    train_split = _audit_text(
-        train_side, "split", context=context, where="train_manifest"
-    )
-    if train_split not in TRAINING_SPLITS:
+    # Literal True, not truthiness: the producer writes ``ok`` only after every
+    # validator pair came back clean, and a stringly "true" (or 1) is a forged
+    # or hand-edited record, not evidence.
+    if record.get("ok") is not True:
         raise HeldOutSplitError(
-            f"{context}: disjointness audit train side has split {train_split!r}; "
-            f"expected one of {sorted(TRAINING_SPLITS)}"
-        )
-    test_split = _audit_text(test_side, "split", context=context, where="test_manifest")
-    if test_split != TEST_SPLIT:
-        raise HeldOutSplitError(
-            f"{context}: disjointness audit held-out side has split "
-            f"{test_split!r}; expected {TEST_SPLIT!r}"
+            f"{context}: disjointness audit records ok={record.get('ok')!r}; "
+            "only an audit whose producer found every pair disjoint (ok: true) "
+            "can vouch for a training manifest"
         )
 
-    audited = _audit_text(
-        train_side, "file_sha256", context=context, where="train_manifest"
-    )
-    actual = getattr(train_manifest, "file_sha256", None)
-    if not isinstance(actual, str) or not actual:
+    manifests = record.get("manifests")
+    if not isinstance(manifests, Mapping) or not manifests:
+        raise HeldOutSplitError(
+            f"{context}: disjointness audit is missing the 'manifests' object"
+        )
+
+    actual_sha = getattr(train_manifest, "file_sha256", None)
+    if not isinstance(actual_sha, str) or not actual_sha:
         raise HeldOutSplitError(
             f"{context}: cannot verify the disjointness audit because the "
             "manifest in hand exposes no file_sha256"
         )
-    if audited != actual:
+
+    matches: list[str] = []
+    test_names: list[str] = []
+    for name, entry in manifests.items():
+        if not isinstance(entry, Mapping):
+            raise HeldOutSplitError(
+                f"{context}: disjointness audit manifests[{name!r}] must be "
+                "an object"
+            )
+        entry_split = _audit_entry_text(entry, "split", context=context, name=name)
+        entry_sha = _audit_entry_text(entry, "file_sha256", context=context, name=name)
+        if entry_sha == actual_sha:
+            matches.append(name)
+        if entry_split == TEST_SPLIT:
+            test_names.append(name)
+
+    if not matches:
         raise HeldOutSplitError(
             f"{context}: disjointness audit was written for a different "
-            f"manifest (audit file_sha256={audited}, in-hand={actual}). "
+            f"manifest (no manifests entry has file_sha256={actual_sha}). "
             "Regenerate the audit for the manifest actually being used."
         )
+    if len(matches) > 1:
+        raise HeldOutSplitError(
+            f"{context}: disjointness audit is ambiguous - manifests entries "
+            f"{sorted(matches)} all carry file_sha256={actual_sha}"
+        )
+    train_name = matches[0]
+    train_split = manifests[train_name]["split"]
+    if train_split not in TRAINING_SPLITS:
+        raise HeldOutSplitError(
+            f"{context}: disjointness audit entry {train_name!r} matching the "
+            f"manifest in hand has split {train_split!r}; expected one of "
+            f"{sorted(TRAINING_SPLITS)}"
+        )
+    declared_split = getattr(train_manifest, "split", None)
+    if (
+        isinstance(declared_split, str)
+        and declared_split
+        and declared_split != train_split
+    ):
+        raise HeldOutSplitError(
+            f"{context}: disjointness audit entry {train_name!r} records split "
+            f"{train_split!r} but the manifest in hand declares "
+            f"{declared_split!r}; refusing a relabelled record"
+        )
 
-    audited_commit = train_side.get("libero_plus_commit") or record.get(
-        "libero_plus_commit"
-    )
+    if len(test_names) != 1:
+        raise HeldOutSplitError(
+            f"{context}: disjointness audit must contain exactly one "
+            f"split={TEST_SPLIT!r} manifests entry, found {sorted(test_names)}"
+        )
+    test_name = test_names[0]
+
+    # The audit must pin the LIBERO-Plus checkout and it must be the one the
+    # manifest in hand was frozen against.  Both sides are required: an audit
+    # without a commit, or a manifest that cannot say which checkout it came
+    # from, cannot be tied to the frozen held-out data and is refused.
     actual_commit = getattr(train_manifest, "libero_plus_commit", None)
-    if isinstance(actual_commit, str) and actual_commit:
-        if audited_commit != actual_commit:
-            raise HeldOutSplitError(
-                f"{context}: disjointness audit libero_plus_commit "
-                f"{audited_commit!r} does not match the manifest's "
-                f"{actual_commit!r}"
-            )
+    if not isinstance(actual_commit, str) or not actual_commit:
+        raise HeldOutSplitError(
+            f"{context}: the manifest in hand exposes no libero_plus_commit, "
+            "so the audit's pinned checkout cannot be verified; refusing"
+        )
+    audited_commit = record.get("libero_plus_commit")
+    if not isinstance(audited_commit, str) or not audited_commit:
+        raise HeldOutSplitError(
+            f"{context}: disjointness audit has no top-level "
+            "libero_plus_commit; an audit that does not pin the LIBERO-Plus "
+            "checkout cannot vouch for a frozen manifest"
+        )
+    if audited_commit != actual_commit:
+        raise HeldOutSplitError(
+            f"{context}: disjointness audit libero_plus_commit "
+            f"{audited_commit!r} does not match the manifest's "
+            f"{actual_commit!r}"
+        )
 
-    dimensions = record.get("dimensions")
-    if not isinstance(dimensions, Mapping):
+    pairs = record.get("pairs")
+    if not isinstance(pairs, (list, tuple)) or not pairs:
         raise HeldOutSplitError(
-            f"{context}: disjointness audit is missing the 'dimensions' object"
+            f"{context}: disjointness audit is missing the 'pairs' list"
         )
-    reported = frozenset(dimensions)
-    if reported != REQUIRED_AUDIT_DIMENSIONS:
-        missing = sorted(REQUIRED_AUDIT_DIMENSIONS - reported)
-        extra = sorted(reported - REQUIRED_AUDIT_DIMENSIONS)
+    wanted = {train_name, test_name}
+    covered = False
+    for index, row in enumerate(pairs):
+        if not isinstance(row, Mapping):
+            raise HeldOutSplitError(
+                f"{context}: disjointness audit pairs[{index}] must be an object"
+            )
+        primary = row.get("primary")
+        heldout = row.get("heldout")
+        status = row.get("status")
+        detail = row.get("detail")
+        # The producer writes status="disjoint" with detail=null for a clean
+        # pair and status="OVERLAP" with the validator's message otherwise.
+        # ``ok`` is true only when no pair overlapped, so ANY non-disjoint row
+        # in an ok-true audit is a forged or hand-edited record.
+        if status != "disjoint":
+            raise HeldOutSplitError(
+                f"{context}: disjointness audit pair ({primary!r} vs "
+                f"{heldout!r}) reports status={status!r}"
+                + (f" with detail {detail!r}" if detail is not None else "")
+                + "; the manifests share held-out identities and must be "
+                "regenerated"
+            )
+        if detail is not None:
+            raise HeldOutSplitError(
+                f"{context}: disjointness audit pair ({primary!r} vs "
+                f"{heldout!r}) is marked disjoint but carries a non-null "
+                f"detail {detail!r}; refusing an ambiguous row"
+            )
+        if row.get("validator") != DISJOINT_AUDIT_VALIDATOR:
+            raise HeldOutSplitError(
+                f"{context}: disjointness audit pair ({primary!r} vs "
+                f"{heldout!r}) was not produced by "
+                f"{DISJOINT_AUDIT_VALIDATOR!r} (got {row.get('validator')!r})"
+            )
+        if {primary, heldout} == wanted:
+            covered = True
+    if not covered:
         raise HeldOutSplitError(
-            f"{context}: disjointness audit dimensions must be exactly "
-            f"{sorted(REQUIRED_AUDIT_DIMENSIONS)}; missing={missing}, "
-            f"unexpected={extra}"
+            f"{context}: disjointness audit contains no pair covering "
+            f"({train_name!r} vs {test_name!r}); it cannot vouch for "
+            "disjointness between the manifest in hand and the held-out test "
+            "manifest"
         )
-    for name in sorted(REQUIRED_AUDIT_DIMENSIONS):
-        overlap = dimensions[name]
-        if not isinstance(overlap, (list, tuple)):
-            raise HeldOutSplitError(
-                f"{context}: disjointness audit dimension {name!r} must be a "
-                f"list of overlapping values, got {type(overlap).__name__}"
-            )
-        if overlap:
-            raise HeldOutSplitError(
-                f"{context}: disjointness audit reports a non-empty overlap on "
-                f"{name!r}: {list(overlap)[:10]}. The train/validation manifest "
-                "shares held-out identities and must be regenerated."
-            )
     return dict(record)
 
 
