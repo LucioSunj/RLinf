@@ -1223,6 +1223,154 @@ class LiberoEnv(gym.Env):
         restore_process_rng_state(outer["main_process_rng"])
         return observation
 
+    def _snapshot_elapsed_steps(self, snapshot, env_idx) -> np.ndarray:
+        """Read the per-slot episode clocks recorded in a gate snapshot."""
+        outer = snapshot.get("outer")
+        per_env = outer.get("per_env") if isinstance(outer, dict) else None
+        if not isinstance(per_env, dict) or "_elapsed_steps" not in per_env:
+            raise ValueError(
+                "LIBERO gate snapshot is missing outer.per_env._elapsed_steps"
+            )
+        elapsed = np.asarray(per_env["_elapsed_steps"]).reshape(-1)
+        if len(elapsed) != len(env_idx):
+            raise ValueError(
+                f"LIBERO gate snapshot records {len(elapsed)} episode clocks for "
+                f"{len(env_idx)} targeted slots"
+            )
+        return elapsed.astype(np.int64)
+
+    def reset_from_snapshot(self, snapshot: dict[str, object], *, horizon_mode: str):
+        """Restore a gate snapshot as a rollout INITIAL STATE.
+
+        ``restore_gate_snapshot`` is a counterfactual-replay device: it rewinds
+        every counter, metric, RNG stream, and episode-scheduling cursor to
+        snapshot time.  This entry point instead produces the bookkeeping of a
+        freshly reset episode that happens to begin mid-task, so downstream
+        reward/horizon logic treats the restored state as a rollout start
+        (snapshot-grouped GRPO semantics).
+
+        ``horizon_mode``:
+
+        - ``"remaining"``: keep the restored per-slot ``elapsed_steps``, so the
+          episode still truncates at the original ``cfg.max_episode_steps``
+          horizon through the normal ``step()`` path.  Stage-2 semantics:
+          reward is success within the REMAINING budget.  ``infos["episode"]``
+          ``episode_len``/``reward`` therefore keep counting from the original
+          episode start.
+        - ``"fresh"``: zero the outer episode clock; the full outer horizon is
+          available from the restored state.  The worker-internal simulator
+          counters are still restored verbatim to their snapshot values (the
+          worker restore machinery is reused unchanged), so only the outer
+          clock is renumbered.
+
+        Per targeted slot this resets ``prev_step_reward``, ``success_once``,
+        ``fail_once``, ``returns``, and ``success_episode_len`` (via
+        ``_reset_metrics``), sets ``_elapsed_steps`` per ``horizon_mode``, and
+        advances ``_episode_generation`` past both its pre-call and snapshot
+        values so repeated starts from one snapshot get distinct episode uids.
+        Global scheduling state (``_generator``/``_generator_ordered``,
+        manifest cursor/order/batch, ``start_idx``, ``_is_start``, eval
+        statistics, and the main-process RNG) is preserved from before the
+        call rather than rewound to snapshot time.
+
+        Fails closed BEFORE mutating anything when the schema is wrong, the
+        targeted slots carry non-identical clocks, the ``"remaining"`` budget
+        is already exhausted, or a subset restore would leave the vector with
+        asynchronous per-slot clocks: ``gate_contract.
+        limit_gate_action_chunk_to_episode`` requires one shared remaining
+        budget across the whole vectorized batch, so a subset start is honored
+        only when every untouched slot already sits at the target clock.
+
+        Returns ``(obs, infos)`` mirroring ``reset()``.
+        """
+        if horizon_mode not in ("remaining", "fresh"):
+            raise ValueError(
+                "reset_from_snapshot horizon_mode must be 'remaining' or "
+                f"'fresh', got {horizon_mode!r}"
+            )
+        if snapshot.get("schema") != LIBERO_GATE_SNAPSHOT_SCHEMA:
+            raise ValueError(
+                f"unsupported LIBERO gate snapshot schema {snapshot.get('schema')!r}"
+            )
+        env_idx = self._normalize_snapshot_env_idx(snapshot.get("env_idx"))
+        snapshot_elapsed = self._snapshot_elapsed_steps(snapshot, env_idx)
+        unique_elapsed = np.unique(snapshot_elapsed)
+        if len(unique_elapsed) != 1:
+            raise ValueError(
+                "reset_from_snapshot requires one shared elapsed_steps across "
+                f"the targeted slots, got {snapshot_elapsed.tolist()}; "
+                "asynchronous episode clocks would invalidate the shared "
+                "fixed-width gate decision contract"
+            )
+        if horizon_mode == "remaining":
+            target_clock = int(unique_elapsed[0])
+            max_episode_steps = int(self.cfg.max_episode_steps)
+            if not 0 <= target_clock < max_episode_steps:
+                raise ValueError(
+                    f"snapshot elapsed_steps={target_clock} leaves no remaining "
+                    f"episode budget under max_episode_steps={max_episode_steps}; "
+                    "use horizon_mode='fresh' or a mid-episode snapshot"
+                )
+        else:
+            target_clock = 0
+        untouched = np.setdiff1d(np.arange(self.num_envs), env_idx)
+        if len(untouched) > 0:
+            untouched_clocks = np.asarray(self._elapsed_steps)[untouched]
+            if not bool((untouched_clocks == target_clock).all()):
+                raise ValueError(
+                    "subset reset_from_snapshot would leave vector slots with "
+                    "asynchronous episode clocks: untouched slots "
+                    f"{untouched.tolist()} sit at {untouched_clocks.tolist()} "
+                    f"but the restored slots would start at {target_clock}; "
+                    "restore every slot together or align the remaining slots "
+                    "first"
+                )
+
+        # Preserve the global scheduling/RNG state the counterfactual restore
+        # would rewind; a rollout start must not replay the sampling schedule.
+        process_rng = capture_process_rng_state()
+        preserved = {
+            "generator_state": copy.deepcopy(self._generator.bit_generator.state),
+            "ordered_generator_state": copy.deepcopy(
+                self._generator_ordered.bit_generator.state
+            ),
+            "manifest_cursor": int(self._manifest_cursor),
+            "manifest_order": self._manifest_order.copy(),
+            "last_manifest_batch": list(self._last_manifest_batch),
+            "start_idx": int(self.start_idx),
+            "is_start": bool(self._is_start),
+            "task_success_stats": copy.deepcopy(self._task_success_stats),
+            "eval_seen_trials": copy.deepcopy(self._eval_seen_trials),
+        }
+        pre_generation = np.asarray(self._episode_generation)[env_idx].copy()
+
+        self.restore_gate_snapshot(snapshot)
+
+        restore_process_rng_state(process_rng)
+        self._generator.bit_generator.state = preserved["generator_state"]
+        self._generator_ordered.bit_generator.state = preserved[
+            "ordered_generator_state"
+        ]
+        self._manifest_cursor = preserved["manifest_cursor"]
+        self._manifest_order = preserved["manifest_order"]
+        self._last_manifest_batch = preserved["last_manifest_batch"]
+        self.start_idx = preserved["start_idx"]
+        self._is_start = preserved["is_start"]
+        self._task_success_stats = preserved["task_success_stats"]
+        self._eval_seen_trials = preserved["eval_seen_trials"]
+
+        restored_generation = np.asarray(self._episode_generation)[env_idx]
+        self._reset_metrics(env_idx)
+        if horizon_mode == "remaining":
+            self._elapsed_steps[env_idx] = target_clock
+        self._episode_generation[env_idx] = (
+            np.maximum(pre_generation, restored_generation) + 1
+        )
+
+        obs = self._wrap_obs(self.current_raw_obs)
+        infos: dict[str, object] = {}
+        return obs, infos
+
     def step(self, actions=None, auto_reset=True):
         """Step the environment with the given actions."""
         if isinstance(actions, torch.Tensor):
