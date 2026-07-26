@@ -3,7 +3,7 @@
 # MODEL/CHECKPOINT LINEAGE: final frozen S-DR branches share WAM/action seeds; collection never reads Plus-Full outcomes.
 # SCIENTIFIC GOAL: Measure decision-level UNCOND-versus-IDM treatment outcomes without task/reset or simulator-state confounding.
 # ACCEPTANCE: Snapshot restore is pre-approved and paired-v1 validates identities, tensors, splits, provenance and finite outcomes.
-# REQUIRED INPUTS: shared WAM artifacts, PAIRED_TRAIN_MANIFEST, disjoint PLUS_FULL_MANIFEST, callbacks and snapshot decision.
+# REQUIRED INPUTS: shared WAM artifacts, PAIRED_TRAIN_MANIFEST, disjoint PLUS_FULL_MANIFEST, DEV_TEST_DISJOINT_AUDIT, callbacks and snapshot decision.
 # OUTPUTS: per-suite physical paired-v1 datasets, one strict logical merged paired-v1 with global folds, validation and decision.json.
 set -euo pipefail
 source "$(dirname "${BASH_SOURCE[0]}")/_common.sh"
@@ -11,11 +11,13 @@ parse_launcher_args "$@"
 require_shared_gate_inputs
 require_env PAIRED_TRAIN_MANIFEST
 require_env PLUS_FULL_MANIFEST
+require_env DEV_TEST_DISJOINT_AUDIT
 require_env E3_SNAPSHOT_DECISION
 require_env PROGRESS_FN
 require_env GATE_PHASE_FN
 require_file "${PAIRED_TRAIN_MANIFEST}"
 require_file "${PLUS_FULL_MANIFEST}"
+require_file "${DEV_TEST_DISJOINT_AUDIT}"
 require_passed_decision "${E3_SNAPSHOT_DECISION}"
 configure_plus_runtime "${PAIRED_TRAIN_MANIFEST}"
 validate_disjoint_plus_manifests \
@@ -66,6 +68,7 @@ while IFS=$'\t' read -r task_suite suite_manifest _suite_episodes _logical_sha; 
         python examples/embodiment/collect_gate_paired_states.py
         --episode-manifest "${suite_manifest}"
         --heldout-test-manifest "${PLUS_FULL_MANIFEST}"
+        --disjoint-audit "${DEV_TEST_DISJOINT_AUDIT}"
         --out "${SUITE_PAIRED}"
         --snapshot-dir "${SUITE_SNAPSHOTS}"
         --collector-seed "${COLLECTOR_SEED}"
@@ -82,7 +85,8 @@ while IFS=$'\t' read -r task_suite suite_manifest _suite_episodes _logical_sha; 
     RUN_ARTIFACTS=(
         "${SHARED_CKPT}" "${DATASET_STATS}" "${COST_PROFILE}"
         "${PAIRED_TRAIN_MANIFEST}" "${suite_manifest}"
-        "${PLUS_FULL_MANIFEST}" "${E3_SNAPSHOT_DECISION}"
+        "${PLUS_FULL_MANIFEST}" "${DEV_TEST_DISJOINT_AUDIT}"
+        "${E3_SNAPSHOT_DECISION}"
     )
     run_command "${CMD[@]}"
     write_scoped_run_manifest \
@@ -97,6 +101,7 @@ done < "${SUITE_TSV}"
 MERGE_CMD=(
     python examples/embodiment/merge_gate_paired_data.py
     --episode-manifest "${PAIRED_TRAIN_MANIFEST}"
+    --disjoint-audit "${DEV_TEST_DISJOINT_AUDIT}"
     --out "${PAIRED_OUT}"
     --summary-out "${RUN_DIR}/paired_merge_summary.json"
 )
@@ -106,7 +111,7 @@ done
 RUN_ARTIFACTS=(
     "${SHARED_CKPT}" "${DATASET_STATS}" "${COST_PROFILE}"
     "${PAIRED_TRAIN_MANIFEST}" "${PLUS_FULL_MANIFEST}"
-    "${E3_SNAPSHOT_DECISION}"
+    "${DEV_TEST_DISJOINT_AUDIT}" "${E3_SNAPSHOT_DECISION}"
 )
 if [[ "${DRY_RUN}" -eq 0 ]]; then
     for binding in "${SUITE_PAIRED_BINDINGS[@]}"; do

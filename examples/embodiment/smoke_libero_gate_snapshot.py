@@ -38,6 +38,16 @@ def main() -> None:
         default=None,
         help="required when the smoke manifest has split=train/validation",
     )
+    parser.add_argument(
+        "--disjoint-audit",
+        default=None,
+        help=(
+            "committed dev-test-disjoint-audit-v1 JSON for the (logical) smoke "
+            "manifest. The smoke executes manifest episodes in the simulator, "
+            "so it refuses to start without a verifiable committed audit and "
+            "refuses any split=test manifest outright."
+        ),
+    )
     parser.add_argument("--rlinf-config-dir", default="examples/embodiment/config")
     parser.add_argument("--rlinf-config-name", default="libero_10_grpo_gate")
     parser.add_argument("--config-override", action="append", default=[])
@@ -53,8 +63,33 @@ def main() -> None:
     from rlinf.models.embodiment.gate_policy.libero_paired_driver import (
         build_libero_fastwam_driver,
     )
+    from rlinf.utils.test_set_guard import (
+        assert_disjoint_audit,
+        assert_training_manifest,
+    )
 
     manifest = load_frozen_episode_manifest(args.episode_manifest)
+    # The smoke drives real episodes from this manifest; the held-out
+    # split=test half is never a legal input here.
+    assert_training_manifest(
+        manifest, context="smoke_libero_gate_snapshot --episode-manifest"
+    )
+    audit_manifest = (
+        load_frozen_episode_manifest(manifest.parent_manifest_path)
+        if manifest.parent_manifest_path is not None
+        else manifest
+    )
+    assert_training_manifest(
+        audit_manifest,
+        context="smoke_libero_gate_snapshot parent (logical) manifest",
+    )
+    # The committed audit is keyed on file_sha256, which for a per-suite
+    # partition only exists for the logical parent manifest - audit that one.
+    assert_disjoint_audit(
+        audit_manifest,
+        args.disjoint_audit,
+        context="smoke_libero_gate_snapshot --disjoint-audit",
+    )
     driver = build_libero_fastwam_driver(args=args, manifest=manifest)
     try:
         episode = manifest.episodes[0].to_dict()

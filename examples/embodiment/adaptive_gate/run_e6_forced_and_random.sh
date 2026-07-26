@@ -129,8 +129,11 @@ while IFS=$'\t' read -r reference_trace _role budget gate_seed _stable; do
         prepare_run_dir "${POINT_DIR}"
         MODE_MANIFEST="${POINT_DIR}/mode_manifest.json"
         TRACE="${POINT_DIR}/trace.jsonl"
+        # --final is the call-site half of the two-key test-split lock; the
+        # operator must additionally export STAGE2_FINAL_EVAL=1 (never set here).
         BUILD_CMD=(
             python examples/embodiment/build_gate_mode_manifest.py
+            --final
             --episode-manifest "${PLUS_FULL_MANIFEST}"
             --checkpoint "${SHARED_CKPT}"
             --reference-trace "${reference_trace}"
