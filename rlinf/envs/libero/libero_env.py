@@ -49,6 +49,10 @@ from rlinf.envs.libero.utils import (
 )
 from rlinf.envs.libero.venv import ReconfigureSubprocEnv
 from rlinf.envs.utils import list_of_dict_to_dict_of_list, to_tensor
+from rlinf.utils.test_set_guard import (
+    assert_manifest_membership,
+    assert_training_manifest,
+)
 
 libero_type = get_libero_type()
 LIBERO_GATE_SNAPSHOT_SCHEMA = "libero-gate-snapshot-v1"
@@ -168,6 +172,20 @@ class LiberoEnv(gym.Env):
                     "scripts/adaptive_gate/plus_suite_manifest.py and merge all "
                     "suite traces before analysis"
                 )
+            # is_eval and group_size cannot separate the headline final
+            # evaluation from an E5 run's periodic in-training validation: both
+            # are eval envs with group_size=1. Reading the held-out half in the
+            # latter would silently turn model selection into test-set
+            # selection, so executing split=test needs an explicit two-key
+            # intent signal rather than an inferred one.
+            # The raw config value is forwarded deliberately: the guard accepts
+            # only a literal True, so a stringly-typed `allow_test_split: "false"`
+            # is refused instead of being coerced to True by bool().
+            assert_training_manifest(
+                self.episode_manifest,
+                context=f"LiberoEnv(episode_manifest_path={manifest_path!r})",
+                allow_test_split=cfg.get("allow_test_split", False),
+            )
             if self.episode_manifest.split == "train":
                 if self.is_eval:
                     raise ValueError("a split=train manifest cannot drive eval envs")
@@ -598,6 +616,14 @@ class LiberoEnv(gym.Env):
         return start + reset_state_id
 
     def _assign_manifest_entries(self, env_idx, entries) -> np.ndarray:
+        # Executed episodes must belong to the manifest this env declared at
+        # construction; otherwise a caller could record split=train provenance
+        # while actually running foreign (e.g. held-out) episodes.
+        assert_manifest_membership(
+            entries,
+            self.episode_manifest,
+            context=f"LiberoEnv._assign_manifest_entries(suite={self.cfg.task_suite_name!r})",
+        )
         if len(entries) * self.group_size == len(env_idx):
             entries = [
                 entry for entry in entries for _ in range(self.group_size)
