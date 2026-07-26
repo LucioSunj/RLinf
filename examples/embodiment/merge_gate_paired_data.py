@@ -41,14 +41,38 @@ def main() -> None:
     )
     parser.add_argument("--out", required=True)
     parser.add_argument("--summary-out", default=None)
+    parser.add_argument(
+        "--disjoint-audit",
+        default=None,
+        help=(
+            "committed dev-test-disjoint-audit-v1 JSON for the logical parent "
+            "manifest. The merged paired-v1 dataset feeds gate training, so "
+            "merging refuses to start without a verifiable committed audit and "
+            "refuses any split=test manifest outright."
+        ),
+    )
     args = parser.parse_args()
 
     from rlinf.envs.libero.episode_manifest import load_frozen_episode_manifest
     from rlinf.models.embodiment.gate_policy.paired_data import (
         merge_paired_suite_datasets,
     )
+    from rlinf.utils.test_set_guard import (
+        assert_disjoint_audit,
+        assert_training_manifest,
+    )
 
     manifest = load_frozen_episode_manifest(args.episode_manifest)
+    # The merged logical paired-v1 dataset is training/label material: the
+    # held-out split=test half is never a legal input here.
+    assert_training_manifest(
+        manifest, context="merge_gate_paired_data --episode-manifest"
+    )
+    assert_disjoint_audit(
+        manifest,
+        args.disjoint_audit,
+        context="merge_gate_paired_data --disjoint-audit",
+    )
     if manifest.parent_manifest_path is not None:
         raise ValueError("--episode-manifest must be the complete logical parent")
     summary = merge_paired_suite_datasets(

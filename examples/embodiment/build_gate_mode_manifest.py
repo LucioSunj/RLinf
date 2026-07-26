@@ -40,6 +40,18 @@ def main() -> None:
     parser.add_argument("--k", type=int, default=None)
     parser.add_argument("--p-idm", type=float, default=None)
     parser.add_argument("--mode", type=int, choices=(0, 1), default=None)
+    parser.add_argument(
+        "--final",
+        action="store_true",
+        help=(
+            "call-site half of the two-key final-evaluation lock: passes "
+            "allow_test_split=True so the frozen split=test manifest may be "
+            "loaded for the headline E6 schedules. The operator must ALSO "
+            "export STAGE2_FINAL_EVAL=1 in the environment - this tool never "
+            "sets it. Without both keys a split=test manifest is refused; "
+            "split=train/validation manifests need neither key."
+        ),
+    )
     args = parser.parse_args()
 
     checkpoint = Path(args.checkpoint).expanduser().resolve()
@@ -47,6 +59,7 @@ def main() -> None:
         parser.error(f"--checkpoint does not exist: {checkpoint}")
 
     from rlinf.envs.libero.episode_manifest import load_frozen_episode_manifest
+    from rlinf.utils.test_set_guard import assert_training_manifest
     from rlinf.models.embodiment.gate_policy.mode_selectors import (
         REFERENCE_MATCH_METHODS,
         build_eval_mode_selector,
@@ -59,6 +72,13 @@ def main() -> None:
 
     # This validates the LIBERO-Plus checkout/commit and every frozen BDDL SHA.
     episode_manifest = load_frozen_episode_manifest(args.episode_manifest)
+    # Two-key lock: the frozen split=test manifest opens only under an explicit
+    # --final AND STAGE2_FINAL_EVAL=1 (exported by the operator, never here).
+    assert_training_manifest(
+        episode_manifest,
+        context="build_gate_mode_manifest --episode-manifest",
+        allow_test_split=args.final,
+    )
     checkpoint_sha256 = sha256_file(checkpoint)
     episode_uids = [
         episode.episode_id for episode in episode_manifest.episodes

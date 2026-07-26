@@ -45,6 +45,16 @@ def main() -> None:
         ),
     )
     parser.add_argument(
+        "--disjoint-audit",
+        default=None,
+        help=(
+            "committed dev-test-disjoint-audit-v1 JSON for the logical "
+            "manifest being collected on. Paired collection is a training-side "
+            "consumer, so it refuses to start without a verifiable committed "
+            "audit and refuses any split=test manifest outright."
+        ),
+    )
+    parser.add_argument(
         "--driver",
         default=(
             "rlinf.models.embodiment.gate_policy.libero_paired_driver:"
@@ -104,14 +114,34 @@ def main() -> None:
     from rlinf.models.embodiment.gate_policy.paired_collector import (
         PairedStateCollector,
     )
+    from rlinf.utils.test_set_guard import (
+        assert_disjoint_audit,
+        assert_training_manifest,
+    )
 
     # Validates LIBERO_PLUS_ROOT, LIBERO_PLUS_COMMIT, git HEAD, every BDDL SHA,
     # explicit seeds/factors/levels and rejects LIBERO_SUFFIX=all.
     manifest = load_frozen_episode_manifest(args.episode_manifest)
+    # Paired collection trains the uplift gate downstream: the held-out
+    # split=test half is never a legal input here, with or without keys.
+    assert_training_manifest(
+        manifest, context="collect_gate_paired_states --episode-manifest"
+    )
     assignment_manifest = (
         load_frozen_episode_manifest(manifest.parent_manifest_path)
         if manifest.parent_manifest_path is not None
         else manifest
+    )
+    assert_training_manifest(
+        assignment_manifest,
+        context="collect_gate_paired_states parent (logical) manifest",
+    )
+    # The committed audit is keyed on file_sha256, which for a per-suite
+    # partition only exists for the logical parent manifest - audit that one.
+    assert_disjoint_audit(
+        assignment_manifest,
+        args.disjoint_audit,
+        context="collect_gate_paired_states --disjoint-audit",
     )
     factory = _load_factory(args.driver)
     driver = factory(args=args, manifest=manifest)
