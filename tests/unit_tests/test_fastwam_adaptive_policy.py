@@ -1,0 +1,379 @@
+import importlib.util
+import sys
+from enum import Enum
+from pathlib import Path
+from types import ModuleType
+
+import pytest
+import torch
+import torch.nn as nn
+
+OUTER = Path(__file__).resolve().parents[3]
+sys.path.insert(0, str(OUTER / "FastWAM/src"))
+
+from fastwam.adapters import PolicyRegime
+from fastwam.models.wan22.kv_tap import (
+    GateKVSnapshot,
+    GateLayerKV,
+    KeyValueBank,
+    KVSource,
+)
+
+
+def _load_policy_package():
+    repo = Path(__file__).resolve().parents[2]
+    base_policy = ModuleType("rlinf.models.embodiment.base_policy")
+    base_policy.ForwardType = Enum("ForwardType", {"DEFAULT": "default"})
+
+    class BasePolicy:
+        def forward(self, forward_type=base_policy.ForwardType.DEFAULT, **kwargs):
+            if forward_type is base_policy.ForwardType.DEFAULT:
+                return self.default_forward(**kwargs)
+            raise NotImplementedError
+
+    base_policy.BasePolicy = BasePolicy
+    sys.modules[base_policy.__name__] = base_policy
+
+    package_name = "fastwam_policy_composite_under_test"
+    package = ModuleType(package_name)
+    package.__path__ = [str(repo / "rlinf/models/embodiment/wam_policy")]
+    sys.modules[package_name] = package
+    for name in (
+        "contracts",
+        "kv_replay",
+        "routing_state",
+        "adaptive_policy",
+        "libero_runtime",
+    ):
+        full_name = f"{package_name}.{name}"
+        spec = importlib.util.spec_from_file_location(
+            full_name,
+            repo / f"rlinf/models/embodiment/wam_policy/{name}.py",
+        )
+        module = importlib.util.module_from_spec(spec)
+        sys.modules[full_name] = module
+        spec.loader.exec_module(module)
+    return sys.modules[f"{package_name}.adaptive_policy"]
+
+
+_policy = _load_policy_package()
+_runtime_module = sys.modules[
+    "fastwam_policy_composite_under_test.libero_runtime"
+]
+FastWAMAdaptivePolicy = _policy.FastWAMAdaptivePolicy
+FastWAMAdaptivePolicyConfig = _policy.FastWAMAdaptivePolicyConfig
+FastWAMChunkSample = _policy.FastWAMChunkSample
+
+
+def _bank(source, value, batch=2):
+    tensor = torch.full((batch, 1, 2), value)
+    return KeyValueBank(
+        source=source,
+        key=tensor,
+        value=tensor + 1,
+        valid_mask=torch.ones(batch, 1, dtype=torch.bool),
+    )
+
+
+def _snapshots(routes):
+    batch = len(routes)
+    modes = tuple(
+        PolicyRegime.IDM if int(route) else PolicyRegime.UNCOND
+        for route in routes
+    )
+    result = []
+    for timestep, action_value in ((900.0, 3.0), (100.0, 4.0)):
+        result.append(
+            GateKVSnapshot(
+                (
+                    GateLayerKV(
+                        layer_index=0,
+                        denoise_timestep=torch.full((batch,), timestep),
+                        current_mode=modes,
+                        current_frame_video=_bank(
+                            KVSource.CURRENT_FRAME_VIDEO, 1.0, batch=batch
+                        ),
+                        action=_bank(
+                            KVSource.ACTION, action_value, batch=batch
+                        ),
+                        context=_bank(
+                            KVSource.TEXT_STATE_CONTEXT, 2.0, batch=batch
+                        ),
+                        actor_version=5,
+                    ),
+                )
+            )
+        )
+    return tuple(result)
+
+
+class _Runtime:
+    def __init__(self):
+        self.recompute_calls = 0
+
+    def sample_action_batch(self, *, env_obs, routes, mode, actor_version):
+        del mode, actor_version
+        batch = routes.shape[0]
+        return FastWAMChunkSample(
+            actions=torch.zeros(batch, 2, 3),
+            old_flow_logprobs=torch.zeros(batch, 2, 3),
+            flow_chains=torch.zeros(batch, 3, 2, 3),
+            denoise_indices=torch.zeros(batch, dtype=torch.long),
+            gate_snapshots=_snapshots(routes),
+            forward_inputs={"critic_states": env_obs["states"].clone()},
+        )
+
+    def replay_action_batch(self, *, forward_inputs, route_info):
+        del route_info
+        batch = forward_inputs["critic_states"].shape[0]
+        return {
+            "flow_logprobs": torch.zeros(batch, 2, 3, dtype=torch.float32),
+            "flow_entropy": torch.ones(batch, 1, dtype=torch.float32),
+        }
+
+    def critic_observation(self, *, env_obs=None, forward_inputs=None):
+        if env_obs is not None:
+            return {"states": env_obs["states"]}
+        return {"states": forward_inputs["critic_states"]}
+
+    def recompute_gate_snapshots(self, *, forward_inputs, route_info):
+        del forward_inputs
+        self.recompute_calls += 1
+        return _snapshots(route_info.route_used)
+
+
+class _Gate(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.bias = nn.Parameter(torch.tensor(-1.0))
+
+    def forward(self, snapshots):
+        return self.bias.expand(snapshots[0].batch_size)
+
+
+class _Critic(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.value_head = nn.Linear(1, 1)
+
+    def predict_value_batch(self, obs, *, return_prefix=False):
+        prefix = obs["states"][:, None, :1]
+        values = self.value_head(prefix.mean(dim=1)).squeeze(-1)
+        return (values, prefix) if return_prefix else values
+
+    def value_from_prefix(self, prefix):
+        return self.value_head(prefix.mean(dim=1)).squeeze(-1)
+
+
+class _LoRA:
+    def __init__(self):
+        self.parameter = nn.Parameter(torch.zeros(1))
+        self.replay_reference_version = None
+
+    def lora_parameters(self):
+        yield self.parameter
+
+    def lora_state_dict(self):
+        return {"p": self.parameter.detach().clone()}
+
+    def load_lora_state_dict(self, state, strict=True):
+        del strict
+        self.parameter.data.copy_(state["p"])
+
+    def capture_replay_reference(self, *, actor_version):
+        self.replay_reference_version = actor_version
+
+
+def _make_policy(backend="stored"):
+    return FastWAMAdaptivePolicy(
+        actor=nn.Linear(1, 1),
+        runtime=_Runtime(),
+        lora_adapter=_LoRA(),
+        gate=_Gate(),
+        critic=_Critic(),
+        config=FastWAMAdaptivePolicyConfig(
+            gate_epsilon=0.0,
+            eval_idm_threshold=0.5,
+            kv_replay=_policy.GateKVReplayConfig(
+                backend=backend,
+                pin_memory=False,
+            ),
+        ),
+    )
+
+
+def test_policy_forces_first_idm_and_applies_gate_to_next_chunk():
+    policy = _make_policy()
+    obs = {
+        "states": torch.ones(2, 3),
+        "_fastwam_env_ids": torch.tensor([11, 22]),
+        "_fastwam_reset_mask": torch.tensor([True, True]),
+    }
+    _, first = policy.predict_action_batch(obs, mode="eval")
+    assert first["route_info"].route_used.tolist() == [1, 1]
+    assert first["emitted_gate"].next_route.tolist() == [0, 0]
+
+    obs["_fastwam_reset_mask"] = torch.tensor([False, False])
+    _, second = policy.predict_action_batch(obs, mode="eval")
+    assert second["route_info"].route_used.tolist() == [0, 0]
+    assert second["route_info"].route_source_chunk_ids.tolist() == [0, 0]
+
+
+def test_policy_update_invalidates_pending_route_and_forces_idm_boundary():
+    policy = _make_policy()
+    obs = {
+        "states": torch.ones(1, 3),
+        "_fastwam_env_ids": torch.tensor([11]),
+        "_fastwam_reset_mask": torch.tensor([True]),
+    }
+    _, rollout = policy.predict_action_batch(obs, mode="eval")
+    assert len(rollout["emitted_gate"].kv_metadata.tensor_shapes) == 12
+    policy.set_global_step(1)
+    obs["_fastwam_reset_mask"] = torch.tensor([False])
+
+    _, boundary = policy.predict_action_batch(obs, mode="eval")
+
+    assert boundary["route_info"].route_used.item() == 1
+    assert boundary["route_info"].route_was_forced.item()
+    assert boundary["route_info"].route_source_chunk_ids.item() == -1
+    assert boundary["route_info"].actor_versions.item() == 1
+
+
+def test_policy_replay_exposes_separate_gate_and_flow_outputs():
+    policy = _make_policy()
+    obs = {
+        "states": torch.ones(2, 3),
+        "_fastwam_env_ids": torch.tensor([1, 2]),
+        "_fastwam_reset_mask": torch.tensor([True, True]),
+    }
+    _, rollout = policy.predict_action_batch(obs, mode="train")
+    replay = policy.default_forward(
+        rollout["forward_inputs"],
+        route_info=rollout["route_info"],
+        emitted_gate=rollout["emitted_gate"],
+    )
+    assert replay["gate_logprobs"].shape == (2,)
+    assert replay["gate_behavior_probabilities"].shape == (2,)
+    assert replay["flow_logprobs"].shape == (2, 2, 3)
+    assert rollout["prev_values"].shape == (2, 1)
+    assert replay["values"].shape == (2, 1)
+
+
+def test_nn_module_forward_dispatches_and_actor_stays_in_eval_mode():
+    policy = _make_policy()
+    policy.train()
+    assert policy.training
+    assert policy.gate.training
+    assert policy.critic.value_head.training
+    assert not policy.actor.training
+
+    obs = {
+        "states": torch.ones(2, 3),
+        "_fastwam_env_ids": torch.tensor([1, 2]),
+        "_fastwam_reset_mask": torch.tensor([True, True]),
+    }
+    _, rollout = policy.predict_action_batch(obs, mode="train")
+    replay = policy(
+        forward_inputs=rollout["forward_inputs"],
+        route_info=rollout["route_info"],
+        emitted_gate=rollout["emitted_gate"],
+    )
+    assert replay["values"].shape == rollout["prev_values"].shape
+
+
+def test_recompute_backend_omits_stored_kv_and_rebuilds_gate_inputs():
+    policy = _make_policy(backend="recompute")
+    obs = {
+        "states": torch.ones(2, 3),
+        "_fastwam_env_ids": torch.tensor([1, 2]),
+        "_fastwam_reset_mask": torch.tensor([True, True]),
+    }
+    _, rollout = policy.predict_action_batch(obs, mode="train")
+    assert not any(key.startswith("gate_kv_") for key in rollout["forward_inputs"])
+    assert rollout["emitted_gate"].kv_metadata.total_bytes.tolist() == [0, 0]
+    policy.capture_gate_recompute_reference()
+    assert policy.lora_adapter.replay_reference_version == 0
+
+    replay = policy.default_forward(
+        rollout["forward_inputs"],
+        route_info=rollout["route_info"],
+        emitted_gate=rollout["emitted_gate"],
+    )
+    assert policy.runtime.recompute_calls == 1
+    assert replay["gate_logprobs"].shape == (2,)
+
+
+def test_trainable_checkpoint_excludes_frozen_actor_and_round_trips_version():
+    policy = _make_policy()
+    policy.set_global_step(3)
+    payload = policy.trainable_state_dict()
+
+    assert set(payload) == {
+        "schema",
+        "actor_version",
+        "gate",
+        "lora",
+        "value_head",
+        "route_tracker",
+    }
+    assert "actor" not in payload
+
+    restored = _make_policy()
+    restored.load_trainable_state_dict(payload)
+    assert restored.actor_version == 3
+    assert torch.equal(restored.gate.bias, policy.gate.bias)
+
+
+def test_zero_flow_sde_noise_is_rejected_only_for_training_uncond() -> None:
+    with pytest.raises(ValueError, match="noise_level > 0"):
+        _runtime_module._validate_flow_sde_sampling(
+            mode="train",
+            routes=torch.tensor([0, 1]),
+            noise_level=0.0,
+        )
+    _runtime_module._validate_flow_sde_sampling(
+        mode="train",
+        routes=torch.tensor([1, 1]),
+        noise_level=0.0,
+    )
+    _runtime_module._validate_flow_sde_sampling(
+        mode="eval",
+        routes=torch.tensor([0, 0]),
+        noise_level=0.0,
+    )
+
+
+def test_runtime_aligns_plain_normalizer_tensors_and_converts_gripper():
+    class _Normalizer:
+        scale = torch.ones(3, dtype=torch.float64)
+        offset = torch.zeros(3, dtype=torch.float64)
+
+    normalizer = _Normalizer()
+    reference = torch.zeros(2, 3, dtype=torch.float32)
+    _runtime_module._align_linear_normalizer(normalizer, reference)
+    assert normalizer.scale.dtype == torch.float32
+    assert normalizer.offset.dtype == torch.float32
+
+    actions = torch.tensor([[0.0, 0.0, 0.0], [0.0, 0.0, 1.0]])
+    converted = _runtime_module._convert_fastwam_gripper_to_libero(
+        actions,
+        binarize=False,
+    )
+    assert torch.equal(converted[:, -1], torch.tensor([1.0, -1.0]))
+    assert torch.equal(actions[:, -1], torch.tensor([0.0, 1.0]))
+
+
+def test_optimizer_groups_are_disjoint():
+    policy = _make_policy()
+    groups = policy.optimizer_parameter_groups(
+        gate_lr=1e-4,
+        lora_lr=2e-4,
+        value_lr=3e-4,
+    )
+    assert [group["name"] for group in groups] == [
+        "gate",
+        "uncond_lora",
+        "value_head",
+    ]
+    ids = [id(parameter) for group in groups for parameter in group["params"]]
+    assert len(ids) == len(set(ids))

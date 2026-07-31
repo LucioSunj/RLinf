@@ -146,6 +146,11 @@ def _register_builtin_models():
 
         return get_model(cfg, torch_dtype)
 
+    def _build_fastwam_adaptive(cfg: DictConfig, torch_dtype):
+        from rlinf.models.embodiment.wam_policy import get_model
+
+        return get_model(cfg, torch_dtype)
+
     register_model(
         SupportedModel.OPENVLA.value,
         _build_openvla,
@@ -266,6 +271,12 @@ def _register_builtin_models():
         category="embodied",
         force=True,
     )
+    register_model(
+        SupportedModel.FASTWAM_ADAPTIVE.value,
+        _build_fastwam_adaptive,
+        category="embodied",
+        force=True,
+    )
 
 
 _register_builtin_models()
@@ -287,7 +298,7 @@ def get_model(cfg: DictConfig):
     ):
         model = model.to(Worker.torch_device_type)
 
-    if cfg.is_lora:
+    if cfg.is_lora and SupportedModel(model_type) is not SupportedModel.FASTWAM_ADAPTIVE:
         from peft import LoraConfig, PeftModel, get_peft_model
 
         if not hasattr(cfg, "lora_path") or cfg.lora_path is None:

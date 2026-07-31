@@ -107,6 +107,9 @@ SupportedModel.RECAP_VALUE_MODEL = SupportedModel.register(
 SupportedModel.STEAM_VALUE_MODEL = SupportedModel.register(
     "steam_value_model", force=True
 )
+SupportedModel.FASTWAM_ADAPTIVE = SupportedModel.register(
+    "fastwam_adaptive", force=True
+)
 
 SupportedModel.QWEN2_5_VL_SFT = SupportedModel.register("qwen2.5_vl", force=True)
 SupportedModel.QWEN3_VL_SFT = SupportedModel.register("qwen3_vl", force=True)
@@ -138,6 +141,7 @@ EMBODIED_MODEL = set(
         SupportedModel.CFG_MODEL,
         SupportedModel.RECAP_VALUE_MODEL,
         SupportedModel.STEAM_VALUE_MODEL,
+        SupportedModel.FASTWAM_ADAPTIVE,
     }
 )
 
@@ -822,6 +826,155 @@ def validate_megatron_cfg(cfg: DictConfig) -> DictConfig:
     return cfg
 
 
+def _validate_fastwam_adaptive_cfg(cfg, *, only_eval: bool) -> None:
+    """Validate contracts that the generic embodied config cannot express."""
+
+    model_cfg = cfg.rollout.model if only_eval else cfg.actor.model
+    if SupportedModel(model_cfg.model_type) is not SupportedModel.FASTWAM_ADAPTIVE:
+        return
+
+    if not bool(model_cfg.get("add_value_head", False)):
+        raise ValueError("FastWAM adaptive requires its colocated pi0.5 value head.")
+
+    if only_eval:
+        return
+
+    actor_model = cfg.actor.model
+    rollout_model = cfg.rollout.model
+    if SupportedModel(rollout_model.model_type) is not SupportedModel.FASTWAM_ADAPTIVE:
+        raise ValueError(
+            "FastWAM adaptive training requires the same model type for actor and rollout."
+        )
+
+    shared_contracts = (
+        "precision",
+        "action_dim",
+        "actor_checkpoint_sha256",
+        "num_action_chunks",
+        "fastwam",
+        "uncond_lora",
+        "gate",
+        "gate_epsilon",
+        "gate_temperature",
+        "eval_idm_threshold",
+        "kv_replay",
+        "flow_sde",
+        "runtime",
+        "critic",
+    )
+
+    def _resolved_value(owner, key):
+        value = OmegaConf.select(owner, key)
+        return (
+            OmegaConf.to_container(value, resolve=True)
+            if OmegaConf.is_config(value)
+            else value
+        )
+
+    mismatches = [
+        key
+        for key in shared_contracts
+        if _resolved_value(actor_model, key) != _resolved_value(rollout_model, key)
+    ]
+    if mismatches:
+        raise ValueError(
+            "FastWAM actor and rollout replay contracts differ for: "
+            f"{', '.join(mismatches)}."
+        )
+
+    required_values = {
+        "algorithm.adv_type": "gae",
+        "algorithm.loss_type": "fastwam_dual_ppo",
+        "algorithm.reward_type": "chunk_level",
+        "algorithm.logprob_type": "chunk_level",
+    }
+    for path, expected in required_values.items():
+        actual = OmegaConf.select(cfg, path)
+        if actual != expected:
+            raise ValueError(
+                f"FastWAM adaptive requires `{path}: {expected}`, got {actual!r}."
+            )
+
+    if int(cfg.actor.optim.get("critic_warmup_steps", 0)) != 0:
+        raise ValueError("FastWAM adaptive does not support critic-only warm-up.")
+    if int(cfg.algorithm.critic_loss.get("warmup_steps", 0)) != 0:
+        raise ValueError("FastWAM adaptive value loss must start on the first update.")
+    if bool(cfg.actor.get("enable_sft_co_train", False)):
+        raise ValueError("FastWAM adaptive v0 does not support SFT co-training.")
+    if bool(cfg.runner.get("use_training_pipeline", False)):
+        raise ValueError(
+            "FastWAM adaptive v0 does not support the pipeline runner because it "
+            "does not preserve delayed Gate advantage records."
+        )
+    if bool(cfg.rollout.get("enable_cuda_graph", False)):
+        raise ValueError(
+            "FastWAM adaptive uses stateful delayed routing and cannot use CUDA graphs."
+        )
+    if bool(cfg.rollout.get("recompute_logprobs", False)):
+        raise ValueError(
+            "FastWAM action and Gate likelihoods are replayed together on the actor; "
+            "`rollout.recompute_logprobs` must remain false."
+        )
+    if not bool(cfg.rollout.get("collect_prev_infos", True)):
+        raise ValueError("FastWAM PPO requires rollout old log-probs and values.")
+    if not bool(cfg.actor.fsdp_config.get("use_orig_params", False)):
+        raise ValueError(
+            "FastWAM's mixed frozen/trainable composite requires FSDP "
+            "`use_orig_params: true`."
+        )
+    if str(cfg.actor.fsdp_config.get("sharding_strategy", "")).lower() != "no_shard":
+        raise ValueError(
+            "FastWAM adaptive v0 checkpointing requires FSDP `no_shard`."
+        )
+    if bool(cfg.actor.fsdp_config.get("save_full_model_weights", False)):
+        raise ValueError(
+            "FastWAM checkpoints must not serialize frozen backbone weights."
+        )
+    if bool(cfg.get("critic", {}).get("use_critic_model", False)):
+        raise ValueError("FastWAM v0 uses a colocated critic, not a critic worker.")
+    if bool(cfg.env.train.get("use_step_penalty", False)):
+        raise ValueError("FastWAM reward forbids an environment step penalty.")
+    if float(cfg.algorithm.uncond_flow_ppo.get("entropy_coefficient", 0.0)) != 0:
+        raise ValueError(
+            "FastWAM Flow-SDE uses fixed transition variance, so its entropy has "
+            "no policy gradient and `entropy_coefficient` must remain zero."
+        )
+
+    branch_cost = cfg.algorithm.get("fixed_branch_cost", {})
+    if float(branch_cost.get("idm_cost", 0.0)) < 0:
+        raise ValueError("FastWAM IDM chunk cost must be non-negative.")
+    if float(branch_cost.get("uncond_cost", 0.0)) != 0:
+        raise ValueError("FastWAM v0 permits cost only on executed IDM chunks.")
+
+    regularization = cfg.algorithm.get("regularization", {})
+    for name in ("base_uncond_kl", "collapse"):
+        coefficient = float(regularization.get(name, {}).get("coefficient", 0.0))
+        if coefficient < 0:
+            raise ValueError(
+                f"FastWAM `{name}` regularization coefficient must be non-negative."
+            )
+    collapse = regularization.get("collapse", {})
+    if float(collapse.get("tau_calls", 1.0)) <= 0:
+        raise ValueError("FastWAM collapse `tau_calls` must be positive.")
+    if str(collapse.get("scope", "microbatch")) != "microbatch":
+        raise ValueError(
+            "FastWAM v0 supports only `microbatch` collapse scope because PPO "
+            "shuffle does not preserve complete episodes or train-global batches."
+        )
+
+    for path in (
+        "actor.optim.gate_lr",
+        "actor.optim.lora_lr",
+        "actor.optim.value_lr",
+        "algorithm.gate_ppo.loss_weight",
+        "algorithm.uncond_flow_ppo.loss_weight",
+        "algorithm.critic_loss.loss_weight",
+    ):
+        value = OmegaConf.select(cfg, path)
+        if value is None or float(value) <= 0:
+            raise ValueError(f"FastWAM requires a positive `{path}`.")
+
+
 def validate_embodied_cfg(cfg):
     only_eval = (
         cfg.runner.get("only_eval", False)
@@ -834,6 +987,7 @@ def validate_embodied_cfg(cfg):
         f"Model type: '{model_cfg.model_type}' is not an embodied model. "
         f"Supported embodied models: {sorted([x.value for x in EMBODIED_MODEL])}."
     )
+    _validate_fastwam_adaptive_cfg(cfg, only_eval=only_eval)
     with open_dict(cfg):
         cfg.runner.val_check_interval = cfg.runner.get("val_check_interval", -1)
     enable_eval = cfg.runner.val_check_interval > 0 or only_eval

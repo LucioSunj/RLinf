@@ -21,7 +21,10 @@ import numpy as np
 import torch
 
 if TYPE_CHECKING:
-    pass
+    from rlinf.models.embodiment.wam_policy.contracts import (
+        ChunkRouteRecord,
+        GateDecisionRecord,
+    )
 
 from rlinf.utils.nested_dict_process import (
     cat_list_of_dict_tensor,
@@ -292,6 +295,8 @@ class RolloutResult:
     intervene_flags: torch.Tensor = None  # [B, num_action_chunks]
     forward_inputs: dict[str, torch.Tensor] = field(default_factory=dict)
     versions: torch.Tensor = None  # [B, 1]
+    route_info: Optional["ChunkRouteRecord"] = None
+    emitted_gate: Optional["GateDecisionRecord"] = None
 
     def __post_init__(self):
         if self.actions is not None:
@@ -308,6 +313,10 @@ class RolloutResult:
             self.forward_inputs = put_tensor_device(self.forward_inputs, "cpu")
         if self.versions is not None:
             self.versions = self.versions.cpu().contiguous()
+        if self.route_info is not None:
+            self.route_info = self.route_info.cpu()
+        if self.emitted_gate is not None:
+            self.emitted_gate = self.emitted_gate.cpu()
 
     @staticmethod
     def merge_rollout_results(
@@ -326,12 +335,29 @@ class RolloutResult:
                 )
             return torch.cat(values, dim=0)
 
+        def _merge_optional_record(field_name: str):
+            values = [
+                getattr(rollout_result, field_name)
+                for rollout_result in rollout_results
+            ]
+            if all(value is None for value in values):
+                return None
+            if any(value is None for value in values):
+                raise ValueError(
+                    f"Inconsistent field '{field_name}': some shards are None "
+                    "while others are records."
+                )
+            record_type = type(values[0])
+            return record_type.cat(values, dim=0)
+
         merged_actions = _merge_optional_tensor("actions")
         merged_prev_logprobs = _merge_optional_tensor("prev_logprobs")
         merged_prev_values = _merge_optional_tensor("prev_values")
         merged_bootstrap_values = _merge_optional_tensor("bootstrap_values")
         merged_intervene_flags = _merge_optional_tensor("intervene_flags")
         merged_versions = _merge_optional_tensor("versions")
+        merged_route_info = _merge_optional_record("route_info")
+        merged_emitted_gate = _merge_optional_record("emitted_gate")
 
         forward_inputs_list = [
             rollout_result.forward_inputs for rollout_result in rollout_results
@@ -349,6 +375,8 @@ class RolloutResult:
             intervene_flags=merged_intervene_flags,
             forward_inputs=merged_forward_inputs,
             versions=merged_versions,
+            route_info=merged_route_info,
+            emitted_gate=merged_emitted_gate,
         )
 
 
@@ -365,6 +393,8 @@ class ChunkStepResult:
     rewards: torch.Tensor = None  # [B, 1]
     forward_inputs: dict[str, torch.Tensor] = field(default_factory=dict)
     versions: torch.Tensor = None  # [B, 1]
+    route_info: Optional["ChunkRouteRecord"] = None
+    emitted_gate: Optional["GateDecisionRecord"] = None
 
     def __post_init__(self):
         if self.actions is not None:
@@ -385,6 +415,10 @@ class ChunkStepResult:
             self.forward_inputs = put_tensor_device(self.forward_inputs, "cpu")
         if self.versions is not None:
             self.versions = self.versions.cpu().contiguous()
+        if self.route_info is not None:
+            self.route_info = self.route_info.cpu()
+        if self.emitted_gate is not None:
+            self.emitted_gate = self.emitted_gate.cpu()
 
 
 @dataclass
@@ -405,6 +439,8 @@ class Trajectory:
     prev_values: torch.Tensor = None
     versions: torch.Tensor = None
     forward_inputs: dict[str, Any] = field(default_factory=dict)
+    route_info: Optional["ChunkRouteRecord"] = None
+    emitted_gate: Optional["GateDecisionRecord"] = None
 
     curr_obs: dict[str, Any] = field(default_factory=dict)
     next_obs: dict[str, Any] = field(default_factory=dict)
@@ -552,6 +588,8 @@ class EmbodiedRolloutResult:
     forward_inputs: list[dict[str, Any]] = field(
         default_factory=list
     )  # trajectory_length
+    route_info: list["ChunkRouteRecord"] = field(default_factory=list)
+    emitted_gate: list["GateDecisionRecord"] = field(default_factory=list)
 
     curr_obs: list[dict[str, Any]] = field(default_factory=list)  # trajectory_length
     next_obs: list[dict[str, Any]] = field(default_factory=list)  # trajectory_length
@@ -578,6 +616,10 @@ class EmbodiedRolloutResult:
             self.versions.append(result.versions)
         if result.forward_inputs:
             self.forward_inputs.append(result.forward_inputs)
+        if result.route_info is not None:
+            self.route_info.append(result.route_info)
+        if result.emitted_gate is not None:
+            self.emitted_gate.append(result.emitted_gate)
 
     def mark_last_step_with_intervene_flags(self, intervene_flags: torch.Tensor):
         if not self.intervene_flags:
@@ -659,6 +701,8 @@ class EmbodiedRolloutResult:
         self.prev_values.clear()
         self.versions.clear()
         self.forward_inputs.clear()
+        self.route_info.clear()
+        self.emitted_gate.clear()
         self.curr_obs.clear()
         self.next_obs.clear()
 
@@ -701,6 +745,12 @@ class EmbodiedRolloutResult:
                 trajectory.forward_inputs[key] = (
                     trajectory.forward_inputs[key].cpu().contiguous()
                 )
+        if len(self.route_info) > 0:
+            record_type = type(self.route_info[0])
+            trajectory.route_info = record_type.stack(self.route_info, dim=0).cpu()
+        if len(self.emitted_gate) > 0:
+            record_type = type(self.emitted_gate[0])
+            trajectory.emitted_gate = record_type.stack(self.emitted_gate, dim=0).cpu()
 
         if len(self.curr_obs) > 0:
             trajectory.curr_obs = stack_list_of_dict_tensor(self.curr_obs)
@@ -762,6 +812,10 @@ class EmbodiedRolloutResult:
                 chunks = torch.chunk(value, split_size, dim=1)
                 for i in range(split_size):
                     setattr(splited_trajectories[i], field_name, chunks[i].contiguous())
+            elif field_name in {"route_info", "emitted_gate"}:
+                chunks = value.chunk(split_size, dim=1)
+                for i in range(split_size):
+                    setattr(splited_trajectories[i], field_name, chunks[i])
             else:
                 raise ValueError(
                     f"Unsupported value type: {type(value)} for field_name: {field_name}"
@@ -791,6 +845,11 @@ class EmbodiedRolloutResult:
             elif isinstance(value, dict):
                 for split_trajectory, split_value in zip(
                     trajectories, split_dict(value, split_sizes, dim=1)
+                ):
+                    setattr(split_trajectory, field_name, split_value)
+            elif field_name in {"route_info", "emitted_gate"}:
+                for split_trajectory, split_value in zip(
+                    trajectories, value.split(split_sizes, dim=1)
                 ):
                     setattr(split_trajectory, field_name, split_value)
             else:
@@ -1474,7 +1533,18 @@ def convert_trajectories_to_batch(
     # -------- tensor fields --------
     reference_trajectory = trajectories[0]
     for field_name in reference_trajectory.__dataclass_fields__.keys():
-        if not isinstance(getattr(reference_trajectory, field_name), torch.Tensor):
+        reference_value = getattr(reference_trajectory, field_name)
+        if field_name in {"route_info", "emitted_gate"}:
+            field_list = [
+                getattr(traj, field_name)
+                for traj in trajectories
+                if getattr(traj, field_name) is not None
+            ]
+            if field_list:
+                record_type = type(field_list[0])
+                batch[field_name] = record_type.cat(field_list, dim=1)
+            continue
+        if not isinstance(reference_value, torch.Tensor):
             continue
         field_list = [
             getattr(traj, field_name)

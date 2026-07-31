@@ -488,6 +488,7 @@ class MultiStepRolloutWorker(Worker):
             SupportedModel.DREAMZERO,
             SupportedModel.CNN_POLICY,
             SupportedModel.CFG_MODEL,
+            SupportedModel.FASTWAM_ADAPTIVE,
         ]:
             if self.enable_dagger:
                 kwargs = {"mode": "eval"}
@@ -559,6 +560,8 @@ class MultiStepRolloutWorker(Worker):
         final_obs: dict[str, Any] | None = None,
         rlt_switch_flags: torch.Tensor | None = None,
         intervene_requested: torch.Tensor | None = None,
+        fastwam_env_ids: torch.Tensor | None = None,
+        fastwam_reset_mask: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, dict[str, Any]]:
         if self.rlt_feature_model is not None:
             return predict_rlt_actions(
@@ -573,6 +576,12 @@ class MultiStepRolloutWorker(Worker):
                 intervene_requested=intervene_requested,
                 expert_model=self.expert_model,
             )
+        if SupportedModel(self.model_cfg.model_type) is SupportedModel.FASTWAM_ADAPTIVE:
+            env_obs = dict(env_obs)
+            if fastwam_env_ids is not None:
+                env_obs["_fastwam_env_ids"] = fastwam_env_ids
+            if fastwam_reset_mask is not None:
+                env_obs["_fastwam_reset_mask"] = fastwam_reset_mask
         return self.predict(env_obs, mode=mode)
 
     def _build_rollout_result(
@@ -602,6 +611,8 @@ class MultiStepRolloutWorker(Worker):
                 float(self.version),
                 dtype=torch.float32,
             ),
+            route_info=result.get("route_info"),
+            emitted_gate=result.get("emitted_gate"),
         )
 
     def get_bootstrap_values(
@@ -613,6 +624,20 @@ class MultiStepRolloutWorker(Worker):
             hasattr(self.hf_model, "value_head") or hasattr(self.hf_model, "q_head")
         ):
             return None
+        if SupportedModel(self.model_cfg.model_type) is SupportedModel.FASTWAM_ADAPTIVE:
+            with torch.no_grad():
+                critic_obs = self.hf_model.runtime.critic_observation(
+                    env_obs=final_obs
+                )
+                final_values = self.hf_model.critic.predict_value_batch(critic_obs)
+            if final_values.ndim == 1:
+                final_values = final_values[:, None]
+            if final_values.ndim != 2 or final_values.shape[1] != 1:
+                raise ValueError(
+                    "FastWAM bootstrap values must have shape [B] or [B, 1], "
+                    f"got {tuple(final_values.shape)}."
+                )
+            return final_values.cpu().contiguous()
         with torch.no_grad():
             actions, result = self._predict_rollout_actions(final_obs)
             if "prev_values" in result and result["prev_values"] is not None:
@@ -620,6 +645,37 @@ class MultiStepRolloutWorker(Worker):
             else:
                 final_values = torch.zeros_like(actions[:, :1], dtype=torch.float32)
         return final_values[:, :1].cpu().contiguous()
+
+    def _fastwam_value_only_rollout_result(
+        self,
+        env_obs: dict[str, Any],
+        final_obs: dict[str, Any] | None,
+    ) -> RolloutResult:
+        """Evaluate the bootstrap critic without advancing delayed routing state."""
+
+        if (
+            SupportedModel(self.model_cfg.model_type)
+            is not SupportedModel.FASTWAM_ADAPTIVE
+        ):
+            raise RuntimeError("FastWAM value-only rollout requested for another model.")
+        with torch.no_grad():
+            critic_obs = self.hf_model.runtime.critic_observation(env_obs=env_obs)
+            values = self.hf_model.critic.predict_value_batch(critic_obs)
+        if values.ndim == 1:
+            values = values[:, None]
+        if values.ndim != 2 or values.shape[1] != 1:
+            raise ValueError(
+                "FastWAM rollout values must have shape [B] or [B, 1], "
+                f"got {tuple(values.shape)}."
+            )
+        return RolloutResult(
+            prev_values=(
+                values.cpu().contiguous()
+                if self.collect_prev_infos
+                else None
+            ),
+            bootstrap_values=self.get_bootstrap_values(final_obs),
+        )
 
     @Worker.timer("sync_model_from_actor")
     async def sync_model_from_actor(self):
@@ -689,6 +745,8 @@ class MultiStepRolloutWorker(Worker):
                     final_obs=env_output.get("final_obs", None),
                     rlt_switch_flags=env_output.get("rlt_switch_flags", None),
                     intervene_requested=env_output.get("intervene_flags", None),
+                    fastwam_env_ids=env_output.get("fastwam_env_ids"),
+                    fastwam_reset_mask=env_output.get("fastwam_reset_mask"),
                 )
 
                 rollout_result = self._build_rollout_result(
@@ -717,35 +775,45 @@ class MultiStepRolloutWorker(Worker):
                 merge_fn=self._merge_obs_batches,
                 infer_batch_size_fn=self._infer_env_batch_size,
             ).async_wait()
-            actions, result = self._predict_rollout_actions(
-                env_output["obs"],
-                final_obs=env_output.get("final_obs", None),
-                rlt_switch_flags=env_output.get("rlt_switch_flags", None),
-                intervene_requested=env_output.get("intervene_flags", None),
-            )
-
-            if self.enable_opd:
-                # OPD keeps this path separate to retain student action tokens for post-rollout teacher logprobs.
-                rollout_result = self._build_rollout_result(
-                    actions,
-                    result,
-                    final_obs=env_output.get("final_obs", None),
+            if (
+                SupportedModel(self.model_cfg.model_type)
+                is SupportedModel.FASTWAM_ADAPTIVE
+            ):
+                rollout_result = self._fastwam_value_only_rollout_result(
+                    env_output["obs"],
+                    env_output.get("final_obs", None),
                 )
             else:
-                rollout_result = RolloutResult(
-                    actions=actions,
-                    prev_values=(
-                        result["prev_values"] if self.collect_prev_infos else None
-                    ),
-                    bootstrap_values=self.get_bootstrap_values(
-                        env_output.get("final_obs", None)
-                    ),
-                    forward_inputs=(
-                        result["forward_inputs"]
-                        if self.rlt_feature_model is not None
-                        else {}
-                    ),
+                actions, result = self._predict_rollout_actions(
+                    env_output["obs"],
+                    final_obs=env_output.get("final_obs", None),
+                    rlt_switch_flags=env_output.get("rlt_switch_flags", None),
+                    intervene_requested=env_output.get("intervene_flags", None),
+                    fastwam_env_ids=env_output.get("fastwam_env_ids"),
+                    fastwam_reset_mask=env_output.get("fastwam_reset_mask"),
                 )
+                if self.enable_opd:
+                    # OPD keeps this path separate to retain student action tokens for post-rollout teacher logprobs.
+                    rollout_result = self._build_rollout_result(
+                        actions,
+                        result,
+                        final_obs=env_output.get("final_obs", None),
+                    )
+                else:
+                    rollout_result = RolloutResult(
+                        actions=actions,
+                        prev_values=(
+                            result["prev_values"] if self.collect_prev_infos else None
+                        ),
+                        bootstrap_values=self.get_bootstrap_values(
+                            env_output.get("final_obs", None)
+                        ),
+                        forward_inputs=(
+                            result["forward_inputs"]
+                            if self.rlt_feature_model is not None
+                            else {}
+                        ),
+                    )
             self.send_to(
                 group_name=self.cfg.env.group_name,
                 channel=output_channel,
@@ -801,6 +869,8 @@ class MultiStepRolloutWorker(Worker):
                     final_obs=env_output.get("final_obs", None),
                     rlt_switch_flags=env_output.get("rlt_switch_flags", None),
                     intervene_requested=env_output.get("intervene_flags", None),
+                    fastwam_env_ids=env_output.get("fastwam_env_ids"),
+                    fastwam_reset_mask=env_output.get("fastwam_reset_mask"),
                 )
                 if isinstance(actions, torch.Tensor):
                     actions = actions.detach().cpu().contiguous()
@@ -835,6 +905,8 @@ class MultiStepRolloutWorker(Worker):
                             final_obs=env_output.get("final_obs", None),
                             rlt_switch_flags=env_output.get("rlt_switch_flags", None),
                             intervene_requested=env_output.get("intervene_flags", None),
+                            fastwam_env_ids=env_output.get("fastwam_env_ids"),
+                            fastwam_reset_mask=env_output.get("fastwam_reset_mask"),
                         )
                         if isinstance(actions, torch.Tensor):
                             actions = actions.detach().cpu().contiguous()
@@ -916,6 +988,12 @@ class MultiStepRolloutWorker(Worker):
         intervene_flags_list = [
             obs_batch.get("intervene_flags", None) for obs_batch in obs_batches
         ]
+        fastwam_env_ids_list = [
+            obs_batch.get("fastwam_env_ids", None) for obs_batch in obs_batches
+        ]
+        fastwam_reset_mask_list = [
+            obs_batch.get("fastwam_reset_mask", None) for obs_batch in obs_batches
+        ]
 
         def _merge_obs_dicts(dicts: list[dict[str, Any]]) -> dict[str, Any]:
             merged: dict[str, Any] = {}
@@ -952,6 +1030,12 @@ class MultiStepRolloutWorker(Worker):
             "intervene_flags": self._merge_optional_flag_tensors(
                 obs_dicts, intervene_flags_list
             ),
+            "fastwam_env_ids": self._merge_optional_flag_tensors(
+                obs_dicts, fastwam_env_ids_list
+            ),
+            "fastwam_reset_mask": self._merge_optional_flag_tensors(
+                obs_dicts, fastwam_reset_mask_list
+            ),
         }
 
     def _split_rollout_result(
@@ -970,6 +1054,16 @@ class MultiStepRolloutWorker(Worker):
         split_bootstrap_values = _split_optional_tensor(rollout_result.bootstrap_values)
         split_intervene_flags = _split_optional_tensor(rollout_result.intervene_flags)
         split_versions = _split_optional_tensor(rollout_result.versions)
+        split_route_info = (
+            (None,) * len(sizes)
+            if rollout_result.route_info is None
+            else rollout_result.route_info.split(sizes, dim=0)
+        )
+        split_emitted_gate = (
+            (None,) * len(sizes)
+            if rollout_result.emitted_gate is None
+            else rollout_result.emitted_gate.split(sizes, dim=0)
+        )
         split_forward_inputs = (
             [{} for _ in sizes]
             if not rollout_result.forward_inputs
@@ -992,6 +1086,8 @@ class MultiStepRolloutWorker(Worker):
                 intervene_flags=split_intervene_flags[idx],
                 forward_inputs=split_forward_inputs[idx],
                 versions=split_versions[idx],
+                route_info=split_route_info[idx],
+                emitted_gate=split_emitted_gate[idx],
             )
             for idx in range(len(sizes))
         ]

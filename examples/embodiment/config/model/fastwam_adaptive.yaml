@@ -1,0 +1,183 @@
+model_type: fastwam_adaptive
+precision: bf16
+init_device: cpu
+
+action_dim: 7
+num_action_chunks: 16
+actor_checkpoint: ${oc.env:FASTWAM_CHECKPOINT}
+actor_checkpoint_sha256: ${oc.env:FASTWAM_CHECKPOINT_SHA256}
+# Kept for RLinf's generic HuggingFace rollout bootstrap; the FastWAM builder
+# still verifies and loads actor_checkpoint explicitly.
+model_path: ${oc.env:FASTWAM_CHECKPOINT}
+is_lora: false
+add_value_head: true
+
+fastwam:
+  _target_: fastwam.runtime.create_fastwam_idm
+  model_id: ${oc.env:FASTWAM_MODEL_ID,Wan-AI/Wan2.2-TI2V-5B}
+  tokenizer_model_id: ${oc.env:FASTWAM_TOKENIZER_MODEL_ID,Wan-AI/Wan2.1-T2V-1.3B}
+  tokenizer_max_len: 128
+  load_text_encoder: true
+  proprio_dim: 8
+  redirect_common_files: true
+  mot_checkpoint_mixed_attn: false
+  action_dit_pretrained_path: null
+  skip_dit_load_from_pretrain: true
+  video_dit_config:
+    has_image_input: false
+    patch_size: [1, 2, 2]
+    in_dim: 48
+    hidden_dim: 3072
+    ffn_dim: 14336
+    freq_dim: 256
+    text_dim: 4096
+    out_dim: 48
+    num_heads: 24
+    attn_head_dim: 128
+    num_layers: 30
+    eps: 1.0e-6
+    seperated_timestep: true
+    require_clip_embedding: false
+    require_vae_embedding: false
+    fuse_vae_embedding_in_latents: true
+    use_gradient_checkpointing: false
+    video_attention_mask_mode: first_frame_causal
+    action_conditioned: false
+    action_dim: ${...action_dim}
+    action_group_causal_mask_mode: group_diagonal
+  action_dit_config:
+    action_dim: ${...action_dim}
+    hidden_dim: 1024
+    ffn_dim: 4096
+    num_heads: 24
+    attn_head_dim: 128
+    num_layers: 30
+    text_dim: 4096
+    freq_dim: 256
+    eps: 1.0e-6
+    use_gradient_checkpointing: false
+  video_scheduler:
+    train_shift: 5.0
+    infer_shift: 5.0
+    num_train_timesteps: 1000
+  action_scheduler:
+    train_shift: 5.0
+    infer_shift: 5.0
+    num_train_timesteps: 1000
+  loss:
+    lambda_action: 1.0
+
+uncond_lora:
+  rank: 16
+  alpha: 16.0
+  dropout: 0.0
+  target_groups:
+    - self_attention_qkvo
+    - cross_attention_qkvo
+    - ffn
+  freeze_base: true
+  strict_target_discovery: true
+
+gate:
+  hidden_dim: 256
+  num_query_tokens: 4
+  share_blocks: false
+  ffn_multiplier: 4
+  denoise_last_n: 1
+  layer_taps:
+    mode: all
+    last_n: null
+    indices: null
+  current_mode_embedding: true
+  layer_index_embedding: true
+  denoise_timestep_embedding: true
+
+gate_epsilon: 0.1
+gate_temperature: 1.0
+eval_idm_threshold: 0.5
+
+kv_replay:
+  # Set to recompute only for the explicit memory ablation.
+  backend: stored
+  storage_dtype: bfloat16
+  pin_memory: true
+  deduplicate_static_banks: true
+  # Fail closed if a shape/config change exceeds the measured all-layer budget.
+  max_bytes_per_sample: 268435456
+
+flow_sde:
+  enabled: true
+  joint_logprob: false
+  denoise_index_sampling: uniform
+  noise_level: 0.5
+  ignore_last_transition: false
+
+runtime:
+  _target_: rlinf.models.embodiment.wam_policy.libero_runtime.LiberoFastWAMRuntime
+  processor:
+    _target_: fastwam.datasets.lerobot.processors.fastwam_processor.FastWAMProcessor
+    shape_meta:
+      images:
+        - {key: image, raw_shape: [3, 256, 256], shape: [3, 224, 224]}
+        - {key: wrist_image, raw_shape: [3, 256, 256], shape: [3, 224, 224]}
+      action:
+        - {key: default, raw_shape: 7, shape: 7}
+      state:
+        - {key: default, raw_shape: 8, shape: 8}
+    num_obs_steps: 33
+    num_output_cameras: 2
+    action_output_dim: 7
+    proprio_output_dim: 8
+    action_state_transforms: null
+    use_stepwise_action_norm: false
+    norm_default_mode: min/max
+    norm_exception_mode: null
+    action_state_merger:
+      _target_: fastwam.datasets.lerobot.transforms.action_state_merger.ConcatLeftAlign
+    train_transforms: null
+    val_transforms: null
+    drop_high_level_prob: 1.0
+    use_zh_instruction: false
+    tokenizer: null
+    delta_action_dim_mask:
+      default: [true, true, true, true, true, true, false]
+  processor_stats_path: ${oc.env:FASTWAM_DATASET_STATS}
+  action_horizon: ${..num_action_chunks}
+  num_video_frames: 33
+  num_inference_steps: 20
+  sigma_shift: null
+  camera_height: 224
+  camera_width: 224
+  camera_concat: horizontal
+  tiled_vae: false
+  binarize_gripper: false
+
+critic:
+  kind: pi0_5_value_after_vlm
+  input_dim: 2048
+  hidden_sizes: [1024, 512, 256]
+  backbone:
+    model_type: openpi
+    model_path: ${oc.env:PI05_CRITIC_CHECKPOINT}
+    precision: null
+    num_action_chunks: 10
+    action_dim: 7
+    is_lora: false
+    lora_rank: 32
+    use_proprio: true
+    num_steps: 5
+    # Must remain false: the composite wrapper creates a fresh head after load.
+    add_value_head: false
+    openpi:
+      config_name: pi05_libero
+      num_images_in_input: 2
+      noise_level: 0.5
+      action_chunk: ${..num_action_chunks}
+      num_steps: ${..num_steps}
+      train_expert_only: true
+      action_env_dim: ${..action_dim}
+      noise_method: flow_sde
+      add_value_head: false
+      value_after_vlm: false
+      value_vlm_mode: mean_token
+      detach_critic_input: true

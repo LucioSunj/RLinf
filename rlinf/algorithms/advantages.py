@@ -12,13 +12,366 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from dataclasses import dataclass
 from typing import Optional
 
 import torch
 
 from rlinf.algorithms.registry import register_advantage
 from rlinf.algorithms.utils import kl_penalty, safe_normalize
+from rlinf.models.embodiment.wam_policy.contracts import (
+    ChunkRouteRecord,
+    GateDecisionRecord,
+    WAMRoute,
+)
 from rlinf.utils.utils import masked_mean
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
+class FastWAMChunkCost:
+    """Chunk rewards with exactly one fixed cost per executed route."""
+
+    rewards: torch.Tensor
+    costs: torch.Tensor
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
+class FastWAMPolicyAlignment:
+    """Source-aligned policy fields for delayed Gate and Flow-SDE PPO."""
+
+    flow_advantages: torch.Tensor
+    flow_valid_mask: torch.Tensor
+    gate_advantages: torch.Tensor
+    gate_valid_mask: torch.Tensor
+
+
+def _raise_first_pair(
+    mask: torch.Tensor,
+    *,
+    message: str,
+    source_times: torch.Tensor,
+    source_columns: torch.Tensor,
+    destination_times: torch.Tensor,
+    destination_columns: torch.Tensor,
+) -> None:
+    if not bool(mask.any().item()):
+        return
+    index = int(mask.nonzero(as_tuple=False)[0].item())
+    source = (int(source_times[index]), int(source_columns[index]))
+    destination = (
+        int(destination_times[index]),
+        int(destination_columns[index]),
+    )
+    raise ValueError(
+        f"{message} First source/destination pair is {source} -> {destination}."
+    )
+
+
+def _chunk_mask(
+    value: torch.Tensor | None,
+    *,
+    shape: torch.Size,
+    name: str,
+    device: torch.device | None = None,
+) -> torch.Tensor:
+    if value is None:
+        return torch.ones(shape, dtype=torch.bool, device=device)
+    if value.dtype != torch.bool:
+        raise TypeError(f"{name} must use torch.bool, got {value.dtype}.")
+    if value.shape[: len(shape)] != shape:
+        raise ValueError(
+            f"{name} must start with shape {tuple(shape)}, got {tuple(value.shape)}."
+        )
+    if value.ndim == len(shape):
+        return value
+    return value.reshape(*shape, -1).any(dim=-1)
+
+
+def apply_fastwam_chunk_cost(
+    *,
+    environment_rewards: torch.Tensor,
+    route_used: torch.Tensor,
+    idm_cost: float,
+    uncond_cost: float = 0.0,
+    valid_mask: torch.Tensor | None = None,
+) -> FastWAMChunkCost:
+    """Aggregate primitive rewards, then subtract one actual-route cost.
+
+    FastWAM routes are chosen once per action chunk while the environment keeps
+    one reward entry per primitive action. This helper deliberately aggregates
+    the primitive rewards before applying the route cost, preventing accidental
+    multiplication by ``num_action_chunks``.
+    """
+
+    if not environment_rewards.is_floating_point():
+        raise TypeError("environment_rewards must use a floating dtype.")
+    if environment_rewards.ndim != 3:
+        raise ValueError(
+            "FastWAM chunk rewards must have shape [time, batch, action_chunks], "
+            f"got {tuple(environment_rewards.shape)}."
+        )
+    if route_used.shape != environment_rewards.shape[:2]:
+        raise ValueError(
+            "route_used must match the reward [time, batch] dimensions; got "
+            f"{tuple(route_used.shape)} and {tuple(environment_rewards.shape)}."
+        )
+    if route_used.dtype not in {
+        torch.uint8,
+        torch.int8,
+        torch.int16,
+        torch.int32,
+        torch.int64,
+    }:
+        raise TypeError("route_used must use an integer dtype.")
+    if idm_cost < 0 or uncond_cost < 0:
+        raise ValueError("FastWAM branch costs must be non-negative.")
+    invalid_route = (route_used != int(WAMRoute.UNCOND)) & (
+        route_used != int(WAMRoute.IDM)
+    )
+    if bool(invalid_route.any().item()):
+        raise ValueError("route_used contains a value outside WAMRoute.")
+
+    rewards = environment_rewards.sum(dim=-1, keepdim=True)
+    costs = torch.where(
+        route_used == int(WAMRoute.IDM),
+        torch.as_tensor(idm_cost, dtype=rewards.dtype, device=rewards.device),
+        torch.as_tensor(uncond_cost, dtype=rewards.dtype, device=rewards.device),
+    ).unsqueeze(-1)
+    if valid_mask is not None:
+        costs = torch.where(
+            _chunk_mask(valid_mask, shape=route_used.shape, name="valid_mask").unsqueeze(
+                -1
+            ),
+            costs,
+            torch.zeros_like(costs),
+        )
+    return FastWAMChunkCost(rewards=rewards - costs, costs=costs)
+
+
+def align_fastwam_policy_advantages(
+    *,
+    advantages: torch.Tensor,
+    route: ChunkRouteRecord,
+    emitted: GateDecisionRecord,
+    dones: torch.Tensor,
+    rollout_epoch: int,
+    carry_pending_across_epochs: bool,
+    loss_mask: torch.Tensor | None = None,
+) -> FastWAMPolicyAlignment:
+    """Pair chunk-``t`` Gate replay with chunk-``t+1`` advantage.
+
+    The Gate record and its K/V remain at their source chunk. Only the scalar
+    destination advantage is copied back to that source position. When rollout
+    epochs were folded into the batch dimension, an auto-reset rollout may pair
+    the last source in epoch ``e`` with the first destination in epoch ``e+1``.
+    Forced/reset destinations and the final unused decision receive no Gate loss.
+
+    Route, episode, chunk-id, and actor-version mismatches fail closed rather
+    than silently changing the training mask.
+    """
+
+    if len(route.shape) != 2:
+        raise ValueError(
+            "FastWAM policy alignment requires route records shaped [time, batch], "
+            f"got {tuple(route.shape)}."
+        )
+    if emitted.shape != route.shape:
+        raise ValueError(
+            "Route and emitted Gate records must have identical shapes, got "
+            f"{tuple(route.shape)} and {tuple(emitted.shape)}."
+        )
+    if rollout_epoch < 1:
+        raise ValueError("rollout_epoch must be positive.")
+    time_steps, folded_batch = route.shape
+    if folded_batch % rollout_epoch != 0:
+        raise ValueError(
+            f"Folded batch {folded_batch} is not divisible by rollout_epoch "
+            f"{rollout_epoch}."
+        )
+    if advantages.shape != (*route.shape, 1):
+        raise ValueError(
+            "FastWAM chunk-level advantages must have shape [time, batch, 1], "
+            f"got {tuple(advantages.shape)} for routes {tuple(route.shape)}."
+        )
+    if not advantages.is_floating_point():
+        raise TypeError("advantages must use a floating dtype.")
+    expected_done_prefix = (time_steps + 1, folded_batch)
+    if dones.shape[:2] != expected_done_prefix:
+        raise ValueError(
+            "dones must have one bootstrap timestep and begin with shape "
+            f"{expected_done_prefix}, got {tuple(dones.shape)}."
+        )
+    if dones.dtype != torch.bool:
+        raise TypeError("dones must use torch.bool.")
+
+    source_metadata_mismatch = emitted.valid & (
+        (emitted.source_chunk_ids != route.chunk_ids)
+        | (emitted.episode_ids != route.episode_ids)
+        | (emitted.actor_versions != route.actor_versions)
+    )
+    if bool(source_metadata_mismatch.any().item()):
+        index = tuple(
+            int(item)
+            for item in source_metadata_mismatch.nonzero(as_tuple=False)[0].tolist()
+        )
+        raise ValueError(
+            "A valid Gate decision does not match its source chunk metadata. "
+            f"First mismatch at {index}."
+        )
+
+    flow_valid_mask = _chunk_mask(
+        loss_mask,
+        shape=route.shape,
+        name="loss_mask",
+        device=route.route_used.device,
+    )
+    done_mask = _chunk_mask(dones, shape=torch.Size(expected_done_prefix), name="dones")
+    destination_times = torch.full(
+        route.shape, -1, dtype=torch.long, device=route.route_used.device
+    )
+    destination_columns = torch.full_like(destination_times, -1)
+    columns = torch.arange(
+        folded_batch, dtype=torch.long, device=route.route_used.device
+    )
+    if time_steps > 1:
+        destination_times[:-1] = torch.arange(
+            1, time_steps, dtype=torch.long, device=route.route_used.device
+        )[:, None]
+        destination_columns[:-1] = columns[None, :]
+    base_batch = folded_batch // rollout_epoch
+    if carry_pending_across_epochs and rollout_epoch > 1:
+        cross_epoch_columns = columns < folded_batch - base_batch
+        destination_times[-1, cross_epoch_columns] = 0
+        destination_columns[-1, cross_epoch_columns] = (
+            columns[cross_epoch_columns] + base_batch
+        )
+
+    candidate_mask = destination_times >= 0
+    source_times, source_columns = candidate_mask.nonzero(as_tuple=True)
+    target_times = destination_times[source_times, source_columns]
+    target_columns = destination_columns[source_times, source_columns]
+    target_is_valid = flow_valid_mask[target_times, target_columns]
+    if not bool(target_is_valid.any().item()):
+        return FastWAMPolicyAlignment(
+            flow_advantages=advantages,
+            flow_valid_mask=flow_valid_mask,
+            gate_advantages=torch.zeros_like(advantages[..., 0]),
+            gate_valid_mask=torch.zeros_like(flow_valid_mask),
+        )
+
+    source_episode = route.episode_ids[source_times, source_columns]
+    target_episode = route.episode_ids[target_times, target_columns]
+    episode_changed = target_episode != source_episode
+    source_done = done_mask[source_times + 1, source_columns]
+    target_forced = route.route_was_forced[target_times, target_columns]
+    target_is_idm = (
+        route.route_used[target_times, target_columns] == int(WAMRoute.IDM)
+    )
+    target_is_first_chunk = route.chunk_ids[target_times, target_columns] == 0
+
+    _raise_first_pair(
+        target_is_valid & source_done & ~episode_changed,
+        message="A valid chunk followed a terminal source without an episode reset.",
+        source_times=source_times,
+        source_columns=source_columns,
+        destination_times=target_times,
+        destination_columns=target_columns,
+    )
+    _raise_first_pair(
+        target_is_valid & episode_changed & ~source_done,
+        message="An episode reset occurred without a terminal source chunk.",
+        source_times=source_times,
+        source_columns=source_columns,
+        destination_times=target_times,
+        destination_columns=target_columns,
+    )
+    invalid_reset = episode_changed & (
+        (~target_forced) | (~target_is_idm) | (~target_is_first_chunk)
+    )
+    _raise_first_pair(
+        target_is_valid & invalid_reset,
+        message="The first valid chunk after reset must be forced IDM chunk zero.",
+        source_times=source_times,
+        source_columns=source_columns,
+        destination_times=target_times,
+        destination_columns=target_columns,
+    )
+
+    consumed = target_is_valid & ~episode_changed & ~target_forced
+    source_decision_valid = emitted.valid[source_times, source_columns]
+    _raise_first_pair(
+        consumed & ~source_decision_valid,
+        message="A non-forced route has no valid preceding Gate decision.",
+        source_times=source_times,
+        source_columns=source_columns,
+        destination_times=target_times,
+        destination_columns=target_columns,
+    )
+    _raise_first_pair(
+        consumed
+        & (
+            route.route_source_chunk_ids[target_times, target_columns]
+            != emitted.source_chunk_ids[source_times, source_columns]
+        ),
+        message="A route references the wrong Gate source chunk.",
+        source_times=source_times,
+        source_columns=source_columns,
+        destination_times=target_times,
+        destination_columns=target_columns,
+    )
+    _raise_first_pair(
+        consumed
+        & (
+            route.chunk_ids[target_times, target_columns]
+            != emitted.source_chunk_ids[source_times, source_columns] + 1
+        ),
+        message="A Gate decision did not control the immediately following chunk.",
+        source_times=source_times,
+        source_columns=source_columns,
+        destination_times=target_times,
+        destination_columns=target_columns,
+    )
+    _raise_first_pair(
+        consumed
+        & (
+            route.route_used[target_times, target_columns]
+            != emitted.next_route[source_times, source_columns]
+        ),
+        message="The executed route differs from the Gate decision.",
+        source_times=source_times,
+        source_columns=source_columns,
+        destination_times=target_times,
+        destination_columns=target_columns,
+    )
+    _raise_first_pair(
+        consumed
+        & (
+            route.actor_versions[target_times, target_columns]
+            != emitted.actor_versions[source_times, source_columns]
+        ),
+        message="A Gate decision crossed an actor-version boundary.",
+        source_times=source_times,
+        source_columns=source_columns,
+        destination_times=target_times,
+        destination_columns=target_columns,
+    )
+
+    gate_advantages = torch.zeros_like(advantages[..., 0])
+    gate_valid_mask = torch.zeros_like(flow_valid_mask)
+    valid_source_times = source_times[consumed]
+    valid_source_columns = source_columns[consumed]
+    valid_target_times = target_times[consumed]
+    valid_target_columns = target_columns[consumed]
+    gate_advantages[valid_source_times, valid_source_columns] = advantages[
+        valid_target_times, valid_target_columns, 0
+    ]
+    gate_valid_mask[valid_source_times, valid_source_columns] = True
+    return FastWAMPolicyAlignment(
+        flow_advantages=advantages,
+        flow_valid_mask=flow_valid_mask,
+        gate_advantages=gate_advantages,
+        gate_valid_mask=gate_valid_mask,
+    )
 
 
 @register_advantage("gae")

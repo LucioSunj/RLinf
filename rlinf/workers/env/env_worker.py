@@ -920,11 +920,49 @@ class EnvWorker(Worker):
 
         return env_outputs
 
-    def _build_rollout_input_data(self, env_batch: dict[str, Any]) -> dict[str, Any]:
+    def _build_rollout_input_data(
+        self,
+        env_batch: dict[str, Any],
+        *,
+        stage_id: int,
+        eval_mode: bool = False,
+        force_reset: bool = False,
+    ) -> dict[str, Any]:
         data = {
             "obs": env_batch["obs"],
             "final_obs": env_batch["final_obs"],
         }
+        if env_batch["obs"]:
+            first_value = next(iter(env_batch["obs"].values()))
+            batch_size = (
+                int(first_value.shape[0])
+                if isinstance(first_value, torch.Tensor)
+                else len(first_value)
+            )
+            per_stage = (
+                self.eval_num_envs_per_stage
+                if eval_mode
+                else self.train_num_envs_per_stage
+            )
+            namespace = 1 << 50 if eval_mode else 0
+            start = namespace + (
+                self._rank * self.stage_num + stage_id
+            ) * per_stage
+            data["fastwam_env_ids"] = torch.arange(
+                start,
+                start + batch_size,
+                dtype=torch.long,
+            )
+            dones = env_batch.get("dones")
+            if force_reset:
+                reset_mask = torch.ones(batch_size, dtype=torch.bool)
+            elif dones is None:
+                reset_mask = torch.zeros(batch_size, dtype=torch.bool)
+            else:
+                reset_mask = dones.to(dtype=torch.bool).reshape(batch_size, -1).any(
+                    dim=1
+                )
+            data["fastwam_reset_mask"] = reset_mask
         if self.enable_rlt:
             data["rlt_switch_flags"] = env_batch.get("rlt_switch_flags", None)
             data["intervene_flags"] = env_batch.get("intervene_flags", None)
@@ -939,7 +977,11 @@ class EnvWorker(Worker):
             self.send_to(
                 group_name=self.cfg.rollout.group_name,
                 channel=rollout_channel,
-                data=self._build_rollout_input_data(env_batch),
+                data=self._build_rollout_input_data(
+                    env_batch,
+                    stage_id=stage_id,
+                    force_reset=not self.cfg.env.train.auto_reset,
+                ),
                 mode="train",
                 tag="rollout_results",
                 route_key=stage_id if not self.env_decoupled_mode else None,
@@ -1089,6 +1131,8 @@ class EnvWorker(Worker):
                         truncations=env_output.truncations,
                         terminations=env_output.terminations,
                         rewards=rewards,
+                        route_info=rollout_result.route_info,
+                        emitted_gate=rollout_result.emitted_gate,
                     )
 
                     self.rollout_results[stage_id].append_step_result(chunk_step_result)
@@ -1126,7 +1170,10 @@ class EnvWorker(Worker):
                     self.send_to(
                         group_name=self.cfg.rollout.group_name,
                         channel=rollout_channel,
-                        data=self._build_rollout_input_data(env_batch),
+                        data=self._build_rollout_input_data(
+                            env_batch,
+                            stage_id=stage_id,
+                        ),
                         mode="train",
                         tag="rollout_results",
                         route_key=stage_id if not self.env_decoupled_mode else None,
@@ -1202,6 +1249,8 @@ class EnvWorker(Worker):
                     truncations=env_output.truncations,
                     terminations=env_output.terminations,
                     rewards=rewards,
+                    route_info=rollout_result.route_info,
+                    emitted_gate=rollout_result.emitted_gate,
                 )
                 self.rollout_results[stage_id].append_step_result(chunk_step_result)
                 if (
@@ -1292,7 +1341,12 @@ class EnvWorker(Worker):
                     self.send_to(
                         group_name=self.cfg.rollout.group_name,
                         channel=rollout_channel,
-                        data=self._build_rollout_input_data(env_batch),
+                        data=self._build_rollout_input_data(
+                            env_batch,
+                            stage_id=stage_id,
+                            eval_mode=True,
+                            force_reset=True,
+                        ),
                         mode="eval",
                         tag="rollout_results",
                         route_key=stage_id if not self.env_decoupled_mode else None,
@@ -1341,7 +1395,11 @@ class EnvWorker(Worker):
                     self.send_to(
                         group_name=self.cfg.rollout.group_name,
                         channel=rollout_channel,
-                        data=self._build_rollout_input_data(env_batch),
+                        data=self._build_rollout_input_data(
+                            env_batch,
+                            stage_id=stage_id,
+                            eval_mode=True,
+                        ),
                         mode="eval",
                         tag="rollout_results",
                         route_key=stage_id if not self.env_decoupled_mode else None,

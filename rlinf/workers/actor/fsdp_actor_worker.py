@@ -24,7 +24,17 @@ from torch.distributed.tensor import DTensor
 from torch.multiprocessing.reductions import reduce_tensor
 
 import rlinf.algorithms  # noqa: F401
+from rlinf.algorithms.advantages import (
+    align_fastwam_policy_advantages,
+    apply_fastwam_chunk_cost,
+)
 from rlinf.algorithms.expert import build_expert_model_config
+from rlinf.algorithms.fastwam_dual_ppo import (
+    compute_base_uncond_kl_loss,
+    compute_fastwam_dual_ppo_loss,
+    compute_gate_collapse_penalty,
+)
+from rlinf.algorithms.losses import compute_ppo_critic_loss
 from rlinf.algorithms.registry import calculate_adv_and_returns, policy_loss
 from rlinf.algorithms.utils import (
     kl_penalty,
@@ -43,6 +53,7 @@ from rlinf.hybrid_engines.fsdp.utils import (
 from rlinf.hybrid_engines.weight_syncer import WeightSyncer
 from rlinf.models import get_model
 from rlinf.models.embodiment.base_policy import ForwardType
+from rlinf.models.embodiment.wam_policy.contracts import WAMRoute
 from rlinf.scheduler import Channel, Cluster, Worker
 from rlinf.utils.data_iter_utils import (
     get_iterator_k_split,
@@ -69,6 +80,9 @@ from rlinf.utils.metric_utils import (
     pop_critic_explained_variance_stats,
 )
 from rlinf.utils.nested_dict_process import (
+    flatten_time_batch,
+    map_nested_tensors,
+    merge_rollout_epoch_batch,
     put_tensor_device,
     split_dict_to_chunk,
 )
@@ -81,10 +95,12 @@ from rlinf.utils.utils import (
     compute_entropy_from_logits,
     compute_logprobs_from_logits,
     cpu_weight_swap,
+    get_rng_state,
     get_loss_agg_func,
     masked_mean,
     reshape_entropy,
     retrieve_model_state_dict_in_cpu,
+    set_rng_state,
 )
 from rlinf.workers.rollout.utils import RankMapper
 
@@ -94,20 +110,7 @@ def process_nested_dict_for_adv(nested_dict, rollout_epoch):
     original shape: [rollout_epoch x n_chunk_steps, bsz, num_action_chunks, ...]
     target shape: [n_chunk_steps, rollout_epoch x bsz, num_action_chunks, ...]
     """
-    ret_dict = {}
-    for key, value in nested_dict.items():
-        if isinstance(value, torch.Tensor):
-            new_value = value.reshape(
-                rollout_epoch, -1, *value.shape[1:]
-            )  # [rollout_epoch, n_chunk_step, bsz, ...]
-            new_value = new_value.transpose(
-                0, 1
-            )  # [n_chunk_step, rollout_epoch, bsz, ...]
-            new_value = new_value.reshape(new_value.shape[0], -1, *new_value.shape[3:])
-            ret_dict[key] = new_value
-        elif isinstance(value, dict):
-            ret_dict[key] = process_nested_dict_for_adv(value, rollout_epoch)
-    return ret_dict
+    return merge_rollout_epoch_batch(nested_dict, rollout_epoch)
 
 
 def process_nested_dict_for_train(nested_dict, shuffle_id):
@@ -119,10 +122,9 @@ def process_nested_dict_for_train(nested_dict, shuffle_id):
             raise NotImplementedError
         if value is None:
             ret_dict[key] = None
-        if isinstance(value, torch.Tensor):
-            ret_dict[key] = value.reshape(-1, *value.shape[2:])[shuffle_id]
-        elif isinstance(value, dict):
-            ret_dict[key] = process_nested_dict_for_train(value, shuffle_id)
+            continue
+
+        ret_dict[key] = flatten_time_batch(value, shuffle_id, field_name=key)
     return ret_dict
 
 
@@ -135,16 +137,15 @@ def trim_nested_tensor_time_dim(value, target_steps: int, key_path=()):
             f"{tuple(value.shape)} to {target_steps} OPD training steps."
         )
         return value[:target_steps]
-    if isinstance(value, dict):
-        return {
-            key: trim_nested_tensor_time_dim(
-                nested_value, target_steps, (*key_path, key)
-            )
-            for key, nested_value in value.items()
-        }
-    raise TypeError(
-        f"Unsupported field {'.'.join(key_path)!r} type {type(value)} for OPD trimming."
-    )
+
+    def trim_tensor(tensor: torch.Tensor) -> torch.Tensor:
+        assert tensor.shape[0] in {target_steps, target_steps + 1}, (
+            f"Cannot trim field {'.'.join(key_path)!r} with shape "
+            f"{tuple(tensor.shape)} to {target_steps} OPD training steps."
+        )
+        return tensor[:target_steps]
+
+    return map_nested_tensors(value, trim_tensor)
 
 
 def flatten_nested_tensor_time_batch(value, key_path=()):
@@ -156,14 +157,15 @@ def flatten_nested_tensor_time_batch(value, key_path=()):
             f"{tuple(value.shape)} across time and batch."
         )
         return value.reshape(-1, *value.shape[2:])
-    if isinstance(value, dict):
-        return {
-            key: flatten_nested_tensor_time_batch(nested_value, (*key_path, key))
-            for key, nested_value in value.items()
-        }
-    raise TypeError(
-        f"Unsupported field {'.'.join(key_path)!r} type {type(value)} for flattening."
-    )
+
+    def flatten_tensor(tensor: torch.Tensor) -> torch.Tensor:
+        assert tensor.dim() >= 2, (
+            f"Cannot flatten field {'.'.join(key_path)!r} with shape "
+            f"{tuple(tensor.shape)} across time and batch."
+        )
+        return tensor.reshape(-1, *tensor.shape[2:])
+
+    return map_nested_tensors(value, flatten_tensor)
 
 
 def compute_rollout_train_kl(
@@ -1140,6 +1142,200 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
     def get_rollout_state_dict(self) -> dict:
         return self.get_model_state_dict(cpu_offload=False, full_state_dict=False)
 
+    def _fastwam_policy_module(self):
+        model = self.model
+        visited = set()
+        while id(model) not in visited:
+            visited.add(id(model))
+            if hasattr(model, "trainable_state_dict") and hasattr(
+                model, "load_trainable_state_dict"
+            ):
+                return model
+            next_model = getattr(model, "module", None)
+            if next_model is None:
+                next_model = getattr(model, "_fsdp_wrapped_module", None)
+            if next_model is None:
+                break
+            model = next_model
+        raise TypeError(
+            "Could not unwrap the FastWAM adaptive policy from its FSDP wrapper."
+        )
+
+    @staticmethod
+    def _checkpoint_cpu_clone(value):
+        if isinstance(value, torch.Tensor):
+            return value.detach().cpu().clone()
+        if isinstance(value, dict):
+            return {
+                key: EmbodiedFSDPActor._checkpoint_cpu_clone(item)
+                for key, item in value.items()
+            }
+        if isinstance(value, list):
+            return [
+                EmbodiedFSDPActor._checkpoint_cpu_clone(item) for item in value
+            ]
+        if isinstance(value, tuple):
+            return tuple(
+                EmbodiedFSDPActor._checkpoint_cpu_clone(item) for item in value
+            )
+        return value
+
+    def _fastwam_checkpoint_contract(self) -> dict:
+        model_cfg = self.cfg.actor.model
+        model_keys = (
+            "model_type",
+            "actor_checkpoint_sha256",
+            "num_action_chunks",
+            "uncond_lora",
+            "gate",
+            "gate_epsilon",
+            "gate_temperature",
+            "eval_idm_threshold",
+            "kv_replay",
+            "flow_sde",
+            "runtime",
+            "critic",
+        )
+        algorithm_keys = (
+            "adv_type",
+            "loss_type",
+            "reward_type",
+            "logprob_type",
+            "gamma",
+            "gae_lambda",
+            "gate_ppo",
+            "uncond_flow_ppo",
+            "critic_loss",
+            "regularization",
+            "fixed_branch_cost",
+        )
+
+        def resolved(owner, key):
+            value = owner.get(key, None)
+            return (
+                OmegaConf.to_container(value, resolve=True)
+                if OmegaConf.is_config(value)
+                else value
+            )
+
+        return {
+            "model": {key: resolved(model_cfg, key) for key in model_keys},
+            "algorithm": {
+                key: resolved(self.cfg.algorithm, key) for key in algorithm_keys
+            },
+            "optim": OmegaConf.to_container(
+                self.cfg.actor.optim,
+                resolve=True,
+            ),
+            "world_size": int(self._world_size),
+        }
+
+    def save_checkpoint(self, save_path: str, step: int = 0) -> None:
+        if (
+            SupportedModel(self.cfg.actor.model.model_type)
+            is not SupportedModel.FASTWAM_ADAPTIVE
+        ):
+            return super().save_checkpoint(save_path, step)
+
+        restore_weight_offload = self.is_weight_offloaded
+        restore_optimizer_offload = self.is_optimizer_offloaded
+        if restore_weight_offload:
+            self.load_param_and_grad(self.device)
+        if restore_optimizer_offload:
+            self.load_optimizer(self.device)
+        try:
+            policy = self._fastwam_policy_module()
+            policy.set_global_step(int(step))
+            self.version = int(step)
+            payload = {
+                "schema": "fastwam-adaptive-rl-checkpoint-v1",
+                "step": int(step),
+                "optimizer_steps": int(self.optimizer_steps),
+                "parent_checkpoint_sha256": str(
+                    self.cfg.actor.model.actor_checkpoint_sha256
+                ).lower(),
+                "contract": self._fastwam_checkpoint_contract(),
+                "policy": policy.trainable_state_dict(),
+                "optimizer": self.optimizer.state_dict(),
+                "lr_scheduler": self.lr_scheduler.state_dict(),
+                "grad_scaler": self.grad_scaler.state_dict(),
+                "rng": get_rng_state(),
+            }
+            payload = self._checkpoint_cpu_clone(payload)
+            os.makedirs(save_path, exist_ok=True)
+            target = os.path.join(save_path, f"rank_{self._rank}.pt")
+            temporary = f"{target}.tmp"
+            try:
+                torch.save(payload, temporary)
+                os.replace(temporary, target)
+            finally:
+                if os.path.exists(temporary):
+                    os.unlink(temporary)
+            if torch.distributed.is_initialized():
+                torch.distributed.barrier()
+        finally:
+            if restore_weight_offload:
+                self.offload_param_and_grad()
+            if restore_optimizer_offload:
+                self.offload_optimizer()
+
+    def load_checkpoint(self, load_path: str) -> None:
+        if (
+            SupportedModel(self.cfg.actor.model.model_type)
+            is not SupportedModel.FASTWAM_ADAPTIVE
+        ):
+            return super().load_checkpoint(load_path)
+
+        restore_weight_offload = self.is_weight_offloaded
+        restore_optimizer_offload = self.is_optimizer_offloaded
+        if restore_weight_offload:
+            self.load_param_and_grad(self.device)
+        if restore_optimizer_offload:
+            self.load_optimizer(self.device)
+        try:
+            checkpoint_path = os.path.join(load_path, f"rank_{self._rank}.pt")
+            payload = torch.load(
+                checkpoint_path,
+                map_location="cpu",
+                weights_only=False,
+            )
+            if payload.get("schema") != "fastwam-adaptive-rl-checkpoint-v1":
+                raise ValueError("Unsupported FastWAM adaptive RL checkpoint schema.")
+            expected_parent = str(
+                self.cfg.actor.model.actor_checkpoint_sha256
+            ).lower()
+            if payload.get("parent_checkpoint_sha256") != expected_parent:
+                raise ValueError(
+                    "FastWAM checkpoint parent hash mismatch: "
+                    f"expected {expected_parent}, got "
+                    f"{payload.get('parent_checkpoint_sha256')}."
+                )
+            expected_contract = self._fastwam_checkpoint_contract()
+            if payload.get("contract") != expected_contract:
+                raise ValueError(
+                    "FastWAM adaptive checkpoint/config contract mismatch."
+                )
+
+            policy = self._fastwam_policy_module()
+            policy.load_trainable_state_dict(payload["policy"])
+            self.optimizer.load_state_dict(payload["optimizer"])
+            self.lr_scheduler.load_state_dict(payload["lr_scheduler"])
+            self.grad_scaler.load_state_dict(payload["grad_scaler"])
+            self.optimizer_steps = int(payload["optimizer_steps"])
+            self.version = int(payload["step"])
+            if policy.actor_version != self.version:
+                raise ValueError(
+                    "FastWAM checkpoint policy version does not match its step."
+                )
+            set_rng_state(payload["rng"])
+            if torch.distributed.is_initialized():
+                torch.distributed.barrier()
+        finally:
+            if restore_weight_offload:
+                self.offload_param_and_grad()
+            if restore_optimizer_offload:
+                self.offload_optimizer()
+
     @Worker.timer("actor/sync_model_to_rollout")
     async def sync_model_to_rollout(self) -> None:
         if self.enable_offload:
@@ -1225,6 +1421,15 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
         original shape: [rollout_epoch x n_chunk_steps, bsz, num_action_chunks, ...]
         target shape: [n_chunk_steps, rollout_epoch x bsz, num_action_chunks, ...]
         """
+        model_type = SupportedModel(self.cfg.actor.model.model_type)
+        if model_type is SupportedModel.FASTWAM_ADAPTIVE:
+            # Packed K/V layer indices are static schema metadata, not a batch
+            # tensor. Trajectory concatenation cannot preserve that distinction,
+            # so training reconstructs them from GateKVMetadata instead.
+            rollout_batch.get("forward_inputs", {}).pop(
+                "gate_kv_layer_indices", None
+            )
+
         rollout_epoch = self.cfg.env.train.rollout_epoch
         rollout_batch = process_nested_dict_for_adv(rollout_batch, rollout_epoch)
 
@@ -1303,6 +1508,30 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
         if self.cfg.algorithm.adv_type == "opd":
             self.compute_opd_teacher_logprobs()
 
+        model_type = SupportedModel(self.cfg.actor.model.model_type)
+        if model_type is SupportedModel.FASTWAM_ADAPTIVE:
+            if self.cfg.algorithm.reward_type != "chunk_level":
+                raise ValueError(
+                    "FastWAM fixed-route rewards require reward_type=chunk_level."
+                )
+            if "route_info" not in self.rollout_batch:
+                raise KeyError("FastWAM advantage computation requires route_info.")
+            if "emitted_gate" not in self.rollout_batch:
+                raise KeyError("FastWAM advantage computation requires emitted_gate.")
+            cost_cfg = self.cfg.algorithm.get("fixed_branch_cost", {})
+            if bool(cost_cfg.get("enabled", False)):
+                if "fastwam_branch_costs" in self.rollout_batch:
+                    raise RuntimeError("FastWAM branch cost was already applied.")
+                cost_result = apply_fastwam_chunk_cost(
+                    environment_rewards=self.rollout_batch["rewards"],
+                    route_used=self.rollout_batch["route_info"].route_used,
+                    idm_cost=float(cost_cfg.get("idm_cost", 0.0)),
+                    uncond_cost=float(cost_cfg.get("uncond_cost", 0.0)),
+                    valid_mask=self.rollout_batch.get("loss_mask", None),
+                )
+                self.rollout_batch["rewards"] = cost_result.rewards
+                self.rollout_batch["fastwam_branch_costs"] = cost_result.costs
+
         kwargs = {
             "task_type": self.cfg.runner.task_type,
             "adv_type": self.cfg.algorithm.adv_type,
@@ -1323,6 +1552,24 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
         advantages_and_returns = calculate_adv_and_returns(**kwargs)
 
         self.rollout_batch.update(advantages_and_returns)
+        if model_type is SupportedModel.FASTWAM_ADAPTIVE:
+            alignment = align_fastwam_policy_advantages(
+                advantages=advantages_and_returns["advantages"],
+                route=self.rollout_batch["route_info"],
+                emitted=self.rollout_batch["emitted_gate"],
+                dones=self.rollout_batch["dones"],
+                rollout_epoch=int(self.cfg.env.train.rollout_epoch),
+                carry_pending_across_epochs=bool(self.cfg.env.train.auto_reset),
+                loss_mask=self.rollout_batch.get("loss_mask", None),
+            )
+            self.rollout_batch.update(
+                {
+                    "flow_advantages": alignment.flow_advantages,
+                    "flow_valid_mask": alignment.flow_valid_mask,
+                    "gate_advantages": alignment.gate_advantages,
+                    "gate_valid_mask": alignment.gate_valid_mask,
+                }
+            )
         if kwargs["loss_mask"] is not None:
             self.rollout_batch.update({"loss_mask": kwargs["loss_mask"]})
         if kwargs["loss_mask_sum"] is not None:
@@ -1491,6 +1738,39 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
             )
         return loss
 
+    def _optimizer_metrics(
+        self,
+        grad_norm: float,
+        lr_list: list[float],
+    ) -> dict[str, float]:
+        data = {"actor/grad_norm": grad_norm}
+        if (
+            SupportedModel(self.cfg.actor.model.model_type)
+            is SupportedModel.FASTWAM_ADAPTIVE
+        ):
+            lr_by_name = {
+                group.get("name"): float(group["lr"])
+                for group in self.optimizer.param_groups
+            }
+            expected = {"gate", "uncond_lora", "value_head"}
+            if set(lr_by_name) != expected:
+                raise RuntimeError(
+                    "FastWAM adaptive optimizer groups changed unexpectedly: "
+                    f"{sorted(lr_by_name)}"
+                )
+            data.update(
+                {
+                    "gate/lr": lr_by_name["gate"],
+                    "uncond_flow/lora_lr": lr_by_name["uncond_lora"],
+                    "critic/lr": lr_by_name["value_head"],
+                }
+            )
+            return data
+        data["actor/lr"] = lr_list[0]
+        if len(lr_list) > 1:
+            data["critic/lr"] = lr_list[1]
+        return data
+
     @Worker.timer("run_training")
     def run_training(self) -> None:
         """
@@ -1513,6 +1793,13 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
                 self.rollout_batch[key] = trim_nested_tensor_time_dim(
                     self.rollout_batch[key], target_steps, (key,)
                 )
+
+        if (
+            SupportedModel(self.cfg.actor.model.model_type)
+            is SupportedModel.FASTWAM_ADAPTIVE
+            and str(self.cfg.actor.model.kv_replay.backend) == "recompute"
+        ):
+            self._fastwam_policy_module().capture_gate_recompute_reference()
 
         self.model.train()
         rollout_size = (
@@ -1558,6 +1845,47 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
                     train_global_batch,
                     train_global_batch_size // self.cfg.actor.micro_batch_size,
                 )
+                selected_loss_scales = None
+                if (
+                    SupportedModel(self.cfg.actor.model.model_type)
+                    is SupportedModel.FASTWAM_ADAPTIVE
+                ):
+                    route_info = train_global_batch["route_info"]
+                    gate_count = (
+                        train_global_batch["gate_valid_mask"].bool().sum()
+                    )
+                    flow_count = (
+                        train_global_batch["flow_valid_mask"].bool()
+                        & (
+                            route_info.route_used
+                            == int(WAMRoute.UNCOND)
+                        )
+                    ).sum()
+                    counts = torch.tensor(
+                        [float(gate_count), float(flow_count)],
+                        device=self.device,
+                        dtype=torch.float32,
+                    )
+                    torch.distributed.all_reduce(
+                        counts,
+                        op=torch.distributed.ReduceOp.SUM,
+                    )
+                    scale_numerator = float(
+                        self.gradient_accumulation
+                        * torch.distributed.get_world_size()
+                    )
+                    selected_loss_scales = {
+                        "gate": (
+                            scale_numerator / counts[0].item()
+                            if counts[0].item() > 0
+                            else 0.0
+                        ),
+                        "flow": (
+                            scale_numerator / counts[1].item()
+                            if counts[1].item() > 0
+                            else 0.0
+                        ),
+                    }
 
                 self.optimizer.zero_grad()
                 for idx, batch in enumerate(train_micro_batch):
@@ -1565,6 +1893,7 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
                         micro_batch=batch,
                         metrics=metrics,
                         is_last=(idx + 1) == self.gradient_accumulation,
+                        selected_loss_scales=selected_loss_scales,
                     )
                     # avoid gpu memory leak
                     train_micro_batch[idx] = None
@@ -1573,12 +1902,7 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
                 self.torch_platform.empty_cache()
 
                 grad_norm, lr_list = self.optimizer_step()
-                data = {
-                    "actor/grad_norm": grad_norm,
-                    "actor/lr": lr_list[0],
-                }
-                if len(lr_list) > 1:
-                    data["critic/lr"] = lr_list[1]
+                data = self._optimizer_metrics(grad_norm, lr_list)
                 append_to_dict(metrics, data)
         # put LR scheduler step here
         self.lr_scheduler.step()
@@ -1599,15 +1923,131 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
 
         return mean_metric_dict
 
+    def _compute_fastwam_loss(
+        self,
+        *,
+        micro_batch: dict,
+        output_dict: dict[str, torch.Tensor],
+        selected_loss_scales: dict[str, float] | None = None,
+    ) -> tuple[torch.Tensor, dict[str, float]]:
+        """Compute independent Gate/Flow PPO losses and the fresh critic loss."""
+
+        required_fields = (
+            "route_info",
+            "emitted_gate",
+            "flow_advantages",
+            "flow_valid_mask",
+            "gate_advantages",
+            "gate_valid_mask",
+            "prev_logprobs",
+            "returns",
+            "prev_values",
+        )
+        missing = [field for field in required_fields if field not in micro_batch]
+        if missing:
+            raise KeyError(f"FastWAM training batch is missing fields: {missing}.")
+
+        gate_cfg = self.cfg.algorithm.gate_ppo
+        flow_cfg = self.cfg.algorithm.uncond_flow_ppo
+        route_info = micro_batch["route_info"]
+        emitted_gate = micro_batch["emitted_gate"]
+        selected_loss_scales = selected_loss_scales or {}
+        policy_loss_value, metrics = compute_fastwam_dual_ppo_loss(
+            gate_logprobs=output_dict["gate_logprobs"].float(),
+            gate_old_logprobs=emitted_gate.old_logprob.float(),
+            gate_advantages=micro_batch["gate_advantages"].float(),
+            gate_valid_mask=micro_batch["gate_valid_mask"].bool(),
+            gate_clip_ratio_low=float(gate_cfg.clip_ratio_low),
+            gate_clip_ratio_high=float(gate_cfg.clip_ratio_high),
+            gate_behavior_probabilities=output_dict[
+                "gate_behavior_probabilities"
+            ].float(),
+            gate_entropy_coefficient=float(gate_cfg.entropy_coefficient),
+            gate_loss_coefficient=float(gate_cfg.get("loss_weight", 1.0)),
+            flow_logprobs=output_dict["flow_logprobs"].float(),
+            flow_old_logprobs=micro_batch["prev_logprobs"].float(),
+            flow_advantages=micro_batch["flow_advantages"].float(),
+            route_used=route_info.route_used,
+            flow_valid_mask=micro_batch["flow_valid_mask"].bool(),
+            flow_clip_ratio_low=float(flow_cfg.clip_ratio_low),
+            flow_clip_ratio_high=float(flow_cfg.clip_ratio_high),
+            flow_entropy=output_dict.get("flow_entropy", None),
+            flow_entropy_coefficient=float(flow_cfg.entropy_coefficient),
+            flow_loss_coefficient=float(flow_cfg.get("loss_weight", 1.0)),
+            gate_selected_loss_scale=selected_loss_scales.get("gate"),
+            flow_selected_loss_scale=selected_loss_scales.get("flow"),
+        )
+        regularization_cfg = self.cfg.algorithm.get("regularization", {})
+        base_kl_cfg = regularization_cfg.get("base_uncond_kl", {})
+        base_kl_enabled = bool(base_kl_cfg.get("enabled", False))
+        base_kl_log_metric = bool(base_kl_cfg.get("log_metric", False))
+        if base_kl_enabled or base_kl_log_metric:
+            if "base_uncond_kl" not in output_dict:
+                raise KeyError(
+                    "Base-UNCOND KL logging requires analytic transition KL replay."
+                )
+            base_kl_loss, base_kl_metrics = compute_base_uncond_kl_loss(
+                kl_values=output_dict["base_uncond_kl"].float(),
+                route_used=route_info.route_used,
+                valid_mask=micro_batch["flow_valid_mask"].bool(),
+                selected_loss_scale=selected_loss_scales.get("flow"),
+            )
+            if base_kl_enabled:
+                policy_loss_value = (
+                    policy_loss_value
+                    + float(base_kl_cfg.get("coefficient", 0.0)) * base_kl_loss
+                )
+            metrics.update(base_kl_metrics)
+
+        collapse_cfg = regularization_cfg.get("collapse", {})
+        if bool(collapse_cfg.get("enabled", False)):
+            collapse_loss, collapse_metrics = compute_gate_collapse_penalty(
+                base_idm_probabilities=output_dict[
+                    "gate_base_probabilities"
+                ].float(),
+                episode_ids=emitted_gate.episode_ids,
+                valid_mask=micro_batch["gate_valid_mask"].bool(),
+                tau_calls=float(collapse_cfg.get("tau_calls", 1.0)),
+                scope=str(collapse_cfg.get("scope", "microbatch")),
+            )
+            policy_loss_value = (
+                policy_loss_value
+                + float(collapse_cfg.get("coefficient", 0.0)) * collapse_loss
+            )
+            metrics.update(collapse_metrics)
+        metrics["fastwam/regularized_policy_loss"] = policy_loss_value.detach()
+
+        critic_cfg = self.cfg.algorithm.critic_loss
+        critic_loss, critic_metrics = compute_ppo_critic_loss(
+            values=output_dict["values"].float(),
+            returns=micro_batch["returns"].float(),
+            prev_values=micro_batch["prev_values"].float(),
+            value_clip=float(critic_cfg.value_clip),
+            huber_delta=float(critic_cfg.huber_delta),
+            loss_mask=micro_batch.get("loss_mask", None),
+            loss_mask_sum=micro_batch.get("loss_mask_sum", None),
+            max_episode_steps=self.cfg.env.train.max_episode_steps,
+        )
+        loss = policy_loss_value + float(critic_cfg.get("loss_weight", 1.0)) * critic_loss
+        metrics.update(critic_metrics)
+        metrics["fastwam/total_loss"] = loss.detach()
+        return loss, {
+            key: value.detach().item() if isinstance(value, torch.Tensor) else value
+            for key, value in metrics.items()
+        }
+
     def train_micro_batch(
         self,
         micro_batch: dict[str, torch.Tensor],
         metrics: dict[str, list[float]],
         *,
         is_last: bool,
+        selected_loss_scales: dict[str, float] | None = None,
     ) -> None:
         micro_batch = put_tensor_device(micro_batch, self.device)
         backward_ctx = self.before_micro_batch(self.model, is_last_micro_batch=is_last)
+        model_type = SupportedModel(self.cfg.actor.model.model_type)
+        is_fastwam = model_type is SupportedModel.FASTWAM_ADAPTIVE
         advantages = micro_batch["advantages"]
         prev_logprobs = micro_batch["prev_logprobs"]
         returns = micro_batch.get("returns", None)
@@ -1617,13 +2057,13 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
         forward_inputs = micro_batch.get("forward_inputs", None)
 
         kwargs = {}
-        if SupportedModel(self.cfg.actor.model.model_type) in [
+        if model_type in [
             SupportedModel.OPENVLA,
             SupportedModel.OPENVLA_OFT,
         ]:
             kwargs["temperature"] = self.cfg.rollout.sampling_params.temperature_train
             kwargs["top_k"] = self.cfg.rollout.sampling_params.top_k
-        elif SupportedModel(self.cfg.actor.model.model_type) in [
+        elif model_type in [
             SupportedModel.GR00T,
             SupportedModel.GR00T_N1D6,
             SupportedModel.GR00T_N1D7,
@@ -1631,18 +2071,56 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
         ]:
             kwargs["prev_logprobs"] = prev_logprobs
 
+        if is_fastwam:
+            route_info = micro_batch.get("route_info")
+            emitted_gate = micro_batch.get("emitted_gate")
+            if route_info is None or emitted_gate is None:
+                raise KeyError("FastWAM replay requires route_info and emitted_gate.")
+            if forward_inputs is None:
+                raise KeyError("FastWAM replay requires forward_inputs.")
+            if "gate_kv_denoise_timesteps" in forward_inputs:
+                if emitted_gate.kv_metadata is None:
+                    raise ValueError("Stored Gate K/V replay requires K/V metadata.")
+                forward_inputs = dict(forward_inputs)
+                forward_inputs["gate_kv_layer_indices"] = torch.tensor(
+                    emitted_gate.kv_metadata.layer_indices,
+                    dtype=torch.long,
+                    device=self.device,
+                )
+            kwargs.update(
+                {
+                    "route_info": route_info,
+                    "emitted_gate": emitted_gate,
+                    "compute_base_logprobs": bool(
+                        (
+                            self.cfg.algorithm.get("regularization", {})
+                            .get("base_uncond_kl", {})
+                            .get("enabled", False)
+                        )
+                        or (
+                            self.cfg.algorithm.get("regularization", {})
+                            .get("base_uncond_kl", {})
+                            .get("log_metric", False)
+                        )
+                    ),
+                }
+            )
+
         compute_values = self.cfg.algorithm.adv_type == "gae"
         with self.amp_context:
             output_dict = self.model(
                 forward_inputs=forward_inputs,
                 compute_logprobs=True,
-                compute_entropy=self.cfg.algorithm.entropy_bonus > 0,
+                compute_entropy=(
+                    is_fastwam
+                    or self.cfg.algorithm.get("entropy_bonus", 0.0) > 0
+                ),
                 compute_values=compute_values,
                 use_cache=False,
                 **kwargs,
             )
 
-        if SupportedModel(self.cfg.actor.model.model_type) in [
+        if model_type in [
             SupportedModel.GR00T,
             SupportedModel.GR00T_N1D6,
             SupportedModel.GR00T_N1D7,
@@ -1650,55 +2128,69 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
         ]:
             prev_logprobs = output_dict["prev_logprobs"]
 
-        loss_kwargs = {
-            "loss_type": self.cfg.algorithm.loss_type,
-            "logprob_type": self.cfg.algorithm.logprob_type,
-            "reward_type": self.cfg.algorithm.reward_type,
-            "single_action_dim": self.cfg.actor.model.get("action_dim", 7),
-            "logprobs": output_dict["logprobs"],
-            "values": output_dict.get("values", None),
-            "old_logprobs": prev_logprobs,
-            "advantages": advantages,
-            "returns": returns,
-            "prev_values": prev_values,
-            "clip_ratio_high": self.cfg.algorithm.clip_ratio_high,
-            "clip_ratio_low": self.cfg.algorithm.clip_ratio_low,
-            "value_clip": self.cfg.algorithm.get("value_clip", None),
-            "huber_delta": self.cfg.algorithm.get("huber_delta", None),
-            "loss_mask": loss_mask,
-            "loss_mask_sum": loss_mask_sum,
-            "max_episode_steps": self.cfg.env.train.max_episode_steps,
-            "task_type": self.cfg.runner.task_type,
-            "critic_warmup": self.optimizer_steps < self.critic_warmup_steps,
-        }
-
-        if SupportedModel(self.cfg.actor.model.model_type) in [
-            SupportedModel.GR00T_N1D6,
-            SupportedModel.GR00T_N1D7,
-        ]:
-            loss_kwargs["clip_ratio_c"] = self.cfg.algorithm.get("clip_ratio_c", 3.0)
-            if self.cfg.algorithm.get("clip_log_ratio_min") is not None:
-                loss_kwargs["clip_log_ratio_min"] = (
-                    self.cfg.algorithm.clip_log_ratio_min
-                )
-            if self.cfg.algorithm.get("clip_log_ratio_max") is not None:
-                loss_kwargs["clip_log_ratio_max"] = (
-                    self.cfg.algorithm.clip_log_ratio_max
-                )
-
-        loss, metrics_data = policy_loss(**loss_kwargs)
-        entropy_loss = torch.tensor(0.0, device=Worker.torch_platform.current_device())
-        if self.cfg.algorithm.entropy_bonus > 0 and not loss_kwargs["critic_warmup"]:
-            entropy = output_dict["entropy"]
-            entropy = reshape_entropy(
-                entropy,
-                entropy_type=self.cfg.algorithm.entropy_type,
-                action_dim=self.cfg.actor.model.get("action_dim", 7),
-                batch_size=output_dict["logprobs"].shape[0],
+        if is_fastwam:
+            loss, metrics_data = self._compute_fastwam_loss(
+                micro_batch=micro_batch,
+                output_dict=output_dict,
+                selected_loss_scales=selected_loss_scales,
             )
-            entropy_loss = masked_mean(entropy, mask=loss_mask)
-            loss -= self.cfg.algorithm.entropy_bonus * entropy_loss
-        metrics_data["actor/entropy_loss"] = entropy_loss.detach().item()
+        else:
+            loss_kwargs = {
+                "loss_type": self.cfg.algorithm.loss_type,
+                "logprob_type": self.cfg.algorithm.logprob_type,
+                "reward_type": self.cfg.algorithm.reward_type,
+                "single_action_dim": self.cfg.actor.model.get("action_dim", 7),
+                "logprobs": output_dict["logprobs"],
+                "values": output_dict.get("values", None),
+                "old_logprobs": prev_logprobs,
+                "advantages": advantages,
+                "returns": returns,
+                "prev_values": prev_values,
+                "clip_ratio_high": self.cfg.algorithm.clip_ratio_high,
+                "clip_ratio_low": self.cfg.algorithm.clip_ratio_low,
+                "value_clip": self.cfg.algorithm.get("value_clip", None),
+                "huber_delta": self.cfg.algorithm.get("huber_delta", None),
+                "loss_mask": loss_mask,
+                "loss_mask_sum": loss_mask_sum,
+                "max_episode_steps": self.cfg.env.train.max_episode_steps,
+                "task_type": self.cfg.runner.task_type,
+                "critic_warmup": self.optimizer_steps < self.critic_warmup_steps,
+            }
+
+            if model_type in [
+                SupportedModel.GR00T_N1D6,
+                SupportedModel.GR00T_N1D7,
+            ]:
+                loss_kwargs["clip_ratio_c"] = self.cfg.algorithm.get(
+                    "clip_ratio_c", 3.0
+                )
+                if self.cfg.algorithm.get("clip_log_ratio_min") is not None:
+                    loss_kwargs["clip_log_ratio_min"] = (
+                        self.cfg.algorithm.clip_log_ratio_min
+                    )
+                if self.cfg.algorithm.get("clip_log_ratio_max") is not None:
+                    loss_kwargs["clip_log_ratio_max"] = (
+                        self.cfg.algorithm.clip_log_ratio_max
+                    )
+
+            loss, metrics_data = policy_loss(**loss_kwargs)
+            entropy_loss = torch.tensor(
+                0.0, device=Worker.torch_platform.current_device()
+            )
+            if (
+                self.cfg.algorithm.get("entropy_bonus", 0.0) > 0
+                and not loss_kwargs["critic_warmup"]
+            ):
+                entropy = output_dict["entropy"]
+                entropy = reshape_entropy(
+                    entropy,
+                    entropy_type=self.cfg.algorithm.entropy_type,
+                    action_dim=self.cfg.actor.model.get("action_dim", 7),
+                    batch_size=output_dict["logprobs"].shape[0],
+                )
+                entropy_loss = masked_mean(entropy, mask=loss_mask)
+                loss -= self.cfg.algorithm.entropy_bonus * entropy_loss
+            metrics_data["actor/entropy_loss"] = entropy_loss.detach().item()
 
         if self.enable_sft_co_train:
             loss = self._train_sft_epoch(metrics_data, loss)
@@ -1722,10 +2214,5 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
         self.torch_platform.empty_cache()
         grad_norm, lr_list = self.optimizer_step()
         self.optimizer.zero_grad()
-        metric_data = {
-            "actor/grad_norm": grad_norm,
-            "actor/lr": lr_list[0],
-        }
-        if len(lr_list) > 1:
-            metric_data["critic/lr"] = lr_list[1]
+        metric_data = self._optimizer_metrics(grad_norm, lr_list)
         append_to_dict(metrics, metric_data)

@@ -507,7 +507,16 @@ class FSDPModelManager:
 
         params_actor = []
         params_critic = []
+        fastwam_adaptive = (
+            str(self._cfg.model.get("model_type", ""))
+            == SupportedModel.FASTWAM_ADAPTIVE.value
+        )
 
+        if fastwam_adaptive and enable_critic_warmup:
+            raise ValueError(
+                "FastWAM adaptive training jointly starts Gate, UNCOND LoRA, and "
+                "the fresh value head; critic warmup must be disabled."
+            )
         if enable_critic_warmup:
             self._logger.info("[FSDP] Enable critic warmup for value head.")
             for name, param in model.named_parameters():
@@ -529,7 +538,46 @@ class FSDPModelManager:
                         params_actor.append(param)
 
         param_groups = []
-        if len(params_actor) > 0:
+        if fastwam_adaptive:
+            from rlinf.models.embodiment.wam_policy.optimizer import (
+                partition_fastwam_trainable_parameters,
+            )
+
+            fastwam_groups = partition_fastwam_trainable_parameters(
+                model.named_parameters()
+            )
+            param_groups.extend(
+                [
+                    {
+                        "name": "gate",
+                        "params": fastwam_groups["gate"],
+                        "lr": self._cfg.optim.get("gate_lr", self._cfg.optim.lr),
+                        "betas": betas,
+                        "weight_decay": self._cfg.optim.get(
+                            "gate_weight_decay", weight_decay
+                        ),
+                    },
+                    {
+                        "name": "uncond_lora",
+                        "params": fastwam_groups["uncond_lora"],
+                        "lr": self._cfg.optim.get("lora_lr", self._cfg.optim.lr),
+                        "betas": betas,
+                        "weight_decay": self._cfg.optim.get(
+                            "lora_weight_decay", weight_decay
+                        ),
+                    },
+                    {
+                        "name": "value_head",
+                        "params": fastwam_groups["value_head"],
+                        "lr": self._cfg.optim.value_lr,
+                        "betas": betas,
+                        "weight_decay": self._cfg.optim.get(
+                            "value_weight_decay", weight_decay
+                        ),
+                    },
+                ]
+            )
+        elif len(params_actor) > 0:
             param_groups.append(
                 {
                     "params": params_actor,
@@ -537,7 +585,7 @@ class FSDPModelManager:
                     "betas": betas,
                 }
             )
-        if len(params_critic) > 0:
+        if not fastwam_adaptive and len(params_critic) > 0:
             param_groups.append(
                 {
                     "params": params_critic,
