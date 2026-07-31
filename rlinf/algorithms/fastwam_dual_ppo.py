@@ -202,6 +202,79 @@ def _zero_ppo_result(
     }
 
 
+_WEIGHTED_METRIC_GROUPS = {
+    "gate": (
+        "policy_loss",
+        "total_loss",
+        "ratio",
+        "ratio_abs",
+        "approx_kl",
+        "clip_fraction",
+        "entropy",
+    ),
+    "uncond_flow": (
+        "policy_loss",
+        "total_loss",
+        "ratio",
+        "ratio_abs",
+        "approx_kl",
+        "clip_fraction",
+        "entropy",
+    ),
+    "base_uncond_kl": ("loss",),
+}
+_WEIGHTED_SUM_SUFFIX = "::weighted_sum"
+
+
+def pop_fastwam_weighted_metric_sums(
+    metrics: dict[str, list[float]],
+) -> tuple[dict[str, float], dict[str, float]]:
+    """Convert microbatch means into additive numerators and denominators."""
+
+    sums: dict[str, float] = {}
+    maxima: dict[str, float] = {}
+    for prefix, suffixes in _WEIGHTED_METRIC_GROUPS.items():
+        count_key = f"{prefix}/sample_count"
+        counts = [float(value) for value in metrics.pop(count_key, [])]
+        if not counts:
+            continue
+        sums[count_key] = sum(counts)
+        for suffix in suffixes:
+            key = f"{prefix}/{suffix}"
+            values = [float(value) for value in metrics.pop(key, [])]
+            if len(values) != len(counts):
+                raise ValueError(
+                    f"Metric {key!r} has {len(values)} values for "
+                    f"{len(counts)} sample counts."
+                )
+            sums[f"{key}{_WEIGHTED_SUM_SUFFIX}"] = sum(
+                value * count for value, count in zip(values, counts)
+            )
+    max_values = metrics.pop("base_uncond_kl/max", [])
+    if max_values:
+        maxima["base_uncond_kl/max"] = max(float(value) for value in max_values)
+    return sums, maxima
+
+
+def finalize_fastwam_weighted_metrics(
+    reduced_sums: dict[str, float],
+) -> dict[str, float]:
+    """Recover globally weighted means after SUM-reducing the payload."""
+
+    finalized: dict[str, float] = {}
+    for prefix, suffixes in _WEIGHTED_METRIC_GROUPS.items():
+        count_key = f"{prefix}/sample_count"
+        if count_key not in reduced_sums:
+            continue
+        count = float(reduced_sums[count_key])
+        finalized[count_key] = count
+        for suffix in suffixes:
+            key = f"{prefix}/{suffix}"
+            numerator = float(reduced_sums[f"{key}{_WEIGHTED_SUM_SUFFIX}"])
+            finalized[key] = numerator / count if count > 0 else 0.0
+    return finalized
+
+
 def _compute_masked_clipped_ppo_loss(
     *,
     logprobs: torch.Tensor,
@@ -271,7 +344,9 @@ def _compute_masked_clipped_ppo_loss(
         else selected_objective.sum() * selected_loss_scale
     )
 
+    metric_policy_loss = selected_objective.detach().mean()
     entropy_mean = policy_loss.detach() * 0.0
+    metric_entropy = metric_policy_loss * 0.0
     if entropy is not None:
         if not entropy.is_floating_point():
             raise TypeError("entropy must use a floating dtype.")
@@ -284,7 +359,9 @@ def _compute_masked_clipped_ppo_loss(
             if selected_loss_scale is None
             else selected_entropy.sum() * selected_loss_scale
         )
+        metric_entropy = selected_entropy.detach().mean()
     total_loss = policy_loss - entropy_coefficient * entropy_mean
+    metric_total_loss = metric_policy_loss - entropy_coefficient * metric_entropy
 
     with torch.no_grad():
         clip_fraction = (
@@ -299,14 +376,14 @@ def _compute_masked_clipped_ppo_loss(
             device=logprobs.device,
         )
     metrics = {
-        f"{prefix}/policy_loss": policy_loss.detach(),
-        f"{prefix}/total_loss": total_loss.detach(),
+        f"{prefix}/policy_loss": metric_policy_loss,
+        f"{prefix}/total_loss": metric_total_loss,
         f"{prefix}/sample_count": sample_count,
         f"{prefix}/ratio": ratio.detach().mean(),
         f"{prefix}/ratio_abs": (ratio.detach() - 1.0).abs().mean(),
         f"{prefix}/approx_kl": approx_kl.detach(),
         f"{prefix}/clip_fraction": clip_fraction.detach(),
-        f"{prefix}/entropy": entropy_mean.detach(),
+        f"{prefix}/entropy": metric_entropy,
         f"{prefix}/selected_loss_scale": (
             torch.tensor(
                 1.0 / float(selected_logprobs.numel()),
@@ -553,7 +630,7 @@ def compute_base_uncond_kl_loss(
             raise ValueError("selected_loss_scale must be non-negative.")
         loss = selected_kl.sum() * scale
     return loss, {
-        "base_uncond_kl/loss": loss.detach(),
+        "base_uncond_kl/loss": selected_kl.detach().mean(),
         "base_uncond_kl/sample_count": torch.tensor(
             float(selected_kl.numel()),
             dtype=torch.float32,

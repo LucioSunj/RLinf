@@ -24,6 +24,7 @@ import numpy as np
 import torch
 from omegaconf.omegaconf import OmegaConf
 
+from rlinf.envs.libero.reward_utils import mask_rewards_after_first_done
 from rlinf.envs.libero.utils import (
     build_interleaved_eval_reset_state_ids,
     distribute_reset_state_ids_round_robin,
@@ -775,6 +776,14 @@ class LiberoEnv(gym.Env):
         raw_chunk_truncations = torch.stack(
             raw_chunk_truncations, dim=1
         )  # [num_envs, chunk_steps]
+        raw_chunk_dones = torch.logical_or(
+            raw_chunk_terminations,
+            raw_chunk_truncations,
+        )
+        chunk_rewards = mask_rewards_after_first_done(
+            chunk_rewards,
+            raw_chunk_dones,
+        )
 
         past_terminations = raw_chunk_terminations.any(dim=1)
         past_truncations = raw_chunk_truncations.any(dim=1)

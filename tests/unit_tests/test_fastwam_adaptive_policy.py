@@ -110,10 +110,24 @@ def _snapshots(routes):
 class _Runtime:
     def __init__(self):
         self.recompute_calls = 0
+        self.sample_batch_sizes = []
+        self.collect_replay_flags = []
+        self.grad_enabled_flags = []
 
-    def sample_action_batch(self, *, env_obs, routes, mode, actor_version):
+    def sample_action_batch(
+        self,
+        *,
+        env_obs,
+        routes,
+        mode,
+        actor_version,
+        collect_replay=True,
+    ):
         del mode, actor_version
         batch = routes.shape[0]
+        self.sample_batch_sizes.append(batch)
+        self.collect_replay_flags.append(collect_replay)
+        self.grad_enabled_flags.append(torch.is_grad_enabled())
         return FastWAMChunkSample(
             actions=torch.zeros(batch, 2, 3),
             old_flow_logprobs=torch.zeros(batch, 2, 3),
@@ -155,8 +169,10 @@ class _Critic(nn.Module):
     def __init__(self):
         super().__init__()
         self.value_head = nn.Linear(1, 1)
+        self.predict_calls = 0
 
     def predict_value_batch(self, obs, *, return_prefix=False):
+        self.predict_calls += 1
         prefix = obs["states"][:, None, :1]
         values = self.value_head(prefix.mean(dim=1)).squeeze(-1)
         return (values, prefix) if return_prefix else values
@@ -184,13 +200,13 @@ class _LoRA:
         self.replay_reference_version = actor_version
 
 
-def _make_policy(backend="stored"):
+def _make_policy(backend="stored", *, with_critic=True):
     return FastWAMAdaptivePolicy(
         actor=nn.Linear(1, 1),
         runtime=_Runtime(),
         lora_adapter=_LoRA(),
         gate=_Gate(),
-        critic=_Critic(),
+        critic=_Critic() if with_critic else None,
         config=FastWAMAdaptivePolicyConfig(
             gate_epsilon=0.0,
             eval_idm_threshold=0.5,
@@ -212,11 +228,81 @@ def test_policy_forces_first_idm_and_applies_gate_to_next_chunk():
     _, first = policy.predict_action_batch(obs, mode="eval")
     assert first["route_info"].route_used.tolist() == [1, 1]
     assert first["emitted_gate"].next_route.tolist() == [0, 0]
+    assert first["forward_inputs"] == {}
+    assert first["emitted_gate"].kv_metadata is None
+    assert policy.runtime.sample_batch_sizes == [1, 1]
+    assert policy.runtime.collect_replay_flags == [False, False]
+    assert policy.runtime.grad_enabled_flags == [False, False]
+    assert policy.critic.predict_calls == 0
 
     obs["_fastwam_reset_mask"] = torch.tensor([False, False])
     _, second = policy.predict_action_batch(obs, mode="eval")
     assert second["route_info"].route_used.tolist() == [0, 0]
     assert second["route_info"].route_source_chunk_ids.tolist() == [0, 0]
+
+
+def test_standalone_eval_runs_and_restores_gate_lora_without_critic():
+    source = _make_policy()
+    source.set_global_step(3)
+    parent_sha256 = "a" * 64
+    payload = {
+        "schema": "fastwam-adaptive-rl-checkpoint-v1",
+        "step": 3,
+        "parent_checkpoint_sha256": parent_sha256,
+        "contract": {
+            "model": {"actor_checkpoint_sha256": parent_sha256},
+        },
+        "policy": source.trainable_state_dict(),
+    }
+
+    policy = _make_policy(with_critic=False)
+    restored_step = policy.load_eval_checkpoint(
+        payload,
+        expected_parent_checkpoint_sha256=parent_sha256,
+    )
+    obs = {
+        "states": torch.ones(1, 3),
+        "_fastwam_env_ids": torch.tensor([11]),
+        "_fastwam_reset_mask": torch.tensor([True]),
+    }
+    actions, rollout = policy.predict_action_batch(
+        obs,
+        mode="eval",
+        compute_values=False,
+    )
+
+    assert policy.critic is None
+    assert restored_step == 3
+    assert policy.actor_version == 3
+    assert torch.equal(policy.gate.bias, source.gate.bias)
+    assert actions.shape == (1, 2, 3)
+    assert rollout["prev_values"].shape == (1, 1)
+    with pytest.raises(RuntimeError, match="critic is intentionally absent"):
+        policy.predict_action_batch(obs, mode="train")
+
+    with pytest.raises(ValueError, match="parent hash mismatch"):
+        _make_policy(with_critic=False).load_eval_checkpoint(
+            payload,
+            expected_parent_checkpoint_sha256="b" * 64,
+        )
+
+    critic_parent_sha256 = "c" * 64
+    payload["critic_parent_checkpoint_sha256"] = critic_parent_sha256
+    payload["contract"]["model"]["critic"] = {
+        "backbone_checkpoint_sha256": critic_parent_sha256,
+    }
+    with pytest.raises(ValueError, match="pi0.5 evaluation checkpoint parent"):
+        _make_policy().load_eval_checkpoint(
+            payload,
+            expected_parent_checkpoint_sha256=parent_sha256,
+            expected_critic_parent_checkpoint_sha256="d" * 64,
+        )
+
+    assert _make_policy().load_eval_checkpoint(
+        payload,
+        expected_parent_checkpoint_sha256=parent_sha256,
+        expected_critic_parent_checkpoint_sha256=critic_parent_sha256,
+    ) == 3
 
 
 def test_policy_update_invalidates_pending_route_and_forces_idm_boundary():
@@ -227,7 +313,7 @@ def test_policy_update_invalidates_pending_route_and_forces_idm_boundary():
         "_fastwam_reset_mask": torch.tensor([True]),
     }
     _, rollout = policy.predict_action_batch(obs, mode="eval")
-    assert len(rollout["emitted_gate"].kv_metadata.tensor_shapes) == 12
+    assert rollout["emitted_gate"].kv_metadata is None
     policy.set_global_step(1)
     obs["_fastwam_reset_mask"] = torch.tensor([False])
 
@@ -336,11 +422,72 @@ def test_zero_flow_sde_noise_is_rejected_only_for_training_uncond() -> None:
         routes=torch.tensor([1, 1]),
         noise_level=0.0,
     )
+    with pytest.raises(ValueError, match="finite"):
+        _runtime_module._validate_flow_sde_sampling(
+            mode="eval",
+            routes=torch.tensor([1, 1]),
+            noise_level=float("nan"),
+        )
+
+
+def test_fastwam_prompt_format_matches_training_template() -> None:
+    prompts = _runtime_module._format_fastwam_prompts(
+        ["pick up the mug", "open the drawer"],
+        prompt_template=_runtime_module.DEFAULT_FASTWAM_PROMPT_TEMPLATE,
+    )
+
+    assert prompts == [
+        "A video recorded from a robot's point of view executing the following instruction: pick up the mug",
+        "A video recorded from a robot's point of view executing the following instruction: open the drawer",
+    ]
+    with pytest.raises(ValueError, match="must contain"):
+        _runtime_module._format_fastwam_prompts(
+            "pick up the mug",
+            prompt_template="static prompt",
+        )
     _runtime_module._validate_flow_sde_sampling(
         mode="eval",
         routes=torch.tensor([0, 0]),
         noise_level=0.0,
     )
+
+
+def test_action_schedule_stays_fp32_for_a_bfloat16_actor() -> None:
+    class _Scheduler:
+        requested_dtype = None
+        num_train_timesteps = 1000
+
+        def build_inference_schedule(
+            self,
+            *,
+            num_inference_steps,
+            device,
+            dtype,
+            shift_override,
+        ):
+            del shift_override
+            self.requested_dtype = dtype
+            return (
+                torch.ones(num_inference_steps, device=device, dtype=dtype),
+                -torch.ones(num_inference_steps, device=device, dtype=dtype),
+            )
+
+    class _Actor(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.anchor = nn.Parameter(torch.zeros(1, dtype=torch.bfloat16))
+            self.infer_action_scheduler = _Scheduler()
+
+    runtime = object.__new__(_runtime_module.LiberoFastWAMRuntime)
+    runtime.actor = _Actor()
+    runtime.num_inference_steps = 20
+    runtime.sigma_shift = None
+
+    timesteps, deltas = runtime._action_schedule()
+
+    assert runtime.actor.infer_action_scheduler.requested_dtype is torch.float32
+    assert timesteps.dtype is torch.float32
+    assert deltas.dtype is torch.float32
 
 
 def test_runtime_aligns_plain_normalizer_tensors_and_converts_gripper():

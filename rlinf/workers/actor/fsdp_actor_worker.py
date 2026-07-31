@@ -33,6 +33,8 @@ from rlinf.algorithms.fastwam_dual_ppo import (
     compute_base_uncond_kl_loss,
     compute_fastwam_dual_ppo_loss,
     compute_gate_collapse_penalty,
+    finalize_fastwam_weighted_metrics,
+    pop_fastwam_weighted_metric_sums,
 )
 from rlinf.algorithms.losses import compute_ppo_critic_loss
 from rlinf.algorithms.registry import calculate_adv_and_returns, policy_loss
@@ -1191,6 +1193,7 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
             "gate_epsilon",
             "gate_temperature",
             "eval_idm_threshold",
+            "eval_microbatch_size",
             "kv_replay",
             "flow_sde",
             "runtime",
@@ -1254,6 +1257,9 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
                 "parent_checkpoint_sha256": str(
                     self.cfg.actor.model.actor_checkpoint_sha256
                 ).lower(),
+                "critic_parent_checkpoint_sha256": str(
+                    self.cfg.actor.model.critic.backbone_checkpoint_sha256
+                ).lower(),
                 "contract": self._fastwam_checkpoint_contract(),
                 "policy": policy.trainable_state_dict(),
                 "optimizer": self.optimizer.state_dict(),
@@ -1279,7 +1285,7 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
             if restore_optimizer_offload:
                 self.offload_optimizer()
 
-    def load_checkpoint(self, load_path: str) -> None:
+    def load_checkpoint(self, load_path: str) -> int | None:
         if (
             SupportedModel(self.cfg.actor.model.model_type)
             is not SupportedModel.FASTWAM_ADAPTIVE
@@ -1310,6 +1316,18 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
                     f"expected {expected_parent}, got "
                     f"{payload.get('parent_checkpoint_sha256')}."
                 )
+            expected_critic_parent = str(
+                self.cfg.actor.model.critic.backbone_checkpoint_sha256
+            ).lower()
+            if (
+                payload.get("critic_parent_checkpoint_sha256")
+                != expected_critic_parent
+            ):
+                raise ValueError(
+                    "pi0.5 critic checkpoint parent hash mismatch: "
+                    f"expected {expected_critic_parent}, got "
+                    f"{payload.get('critic_parent_checkpoint_sha256')}."
+                )
             expected_contract = self._fastwam_checkpoint_contract()
             if payload.get("contract") != expected_contract:
                 raise ValueError(
@@ -1330,6 +1348,7 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
             set_rng_state(payload["rng"])
             if torch.distributed.is_initialized():
                 torch.distributed.barrier()
+            return self.version
         finally:
             if restore_weight_offload:
                 self.offload_param_and_grad()
@@ -1814,6 +1833,19 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
             self.rollout_batch = process_nested_dict_for_train(
                 self.rollout_batch, shuffle_id
             )
+        if (
+            SupportedModel(self.cfg.actor.model.model_type)
+            is SupportedModel.FASTWAM_ADAPTIVE
+            and str(self.cfg.actor.model.kv_replay.backend) == "stored"
+            and bool(self.cfg.actor.model.kv_replay.get("pin_memory", True))
+        ):
+            from rlinf.models.embodiment.wam_policy.kv_replay import (
+                pin_gate_kv_forward_inputs,
+            )
+
+            self.rollout_batch["forward_inputs"] = pin_gate_kv_forward_inputs(
+                self.rollout_batch.get("forward_inputs", {})
+            )
 
         # Split to make minibatch iterator for updating the actor
         # See PPO paper for details. https://arxiv.org/abs/1707.06347
@@ -1909,6 +1941,15 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
         self.optimizer.zero_grad()
         clear_memory()
         explained_variance_stats = pop_critic_explained_variance_stats(metrics)
+        weighted_sums = {}
+        weighted_maxima = {}
+        if (
+            SupportedModel(self.cfg.actor.model.model_type)
+            is SupportedModel.FASTWAM_ADAPTIVE
+        ):
+            weighted_sums, weighted_maxima = pop_fastwam_weighted_metric_sums(
+                metrics
+            )
         mean_metric_dict = {key: np.mean(value) for key, value in metrics.items()}
         mean_metric_dict = all_reduce_dict(
             mean_metric_dict, op=torch.distributed.ReduceOp.AVG
@@ -1919,6 +1960,29 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
             )
             mean_metric_dict[CRITIC_EXPLAINED_VARIANCE_KEY] = (
                 compute_critic_explained_variance_from_stats(reduced_stats).item()
+            )
+        if weighted_sums:
+            reduced_weighted_sums = all_reduce_dict(
+                weighted_sums, op=torch.distributed.ReduceOp.SUM
+            )
+            mean_metric_dict.update(
+                finalize_fastwam_weighted_metrics(reduced_weighted_sums)
+            )
+        if weighted_maxima:
+            mean_metric_dict.update(
+                all_reduce_dict(
+                    weighted_maxima,
+                    op=torch.distributed.ReduceOp.MAX,
+                )
+            )
+        if "gate/total_loss" in mean_metric_dict:
+            mean_metric_dict["fastwam_dual/total_policy_loss"] = (
+                float(self.cfg.algorithm.gate_ppo.get("loss_weight", 1.0))
+                * mean_metric_dict["gate/total_loss"]
+                + float(
+                    self.cfg.algorithm.uncond_flow_ppo.get("loss_weight", 1.0)
+                )
+                * mean_metric_dict["uncond_flow/total_loss"]
             )
 
         return mean_metric_dict

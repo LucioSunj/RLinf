@@ -42,6 +42,27 @@ from .contracts import ChunkRouteRecord, WAMRoute
 from .kv_replay import GateKVReplayBackend
 
 
+DEFAULT_FASTWAM_PROMPT_TEMPLATE = (
+    "A video recorded from a robot's point of view executing the following "
+    "instruction: {task}"
+)
+
+
+def _format_fastwam_prompts(
+    task_descriptions: str | list[str] | tuple[str, ...],
+    *,
+    prompt_template: str,
+) -> list[str]:
+    if "{task}" not in prompt_template:
+        raise ValueError("FastWAM `prompt_template` must contain `{task}`.")
+    descriptions = (
+        [task_descriptions]
+        if isinstance(task_descriptions, str)
+        else list(task_descriptions)
+    )
+    return [prompt_template.format(task=str(task)) for task in descriptions]
+
+
 def _cat_bank(banks: list[KeyValueBank]) -> KeyValueBank:
     first = banks[0]
     if any(
@@ -101,6 +122,8 @@ def _validate_flow_sde_sampling(
 ) -> None:
     if mode not in {"train", "eval"}:
         raise ValueError(f"Unsupported FastWAM runtime mode {mode!r}.")
+    if not math.isfinite(noise_level) or noise_level < 0:
+        raise ValueError("`flow_sde_noise_level` must be finite and non-negative.")
     has_uncond = bool((routes == int(WAMRoute.UNCOND)).any().item())
     if mode == "train" and has_uncond and noise_level <= 0:
         raise ValueError(
@@ -165,6 +188,7 @@ class LiberoFastWAMRuntime:
         camera_concat: str = "horizontal",
         tiled_vae: bool = False,
         binarize_gripper: bool = False,
+        prompt_template: str = DEFAULT_FASTWAM_PROMPT_TEMPLATE,
     ) -> None:
         self.actor = actor
         self.lora_adapter = lora_adapter
@@ -187,12 +211,13 @@ class LiberoFastWAMRuntime:
         self.camera_concat = str(camera_concat)
         self.tiled_vae = bool(tiled_vae)
         self.binarize_gripper = bool(binarize_gripper)
+        self.prompt_template = str(prompt_template)
         if self.action_horizon < 1 or self.num_inference_steps < 1:
             raise ValueError("Action horizon and inference steps must be positive.")
         if self.num_video_frames % 4 != 1:
             raise ValueError("`num_video_frames` must satisfy T % 4 == 1.")
-        if self.flow_sde_noise_level < 0:
-            raise ValueError("Flow-SDE noise level must be non-negative.")
+        if not math.isfinite(self.flow_sde_noise_level) or self.flow_sde_noise_level < 0:
+            raise ValueError("Flow-SDE noise level must be finite and non-negative.")
         if self.gate_denoise_last_n < 1:
             raise ValueError("`gate_denoise_last_n` must be positive.")
         if self.camera_concat not in {"horizontal", "vertical", "main_only"}:
@@ -201,6 +226,7 @@ class LiberoFastWAMRuntime:
             raise ValueError(
                 "FastWAM processor and `processor_stats_path` must be configured together."
             )
+        _format_fastwam_prompts("validation", prompt_template=self.prompt_template)
         if self.processor is not None:
             from fastwam.datasets.lerobot.utils.normalizer import (
                 load_dataset_stats_from_json,
@@ -286,7 +312,10 @@ class LiberoFastWAMRuntime:
         env_obs: dict[str, Any],
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         images = self._model_images(env_obs)
-        prompts = env_obs["task_descriptions"]
+        prompts = _format_fastwam_prompts(
+            env_obs["task_descriptions"],
+            prompt_template=self.prompt_template,
+        )
         context, context_mask = self.actor.encode_prompt(prompts)
         proprio = self._normalized_proprio(env_obs["states"])
         context, context_mask = self.actor._append_proprio_to_context(
@@ -395,6 +424,7 @@ class LiberoFastWAMRuntime:
                 "mask": video_pre["context_mask"],
             },
             video_attention_mask=attention_mask[:video_seq_len, :video_seq_len],
+            gate_current_frame_video_tokens=tokens_per_frame,
         )
         return (
             CachedActionCondition(
@@ -409,10 +439,13 @@ class LiberoFastWAMRuntime:
         )
 
     def _action_schedule(self):
+        # Keep schedule arithmetic in FP32. The sampler casts model timesteps
+        # and ODE deltas to the action dtype only at their point of use; building
+        # both arrays in BF16 can otherwise round the final next-time below zero.
         return self.actor.infer_action_scheduler.build_inference_schedule(
             num_inference_steps=self.num_inference_steps,
             device=self.device,
-            dtype=self.dtype,
+            dtype=torch.float32,
             shift_override=self.sigma_shift,
         )
 
@@ -442,6 +475,7 @@ class LiberoFastWAMRuntime:
         routes: torch.Tensor,
         mode: Literal["train", "eval"],
         actor_version: int,
+        collect_replay: bool = True,
     ) -> FastWAMChunkSample:
         _validate_flow_sde_sampling(
             mode=mode,
@@ -498,7 +532,10 @@ class LiberoFastWAMRuntime:
                     else None
                 ),
             )
-            if self.gate_replay_backend is GateKVReplayBackend.RECOMPUTE:
+            if (
+                collect_replay
+                and self.gate_replay_backend is GateKVReplayBackend.RECOMPUTE
+            ):
                 if replay_video_noise is None:
                     latent_t = (
                         self.num_video_frames - 1
@@ -543,6 +580,7 @@ class LiberoFastWAMRuntime:
                 noise_level=self.flow_sde_noise_level,
                 gate_last_n=self.gate_denoise_last_n,
                 stochastic=mode == "train" and regime is PolicyRegime.UNCOND,
+                collect_replay=collect_replay,
             )
             rollouts.append(rollout)
 
@@ -556,12 +594,17 @@ class LiberoFastWAMRuntime:
             [rollout.actions for rollout in rollouts],
             dim=0,
         )
-        replay_inputs = {
-            "fastwam_images": images.detach(),
-            "fastwam_context": context.detach(),
-            "fastwam_context_mask": context_mask.detach(),
-        }
-        if self.gate_replay_backend is GateKVReplayBackend.RECOMPUTE:
+        replay_inputs = {}
+        if collect_replay:
+            replay_inputs = {
+                "fastwam_images": images.detach(),
+                "fastwam_context": context.detach(),
+                "fastwam_context_mask": context_mask.detach(),
+            }
+        if (
+            collect_replay
+            and self.gate_replay_backend is GateKVReplayBackend.RECOMPUTE
+        ):
             replay_inputs["fastwam_idm_initial_latents"] = torch.cat(
                 idm_initial_latents,
                 dim=0,

@@ -147,8 +147,35 @@ class MultiStepRolloutWorker(Worker):
         self.hf_model: BasePolicy = get_model(rollout_model_config)
 
         if self.cfg.runner.get("ckpt_path", None):
-            model_dict = torch.load(self.cfg.runner.ckpt_path)
-            self.hf_model.load_state_dict(model_dict)
+            if (
+                SupportedModel(self.model_cfg.model_type)
+                is SupportedModel.FASTWAM_ADAPTIVE
+            ):
+                from rlinf.models.embodiment.wam_policy import (
+                    resolve_fastwam_adaptive_eval_checkpoint,
+                )
+
+                checkpoint_path = resolve_fastwam_adaptive_eval_checkpoint(
+                    self.cfg.runner.ckpt_path,
+                    rank=self._rank,
+                )
+                payload = torch.load(
+                    checkpoint_path,
+                    map_location="cpu",
+                    weights_only=False,
+                )
+                self.version = self.hf_model.load_eval_checkpoint(
+                    payload,
+                    expected_parent_checkpoint_sha256=str(
+                        self.model_cfg.actor_checkpoint_sha256
+                    ),
+                    expected_critic_parent_checkpoint_sha256=str(
+                        self.model_cfg.critic.get("backbone_checkpoint_sha256", "")
+                    ),
+                )
+            else:
+                model_dict = torch.load(self.cfg.runner.ckpt_path)
+                self.hf_model.load_state_dict(model_dict)
 
         rlt_feature_model_config = OmegaConf.select(
             self.cfg, "rollout.rlt_feature_model", default=None

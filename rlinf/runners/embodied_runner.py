@@ -22,6 +22,7 @@ from typing import TYPE_CHECKING, Union
 
 from omegaconf.dictconfig import DictConfig
 
+from rlinf.config_contracts import validate_fastwam_resume_steps
 from rlinf.scheduler import Channel
 from rlinf.scheduler import WorkerGroupFuncResult as Handle
 from rlinf.utils.distributed import ScopedTimer
@@ -181,8 +182,14 @@ class EmbodiedRunner:
         assert os.path.exists(actor_checkpoint_path), (
             f"resume_dir {actor_checkpoint_path} does not exist."
         )
-        self.actor.load_checkpoint(actor_checkpoint_path).wait()
-        self.global_step = int(resume_dir.split("global_step_")[-1])
+        loaded_steps = self.actor.load_checkpoint(actor_checkpoint_path).wait()
+        if str(self.cfg.actor.model.model_type) == "fastwam_adaptive":
+            self.global_step = validate_fastwam_resume_steps(
+                loaded_steps,
+                resume_dir,
+            )
+        else:
+            self.global_step = int(resume_dir.split("global_step_")[-1])
 
     def update_rollout_weights(self):
         rollout_handle: Handle = self.rollout.sync_model_from_actor()

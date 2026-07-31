@@ -273,6 +273,29 @@ def test_base_uncond_kl_sums_joint_chunk_and_masks_idm():
     )
 
 
+def test_reported_policy_metrics_are_weighted_by_selected_sample_count():
+    metrics = {
+        "gate/sample_count": [1.0, 3.0],
+        "gate/policy_loss": [2.0, 6.0],
+        "gate/total_loss": [2.0, 6.0],
+        "gate/ratio": [1.0, 3.0],
+        "gate/ratio_abs": [0.0, 2.0],
+        "gate/approx_kl": [0.0, 4.0],
+        "gate/clip_fraction": [0.0, 1.0],
+        "gate/entropy": [0.5, 0.25],
+    }
+
+    sums, maxima = dual_ppo.pop_fastwam_weighted_metric_sums(metrics)
+    reduced = dual_ppo.finalize_fastwam_weighted_metrics(sums)
+
+    assert maxima == {}
+    assert metrics == {}
+    assert reduced["gate/sample_count"] == 4.0
+    assert reduced["gate/policy_loss"] == pytest.approx(5.0)
+    assert reduced["gate/ratio"] == pytest.approx(2.5)
+    assert reduced["gate/clip_fraction"] == pytest.approx(0.75)
+
+
 def test_collapse_penalty_uses_differentiable_expected_calls_per_episode():
     probabilities = torch.tensor([0.0, 0.5, 1.0], requires_grad=True)
     penalty, metrics = dual_ppo.compute_gate_collapse_penalty(

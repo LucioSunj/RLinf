@@ -85,6 +85,32 @@ def _pin_tensor(tensor: torch.Tensor) -> torch.Tensor:
         return tensor
 
 
+def pin_gate_kv_forward_inputs(
+    forward_inputs: Mapping[str, torch.Tensor],
+    *,
+    prefix: str = "gate_kv",
+) -> dict[str, torch.Tensor]:
+    """Re-pin packed Gate K/V after trajectory stack/cat/shuffle copies."""
+
+    if isinstance(forward_inputs, dict):
+        pinned = forward_inputs
+    else:
+        pinned = dict(forward_inputs)
+    key_prefix = f"{prefix}_"
+    # Keep only the keys while replacing values in place. Holding an
+    # ``items()`` snapshot would retain every pageable K/V tensor until the
+    # entire packed payload had been duplicated in pinned memory.
+    for name in list(pinned):
+        value = pinned[name]
+        if (
+            name.startswith(key_prefix)
+            and torch.is_tensor(value)
+            and value.device.type == "cpu"
+        ):
+            pinned[name] = _pin_tensor(value.contiguous())
+    return pinned
+
+
 def _map_bank(
     bank: KeyValueBank,
     transform: Callable[[torch.Tensor], torch.Tensor],

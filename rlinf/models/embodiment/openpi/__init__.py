@@ -20,6 +20,47 @@ import torch
 from omegaconf import DictConfig
 
 
+_VLM_STATE_PREFIX = "paligemma_with_expert.paligemma."
+
+
+def _is_legacy_value_head_key(key: str) -> bool:
+    return "value_head" in key.split(".")
+
+
+def _load_openpi_state_dict(
+    model: torch.nn.Module,
+    state_dict: dict[str, torch.Tensor],
+    *,
+    strict_vlm_checkpoint: bool,
+) -> None:
+    """Load an OpenPi parent while fail-closing on a partial VLM restore."""
+
+    incompatible = model.load_state_dict(state_dict, strict=False)
+    if not strict_vlm_checkpoint:
+        return
+
+    expected_vlm = {
+        key for key in model.state_dict() if key.startswith(_VLM_STATE_PREFIX)
+    }
+    if not expected_vlm:
+        raise ValueError(
+            "Strict pi0.5 loading found no PaliGemma VLM parameters in the model."
+        )
+    missing_vlm = sorted(
+        key for key in incompatible.missing_keys if key.startswith(_VLM_STATE_PREFIX)
+    )
+    unexpected = sorted(
+        key
+        for key in incompatible.unexpected_keys
+        if not _is_legacy_value_head_key(key)
+    )
+    if missing_vlm or unexpected:
+        raise ValueError(
+            "Strict pi0.5 VLM checkpoint mismatch: "
+            f"missing_vlm={missing_vlm[:8]}, unexpected={unexpected[:8]}."
+        )
+
+
 def get_model(cfg: DictConfig, torch_dtype=None):
     import glob
 
@@ -63,6 +104,7 @@ def get_model(cfg: DictConfig, torch_dtype=None):
     model: OpenPi0ForRLActionPrediction = OpenPi0ForRLActionPrediction(
         actor_model_config
     )
+    strict_vlm_checkpoint = bool(getattr(cfg, "strict_vlm_checkpoint", False))
     # train expert only
     if actor_model_config.train_expert_only:
         model.freeze_vlm()
@@ -71,11 +113,19 @@ def get_model(cfg: DictConfig, torch_dtype=None):
     if os.path.exists(full_weights_path):
         # Direct checkpoint directory
         model_state_dict = torch.load(full_weights_path, map_location="cpu")
-        model.load_state_dict(model_state_dict, strict=False)
+        _load_openpi_state_dict(
+            model,
+            model_state_dict,
+            strict_vlm_checkpoint=strict_vlm_checkpoint,
+        )
     elif os.path.exists(actor_full_weights_path):
         # Checkpoint directory from runner
         model_state_dict = torch.load(actor_full_weights_path, map_location="cpu")
-        model.load_state_dict(model_state_dict, strict=False)
+        _load_openpi_state_dict(
+            model,
+            model_state_dict,
+            strict_vlm_checkpoint=strict_vlm_checkpoint,
+        )
     else:
         # Original model directory with safetensors files
         weight_paths = sorted(glob.glob(os.path.join(checkpoint_dir, "*.safetensors")))
@@ -85,7 +135,11 @@ def get_model(cfg: DictConfig, torch_dtype=None):
         for weight_path in weight_paths:
             state_dict = safetensors.torch.load_file(weight_path, device="cpu")
             all_state_dict.update(state_dict)
-        model.load_state_dict(all_state_dict, strict=False)
+        _load_openpi_state_dict(
+            model,
+            all_state_dict,
+            strict_vlm_checkpoint=strict_vlm_checkpoint,
+        )
 
     model.paligemma_with_expert.to_bfloat16_for_selected_params("bfloat16")
     # fsdp replace

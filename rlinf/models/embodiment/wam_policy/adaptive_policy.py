@@ -16,6 +16,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from typing import Any, Literal, Protocol
 
@@ -80,6 +81,7 @@ class FastWAMPolicyRuntime(Protocol):
         routes: torch.Tensor,
         mode: Literal["train", "eval"],
         actor_version: int,
+        collect_replay: bool = True,
     ) -> FastWAMChunkSample: ...
 
     def replay_action_batch(
@@ -112,6 +114,7 @@ class FastWAMAdaptivePolicyConfig:
     gate_epsilon: float = 0.1
     gate_temperature: float = 1.0
     eval_idm_threshold: float = 0.5
+    eval_microbatch_size: int = 1
     kv_replay: GateKVReplayConfig = field(default_factory=GateKVReplayConfig)
 
     def __post_init__(self) -> None:
@@ -121,6 +124,8 @@ class FastWAMAdaptivePolicyConfig:
             raise ValueError("`gate_temperature` must be positive.")
         if not 0 <= self.eval_idm_threshold <= 1:
             raise ValueError("`eval_idm_threshold` must lie in [0, 1].")
+        if self.eval_microbatch_size < 1:
+            raise ValueError("`eval_microbatch_size` must be positive.")
 
 
 def _bytes_per_sample(packed: PackedGateKVTaps) -> torch.Tensor:
@@ -156,7 +161,7 @@ class FastWAMAdaptivePolicy(nn.Module, BasePolicy):
         runtime: FastWAMPolicyRuntime,
         lora_adapter: Any,
         gate: nn.Module,
-        critic: nn.Module,
+        critic: nn.Module | None,
         config: FastWAMAdaptivePolicyConfig | None = None,
     ) -> None:
         super().__init__()
@@ -170,6 +175,13 @@ class FastWAMAdaptivePolicy(nn.Module, BasePolicy):
         self.actor_version = 0
         self._enforce_frozen_actor()
         self.actor.eval()
+
+    def _require_critic(self) -> nn.Module:
+        if self.critic is None:
+            raise RuntimeError(
+                "The pi0.5 critic is intentionally absent from standalone evaluation."
+            )
+        return self.critic
 
     def _enforce_frozen_actor(self) -> None:
         """Keep only the injected UNCOND LoRA trainable inside FastWAM."""
@@ -196,7 +208,8 @@ class FastWAMAdaptivePolicy(nn.Module, BasePolicy):
         super().train(mode)
         self.actor.eval()
         self.gate.train(mode)
-        self.critic.train(mode)
+        if self.critic is not None:
+            self.critic.train(mode)
         return self
 
     def forward(
@@ -212,7 +225,7 @@ class FastWAMAdaptivePolicy(nn.Module, BasePolicy):
     def value_head(self) -> nn.Module:
         """Expose the colocated critic head to existing rollout bootstrap code."""
 
-        return self.critic.value_head
+        return self._require_critic().value_head
 
     def set_global_step(self, version: int) -> None:
         if version < 0:
@@ -280,6 +293,107 @@ class FastWAMAdaptivePolicy(nn.Module, BasePolicy):
             logprob,
         )
 
+    @staticmethod
+    def _slice_env_obs(
+        env_obs: dict[str, Any],
+        *,
+        start: int,
+        end: int,
+        batch_size: int,
+    ) -> dict[str, Any]:
+        result: dict[str, Any] = {}
+        for key, value in env_obs.items():
+            if (
+                isinstance(value, torch.Tensor)
+                and value.ndim > 0
+                and value.shape[0] == batch_size
+            ):
+                result[key] = value[start:end]
+            elif isinstance(value, list) and len(value) == batch_size:
+                result[key] = value[start:end]
+            elif isinstance(value, tuple) and len(value) == batch_size:
+                result[key] = value[start:end]
+            else:
+                result[key] = value
+        return result
+
+    @torch.no_grad()
+    def _predict_eval_action_batch(
+        self,
+        *,
+        env_obs: dict[str, Any],
+        route_info: ChunkRouteRecord,
+        env_ids: torch.Tensor,
+    ) -> tuple[torch.Tensor, dict[str, Any]]:
+        """Run deterministic evaluation without constructing PPO replay."""
+
+        batch_size = route_info.route_used.shape[0]
+        actions = []
+        decisions = []
+        microbatch = self.config.eval_microbatch_size
+        for start in range(0, batch_size, microbatch):
+            end = min(start + microbatch, batch_size)
+            sample = self.runtime.sample_action_batch(
+                env_obs=self._slice_env_obs(
+                    env_obs,
+                    start=start,
+                    end=end,
+                    batch_size=batch_size,
+                ),
+                routes=route_info.route_used[start:end],
+                mode="eval",
+                actor_version=self.actor_version,
+                collect_replay=False,
+            )
+            logits = self.gate(sample.gate_snapshots)
+            decisions.append(self._gate_decision(logits=logits, mode="eval"))
+            actions.append(sample.actions)
+
+        next_route = torch.cat([item[0] for item in decisions], dim=0)
+        base_probability = torch.cat([item[1] for item in decisions], dim=0)
+        behavior_probability = torch.cat([item[2] for item in decisions], dim=0)
+        gate_logprob = torch.cat([item[3] for item in decisions], dim=0)
+        self.route_tracker.emit(
+            env_ids=env_ids,
+            routes=next_route,
+            source_chunk_ids=route_info.chunk_ids,
+            episode_ids=route_info.episode_ids,
+            actor_version=self.actor_version,
+        )
+        emitted_gate = GateDecisionRecord(
+            next_route=next_route,
+            base_probability=base_probability,
+            behavior_probability=behavior_probability,
+            old_logprob=gate_logprob,
+            epsilon=torch.zeros_like(base_probability),
+            temperature=torch.full_like(
+                base_probability,
+                self.config.gate_temperature,
+            ),
+            valid=torch.ones_like(next_route, dtype=torch.bool),
+            source_chunk_ids=route_info.chunk_ids,
+            episode_ids=route_info.episode_ids,
+            actor_versions=torch.full_like(next_route, self.actor_version),
+            kv_metadata=None,
+        )
+        return torch.cat(actions, dim=0), {
+            "prev_logprobs": torch.empty(
+                batch_size,
+                0,
+                device=route_info.route_used.device,
+                dtype=torch.float32,
+            ),
+            "prev_values": torch.zeros(
+                batch_size,
+                1,
+                device=route_info.route_used.device,
+                dtype=torch.float32,
+            ),
+            "forward_inputs": {},
+            "route_info": route_info,
+            "emitted_gate": emitted_gate,
+        }
+
     def predict_action_batch(
         self,
         env_obs: dict[str, Any],
@@ -298,11 +412,19 @@ class FastWAMAdaptivePolicy(nn.Module, BasePolicy):
             actor_version=self.actor_version,
         )
 
+        if mode == "eval":
+            return self._predict_eval_action_batch(
+                env_obs=env_obs,
+                route_info=route_info,
+                env_ids=env_ids,
+            )
+
         sample = self.runtime.sample_action_batch(
             env_obs=env_obs,
             routes=route_info.route_used,
             mode=mode,
             actor_version=self.actor_version,
+            collect_replay=True,
         )
         logits = self.gate(sample.gate_snapshots)
         next_route, base_probability, behavior_probability, gate_logprob = (
@@ -373,7 +495,7 @@ class FastWAMAdaptivePolicy(nn.Module, BasePolicy):
 
         if compute_values:
             critic_obs = self.runtime.critic_observation(env_obs=env_obs)
-            critic_result = self.critic.predict_value_batch(
+            critic_result = self._require_critic().predict_value_batch(
                 critic_obs,
                 return_prefix=True,
             )
@@ -465,15 +587,16 @@ class FastWAMAdaptivePolicy(nn.Module, BasePolicy):
         replay = self.runtime.replay_action_batch(**replay_kwargs)
 
         if compute_values:
+            critic = self._require_critic()
             if "critic_prefix" in forward_inputs:
-                values = self.critic.value_from_prefix(
+                values = critic.value_from_prefix(
                     forward_inputs["critic_prefix"]
                 )
             else:
                 critic_obs = self.runtime.critic_observation(
                     forward_inputs=forward_inputs
                 )
-                values = self.critic.predict_value_batch(critic_obs)
+                values = critic.predict_value_batch(critic_obs)
         else:
             values = torch.zeros(
                 (gate_logits.shape[0], 1),
@@ -508,6 +631,7 @@ class FastWAMAdaptivePolicy(nn.Module, BasePolicy):
     ) -> list[dict[str, Any]]:
         """Return disjoint Gate, LoRA, and fresh-value-head optimizer groups."""
 
+        critic = self._require_critic()
         groups = [
             {
                 "name": "gate",
@@ -531,7 +655,7 @@ class FastWAMAdaptivePolicy(nn.Module, BasePolicy):
                 "name": "value_head",
                 "params": [
                     parameter
-                    for parameter in self.critic.value_head.parameters()
+                    for parameter in critic.value_head.parameters()
                     if parameter.requires_grad
                 ],
                 "lr": value_lr,
@@ -552,12 +676,13 @@ class FastWAMAdaptivePolicy(nn.Module, BasePolicy):
     def trainable_state_dict(self) -> dict[str, Any]:
         """Save only adaptive state plus delayed-route schedules."""
 
+        critic = self._require_critic()
         return {
             "schema": "fastwam-adaptive-policy-v1",
             "actor_version": self.actor_version,
             "gate": self.gate.state_dict(),
             "lora": self.lora_adapter.lora_state_dict(),
-            "value_head": self.critic.value_head.state_dict(),
+            "value_head": critic.value_head.state_dict(),
             "route_tracker": self.route_tracker.state_dict(),
         }
 
@@ -566,7 +691,8 @@ class FastWAMAdaptivePolicy(nn.Module, BasePolicy):
             raise ValueError("Unsupported FastWAM adaptive-policy checkpoint.")
         self.gate.load_state_dict(payload["gate"], strict=True)
         self.lora_adapter.load_lora_state_dict(payload["lora"], strict=True)
-        self.critic.value_head.load_state_dict(payload["value_head"], strict=True)
+        if self.critic is not None:
+            self.critic.value_head.load_state_dict(payload["value_head"], strict=True)
         self.route_tracker.load_state_dict(payload["route_tracker"])
         actor_version = int(payload["actor_version"])
         if actor_version < 0:
@@ -574,3 +700,85 @@ class FastWAMAdaptivePolicy(nn.Module, BasePolicy):
         # Exact resume restores a pending decision produced by these same
         # weights, so it must not be invalidated as a live policy update.
         self.actor_version = actor_version
+
+    def load_eval_checkpoint(
+        self,
+        payload: Mapping[str, Any],
+        *,
+        expected_parent_checkpoint_sha256: str,
+        expected_critic_parent_checkpoint_sha256: str | None = None,
+    ) -> int:
+        """Restore adaptive policy state from one actor-rank project checkpoint."""
+
+        if payload.get("schema") != "fastwam-adaptive-rl-checkpoint-v1":
+            raise ValueError("Unsupported FastWAM adaptive evaluation checkpoint.")
+        expected_parent = str(expected_parent_checkpoint_sha256).strip().lower()
+        if len(expected_parent) != 64 or any(
+            character not in "0123456789abcdef" for character in expected_parent
+        ):
+            raise ValueError("Expected FastWAM parent SHA-256 is invalid.")
+        if payload.get("parent_checkpoint_sha256") != expected_parent:
+            raise ValueError(
+                "FastWAM evaluation checkpoint parent hash mismatch: "
+                f"expected {expected_parent}, got "
+                f"{payload.get('parent_checkpoint_sha256')}."
+            )
+
+        contract = payload.get("contract")
+        contract_model = contract.get("model") if isinstance(contract, Mapping) else None
+        if not isinstance(contract_model, Mapping) or (
+            str(contract_model.get("actor_checkpoint_sha256", "")).lower()
+            != expected_parent
+        ):
+            raise ValueError(
+                "FastWAM evaluation checkpoint contract has the wrong parent hash."
+            )
+
+        if self.critic is not None:
+            expected_critic_parent = str(
+                expected_critic_parent_checkpoint_sha256 or ""
+            ).strip().lower()
+            if len(expected_critic_parent) != 64 or any(
+                character not in "0123456789abcdef"
+                for character in expected_critic_parent
+            ):
+                raise ValueError("Expected pi0.5 critic parent SHA-256 is invalid.")
+            if (
+                payload.get("critic_parent_checkpoint_sha256")
+                != expected_critic_parent
+            ):
+                raise ValueError(
+                    "pi0.5 evaluation checkpoint parent hash mismatch: "
+                    f"expected {expected_critic_parent}, got "
+                    f"{payload.get('critic_parent_checkpoint_sha256')}."
+                )
+            contract_critic = contract_model.get("critic")
+            if not isinstance(contract_critic, Mapping) or (
+                str(contract_critic.get("backbone_checkpoint_sha256", "")).lower()
+                != expected_critic_parent
+            ):
+                raise ValueError(
+                    "FastWAM evaluation checkpoint contract has the wrong critic "
+                    "parent hash."
+                )
+
+        policy_payload = payload.get("policy")
+        if not isinstance(policy_payload, Mapping):
+            raise ValueError("FastWAM evaluation checkpoint is missing its policy payload.")
+        outer_step = payload.get("step")
+        inner_step = policy_payload.get("actor_version")
+        if (
+            outer_step is None
+            or inner_step is None
+            or isinstance(outer_step, bool)
+            or isinstance(inner_step, bool)
+            or int(outer_step) != int(inner_step)
+        ):
+            raise ValueError(
+                "FastWAM evaluation checkpoint step does not match its policy version."
+            )
+
+        self.load_trainable_state_dict(dict(policy_payload))
+        if self.actor_version != int(outer_step):
+            raise RuntimeError("FastWAM evaluation checkpoint restored the wrong version.")
+        return self.actor_version

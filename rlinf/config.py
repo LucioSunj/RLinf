@@ -24,6 +24,11 @@ import torch.nn.functional as F
 from omegaconf import OmegaConf, open_dict
 from omegaconf.dictconfig import DictConfig
 
+from rlinf.config_contracts import (
+    validate_fastwam_kv_weight_sync,
+    validate_libero_terminal_reward_config,
+    validate_pi05_critic_artifact_config,
+)
 from rlinf.envs import SupportedEnvType
 from rlinf.scheduler.cluster import Cluster
 from rlinf.utils.placement import (
@@ -833,10 +838,27 @@ def _validate_fastwam_adaptive_cfg(cfg, *, only_eval: bool) -> None:
     if SupportedModel(model_cfg.model_type) is not SupportedModel.FASTWAM_ADAPTIVE:
         return
 
-    if not bool(model_cfg.get("add_value_head", False)):
+    for split_name in ("train", "eval"):
+        split_cfg = cfg.env.get(split_name, None)
+        if split_cfg is not None:
+            validate_libero_terminal_reward_config(
+                ignore_terminations=bool(split_cfg.get("ignore_terminations", False)),
+                use_rel_reward=bool(split_cfg.get("use_rel_reward", True)),
+            )
+
+    if not only_eval and not bool(model_cfg.get("add_value_head", False)):
         raise ValueError("FastWAM adaptive requires its colocated pi0.5 value head.")
 
+    load_for_eval = bool(model_cfg.critic.get("load_for_eval", False))
+    if not only_eval or load_for_eval:
+        validate_pi05_critic_artifact_config(
+            str(model_cfg.critic.backbone.get("model_path", "")),
+            str(model_cfg.critic.get("backbone_checkpoint_sha256", "")),
+        )
+
     if only_eval:
+        with open_dict(model_cfg):
+            model_cfg.eval_without_critic = not load_for_eval
         return
 
     actor_model = cfg.actor.model
@@ -857,6 +879,7 @@ def _validate_fastwam_adaptive_cfg(cfg, *, only_eval: bool) -> None:
         "gate_epsilon",
         "gate_temperature",
         "eval_idm_threshold",
+        "eval_microbatch_size",
         "kv_replay",
         "flow_sde",
         "runtime",
@@ -915,6 +938,9 @@ def _validate_fastwam_adaptive_cfg(cfg, *, only_eval: bool) -> None:
             "FastWAM action and Gate likelihoods are replayed together on the actor; "
             "`rollout.recompute_logprobs` must remain false."
         )
+    kv_backend = str(actor_model.kv_replay.get("backend", "stored")).lower()
+    weight_sync_interval = int(cfg.runner.get("weight_sync_interval", 1))
+    validate_fastwam_kv_weight_sync(kv_backend, weight_sync_interval)
     if not bool(cfg.rollout.get("collect_prev_infos", True)):
         raise ValueError("FastWAM PPO requires rollout old log-probs and values.")
     if not bool(cfg.actor.fsdp_config.get("use_orig_params", False)):

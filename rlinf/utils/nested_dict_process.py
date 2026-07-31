@@ -156,9 +156,13 @@ def clone_nested_to_cpu(value: Any):
 def put_tensor_device(data_dict, device):
     """Move every tensor leaf, including dataclass fields, to ``device``."""
 
+    def move_tensor(value: torch.Tensor) -> torch.Tensor:
+        non_blocking = value.device.type == "cpu" and value.is_pinned()
+        return value.to(device=device, non_blocking=non_blocking).contiguous()
+
     return map_nested_tensors(
         data_dict,
-        lambda value: value.to(device=device).contiguous(),
+        move_tensor,
     )
 
 

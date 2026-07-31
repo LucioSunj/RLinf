@@ -77,7 +77,9 @@ algorithm:
   fixed_branch_cost:
     enabled: true
     # Sweep with `algorithm.fixed_branch_cost.idm_cost=<value>`.
-    idm_cost: 1.0
+    # A 512-step episode contains at most 32 16-action chunks. Keep the smoke
+    # default below 1/32 so an all-IDM successful trajectory can remain positive.
+    idm_cost: 0.01
     uncond_cost: 0.0
 
 env:
@@ -92,6 +94,7 @@ env:
   eval:
     rollout_epoch: 1
     total_num_envs: 100
+    reward_coef: ${algorithm.reward_coef}
     auto_reset: true
     ignore_terminations: true
     group_size: 1

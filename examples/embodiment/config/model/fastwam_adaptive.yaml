@@ -95,6 +95,7 @@ gate:
 gate_epsilon: 0.1
 gate_temperature: 1.0
 eval_idm_threshold: 0.5
+eval_microbatch_size: 1
 
 kv_replay:
   # Set to recompute only for the explicit memory ablation.
@@ -151,18 +152,23 @@ runtime:
   camera_concat: horizontal
   tiled_vae: false
   binarize_gripper: false
+  prompt_template: "A video recorded from a robot's point of view executing the following instruction: {task}"
 
 critic:
   kind: pi0_5_value_after_vlm
+  # Standalone evaluation loads only Gate + LoRA unless explicitly overridden.
+  load_for_eval: false
+  backbone_checkpoint_sha256: ${oc.env:PI05_CRITIC_CHECKPOINT_SHA256,''}
   input_dim: 2048
   hidden_sizes: [1024, 512, 256]
   backbone:
     model_type: openpi
-    model_path: ${oc.env:PI05_CRITIC_CHECKPOINT}
+    model_path: ${oc.env:PI05_CRITIC_CHECKPOINT,''}
     precision: null
     num_action_chunks: 10
     action_dim: 7
     is_lora: false
+    strict_vlm_checkpoint: true
     lora_rank: 32
     use_proprio: true
     num_steps: 5

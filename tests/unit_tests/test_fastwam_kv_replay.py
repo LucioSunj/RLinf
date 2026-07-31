@@ -30,6 +30,7 @@ GateKVReplayConfig = _module.GateKVReplayConfig
 GateKVReplayRecord = _module.GateKVReplayRecord
 offload_gate_kv = _module.offload_gate_kv
 pack_gate_kv = _module.pack_gate_kv
+pin_gate_kv_forward_inputs = _module.pin_gate_kv_forward_inputs
 PackedGateKVTaps = _module.PackedGateKVTaps
 
 
@@ -152,3 +153,23 @@ def test_packed_kv_rejects_mixed_actor_versions():
 
     with pytest.raises(ValueError, match="exactly one actor version"):
         replace(packed, **batch_two)
+
+
+def test_gate_kv_is_repinned_after_collation(monkeypatch):
+    calls = []
+
+    def record_pin(tensor):
+        calls.append(tensor)
+        return tensor
+
+    monkeypatch.setattr(_module, "_pin_tensor", record_pin)
+    inputs = {
+        "gate_kv_video_key": torch.zeros(2, 3),
+        "gate_kv_action_value": torch.ones(2, 3),
+        "flow_chains": torch.zeros(2, 3),
+    }
+
+    result = pin_gate_kv_forward_inputs(inputs)
+
+    assert len(calls) == 2
+    assert result["flow_chains"] is inputs["flow_chains"]
