@@ -1,5 +1,22 @@
+# Copyright 2026 The RLinf Authors.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+from __future__ import annotations
+
 import importlib.util
 import sys
+from dataclasses import dataclass
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -54,6 +71,22 @@ class _DummyPi05(nn.Module):
         return self.value_head(pooled)[:, 0]
 
 
+@dataclass(frozen=True)
+class _FrozenPi05Config:
+    config_name: str = "pi05_libero"
+    num_images_in_input: int = 1
+    add_value_head: bool = False
+    value_after_vlm: bool = False
+    value_vlm_mode: str = "last_token"
+    detach_critic_input: bool = False
+
+
+class _FrozenConfigDummyPi05(_DummyPi05):
+    def __init__(self) -> None:
+        super().__init__()
+        self.config = _FrozenPi05Config()
+
+
 def test_filter_pretrained_value_head_removes_nested_keys():
     state = {
         "encoder.weight": torch.ones(1),
@@ -66,6 +99,7 @@ def test_filter_pretrained_value_head_removes_nested_keys():
 def test_critic_replaces_value_head_and_freezes_backbone():
     torch.manual_seed(3)
     backbone = _DummyPi05()
+    mutable_config = backbone.config
     old_head = backbone.value_head
     critic = Pi05ValueAfterVLMCritic(
         backbone,
@@ -74,10 +108,41 @@ def test_critic_replaces_value_head_and_freezes_backbone():
     )
 
     assert critic.value_head is not old_head
-    assert all(not parameter.requires_grad for parameter in backbone.encoder.parameters())
+    assert all(
+        not parameter.requires_grad for parameter in backbone.encoder.parameters()
+    )
     assert all(parameter.requires_grad for parameter in critic.value_head.parameters())
     assert critic.trainable_parameters() == list(critic.value_head.parameters())
+    assert backbone.config is mutable_config
     assert backbone.config.detach_critic_input is True
+
+
+def test_critic_replaces_frozen_config_and_backpropagates():
+    backbone = _FrozenConfigDummyPi05()
+    original_config = backbone.config
+    critic = Pi05ValueAfterVLMCritic(
+        backbone,
+        input_dim=4,
+        hidden_sizes=(3, 2),
+    )
+
+    assert backbone.config is not original_config
+    assert original_config == _FrozenPi05Config()
+    assert backbone.config.add_value_head is True
+    assert backbone.config.value_after_vlm is True
+    assert backbone.config.value_vlm_mode == "mean_token"
+    assert backbone.config.detach_critic_input is True
+
+    prefix = torch.randn(2, 5, 4, requires_grad=True)
+    values = critic.value_from_prefix(prefix)
+    assert values.shape == (2,)
+    values.sum().backward()
+
+    assert prefix.grad is None
+    assert all(parameter.grad is None for parameter in backbone.encoder.parameters())
+    assert all(
+        parameter.grad is not None for parameter in critic.value_head.parameters()
+    )
 
 
 def test_critic_gradient_stops_at_prefix_and_updates_only_value_head():
@@ -92,7 +157,9 @@ def test_critic_gradient_stops_at_prefix_and_updates_only_value_head():
 
     assert prefix.grad is None
     assert all(parameter.grad is None for parameter in backbone.encoder.parameters())
-    assert all(parameter.grad is not None for parameter in critic.value_head.parameters())
+    assert all(
+        parameter.grad is not None for parameter in critic.value_head.parameters()
+    )
 
 
 def test_value_head_hook_matches_live_parameter_dtype():

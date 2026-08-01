@@ -40,6 +40,36 @@ from rlinf.scheduler import Worker
 from rlinf.utils.utils import clear_memory
 
 
+def _frozen_parameters_to_ignore(
+    model: nn.Module,
+    fsdp_config,
+) -> tuple[nn.Parameter, ...] | None:
+    """Return frozen parameters that explicit FSDP config leaves unmanaged."""
+
+    if not bool(fsdp_config.get("ignore_frozen_parameters", False)):
+        return None
+    if not bool(fsdp_config.get("use_orig_params", False)):
+        raise ValueError(
+            "FSDP ignore_frozen_parameters requires use_orig_params=True."
+        )
+
+    frozen = tuple(
+        parameter for parameter in model.parameters() if not parameter.requires_grad
+    )
+    trainable_count = sum(
+        int(parameter.requires_grad) for parameter in model.parameters()
+    )
+    if not frozen:
+        raise ValueError(
+            "FSDP ignore_frozen_parameters=True found no frozen parameters."
+        )
+    if trainable_count == 0:
+        raise ValueError(
+            "FSDP ignore_frozen_parameters=True found no trainable parameters."
+        )
+    return frozen
+
+
 class FSDPStrategy(FSDPStrategyBase):
     _FSDP_CACHE_ATTRS = (
         "_mp_shard",
@@ -169,6 +199,10 @@ class FSDPStrategy(FSDPStrategyBase):
         )
 
         cpu_offload = CPUOffload(offload_params=self.cfg.fsdp_config.cpu_offload)
+        ignored_states = _frozen_parameters_to_ignore(
+            model,
+            self.cfg.fsdp_config,
+        )
 
         fsdp_model = FSDP(
             module=model,
@@ -184,6 +218,7 @@ class FSDPStrategy(FSDPStrategyBase):
             limit_all_gathers=self.cfg.fsdp_config.limit_all_gathers,
             use_orig_params=self.cfg.fsdp_config.use_orig_params,
             cpu_offload=cpu_offload,
+            ignored_states=ignored_states,
         )
         return fsdp_model
 

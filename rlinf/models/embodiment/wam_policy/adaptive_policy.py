@@ -22,7 +22,6 @@ from typing import Any, Literal, Protocol
 
 import torch
 import torch.nn as nn
-
 from fastwam.models.wan22.gate_transformer import (
     deterministic_idm_route,
     epsilon_mixture_bernoulli,
@@ -35,7 +34,6 @@ from .contracts import (
     ChunkRouteRecord,
     GateDecisionRecord,
     GateKVMetadata,
-    WAMRoute,
 )
 from .kv_replay import (
     GateKVReplayBackend,
@@ -188,7 +186,9 @@ class FastWAMAdaptivePolicy(nn.Module, BasePolicy):
 
         lora_parameters = tuple(self.lora_adapter.lora_parameters())
         if not lora_parameters:
-            raise ValueError("FastWAM adaptive policy requires trainable LoRA parameters.")
+            raise ValueError(
+                "FastWAM adaptive policy requires trainable LoRA parameters."
+            )
         lora_parameter_ids = {id(parameter) for parameter in lora_parameters}
         for parameter in self.actor.parameters():
             parameter.requires_grad_(id(parameter) in lora_parameter_ids)
@@ -227,6 +227,39 @@ class FastWAMAdaptivePolicy(nn.Module, BasePolicy):
 
         return self._require_critic().value_head
 
+    @staticmethod
+    def _critic_backbone_no_split_values(
+        critic: nn.Module | None,
+        attribute: str,
+    ) -> list[str]:
+        """Return deduplicated FSDP metadata from the nested critic backbone."""
+
+        backbone = getattr(critic, "backbone", None)
+        values = getattr(backbone, attribute, None)
+        if values is None:
+            return []
+        if isinstance(values, str):
+            values = (values,)
+        return list(dict.fromkeys(values))
+
+    @property
+    def _no_split_modules(self) -> list[str]:
+        """Expose nested pi0.5 module classes to FSDP wrapping."""
+
+        return self._critic_backbone_no_split_values(
+            self.critic,
+            "_no_split_modules",
+        )
+
+    @property
+    def _no_split_names(self) -> list[str]:
+        """Expose nested pi0.5 backbone parameter names to FSDP wrapping."""
+
+        return self._critic_backbone_no_split_values(
+            self.critic,
+            "_no_split_names",
+        )
+
     def set_global_step(self, version: int) -> None:
         if version < 0:
             raise ValueError("Actor version must be non-negative.")
@@ -261,9 +294,7 @@ class FastWAMAdaptivePolicy(nn.Module, BasePolicy):
             # receive an explicit reset mask from the environment worker.
             reset_mask = torch.zeros(batch_size, device=device, dtype=torch.bool)
         else:
-            reset_mask = torch.as_tensor(
-                reset_mask, device=device, dtype=torch.bool
-            )
+            reset_mask = torch.as_tensor(reset_mask, device=device, dtype=torch.bool)
         return env_ids, reset_mask
 
     def _gate_decision(
@@ -371,8 +402,8 @@ class FastWAMAdaptivePolicy(nn.Module, BasePolicy):
                 self.config.gate_temperature,
             ),
             valid=torch.ones_like(next_route, dtype=torch.bool),
-            source_chunk_ids=route_info.chunk_ids,
-            episode_ids=route_info.episode_ids,
+            source_chunk_ids=route_info.chunk_ids.to(next_route.device),
+            episode_ids=route_info.episode_ids.to(next_route.device),
             actor_versions=torch.full_like(next_route, self.actor_version),
             kv_metadata=None,
         )
@@ -487,8 +518,8 @@ class FastWAMAdaptivePolicy(nn.Module, BasePolicy):
             ),
             temperature=torch.full_like(logits, self.config.gate_temperature),
             valid=torch.ones_like(next_route, dtype=torch.bool),
-            source_chunk_ids=route_info.chunk_ids,
-            episode_ids=route_info.episode_ids,
+            source_chunk_ids=route_info.chunk_ids.to(next_route.device),
+            episode_ids=route_info.episode_ids.to(next_route.device),
             actor_versions=torch.full_like(next_route, self.actor_version),
             kv_metadata=kv_metadata,
         )
@@ -589,9 +620,7 @@ class FastWAMAdaptivePolicy(nn.Module, BasePolicy):
         if compute_values:
             critic = self._require_critic()
             if "critic_prefix" in forward_inputs:
-                values = critic.value_from_prefix(
-                    forward_inputs["critic_prefix"]
-                )
+                values = critic.value_from_prefix(forward_inputs["critic_prefix"])
             else:
                 critic_obs = self.runtime.critic_observation(
                     forward_inputs=forward_inputs
@@ -665,9 +694,7 @@ class FastWAMAdaptivePolicy(nn.Module, BasePolicy):
         if empty_groups:
             raise RuntimeError(f"FastWAM optimizer groups are empty: {empty_groups}.")
         parameter_ids = [
-            id(parameter)
-            for group in groups
-            for parameter in group["params"]
+            id(parameter) for group in groups for parameter in group["params"]
         ]
         if len(parameter_ids) != len(set(parameter_ids)):
             raise RuntimeError("FastWAM optimizer parameter groups overlap.")
@@ -687,6 +714,18 @@ class FastWAMAdaptivePolicy(nn.Module, BasePolicy):
         }
 
     def load_trainable_state_dict(self, payload: dict[str, Any]) -> None:
+        expected_keys = {
+            "schema",
+            "actor_version",
+            "gate",
+            "lora",
+            "value_head",
+            "route_tracker",
+        }
+        if set(payload) != expected_keys:
+            raise ValueError(
+                f"FastWAM adaptive-policy checkpoint keys changed: {sorted(payload)}."
+            )
         if payload.get("schema") != "fastwam-adaptive-policy-v1":
             raise ValueError("Unsupported FastWAM adaptive-policy checkpoint.")
         self.gate.load_state_dict(payload["gate"], strict=True)
@@ -699,6 +738,34 @@ class FastWAMAdaptivePolicy(nn.Module, BasePolicy):
             raise ValueError("Checkpoint actor version must be non-negative.")
         # Exact resume restores a pending decision produced by these same
         # weights, so it must not be invalidated as a live policy update.
+        self.actor_version = actor_version
+
+    def rollout_runtime_state_dict(self) -> dict[str, Any]:
+        """Serialize only delayed-route runtime state owned by rollout workers."""
+
+        return {
+            "schema": "fastwam-adaptive-rollout-policy-runtime-v1",
+            "actor_version": self.actor_version,
+            "route_tracker": self.route_tracker.state_dict(),
+        }
+
+    def load_rollout_runtime_state_dict(self, payload: dict[str, Any]) -> None:
+        """Restore rollout-owned delayed routes without duplicating trainables."""
+
+        expected_keys = {"schema", "actor_version", "route_tracker"}
+        if set(payload) != expected_keys:
+            raise ValueError(
+                f"FastWAM rollout-runtime policy keys changed: {sorted(payload)}."
+            )
+        if payload.get("schema") != ("fastwam-adaptive-rollout-policy-runtime-v1"):
+            raise ValueError("Unsupported FastWAM rollout-runtime policy schema.")
+        actor_version = int(payload["actor_version"])
+        if actor_version < 0:
+            raise ValueError("Rollout-runtime actor version must be non-negative.")
+        self.route_tracker.load_state_dict(payload["route_tracker"])
+        # The saved pending decision was emitted by this exact rollout version.
+        # A subsequent actor-version change still invalidates it through
+        # set_global_step before the first resumed chunk.
         self.actor_version = actor_version
 
     def load_eval_checkpoint(
@@ -725,7 +792,9 @@ class FastWAMAdaptivePolicy(nn.Module, BasePolicy):
             )
 
         contract = payload.get("contract")
-        contract_model = contract.get("model") if isinstance(contract, Mapping) else None
+        contract_model = (
+            contract.get("model") if isinstance(contract, Mapping) else None
+        )
         if not isinstance(contract_model, Mapping) or (
             str(contract_model.get("actor_checkpoint_sha256", "")).lower()
             != expected_parent
@@ -735,18 +804,15 @@ class FastWAMAdaptivePolicy(nn.Module, BasePolicy):
             )
 
         if self.critic is not None:
-            expected_critic_parent = str(
-                expected_critic_parent_checkpoint_sha256 or ""
-            ).strip().lower()
+            expected_critic_parent = (
+                str(expected_critic_parent_checkpoint_sha256 or "").strip().lower()
+            )
             if len(expected_critic_parent) != 64 or any(
                 character not in "0123456789abcdef"
                 for character in expected_critic_parent
             ):
                 raise ValueError("Expected pi0.5 critic parent SHA-256 is invalid.")
-            if (
-                payload.get("critic_parent_checkpoint_sha256")
-                != expected_critic_parent
-            ):
+            if payload.get("critic_parent_checkpoint_sha256") != expected_critic_parent:
                 raise ValueError(
                     "pi0.5 evaluation checkpoint parent hash mismatch: "
                     f"expected {expected_critic_parent}, got "
@@ -764,7 +830,9 @@ class FastWAMAdaptivePolicy(nn.Module, BasePolicy):
 
         policy_payload = payload.get("policy")
         if not isinstance(policy_payload, Mapping):
-            raise ValueError("FastWAM evaluation checkpoint is missing its policy payload.")
+            raise ValueError(
+                "FastWAM evaluation checkpoint is missing its policy payload."
+            )
         outer_step = payload.get("step")
         inner_step = policy_payload.get("actor_version")
         if (
@@ -780,5 +848,7 @@ class FastWAMAdaptivePolicy(nn.Module, BasePolicy):
 
         self.load_trainable_state_dict(dict(policy_payload))
         if self.actor_version != int(outer_step):
-            raise RuntimeError("FastWAM evaluation checkpoint restored the wrong version.")
+            raise RuntimeError(
+                "FastWAM evaluation checkpoint restored the wrong version."
+            )
         return self.actor_version

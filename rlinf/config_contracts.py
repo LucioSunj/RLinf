@@ -15,6 +15,9 @@
 """Small fail-fast contracts shared by RLinf configuration entry points."""
 
 from pathlib import Path
+from typing import Any
+
+from omegaconf import OmegaConf
 
 
 def validate_pi05_critic_artifact_config(
@@ -28,12 +31,12 @@ def validate_pi05_critic_artifact_config(
     if len(digest) != 64 or any(
         character not in "0123456789abcdef" for character in digest
     ):
-        raise ValueError("The pi0.5 critic requires a 64-character hexadecimal SHA-256.")
+        raise ValueError(
+            "The pi0.5 critic requires a 64-character hexadecimal SHA-256."
+        )
 
 
-def validate_fastwam_kv_weight_sync(
-    backend: str, weight_sync_interval: int
-) -> None:
+def validate_fastwam_kv_weight_sync(backend: str, weight_sync_interval: int) -> None:
     backend = str(backend).lower()
     interval = int(weight_sync_interval)
     if interval < 1:
@@ -57,6 +60,88 @@ def validate_libero_terminal_reward_config(
         )
 
 
+def _resolved_checkpoint_value(value: Any) -> Any:
+    if OmegaConf.is_config(value):
+        return OmegaConf.to_container(value, resolve=True)
+    return value
+
+
+def _selected_checkpoint_values(owner: Any, keys: tuple[str, ...]) -> dict[str, Any]:
+    return {
+        key: _resolved_checkpoint_value(OmegaConf.select(owner, key, default=None))
+        for key in keys
+    }
+
+
+def build_fastwam_checkpoint_contract(cfg: Any, *, world_size: int) -> dict[str, Any]:
+    """Build the resolved continuation contract shared by actor and rollout.
+
+    Output and scheduling limits are intentionally excluded so a checkpoint made
+    by a one-step interruption job can resume in a two-step continuation job.
+    Every field that can change model construction, rollout sampling, trajectory
+    semantics, optimizer behavior, FSDP ownership, or initial weight sync is
+    included and compared exactly on load.
+    """
+
+    actor_keys = (
+        "seed",
+        "micro_batch_size",
+        "global_batch_size",
+        "training_backend",
+        "enable_offload",
+        "fsdp_config",
+        "optim",
+    )
+    rollout_keys = (
+        "generation_backend",
+        "recompute_logprobs",
+        "unnorm_key",
+        "enable_offload",
+        "pipeline_stage_num",
+        "collect_prev_infos",
+        "enable_cuda_graph",
+    )
+    env_keys = (
+        "env_type",
+        "task_suite_name",
+        "total_num_envs",
+        "rollout_epoch",
+        "group_size",
+        "auto_reset",
+        "ignore_terminations",
+        "max_steps_per_rollout_epoch",
+        "max_episode_steps",
+        "specific_reset_id",
+        "use_fixed_reset_state_ids",
+        "use_ordered_reset_state_ids",
+        "use_rel_reward",
+        "reward_coef",
+        "use_step_penalty",
+        "reset_gripper_open",
+        "seed",
+        "init_params",
+    )
+    runner_keys = (
+        "weight_sync_interval",
+        "overlap_env_bootstrap",
+        "use_training_pipeline",
+    )
+    return {
+        "schema": "fastwam-adaptive-checkpoint-contract-v2",
+        "model": _resolved_checkpoint_value(cfg.actor.model),
+        "algorithm": _resolved_checkpoint_value(cfg.algorithm),
+        "actor": _selected_checkpoint_values(cfg.actor, actor_keys),
+        "rollout": _selected_checkpoint_values(cfg.rollout, rollout_keys),
+        "env_train": _selected_checkpoint_values(cfg.env.train, env_keys),
+        "runner": _selected_checkpoint_values(cfg.runner, runner_keys),
+        "weight_syncer": _resolved_checkpoint_value(cfg.weight_syncer),
+        "component_placement": _resolved_checkpoint_value(
+            cfg.cluster.component_placement
+        ),
+        "world_size": int(world_size),
+    }
+
+
 def validate_fastwam_resume_steps(
     loaded_steps,
     resume_dir: str,
@@ -68,9 +153,7 @@ def validate_fastwam_resume_steps(
         if isinstance(loaded_steps, (list, tuple))
         else [loaded_steps]
     )
-    if not values or any(
-        value is None or isinstance(value, bool) for value in values
-    ):
+    if not values or any(value is None or isinstance(value, bool) for value in values):
         raise ValueError("FastWAM checkpoint workers did not return payload steps.")
     steps = {int(value) for value in values}
     if len(steps) != 1:

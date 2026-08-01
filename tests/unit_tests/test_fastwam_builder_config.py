@@ -1,3 +1,17 @@
+# Copyright 2026 The RLinf Authors.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 import hashlib
 import importlib.util
 import sys
@@ -8,7 +22,6 @@ import pytest
 import torch.nn as nn
 from hydra import compose, initialize_config_dir
 from omegaconf import OmegaConf
-
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 CONFIG_ROOT = REPO_ROOT / "examples/embodiment/config"
@@ -78,7 +91,9 @@ def test_builder_skips_critic_allocation_contract_in_standalone_eval(
     def _unexpected_call(*_args, **_kwargs):
         pytest.fail("standalone evaluation must not inspect or load the critic")
 
-    monkeypatch.setattr(_builder, "_validate_exact_pi05_critic_config", _unexpected_call)
+    monkeypatch.setattr(
+        _builder, "_validate_exact_pi05_critic_config", _unexpected_call
+    )
     monkeypatch.setattr(_builder, "_validate_critic_parent_artifact", _unexpected_call)
 
     assert not _builder._validate_critic_build_config(
@@ -153,18 +168,27 @@ def test_eval_checkpoint_resolver_accepts_actor_directory(tmp_path) -> None:
     rank_zero.write_bytes(b"rank-zero")
     rank_one.write_bytes(b"rank-one")
 
-    assert _builder.resolve_fastwam_adaptive_eval_checkpoint(
-        actor_dir,
-        rank=1,
-    ) == rank_one
-    assert _builder.resolve_fastwam_adaptive_eval_checkpoint(
-        actor_dir,
-        rank=7,
-    ) == rank_zero
-    assert _builder.resolve_fastwam_adaptive_eval_checkpoint(
-        rank_one,
-        rank=0,
-    ) == rank_one
+    assert (
+        _builder.resolve_fastwam_adaptive_eval_checkpoint(
+            actor_dir,
+            rank=1,
+        )
+        == rank_one
+    )
+    assert (
+        _builder.resolve_fastwam_adaptive_eval_checkpoint(
+            actor_dir,
+            rank=7,
+        )
+        == rank_zero
+    )
+    assert (
+        _builder.resolve_fastwam_adaptive_eval_checkpoint(
+            rank_one,
+            rank=0,
+        )
+        == rank_one
+    )
 
 
 def test_builder_enforces_non_joint_positive_flow_sde() -> None:
@@ -208,6 +232,8 @@ def test_libero_adaptive_config_composes_with_confirmed_defaults(monkeypatch) ->
     assert cfg.actor.model.is_lora is False
     assert cfg.actor.model.add_value_head is True
     assert cfg.actor.fsdp_config.use_orig_params is True
+    assert cfg.actor.fsdp_config.ignore_frozen_parameters is True
+    assert cfg.weight_syncer.patch.init_sync.enabled is True
     assert cfg.actor.model.gate.layer_taps.mode == "all"
     assert cfg.actor.model.gate.denoise_last_n == 1
     assert cfg.actor.model.gate_epsilon == 0.1

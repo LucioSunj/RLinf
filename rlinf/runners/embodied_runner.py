@@ -179,15 +179,35 @@ class EmbodiedRunner:
 
         self.logger.info(f"Resuming training from checkpoint directory {resume_dir}.")
         actor_checkpoint_path = os.path.join(resume_dir, "actor")
-        assert os.path.exists(actor_checkpoint_path), (
-            f"resume_dir {actor_checkpoint_path} does not exist."
-        )
+        if not os.path.exists(actor_checkpoint_path):
+            raise FileNotFoundError(
+                f"resume_dir {actor_checkpoint_path} does not exist."
+            )
         loaded_steps = self.actor.load_checkpoint(actor_checkpoint_path).wait()
         if str(self.cfg.actor.model.model_type) == "fastwam_adaptive":
-            self.global_step = validate_fastwam_resume_steps(
+            actor_step = validate_fastwam_resume_steps(
                 loaded_steps,
                 resume_dir,
             )
+            rollout_checkpoint_path = os.path.join(resume_dir, "rollout")
+            if not os.path.exists(rollout_checkpoint_path):
+                raise FileNotFoundError(
+                    "FastWAM resume requires rollout runtime checkpoints at "
+                    f"{rollout_checkpoint_path}."
+                )
+            rollout_loaded_steps = self.rollout.load_checkpoint(
+                rollout_checkpoint_path
+            ).wait()
+            rollout_step = validate_fastwam_resume_steps(
+                rollout_loaded_steps,
+                resume_dir,
+            )
+            if rollout_step != actor_step:
+                raise ValueError(
+                    "FastWAM actor and rollout checkpoints disagree on step: "
+                    f"actor={actor_step}, rollout={rollout_step}."
+                )
+            self.global_step = actor_step
         else:
             self.global_step = int(resume_dir.split("global_step_")[-1])
 
@@ -656,8 +676,12 @@ class EmbodiedRunner:
             f"checkpoints/global_step_{self.global_step}",
         )
         actor_save_path = os.path.join(base_output_dir, "actor")
+        rollout_save_path = os.path.join(base_output_dir, "rollout")
         os.makedirs(actor_save_path, exist_ok=True)
+        os.makedirs(rollout_save_path, exist_ok=True)
         self.actor.save_checkpoint(actor_save_path, self.global_step).wait()
+        if str(self.cfg.actor.model.model_type) == "fastwam_adaptive":
+            self.rollout.save_checkpoint(rollout_save_path, self.global_step).wait()
 
     def set_max_steps(self):
         self.num_steps_per_epoch = 1

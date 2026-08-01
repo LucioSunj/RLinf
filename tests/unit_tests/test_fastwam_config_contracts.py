@@ -1,8 +1,22 @@
+# Copyright 2026 The RLinf Authors.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 import importlib.util
 from pathlib import Path
 
 import pytest
-
+from omegaconf import OmegaConf
 
 MODULE_PATH = Path(__file__).resolve().parents[2] / "rlinf/config_contracts.py"
 SPEC = importlib.util.spec_from_file_location("fastwam_config_contracts", MODULE_PATH)
@@ -45,10 +59,13 @@ def test_terminal_reward_config_rejects_repeated_success_reward_mode() -> None:
 
 
 def test_fastwam_resume_uses_consistent_payload_step() -> None:
-    assert MODULE.validate_fastwam_resume_steps(
-        [7, 7],
-        "/tmp/global_step_7",
-    ) == 7
+    assert (
+        MODULE.validate_fastwam_resume_steps(
+            [7, 7],
+            "/tmp/global_step_7",
+        )
+        == 7
+    )
 
     with pytest.raises(ValueError, match="directory/payload step mismatch"):
         MODULE.validate_fastwam_resume_steps([7, 7], "/tmp/global_step_8")
@@ -58,3 +75,72 @@ def test_fastwam_resume_uses_consistent_payload_step() -> None:
 
     with pytest.raises(ValueError, match="did not return payload steps"):
         MODULE.validate_fastwam_resume_steps([7, None], "/tmp/global_step_7")
+
+
+def _checkpoint_cfg():
+    return OmegaConf.create(
+        {
+            "actor": {
+                "seed": 42,
+                "micro_batch_size": 1,
+                "global_batch_size": 4,
+                "training_backend": "fsdp",
+                "enable_offload": False,
+                "model": {"model_type": "fastwam_adaptive", "precision": "bf16"},
+                "fsdp_config": {
+                    "sharding_strategy": "no_shard",
+                    "use_orig_params": True,
+                    "ignore_frozen_parameters": True,
+                },
+                "optim": {"gate_lr": 1e-4, "lora_lr": 1e-5, "value_lr": 1e-4},
+            },
+            "algorithm": {"loss_type": "fastwam_dual_ppo"},
+            "rollout": {
+                "generation_backend": "huggingface",
+                "recompute_logprobs": False,
+                "unnorm_key": "libero_10",
+                "enable_offload": False,
+                "pipeline_stage_num": 1,
+                "collect_prev_infos": True,
+                "enable_cuda_graph": False,
+            },
+            "env": {
+                "train": {
+                    "env_type": "libero",
+                    "task_suite_name": "libero_10",
+                    "total_num_envs": 2,
+                    "rollout_epoch": 1,
+                    "group_size": 1,
+                    "auto_reset": True,
+                    "max_episode_steps": 32,
+                    "max_steps_per_rollout_epoch": 32,
+                    "seed": 0,
+                }
+            },
+            "runner": {
+                "max_steps": 1,
+                "weight_sync_interval": 1,
+                "overlap_env_bootstrap": False,
+                "use_training_pipeline": False,
+            },
+            "weight_syncer": {
+                "type": "patch",
+                "patch": {"init_sync": {"enabled": True}},
+            },
+            "cluster": {"component_placement": {"actor": "0-1"}},
+        }
+    )
+
+
+def test_checkpoint_contract_covers_continuation_semantics_not_run_length() -> None:
+    cfg = _checkpoint_cfg()
+    baseline = MODULE.build_fastwam_checkpoint_contract(cfg, world_size=2)
+    assert baseline["schema"] == "fastwam-adaptive-checkpoint-contract-v2"
+    assert baseline["actor"]["seed"] == 42
+    assert baseline["weight_syncer"]["patch"]["init_sync"]["enabled"] is True
+
+    cfg.runner.max_steps = 2
+    assert MODULE.build_fastwam_checkpoint_contract(cfg, world_size=2) == baseline
+
+    cfg.actor.seed = 43
+    assert MODULE.build_fastwam_checkpoint_contract(cfg, world_size=2) != baseline

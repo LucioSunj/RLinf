@@ -286,6 +286,27 @@ class PatchBuilder(ABC):
         if not self.ordered_keys:
             raise ValueError("ordered_keys must not be empty")
 
+        if len(self.param_names_need_sync_set) != len(self.param_names_need_sync):
+            raise ValueError("param_names_need_sync must not contain duplicate keys")
+
+        unknown_sync_keys = self.param_names_need_sync_set.difference(self.ordered_keys)
+        if unknown_sync_keys:
+            raise ValueError(
+                "param_names_need_sync contains keys missing from the receiver: "
+                f"{sorted(unknown_sync_keys)}"
+            )
+
+    def _validate_state_dict_keys(
+        self, state_dict: dict[str, torch.Tensor | DTensor]
+    ) -> None:
+        """Accept a full receiver state or the exact selective-sync state."""
+
+        state_keys = set(state_dict)
+        if state_keys != set(self.ordered_keys) and (
+            state_keys != self.param_names_need_sync_set
+        ):
+            raise ValueError("State dict keys do not match snapshot keys")
+
     @staticmethod
     def delta_encode(
         rows: torch.Tensor, cols: torch.Tensor
@@ -448,8 +469,7 @@ class CPUSnapshotPatchBuilder(PatchBuilder):
         # empty patch for it, because this rank does not really
         # send.
         if self.snapshot is None:
-            if set(state_dict.keys()) != set(self.ordered_keys):
-                raise ValueError("State dict keys do not match snapshot keys")
+            self._validate_state_dict_keys(state_dict)
             for key in self.param_names_need_sync:
                 _ = materialize_tensor(state_dict[key])
             return EmptyWeightPatch(
@@ -460,8 +480,7 @@ class CPUSnapshotPatchBuilder(PatchBuilder):
                 )
             )
 
-        if set(state_dict.keys()) != set(self.ordered_keys):
-            raise ValueError("State dict keys do not match snapshot keys")
+        self._validate_state_dict_keys(state_dict)
 
         ordinals: list[torch.Tensor] = []
         nnz_per_tensor: list[torch.Tensor] = []
@@ -656,8 +675,7 @@ class GPUSnapshotPatchBuilder(PatchBuilder):
         # empty patch for it, because this rank does not really
         # send.
         if self.snapshot is None:
-            if set(state_dict.keys()) != set(self.ordered_keys):
-                raise ValueError("State dict keys do not match snapshot keys")
+            self._validate_state_dict_keys(state_dict)
             for param_name in self.param_names_need_sync:
                 _ = materialize_tensor(state_dict[param_name])
             return EmptyWeightPatch(
@@ -668,8 +686,7 @@ class GPUSnapshotPatchBuilder(PatchBuilder):
                 )
             )
 
-        if set(state_dict.keys()) != set(self.ordered_keys):
-            raise ValueError("State dict keys do not match snapshot keys")
+        self._validate_state_dict_keys(state_dict)
 
         ordinals: list[torch.Tensor] = []
         nnz_per_tensor: list[torch.Tensor] = []
@@ -926,8 +943,22 @@ class PatchWeightSyncer(WeightSyncer):
         self.param_names_need_sync = param_names_need_sync
         receiver_dtypes = metadata["receiver_dtypes"]
 
-        if set(state_dict.keys()) != set(self.ordered_keys):
-            raise ValueError("Sender state dict keys do not match receiver keys")
+        state_keys = set(state_dict)
+        receiver_keys = set(self.ordered_keys)
+        sync_keys = set(self.param_names_need_sync)
+        if len(sync_keys) != len(self.param_names_need_sync):
+            raise ValueError("param_names_need_sync must not contain duplicate keys")
+        unknown_sync_keys = sync_keys.difference(receiver_keys)
+        if unknown_sync_keys:
+            raise ValueError(
+                "param_names_need_sync contains keys missing from the receiver: "
+                f"{sorted(unknown_sync_keys)}"
+            )
+        if state_keys != receiver_keys and state_keys != sync_keys:
+            raise ValueError(
+                "Sender state dict keys must match either all receiver keys or "
+                "exactly param_names_need_sync"
+            )
 
         if self.init_sync_enabled:
             await self._sync_init_weights(state_dict, receiver_dtypes, send)

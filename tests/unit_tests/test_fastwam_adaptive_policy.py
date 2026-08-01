@@ -1,3 +1,17 @@
+# Copyright 2026 The RLinf Authors.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 import importlib.util
 import sys
 from enum import Enum
@@ -11,8 +25,8 @@ import torch.nn as nn
 OUTER = Path(__file__).resolve().parents[3]
 sys.path.insert(0, str(OUTER / "FastWAM/src"))
 
-from fastwam.adapters import PolicyRegime
-from fastwam.models.wan22.kv_tap import (
+from fastwam.adapters import PolicyRegime  # noqa: E402
+from fastwam.models.wan22.kv_tap import (  # noqa: E402
     GateKVSnapshot,
     GateLayerKV,
     KeyValueBank,
@@ -218,6 +232,56 @@ def _make_policy(backend="stored", *, with_critic=True):
     )
 
 
+def test_policy_forwards_and_deduplicates_critic_backbone_no_split_metadata():
+    class Backbone(nn.Module):
+        _no_split_modules = [
+            "GemmaRMSNorm",
+            "SiglipVisionEmbeddings",
+            "GemmaRMSNorm",
+        ]
+        _no_split_names = [
+            "action_in_proj",
+            "lm_head",
+            "action_in_proj",
+        ]
+
+    policy = _make_policy()
+    policy.critic.backbone = Backbone()
+
+    assert policy._no_split_modules == [
+        "GemmaRMSNorm",
+        "SiglipVisionEmbeddings",
+    ]
+    assert policy._no_split_names == ["action_in_proj", "lm_head"]
+
+    # Callers receive a fresh list and cannot mutate backbone metadata.
+    policy._no_split_modules.append("Unexpected")
+    assert policy._no_split_modules == [
+        "GemmaRMSNorm",
+        "SiglipVisionEmbeddings",
+    ]
+
+
+@pytest.mark.parametrize(
+    "policy",
+    [
+        pytest.param(_make_policy(with_critic=False), id="no-critic"),
+        pytest.param(_make_policy(), id="critic-without-backbone"),
+    ],
+)
+def test_policy_no_split_metadata_is_empty_without_nested_backbone(policy):
+    assert policy._no_split_modules == []
+    assert policy._no_split_names == []
+
+
+def test_policy_no_split_metadata_is_empty_when_backbone_attributes_are_missing():
+    policy = _make_policy()
+    policy.critic.backbone = nn.Identity()
+
+    assert policy._no_split_modules == []
+    assert policy._no_split_names == []
+
+
 def test_policy_forces_first_idm_and_applies_gate_to_next_chunk():
     policy = _make_policy()
     obs = {
@@ -239,6 +303,80 @@ def test_policy_forces_first_idm_and_applies_gate_to_next_chunk():
     _, second = policy.predict_action_batch(obs, mode="eval")
     assert second["route_info"].route_used.tolist() == [0, 0]
     assert second["route_info"].route_source_chunk_ids.tolist() == [0, 0]
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is unavailable")
+@pytest.mark.parametrize("mode", ["train", "eval"])
+def test_policy_gate_record_normalizes_cpu_route_metadata_to_cuda(mode):
+    policy = _make_policy().to("cuda")
+    obs = {
+        "states": torch.ones(1, 3),
+        "_fastwam_env_ids": torch.tensor([11]),
+        "_fastwam_reset_mask": torch.tensor([True]),
+    }
+
+    _, first = policy.predict_action_batch(
+        obs,
+        mode=mode,
+        compute_values=False,
+    )
+
+    assert first["route_info"].chunk_ids.device.type == "cpu"
+    for field in (
+        "next_route",
+        "base_probability",
+        "behavior_probability",
+        "old_logprob",
+        "epsilon",
+        "temperature",
+        "valid",
+        "source_chunk_ids",
+        "episode_ids",
+        "actor_versions",
+    ):
+        assert getattr(first["emitted_gate"], field).device.type == "cuda"
+
+    obs["_fastwam_reset_mask"] = torch.tensor([False])
+    _, second = policy.predict_action_batch(
+        obs,
+        mode=mode,
+        compute_values=False,
+    )
+    assert torch.equal(
+        second["route_info"].route_used,
+        first["emitted_gate"].next_route.cpu(),
+    )
+
+
+def test_libero_critic_observation_canonicalizes_optional_camera_keys():
+    main_images = torch.zeros(1, 8, 8, 3)
+    states = torch.ones(1, 8)
+    raw = {
+        "main_images": main_images,
+        "states": states,
+        "task_descriptions": ["test task"],
+        "_fastwam_env_ids": torch.tensor([3]),
+    }
+
+    canonical = _runtime_module.LiberoFastWAMRuntime.critic_observation(
+        object(),
+        env_obs=raw,
+    )
+
+    assert canonical["main_images"] is main_images
+    assert canonical["states"] is states
+    assert canonical["wrist_images"] is None
+    assert canonical["extra_view_images"] is None
+    assert "_fastwam_env_ids" not in canonical
+    assert "wrist_images" not in raw
+    assert "extra_view_images" not in raw
+
+    extra_view_images = torch.ones(1, 2, 8, 8, 3)
+    explicit = _runtime_module.LiberoFastWAMRuntime.critic_observation(
+        object(),
+        env_obs={**raw, "extra_view_images": extra_view_images},
+    )
+    assert explicit["extra_view_images"] is extra_view_images
 
 
 def test_standalone_eval_runs_and_restores_gate_lora_without_critic():

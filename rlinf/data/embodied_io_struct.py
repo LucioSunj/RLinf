@@ -20,12 +20,6 @@ from typing import TYPE_CHECKING, Any, Optional
 import numpy as np
 import torch
 
-if TYPE_CHECKING:
-    from rlinf.models.embodiment.wam_policy.contracts import (
-        ChunkRouteRecord,
-        GateDecisionRecord,
-    )
-
 from rlinf.utils.nested_dict_process import (
     cat_list_of_dict_tensor,
     put_tensor_device,
@@ -33,6 +27,15 @@ from rlinf.utils.nested_dict_process import (
     split_dict_to_chunk,
     stack_list_of_dict_tensor,
 )
+
+if TYPE_CHECKING:
+    from rlinf.models.embodiment.wam_policy.contracts import (
+        ChunkRouteRecord,
+        GateDecisionRecord,
+    )
+
+
+ACTOR_TRAJECTORY_CHANNEL_TAG = "actor_trajectory"
 
 
 def get_model_weights_id(versions: torch.Tensor) -> str:

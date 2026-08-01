@@ -137,6 +137,10 @@ actor:
     # The composite module deliberately mixes frozen backbones with three
     # trainable parameter families.
     use_orig_params: true
+    # Keep frozen FastWAM/pi0.5 parents outside FSDP flat handles. Otherwise
+    # use_orig_params propagates requires_grad across a multi-billion-param
+    # mixed root handle and allocates a full frozen-backbone gradient.
+    ignore_frozen_parameters: true
     gradient_checkpointing: false
     mixed_precision:
       param_dtype: ${actor.model.precision}

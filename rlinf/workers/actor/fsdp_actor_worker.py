@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import os
 import time
 from functools import partial
 from typing import Optional
@@ -42,7 +43,12 @@ from rlinf.algorithms.utils import (
     kl_penalty,
 )
 from rlinf.config import SupportedModel, torch_dtype_from_precision
-from rlinf.data.embodied_io_struct import Trajectory, convert_trajectories_to_batch
+from rlinf.config_contracts import build_fastwam_checkpoint_contract
+from rlinf.data.embodied_io_struct import (
+    ACTOR_TRAJECTORY_CHANNEL_TAG,
+    Trajectory,
+    convert_trajectories_to_batch,
+)
 from rlinf.data.io_struct import BatchResizingIterator, RolloutResult
 from rlinf.data.lerobot_paths import resolve_lerobot_repo_id
 from rlinf.hybrid_engines.fsdp.fsdp_model_manager import FSDPModelManager
@@ -56,7 +62,7 @@ from rlinf.hybrid_engines.weight_syncer import WeightSyncer
 from rlinf.models import get_model
 from rlinf.models.embodiment.base_policy import ForwardType
 from rlinf.models.embodiment.wam_policy.contracts import WAMRoute
-from rlinf.scheduler import Channel, Cluster, Worker
+from rlinf.scheduler import Channel, Cluster, CommMapper, Worker
 from rlinf.utils.data_iter_utils import (
     get_iterator_k_split,
     get_reverse_idx,
@@ -78,7 +84,6 @@ from rlinf.utils.metric_utils import (
     compute_critic_explained_variance_from_stats,
     compute_loss_mask,
     compute_rollout_metrics,
-    compute_split_num,
     pop_critic_explained_variance_stats,
 )
 from rlinf.utils.nested_dict_process import (
@@ -97,14 +102,89 @@ from rlinf.utils.utils import (
     compute_entropy_from_logits,
     compute_logprobs_from_logits,
     cpu_weight_swap,
-    get_rng_state,
     get_loss_agg_func,
+    get_rng_state,
     masked_mean,
     reshape_entropy,
     retrieve_model_state_dict_in_cpu,
     set_rng_state,
 )
+from rlinf.workers.actor.fastwam_selective_sync import (
+    materialize_fastwam_sync_state,
+    prepare_fastwam_sync_tensors,
+)
 from rlinf.workers.rollout.utils import RankMapper
+
+
+def _raise_fastwam_collective_checkpoint_error(
+    local_error: Exception | None,
+    *,
+    context: str,
+) -> None:
+    """Make rank-local checkpoint failures visible to every actor rank."""
+
+    if not torch.distributed.is_initialized():
+        if local_error is not None:
+            raise local_error
+        return
+    local_message = (
+        None if local_error is None else f"{type(local_error).__name__}: {local_error}"
+    )
+    errors: list[str | None] = [None for _ in range(torch.distributed.get_world_size())]
+    torch.distributed.all_gather_object(errors, local_message)
+    failed = {rank: error for rank, error in enumerate(errors) if error is not None}
+    if failed:
+        raise RuntimeError(
+            f"FastWAM {context} failed collectively: {failed}."
+        ) from local_error
+
+
+_MISSING_FASTWAM_FSDP_ROOT = object()
+
+
+def _snapshot_fastwam_fsdp_lazy_root_state(
+    model,
+    *,
+    fsdp_cls=None,
+):
+    """Capture private FSDP lazy-root flags before adaptive checkpoint load.
+
+    Loading rank-local trainable and optimizer state before the first forward
+    may trigger PyTorch FSDP bookkeeping on nested wrappers. Those flags are
+    execution state rather than checkpoint state and must remain exactly as
+    they were before restore so the first resumed root forward can initialize
+    the hierarchy normally.
+    """
+
+    if fsdp_cls is None:
+        from torch.distributed.fsdp import FullyShardedDataParallel
+
+        fsdp_cls = FullyShardedDataParallel
+    modules_fn = getattr(model, "modules", None)
+    if not callable(modules_fn):
+        return []
+    seen = set()
+    snapshot = []
+    for module in modules_fn():
+        identity = id(module)
+        if identity in seen or not isinstance(module, fsdp_cls):
+            continue
+        seen.add(identity)
+        snapshot.append(
+            (module, getattr(module, "_is_root", _MISSING_FASTWAM_FSDP_ROOT))
+        )
+    return snapshot
+
+
+def _restore_fastwam_fsdp_lazy_root_state(snapshot) -> None:
+    """Restore private FSDP lazy-root flags captured before checkpoint load."""
+
+    for module, original in snapshot:
+        if original is _MISSING_FASTWAM_FSDP_ROOT:
+            if hasattr(module, "_is_root"):
+                delattr(module, "_is_root")
+        else:
+            module._is_root = original
 
 
 def process_nested_dict_for_adv(nested_dict, rollout_epoch):
@@ -1139,9 +1219,41 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
             model_dict = torch.load(self.cfg.runner.ckpt_path)
             model.load_state_dict(model_dict)
 
+        model_type = str(self.cfg.actor.model.get("model_type", ""))
+        if model_type == SupportedModel.FASTWAM_ADAPTIVE.value:
+            if not bool(self.cfg.actor.fsdp_config.get("use_orig_params", False)):
+                raise RuntimeError(
+                    "FastWAM selective FSDP sync requires use_orig_params=True."
+                )
+            if not bool(
+                self.cfg.actor.fsdp_config.get("ignore_frozen_parameters", False)
+            ):
+                raise RuntimeError(
+                    "FastWAM FSDP requires ignore_frozen_parameters=True."
+                )
+            local_device = torch.device(
+                Worker.torch_device_type,
+                int(os.environ.get("LOCAL_RANK", 0)),
+            )
+            self._fastwam_rollout_sync_tensors = prepare_fastwam_sync_tensors(
+                model,
+                device=local_device,
+            )
+
         return model
 
     def get_rollout_state_dict(self) -> dict:
+        model_type = str(self.cfg.actor.model.get("model_type", ""))
+        if model_type == SupportedModel.FASTWAM_ADAPTIVE.value:
+            captured = getattr(self, "_fastwam_rollout_sync_tensors", None)
+            if captured is None:
+                raise RuntimeError(
+                    "FastWAM rollout sync tensors were not captured before FSDP wrap."
+                )
+            return materialize_fastwam_sync_state(
+                captured,
+                self.param_names_need_sync,
+            )
         return self.get_model_state_dict(cpu_offload=False, full_state_dict=False)
 
     def _fastwam_policy_module(self):
@@ -1173,9 +1285,7 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
                 for key, item in value.items()
             }
         if isinstance(value, list):
-            return [
-                EmbodiedFSDPActor._checkpoint_cpu_clone(item) for item in value
-            ]
+            return [EmbodiedFSDPActor._checkpoint_cpu_clone(item) for item in value]
         if isinstance(value, tuple):
             return tuple(
                 EmbodiedFSDPActor._checkpoint_cpu_clone(item) for item in value
@@ -1183,55 +1293,10 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
         return value
 
     def _fastwam_checkpoint_contract(self) -> dict:
-        model_cfg = self.cfg.actor.model
-        model_keys = (
-            "model_type",
-            "actor_checkpoint_sha256",
-            "num_action_chunks",
-            "uncond_lora",
-            "gate",
-            "gate_epsilon",
-            "gate_temperature",
-            "eval_idm_threshold",
-            "eval_microbatch_size",
-            "kv_replay",
-            "flow_sde",
-            "runtime",
-            "critic",
+        return build_fastwam_checkpoint_contract(
+            self.cfg,
+            world_size=int(self._world_size),
         )
-        algorithm_keys = (
-            "adv_type",
-            "loss_type",
-            "reward_type",
-            "logprob_type",
-            "gamma",
-            "gae_lambda",
-            "gate_ppo",
-            "uncond_flow_ppo",
-            "critic_loss",
-            "regularization",
-            "fixed_branch_cost",
-        )
-
-        def resolved(owner, key):
-            value = owner.get(key, None)
-            return (
-                OmegaConf.to_container(value, resolve=True)
-                if OmegaConf.is_config(value)
-                else value
-            )
-
-        return {
-            "model": {key: resolved(model_cfg, key) for key in model_keys},
-            "algorithm": {
-                key: resolved(self.cfg.algorithm, key) for key in algorithm_keys
-            },
-            "optim": OmegaConf.to_container(
-                self.cfg.actor.optim,
-                resolve=True,
-            ),
-            "world_size": int(self._world_size),
-        }
 
     def save_checkpoint(self, save_path: str, step: int = 0) -> None:
         if (
@@ -1247,38 +1312,44 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
         if restore_optimizer_offload:
             self.load_optimizer(self.device)
         try:
-            policy = self._fastwam_policy_module()
-            policy.set_global_step(int(step))
-            self.version = int(step)
-            payload = {
-                "schema": "fastwam-adaptive-rl-checkpoint-v1",
-                "step": int(step),
-                "optimizer_steps": int(self.optimizer_steps),
-                "parent_checkpoint_sha256": str(
-                    self.cfg.actor.model.actor_checkpoint_sha256
-                ).lower(),
-                "critic_parent_checkpoint_sha256": str(
-                    self.cfg.actor.model.critic.backbone_checkpoint_sha256
-                ).lower(),
-                "contract": self._fastwam_checkpoint_contract(),
-                "policy": policy.trainable_state_dict(),
-                "optimizer": self.optimizer.state_dict(),
-                "lr_scheduler": self.lr_scheduler.state_dict(),
-                "grad_scaler": self.grad_scaler.state_dict(),
-                "rng": get_rng_state(),
-            }
-            payload = self._checkpoint_cpu_clone(payload)
-            os.makedirs(save_path, exist_ok=True)
-            target = os.path.join(save_path, f"rank_{self._rank}.pt")
-            temporary = f"{target}.tmp"
+            local_error: Exception | None = None
             try:
-                torch.save(payload, temporary)
-                os.replace(temporary, target)
-            finally:
-                if os.path.exists(temporary):
-                    os.unlink(temporary)
-            if torch.distributed.is_initialized():
-                torch.distributed.barrier()
+                policy = self._fastwam_policy_module()
+                policy.set_global_step(int(step))
+                self.version = int(step)
+                payload = {
+                    "schema": "fastwam-adaptive-rl-checkpoint-v1",
+                    "step": int(step),
+                    "optimizer_steps": int(self.optimizer_steps),
+                    "parent_checkpoint_sha256": str(
+                        self.cfg.actor.model.actor_checkpoint_sha256
+                    ).lower(),
+                    "critic_parent_checkpoint_sha256": str(
+                        self.cfg.actor.model.critic.backbone_checkpoint_sha256
+                    ).lower(),
+                    "contract": self._fastwam_checkpoint_contract(),
+                    "policy": policy.trainable_state_dict(),
+                    "optimizer": self.optimizer.state_dict(),
+                    "lr_scheduler": self.lr_scheduler.state_dict(),
+                    "grad_scaler": self.grad_scaler.state_dict(),
+                    "rng": get_rng_state(),
+                }
+                payload = self._checkpoint_cpu_clone(payload)
+                os.makedirs(save_path, exist_ok=True)
+                target = os.path.join(save_path, f"rank_{self._rank}.pt")
+                temporary = f"{target}.tmp"
+                try:
+                    torch.save(payload, temporary)
+                    os.replace(temporary, target)
+                finally:
+                    if os.path.exists(temporary):
+                        os.unlink(temporary)
+            except Exception as error:
+                local_error = error
+            _raise_fastwam_collective_checkpoint_error(
+                local_error,
+                context="actor checkpoint save",
+            )
         finally:
             if restore_weight_offload:
                 self.offload_param_and_grad()
@@ -1298,58 +1369,90 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
             self.load_param_and_grad(self.device)
         if restore_optimizer_offload:
             self.load_optimizer(self.device)
+        fsdp_lazy_root_state = _snapshot_fastwam_fsdp_lazy_root_state(self.model)
         try:
-            checkpoint_path = os.path.join(load_path, f"rank_{self._rank}.pt")
-            payload = torch.load(
-                checkpoint_path,
-                map_location="cpu",
-                weights_only=False,
-            )
-            if payload.get("schema") != "fastwam-adaptive-rl-checkpoint-v1":
-                raise ValueError("Unsupported FastWAM adaptive RL checkpoint schema.")
-            expected_parent = str(
-                self.cfg.actor.model.actor_checkpoint_sha256
-            ).lower()
-            if payload.get("parent_checkpoint_sha256") != expected_parent:
-                raise ValueError(
-                    "FastWAM checkpoint parent hash mismatch: "
-                    f"expected {expected_parent}, got "
-                    f"{payload.get('parent_checkpoint_sha256')}."
+            local_error: Exception | None = None
+            loaded_version: int | None = None
+            try:
+                checkpoint_path = os.path.join(load_path, f"rank_{self._rank}.pt")
+                payload = torch.load(
+                    checkpoint_path,
+                    map_location="cpu",
+                    weights_only=False,
                 )
-            expected_critic_parent = str(
-                self.cfg.actor.model.critic.backbone_checkpoint_sha256
-            ).lower()
-            if (
-                payload.get("critic_parent_checkpoint_sha256")
-                != expected_critic_parent
-            ):
-                raise ValueError(
-                    "pi0.5 critic checkpoint parent hash mismatch: "
-                    f"expected {expected_critic_parent}, got "
-                    f"{payload.get('critic_parent_checkpoint_sha256')}."
-                )
-            expected_contract = self._fastwam_checkpoint_contract()
-            if payload.get("contract") != expected_contract:
-                raise ValueError(
-                    "FastWAM adaptive checkpoint/config contract mismatch."
-                )
+                expected_keys = {
+                    "schema",
+                    "step",
+                    "optimizer_steps",
+                    "parent_checkpoint_sha256",
+                    "critic_parent_checkpoint_sha256",
+                    "contract",
+                    "policy",
+                    "optimizer",
+                    "lr_scheduler",
+                    "grad_scaler",
+                    "rng",
+                }
+                if set(payload) != expected_keys:
+                    raise ValueError(
+                        "FastWAM adaptive RL checkpoint keys changed: "
+                        f"{sorted(payload)}."
+                    )
+                if payload.get("schema") != "fastwam-adaptive-rl-checkpoint-v1":
+                    raise ValueError(
+                        "Unsupported FastWAM adaptive RL checkpoint schema."
+                    )
+                expected_parent = str(
+                    self.cfg.actor.model.actor_checkpoint_sha256
+                ).lower()
+                if payload.get("parent_checkpoint_sha256") != expected_parent:
+                    raise ValueError(
+                        "FastWAM checkpoint parent hash mismatch: "
+                        f"expected {expected_parent}, got "
+                        f"{payload.get('parent_checkpoint_sha256')}."
+                    )
+                expected_critic_parent = str(
+                    self.cfg.actor.model.critic.backbone_checkpoint_sha256
+                ).lower()
+                if (
+                    payload.get("critic_parent_checkpoint_sha256")
+                    != expected_critic_parent
+                ):
+                    raise ValueError(
+                        "pi0.5 critic checkpoint parent hash mismatch: "
+                        f"expected {expected_critic_parent}, got "
+                        f"{payload.get('critic_parent_checkpoint_sha256')}."
+                    )
+                expected_contract = self._fastwam_checkpoint_contract()
+                if payload.get("contract") != expected_contract:
+                    raise ValueError(
+                        "FastWAM adaptive checkpoint/config contract mismatch."
+                    )
 
-            policy = self._fastwam_policy_module()
-            policy.load_trainable_state_dict(payload["policy"])
-            self.optimizer.load_state_dict(payload["optimizer"])
-            self.lr_scheduler.load_state_dict(payload["lr_scheduler"])
-            self.grad_scaler.load_state_dict(payload["grad_scaler"])
-            self.optimizer_steps = int(payload["optimizer_steps"])
-            self.version = int(payload["step"])
-            if policy.actor_version != self.version:
-                raise ValueError(
-                    "FastWAM checkpoint policy version does not match its step."
-                )
-            set_rng_state(payload["rng"])
-            if torch.distributed.is_initialized():
-                torch.distributed.barrier()
-            return self.version
+                policy = self._fastwam_policy_module()
+                policy.load_trainable_state_dict(payload["policy"])
+                self.optimizer.load_state_dict(payload["optimizer"])
+                self.lr_scheduler.load_state_dict(payload["lr_scheduler"])
+                self.grad_scaler.load_state_dict(payload["grad_scaler"])
+                self.optimizer_steps = int(payload["optimizer_steps"])
+                self.version = int(payload["step"])
+                if policy.actor_version != self.version:
+                    raise ValueError(
+                        "FastWAM checkpoint policy version does not match its step."
+                    )
+                set_rng_state(payload["rng"])
+                loaded_version = self.version
+            except Exception as error:
+                local_error = error
+            _raise_fastwam_collective_checkpoint_error(
+                local_error,
+                context="actor checkpoint load",
+            )
+            if loaded_version is None:
+                raise RuntimeError("FastWAM actor checkpoint load returned no version.")
+            return loaded_version
         finally:
+            _restore_fastwam_fsdp_lazy_root_state(fsdp_lazy_root_state)
             if restore_weight_offload:
                 self.offload_param_and_grad()
             if restore_optimizer_offload:
@@ -1420,14 +1523,27 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
         """
         clear_memory(sync=False)
 
-        send_num = self._component_placement.get_world_size("env") * self.stage_num
-        recv_num = self._component_placement.get_world_size("actor")
-        split_num = compute_split_num(send_num, recv_num)
-
-        recv_list = []
-        for _ in range(split_num):
-            trajectory: Trajectory = await input_channel.get(async_op=True).async_wait()
-            recv_list.append(trajectory)
+        env_world_size = self._component_placement.get_world_size("env")
+        actor_world_size = self._component_placement.get_world_size("actor")
+        logical_env_world_size = env_world_size * self.stage_num
+        routes = CommMapper.get_src_ranks(
+            batch_size=int(self.cfg.env.train.total_num_envs),
+            src_world_size=logical_env_world_size,
+            dst_world_size=actor_world_size,
+            dst_rank=self._rank,
+        )
+        works = [
+            input_channel.get(
+                key=CommMapper.build_channel_key(
+                    logical_env_rank,
+                    self._rank,
+                    ACTOR_TRAJECTORY_CHANNEL_TAG,
+                ),
+                async_op=True,
+            )
+            for logical_env_rank, _ in routes
+        ]
+        recv_list: list[Trajectory] = [await work.async_wait() for work in works]
 
         self.rollout_batch = convert_trajectories_to_batch(recv_list)
 
@@ -1445,9 +1561,7 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
             # Packed K/V layer indices are static schema metadata, not a batch
             # tensor. Trajectory concatenation cannot preserve that distinction,
             # so training reconstructs them from GateKVMetadata instead.
-            rollout_batch.get("forward_inputs", {}).pop(
-                "gate_kv_layer_indices", None
-            )
+            rollout_batch.get("forward_inputs", {}).pop("gate_kv_layer_indices", None)
 
         rollout_epoch = self.cfg.env.train.rollout_epoch
         rollout_batch = process_nested_dict_for_adv(rollout_batch, rollout_epoch)
@@ -1883,15 +1997,10 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
                     is SupportedModel.FASTWAM_ADAPTIVE
                 ):
                     route_info = train_global_batch["route_info"]
-                    gate_count = (
-                        train_global_batch["gate_valid_mask"].bool().sum()
-                    )
+                    gate_count = train_global_batch["gate_valid_mask"].bool().sum()
                     flow_count = (
                         train_global_batch["flow_valid_mask"].bool()
-                        & (
-                            route_info.route_used
-                            == int(WAMRoute.UNCOND)
-                        )
+                        & (route_info.route_used == int(WAMRoute.UNCOND))
                     ).sum()
                     counts = torch.tensor(
                         [float(gate_count), float(flow_count)],
@@ -1903,8 +2012,7 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
                         op=torch.distributed.ReduceOp.SUM,
                     )
                     scale_numerator = float(
-                        self.gradient_accumulation
-                        * torch.distributed.get_world_size()
+                        self.gradient_accumulation * torch.distributed.get_world_size()
                     )
                     selected_loss_scales = {
                         "gate": (
@@ -1947,9 +2055,7 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
             SupportedModel(self.cfg.actor.model.model_type)
             is SupportedModel.FASTWAM_ADAPTIVE
         ):
-            weighted_sums, weighted_maxima = pop_fastwam_weighted_metric_sums(
-                metrics
-            )
+            weighted_sums, weighted_maxima = pop_fastwam_weighted_metric_sums(metrics)
         mean_metric_dict = {key: np.mean(value) for key, value in metrics.items()}
         mean_metric_dict = all_reduce_dict(
             mean_metric_dict, op=torch.distributed.ReduceOp.AVG
@@ -1979,9 +2085,7 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
             mean_metric_dict["fastwam_dual/total_policy_loss"] = (
                 float(self.cfg.algorithm.gate_ppo.get("loss_weight", 1.0))
                 * mean_metric_dict["gate/total_loss"]
-                + float(
-                    self.cfg.algorithm.uncond_flow_ppo.get("loss_weight", 1.0)
-                )
+                + float(self.cfg.algorithm.uncond_flow_ppo.get("loss_weight", 1.0))
                 * mean_metric_dict["uncond_flow/total_loss"]
             )
 
@@ -2066,9 +2170,7 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
         collapse_cfg = regularization_cfg.get("collapse", {})
         if bool(collapse_cfg.get("enabled", False)):
             collapse_loss, collapse_metrics = compute_gate_collapse_penalty(
-                base_idm_probabilities=output_dict[
-                    "gate_base_probabilities"
-                ].float(),
+                base_idm_probabilities=output_dict["gate_base_probabilities"].float(),
                 episode_ids=emitted_gate.episode_ids,
                 valid_mask=micro_batch["gate_valid_mask"].bool(),
                 tau_calls=float(collapse_cfg.get("tau_calls", 1.0)),
@@ -2092,7 +2194,9 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
             loss_mask_sum=micro_batch.get("loss_mask_sum", None),
             max_episode_steps=self.cfg.env.train.max_episode_steps,
         )
-        loss = policy_loss_value + float(critic_cfg.get("loss_weight", 1.0)) * critic_loss
+        loss = (
+            policy_loss_value + float(critic_cfg.get("loss_weight", 1.0)) * critic_loss
+        )
         metrics.update(critic_metrics)
         metrics["fastwam/total_loss"] = loss.detach()
         return loss, {
@@ -2176,8 +2280,7 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
                 forward_inputs=forward_inputs,
                 compute_logprobs=True,
                 compute_entropy=(
-                    is_fastwam
-                    or self.cfg.algorithm.get("entropy_bonus", 0.0) > 0
+                    is_fastwam or self.cfg.algorithm.get("entropy_bonus", 0.0) > 0
                 ),
                 compute_values=compute_values,
                 use_cache=False,

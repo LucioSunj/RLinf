@@ -24,6 +24,7 @@ from omegaconf import DictConfig, OmegaConf
 from rlinf.algorithms.registry import calculate_adv_and_returns
 from rlinf.algorithms.rlt.transition import update_rlt_transitions
 from rlinf.data.embodied_io_struct import (
+    ACTOR_TRAJECTORY_CHANNEL_TAG,
     ChunkStepResult,
     EmbodiedLerobotRolloutResult,
     EmbodiedRolloutResult,
@@ -945,9 +946,7 @@ class EnvWorker(Worker):
                 else self.train_num_envs_per_stage
             )
             namespace = 1 << 50 if eval_mode else 0
-            start = namespace + (
-                self._rank * self.stage_num + stage_id
-            ) * per_stage
+            start = namespace + (self._rank * self.stage_num + stage_id) * per_stage
             data["fastwam_env_ids"] = torch.arange(
                 start,
                 start + batch_size,
@@ -959,8 +958,8 @@ class EnvWorker(Worker):
             elif dones is None:
                 reset_mask = torch.zeros(batch_size, dtype=torch.bool)
             else:
-                reset_mask = dones.to(dtype=torch.bool).reshape(batch_size, -1).any(
-                    dim=1
+                reset_mask = (
+                    dones.to(dtype=torch.bool).reshape(batch_size, -1).any(dim=1)
                 )
             data["fastwam_reset_mask"] = reset_mask
         if self.enable_rlt:
@@ -1021,14 +1020,40 @@ class EnvWorker(Worker):
 
     @Worker.timer("env/send_rollout_trajectories")
     async def send_rollout_trajectories(
-        self, rollout_result: EmbodiedRolloutResult, channel: Channel
+        self,
+        rollout_result: EmbodiedRolloutResult,
+        channel: Channel,
+        *,
+        stage_id: int,
     ):
-        trajectories: list[Trajectory] = rollout_result.to_splited_trajectories(
-            self.actor_split_num
+        env_world_size = self._component_placement.get_world_size("env")
+        actor_world_size = self._component_placement.get_world_size("actor")
+        logical_env_world_size = env_world_size * self.stage_num
+        logical_env_rank = self._rank * self.stage_num + int(stage_id)
+        routes = CommMapper.get_dst_ranks(
+            batch_size=int(self.cfg.env.train.total_num_envs),
+            src_world_size=logical_env_world_size,
+            dst_world_size=actor_world_size,
+            src_rank=logical_env_rank,
+        )
+        trajectories: list[Trajectory] = (
+            rollout_result.to_splited_trajectories_by_sizes(
+                [batch_size for _, batch_size in routes]
+            )
         )
         rollout_result.clear()
-        for trajectory in trajectories:
-            channel.put(trajectory, async_op=True)
+        works = []
+        for (actor_rank, _), trajectory in zip(routes, trajectories, strict=True):
+            key = CommMapper.build_channel_key(
+                logical_env_rank,
+                actor_rank,
+                ACTOR_TRAJECTORY_CHANNEL_TAG,
+            )
+            work = channel.put(trajectory, key=key, async_op=True)
+            if work is not None:
+                works.append(work)
+        for work in works:
+            await work.async_wait()
         del trajectories
         gc.collect()
 
@@ -1287,7 +1312,9 @@ class EnvWorker(Worker):
             else:
                 for stage_id in range(self.stage_num):
                     await self.send_rollout_trajectories(
-                        self.rollout_results[stage_id], actor_channel
+                        self.rollout_results[stage_id],
+                        actor_channel,
+                        stage_id=stage_id,
                     )
 
         for key, value in env_metrics.items():

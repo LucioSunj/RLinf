@@ -454,6 +454,9 @@ def validate_fsdp_cfg(cfg: DictConfig) -> DictConfig:
             "backward_prefetch", None
         )
         cfg.fsdp_config.use_orig_params = cfg.fsdp_config.get("use_orig_params", False)
+        cfg.fsdp_config.ignore_frozen_parameters = cfg.fsdp_config.get(
+            "ignore_frozen_parameters", False
+        )
         cfg.fsdp_config.use_liger_kernel = cfg.fsdp_config.get(
             "use_liger_kernel", False
         )
@@ -941,6 +944,19 @@ def _validate_fastwam_adaptive_cfg(cfg, *, only_eval: bool) -> None:
     kv_backend = str(actor_model.kv_replay.get("backend", "stored")).lower()
     weight_sync_interval = int(cfg.runner.get("weight_sync_interval", 1))
     validate_fastwam_kv_weight_sync(kv_backend, weight_sync_interval)
+    if str(OmegaConf.select(cfg, "weight_syncer.type", default="")).lower() != "patch":
+        raise ValueError("FastWAM adaptive requires the patch weight syncer.")
+    if not bool(
+        OmegaConf.select(
+            cfg,
+            "weight_syncer.patch.init_sync.enabled",
+            default=False,
+        )
+    ):
+        raise ValueError(
+            "FastWAM resume requires `weight_syncer.patch.init_sync.enabled: true` "
+            "so fresh rollout workers receive the restored actor state."
+        )
     if not bool(cfg.rollout.get("collect_prev_infos", True)):
         raise ValueError("FastWAM PPO requires rollout old log-probs and values.")
     if not bool(cfg.actor.fsdp_config.get("use_orig_params", False)):
@@ -948,10 +964,14 @@ def _validate_fastwam_adaptive_cfg(cfg, *, only_eval: bool) -> None:
             "FastWAM's mixed frozen/trainable composite requires FSDP "
             "`use_orig_params: true`."
         )
-    if str(cfg.actor.fsdp_config.get("sharding_strategy", "")).lower() != "no_shard":
+    if not bool(cfg.actor.fsdp_config.get("ignore_frozen_parameters", False)):
         raise ValueError(
-            "FastWAM adaptive v0 checkpointing requires FSDP `no_shard`."
+            "FastWAM adaptive requires FSDP "
+            "ignore_frozen_parameters: true so frozen parent weights are not "
+            "flattened into trainable handles."
         )
+    if str(cfg.actor.fsdp_config.get("sharding_strategy", "")).lower() != "no_shard":
+        raise ValueError("FastWAM adaptive v0 checkpointing requires FSDP `no_shard`.")
     if bool(cfg.actor.fsdp_config.get("save_full_model_weights", False)):
         raise ValueError(
             "FastWAM checkpoints must not serialize frozen backbone weights."

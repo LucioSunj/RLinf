@@ -21,7 +21,6 @@ from typing import Any, Literal
 
 import torch
 import torch.nn.functional as F
-
 from fastwam.adapters import PolicyRegime
 from fastwam.models.wan22.adaptive_action import (
     CachedActionCondition,
@@ -40,7 +39,6 @@ from fastwam.models.wan22.kv_tap import (
 from .adaptive_policy import FastWAMChunkSample
 from .contracts import ChunkRouteRecord, WAMRoute
 from .kv_replay import GateKVReplayBackend
-
 
 DEFAULT_FASTWAM_PROMPT_TEMPLATE = (
     "A video recorded from a robot's point of view executing the following "
@@ -812,8 +810,11 @@ class LiberoFastWAMRuntime:
             raise ValueError(
                 "Critic replay uses stored pi0.5 prefix features, not raw observations."
             )
-        return {
+        observation = {
             key: value
             for key, value in env_obs.items()
             if not key.startswith("_fastwam_")
         }
+        observation.setdefault("wrist_images", None)
+        observation.setdefault("extra_view_images", None)
+        return observation

@@ -15,10 +15,10 @@
 
 import os
 import pathlib
+from collections.abc import Mapping
 
 import torch
 from omegaconf import DictConfig
-
 
 _VLM_STATE_PREFIX = "paligemma_with_expert.paligemma."
 
@@ -27,11 +27,72 @@ def _is_legacy_value_head_key(key: str) -> bool:
     return "value_head" in key.split(".")
 
 
+def _merge_vlm_checkpoint_aliases(
+    aliases: dict[str, str],
+    metadata: Mapping[str, str] | None,
+    *,
+    source: str,
+) -> None:
+    """Merge safetensors-declared VLM aliases without accepting conflicts."""
+
+    for alias, canonical in (metadata or {}).items():
+        alias_is_vlm = alias.startswith(_VLM_STATE_PREFIX)
+        canonical_is_vlm = canonical.startswith(_VLM_STATE_PREFIX)
+        if alias_is_vlm != canonical_is_vlm:
+            raise ValueError(
+                "pi0.5 safetensors alias metadata crosses the VLM boundary: "
+                f"{alias!r} -> {canonical!r} in {source}."
+            )
+        if not alias_is_vlm:
+            continue
+        previous = aliases.get(alias)
+        if previous is not None and previous != canonical:
+            raise ValueError(
+                "Conflicting pi0.5 safetensors alias metadata for "
+                f"{alias!r}: {previous!r} versus {canonical!r} in {source}."
+            )
+        aliases[alias] = canonical
+
+
+def _is_verified_tied_vlm_alias(
+    model: torch.nn.Module,
+    state_dict: Mapping[str, torch.Tensor],
+    missing_key: str,
+    checkpoint_aliases: Mapping[str, str],
+) -> bool:
+    """Return whether a missing VLM key is a verified safetensors tied alias."""
+
+    canonical_key = checkpoint_aliases.get(missing_key)
+    if canonical_key is None or not canonical_key.startswith(_VLM_STATE_PREFIX):
+        return False
+    checkpoint_tensor = state_dict.get(canonical_key)
+    if checkpoint_tensor is None:
+        return False
+    try:
+        alias_parameter = model.get_parameter(missing_key)
+        canonical_parameter = model.get_parameter(canonical_key)
+    except AttributeError:
+        return False
+    return (
+        alias_parameter is canonical_parameter
+        and checkpoint_tensor.shape == alias_parameter.shape
+        and checkpoint_tensor.shape == canonical_parameter.shape
+        and (
+            checkpoint_tensor.dtype == alias_parameter.dtype
+            or (
+                checkpoint_tensor.is_floating_point()
+                and alias_parameter.is_floating_point()
+            )
+        )
+    )
+
+
 def _load_openpi_state_dict(
     model: torch.nn.Module,
     state_dict: dict[str, torch.Tensor],
     *,
     strict_vlm_checkpoint: bool,
+    checkpoint_aliases: Mapping[str, str] | None = None,
 ) -> None:
     """Load an OpenPi parent while fail-closing on a partial VLM restore."""
 
@@ -46,8 +107,12 @@ def _load_openpi_state_dict(
         raise ValueError(
             "Strict pi0.5 loading found no PaliGemma VLM parameters in the model."
         )
+    aliases = checkpoint_aliases or {}
     missing_vlm = sorted(
-        key for key in incompatible.missing_keys if key.startswith(_VLM_STATE_PREFIX)
+        key
+        for key in incompatible.missing_keys
+        if key.startswith(_VLM_STATE_PREFIX)
+        and not _is_verified_tied_vlm_alias(model, state_dict, key, aliases)
     )
     unexpected = sorted(
         key
@@ -132,13 +197,29 @@ def get_model(cfg: DictConfig, torch_dtype=None):
         if not weight_paths:
             weight_paths = [os.path.join(checkpoint_dir, "model.safetensors")]
         all_state_dict = {}
+        checkpoint_aliases: dict[str, str] = {}
         for weight_path in weight_paths:
+            with safetensors.safe_open(
+                weight_path, framework="pt", device="cpu"
+            ) as handle:
+                _merge_vlm_checkpoint_aliases(
+                    checkpoint_aliases,
+                    handle.metadata(),
+                    source=weight_path,
+                )
             state_dict = safetensors.torch.load_file(weight_path, device="cpu")
+            duplicate_keys = sorted(all_state_dict.keys() & state_dict.keys())
+            if duplicate_keys:
+                raise ValueError(
+                    "Duplicate tensors across pi0.5 safetensors shards: "
+                    f"{duplicate_keys[:8]}."
+                )
             all_state_dict.update(state_dict)
         _load_openpi_state_dict(
             model,
             all_state_dict,
             strict_vlm_checkpoint=strict_vlm_checkpoint,
+            checkpoint_aliases=checkpoint_aliases,
         )
 
     model.paligemma_with_expert.to_bfloat16_for_selected_params("bfloat16")

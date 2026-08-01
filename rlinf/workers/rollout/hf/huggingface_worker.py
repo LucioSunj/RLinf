@@ -15,6 +15,7 @@
 import asyncio
 import copy
 import gc
+import os
 import time
 from typing import Any, Callable, Literal, Optional
 
@@ -29,6 +30,7 @@ from rlinf.algorithms.rlt import (
     predict_rlt_actions,
 )
 from rlinf.config import SupportedModel
+from rlinf.config_contracts import build_fastwam_checkpoint_contract
 from rlinf.data.embodied_io_struct import (
     RolloutResult,
 )
@@ -37,6 +39,19 @@ from rlinf.models import get_model
 from rlinf.models.embodiment.base_policy import BasePolicy
 from rlinf.scheduler import Channel, Cluster, Worker, split_channel_message
 from rlinf.utils.placement import HybridComponentPlacement
+from rlinf.utils.utils import get_rng_state, set_rng_state
+
+
+def _fastwam_checkpoint_cpu_clone(value: Any) -> Any:
+    if isinstance(value, torch.Tensor):
+        return value.detach().cpu().clone()
+    if isinstance(value, dict):
+        return {key: _fastwam_checkpoint_cpu_clone(item) for key, item in value.items()}
+    if isinstance(value, list):
+        return [_fastwam_checkpoint_cpu_clone(item) for item in value]
+    if isinstance(value, tuple):
+        return tuple(_fastwam_checkpoint_cpu_clone(item) for item in value)
+    return value
 
 
 class MultiStepRolloutWorker(Worker):
@@ -218,6 +233,133 @@ class MultiStepRolloutWorker(Worker):
         self.setup_sample_params()
         if self.enable_offload:
             self.offload_model()
+
+    def _fastwam_checkpoint_contract(self) -> dict[str, Any]:
+        return build_fastwam_checkpoint_contract(
+            self.cfg,
+            world_size=int(self._world_size),
+        )
+
+    def save_checkpoint(self, save_path: str, step: int = 0) -> None:
+        """Save rollout-owned RNG and delayed-route state for exact resume."""
+
+        if (
+            SupportedModel(self.model_cfg.model_type)
+            is not SupportedModel.FASTWAM_ADAPTIVE
+        ):
+            raise TypeError(
+                "Rollout runtime checkpointing is implemented only for "
+                "FastWAM adaptive."
+            )
+        if not hasattr(self.hf_model, "rollout_runtime_state_dict"):
+            raise TypeError("FastWAM rollout policy has no runtime-state API.")
+        step = int(step)
+        rollout_actor_version = int(self.version)
+        if step < 1 or rollout_actor_version not in {step - 1, step}:
+            raise ValueError(
+                "FastWAM rollout checkpoint version must be the checkpoint step "
+                f"or its immediately preceding behavior version, got "
+                f"step={step}, version={rollout_actor_version}."
+            )
+        policy_runtime = self.hf_model.rollout_runtime_state_dict()
+        if int(policy_runtime.get("actor_version", -1)) != rollout_actor_version:
+            raise ValueError(
+                "FastWAM rollout worker and policy versions disagree at save."
+            )
+        payload = {
+            "schema": "fastwam-adaptive-rollout-runtime-v1",
+            "rank": int(self._rank),
+            "world_size": int(self._world_size),
+            "step": step,
+            "rollout_actor_version": rollout_actor_version,
+            "parent_checkpoint_sha256": str(
+                self.model_cfg.actor_checkpoint_sha256
+            ).lower(),
+            "critic_parent_checkpoint_sha256": str(
+                self.model_cfg.critic.backbone_checkpoint_sha256
+            ).lower(),
+            "contract": self._fastwam_checkpoint_contract(),
+            "policy_runtime": policy_runtime,
+            "rng": get_rng_state(),
+        }
+        payload = _fastwam_checkpoint_cpu_clone(payload)
+        os.makedirs(save_path, exist_ok=True)
+        target = os.path.join(save_path, f"rank_{self._rank}.pt")
+        temporary = f"{target}.tmp"
+        try:
+            torch.save(payload, temporary)
+            os.replace(temporary, target)
+        finally:
+            if os.path.exists(temporary):
+                os.unlink(temporary)
+
+    def load_checkpoint(self, load_path: str) -> int:
+        """Restore rollout RNG/routes before the first post-resume sync."""
+
+        if (
+            SupportedModel(self.model_cfg.model_type)
+            is not SupportedModel.FASTWAM_ADAPTIVE
+        ):
+            raise TypeError(
+                "Rollout runtime checkpointing is implemented only for "
+                "FastWAM adaptive."
+            )
+        if not hasattr(self.hf_model, "load_rollout_runtime_state_dict"):
+            raise TypeError("FastWAM rollout policy has no runtime-state loader.")
+        checkpoint_path = os.path.join(load_path, f"rank_{self._rank}.pt")
+        payload = torch.load(
+            checkpoint_path,
+            map_location="cpu",
+            weights_only=False,
+        )
+        expected_keys = {
+            "schema",
+            "rank",
+            "world_size",
+            "step",
+            "rollout_actor_version",
+            "parent_checkpoint_sha256",
+            "critic_parent_checkpoint_sha256",
+            "contract",
+            "policy_runtime",
+            "rng",
+        }
+        if set(payload) != expected_keys:
+            raise ValueError(
+                f"FastWAM rollout-runtime checkpoint keys changed: {sorted(payload)}."
+            )
+        if payload.get("schema") != "fastwam-adaptive-rollout-runtime-v1":
+            raise ValueError("Unsupported FastWAM rollout-runtime schema.")
+        if int(payload.get("rank", -1)) != int(self._rank) or int(
+            payload.get("world_size", -1)
+        ) != int(self._world_size):
+            raise ValueError("FastWAM rollout-runtime rank/world-size mismatch.")
+        expected_parent = str(self.model_cfg.actor_checkpoint_sha256).lower()
+        if payload.get("parent_checkpoint_sha256") != expected_parent:
+            raise ValueError("FastWAM rollout-runtime parent hash mismatch.")
+        expected_critic_parent = str(
+            self.model_cfg.critic.backbone_checkpoint_sha256
+        ).lower()
+        if payload.get("critic_parent_checkpoint_sha256") != expected_critic_parent:
+            raise ValueError("FastWAM rollout-runtime pi0.5 parent hash mismatch.")
+        if payload.get("contract") != self._fastwam_checkpoint_contract():
+            raise ValueError("FastWAM rollout-runtime config contract mismatch.")
+        step = int(payload.get("step", -1))
+        rollout_actor_version = int(payload.get("rollout_actor_version", -1))
+        if step < 1 or rollout_actor_version not in {step - 1, step}:
+            raise ValueError(
+                "FastWAM rollout-runtime checkpoint step/version mismatch."
+            )
+        policy_runtime = payload.get("policy_runtime")
+        if (
+            not isinstance(policy_runtime, dict)
+            or int(policy_runtime.get("actor_version", -1)) != rollout_actor_version
+        ):
+            raise ValueError("FastWAM rollout-runtime policy/worker version mismatch.")
+        self.hf_model.load_rollout_runtime_state_dict(policy_runtime)
+        self.version = rollout_actor_version
+        set_rng_state(payload["rng"])
+        return step
 
     def setup_sample_params(self):
         # sampling parameters for rollout
@@ -653,9 +795,7 @@ class MultiStepRolloutWorker(Worker):
             return None
         if SupportedModel(self.model_cfg.model_type) is SupportedModel.FASTWAM_ADAPTIVE:
             with torch.no_grad():
-                critic_obs = self.hf_model.runtime.critic_observation(
-                    env_obs=final_obs
-                )
+                critic_obs = self.hf_model.runtime.critic_observation(env_obs=final_obs)
                 final_values = self.hf_model.critic.predict_value_batch(critic_obs)
             if final_values.ndim == 1:
                 final_values = final_values[:, None]
@@ -684,7 +824,9 @@ class MultiStepRolloutWorker(Worker):
             SupportedModel(self.model_cfg.model_type)
             is not SupportedModel.FASTWAM_ADAPTIVE
         ):
-            raise RuntimeError("FastWAM value-only rollout requested for another model.")
+            raise RuntimeError(
+                "FastWAM value-only rollout requested for another model."
+            )
         with torch.no_grad():
             critic_obs = self.hf_model.runtime.critic_observation(env_obs=env_obs)
             values = self.hf_model.critic.predict_value_batch(critic_obs)
@@ -697,9 +839,7 @@ class MultiStepRolloutWorker(Worker):
             )
         return RolloutResult(
             prev_values=(
-                values.cpu().contiguous()
-                if self.collect_prev_infos
-                else None
+                values.cpu().contiguous() if self.collect_prev_infos else None
             ),
             bootstrap_values=self.get_bootstrap_values(final_obs),
         )

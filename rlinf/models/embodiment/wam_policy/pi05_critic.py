@@ -16,6 +16,7 @@
 
 from __future__ import annotations
 
+import dataclasses
 from collections.abc import Mapping
 from typing import Any
 
@@ -23,7 +24,6 @@ import torch
 import torch.nn as nn
 
 from rlinf.models.embodiment.modules.value_head import ValueHead
-
 
 VALUE_HEAD_KEY_FRAGMENT = "value_head."
 
@@ -38,6 +38,22 @@ def filter_pretrained_value_head(
         for key, value in state_dict.items()
         if VALUE_HEAD_KEY_FRAGMENT not in key
     }
+
+
+def _configure_value_after_vlm(config: Any) -> Any:
+    """Return a config with the literal pi0.5 critic fields enabled."""
+
+    updates = {
+        "add_value_head": True,
+        "value_after_vlm": True,
+        "value_vlm_mode": "mean_token",
+        "detach_critic_input": True,
+    }
+    if dataclasses.is_dataclass(config) and not isinstance(config, type):
+        return dataclasses.replace(config, **updates)
+    for name, value in updates.items():
+        setattr(config, name, value)
+    return config
 
 
 class Pi05ValueAfterVLMCritic(nn.Module):
@@ -84,10 +100,7 @@ class Pi05ValueAfterVLMCritic(nn.Module):
         )
         backbone.value_head = value_head
         value_head.register_forward_pre_hook(self._match_value_head_input_dtype)
-        backbone.config.add_value_head = True
-        backbone.config.value_after_vlm = True
-        backbone.config.value_vlm_mode = "mean_token"
-        backbone.config.detach_critic_input = True
+        backbone.config = _configure_value_after_vlm(backbone.config)
         for parameter in value_head.parameters():
             parameter.requires_grad_(True)
 
