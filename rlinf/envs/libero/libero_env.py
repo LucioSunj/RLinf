@@ -103,6 +103,10 @@ class LiberoEnv(gym.Env):
         self.task_id_filter = cfg.get("task_id_filter", None)
         if self.task_id_filter is not None:
             self.task_id_filter = list(self.task_id_filter)
+        self.ordered_reset_state_ids = cfg.get("ordered_reset_state_ids", None)
+        if self.ordered_reset_state_ids is not None:
+            self.ordered_reset_state_ids = list(self.ordered_reset_state_ids)
+
 
         self.ignore_terminations = cfg.ignore_terminations
         self.auto_reset = cfg.auto_reset
@@ -429,6 +433,43 @@ class LiberoEnv(gym.Env):
         else:
             self._valid_reset_state_ids = None
 
+        if self.ordered_reset_state_ids is not None:
+            if not self.is_eval:
+                raise ValueError("ordered_reset_state_ids is evaluation-only.")
+            if get_libero_type() != "standard":
+                raise ValueError(
+                    "ordered_reset_state_ids is supported only for standard LIBERO."
+                )
+            if self.specific_reset_id is not None or self.task_id_filter is not None:
+                raise ValueError(
+                    "ordered_reset_state_ids cannot be combined with "
+                    "specific_reset_id or task_id_filter."
+                )
+            validated_reset_ids = []
+            for reset_id in self.ordered_reset_state_ids:
+                if not isinstance(reset_id, (int, np.integer)):
+                    raise ValueError(
+                        "ordered_reset_state_ids must contain ints, got "
+                        f"{type(reset_id).__name__}: {reset_id}"
+                    )
+                reset_id = int(reset_id)
+                if reset_id < 0 or reset_id >= self.total_num_group_envs:
+                    raise ValueError(
+                        f"reset_state_id {reset_id} is out of range "
+                        f"[0, {self.total_num_group_envs - 1}]."
+                    )
+                validated_reset_ids.append(reset_id)
+            if len(set(validated_reset_ids)) != len(validated_reset_ids):
+                raise ValueError("ordered_reset_state_ids must be unique.")
+            if len(validated_reset_ids) < self.total_num_processes:
+                raise ValueError(
+                    "ordered_reset_state_ids must provide at least one episode "
+                    "for every evaluation process."
+                )
+            self.ordered_reset_state_ids = np.asarray(
+                validated_reset_ids, dtype=np.int64
+            )
+
     def update_reset_state_ids(self):
         if self.is_eval or self.cfg.use_ordered_reset_state_ids:
             reset_state_ids = self._get_ordered_reset_state_ids(self.num_group)
@@ -459,7 +500,9 @@ class LiberoEnv(gym.Env):
 
     def get_reset_state_ids_all(self):
         if self.is_eval:
-            if self._valid_reset_state_ids is not None:
+            if self.ordered_reset_state_ids is not None:
+                reset_state_ids = self.ordered_reset_state_ids.copy()
+            elif self._valid_reset_state_ids is not None:
                 reset_state_ids = self._valid_reset_state_ids.copy()
             else:
                 reset_state_ids = build_interleaved_eval_reset_state_ids(

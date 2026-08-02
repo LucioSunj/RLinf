@@ -73,7 +73,21 @@ class EmbodiedEvalRunner:
         env_decoupled_mode = self.cfg.runner.get("enable_decoupled_mode", False)
         if not env_decoupled_mode:
             rollout_handle.wait()
-        eval_metrics_list = [results for results in env_results if results is not None]
+        eval_metrics_list = []
+        artifact_shards = []
+        for results in env_results:
+            if results is None:
+                continue
+            if "evaluation_artifact_shard" in results:
+                eval_metrics_list.append(results.get("metrics", {}))
+                artifact_shards.append(results["evaluation_artifact_shard"])
+            else:
+                eval_metrics_list.append(results)
+        self.evaluation_artifact_shards = artifact_shards
+        if artifact_shards:
+            self.logger.info(
+                "FastWAM evaluation artifact shards: %s", artifact_shards
+            )
         eval_metrics = compute_evaluate_metrics(eval_metrics_list)
         return eval_metrics
 

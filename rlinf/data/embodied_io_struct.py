@@ -33,6 +33,9 @@ if TYPE_CHECKING:
         ChunkRouteRecord,
         GateDecisionRecord,
     )
+    from rlinf.models.embodiment.wam_policy.evaluation import (
+        EvaluationRouteSelection,
+    )
 
 
 ACTOR_TRAJECTORY_CHANNEL_TAG = "actor_trajectory"
@@ -300,6 +303,7 @@ class RolloutResult:
     versions: torch.Tensor = None  # [B, 1]
     route_info: Optional["ChunkRouteRecord"] = None
     emitted_gate: Optional["GateDecisionRecord"] = None
+    evaluation_selection: Optional["EvaluationRouteSelection"] = None
 
     def __post_init__(self):
         if self.actions is not None:
@@ -320,6 +324,8 @@ class RolloutResult:
             self.route_info = self.route_info.cpu()
         if self.emitted_gate is not None:
             self.emitted_gate = self.emitted_gate.cpu()
+        if self.evaluation_selection is not None:
+            self.evaluation_selection = self.evaluation_selection.cpu()
 
     @staticmethod
     def merge_rollout_results(
@@ -361,6 +367,9 @@ class RolloutResult:
         merged_versions = _merge_optional_tensor("versions")
         merged_route_info = _merge_optional_record("route_info")
         merged_emitted_gate = _merge_optional_record("emitted_gate")
+        merged_evaluation_selection = _merge_optional_record(
+            "evaluation_selection"
+        )
 
         forward_inputs_list = [
             rollout_result.forward_inputs for rollout_result in rollout_results
@@ -380,6 +389,7 @@ class RolloutResult:
             versions=merged_versions,
             route_info=merged_route_info,
             emitted_gate=merged_emitted_gate,
+            evaluation_selection=merged_evaluation_selection,
         )
 
 

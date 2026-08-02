@@ -16,16 +16,14 @@
 
 from __future__ import annotations
 
+import math
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 from typing import Any, Literal, Protocol
 
 import torch
 import torch.nn as nn
-from fastwam.models.wan22.gate_transformer import (
-    deterministic_idm_route,
-    epsilon_mixture_bernoulli,
-)
+from fastwam.models.wan22.gate_transformer import epsilon_mixture_bernoulli
 from fastwam.models.wan22.kv_tap import GateKVSnapshot
 
 from rlinf.models.embodiment.base_policy import BasePolicy, ForwardType
@@ -34,6 +32,12 @@ from .contracts import (
     ChunkRouteRecord,
     GateDecisionRecord,
     GateKVMetadata,
+)
+from .evaluation import (
+    EvaluationRouteSelection,
+    EvaluationRoutingConfig,
+    EvaluationRoutingMode,
+    select_evaluation_routes,
 )
 from .kv_replay import (
     GateKVReplayBackend,
@@ -111,19 +115,42 @@ class FastWAMAdaptivePolicyConfig:
 
     gate_epsilon: float = 0.1
     gate_temperature: float = 1.0
+    eval_routing_mode: EvaluationRoutingMode | str = (
+        EvaluationRoutingMode.LEARNED_THRESHOLD
+    )
     eval_idm_threshold: float = 0.5
+    eval_random_idm_probability: float | None = None
+    eval_routing_seed: int = 0
     eval_microbatch_size: int = 1
     kv_replay: GateKVReplayConfig = field(default_factory=GateKVReplayConfig)
 
     def __post_init__(self) -> None:
-        if not 0 <= self.gate_epsilon <= 1:
+        if not math.isfinite(self.gate_epsilon) or not 0 <= self.gate_epsilon <= 1:
             raise ValueError("`gate_epsilon` must lie in [0, 1].")
-        if self.gate_temperature <= 0:
+        if not math.isfinite(self.gate_temperature) or self.gate_temperature <= 0:
             raise ValueError("`gate_temperature` must be positive.")
-        if not 0 <= self.eval_idm_threshold <= 1:
-            raise ValueError("`eval_idm_threshold` must lie in [0, 1].")
         if self.eval_microbatch_size < 1:
             raise ValueError("`eval_microbatch_size` must be positive.")
+        evaluation = self.evaluation_routing
+        object.__setattr__(self, "eval_routing_mode", evaluation.mode)
+        object.__setattr__(self, "eval_idm_threshold", evaluation.idm_threshold)
+        object.__setattr__(
+            self,
+            "eval_random_idm_probability",
+            evaluation.random_idm_probability,
+        )
+        object.__setattr__(self, "eval_routing_seed", evaluation.routing_seed)
+
+    @property
+    def evaluation_routing(self) -> EvaluationRoutingConfig:
+        """Return the validated pure evaluation-routing configuration."""
+
+        return EvaluationRoutingConfig(
+            mode=self.eval_routing_mode,
+            idm_threshold=self.eval_idm_threshold,
+            random_idm_probability=self.eval_random_idm_probability,
+            routing_seed=self.eval_routing_seed,
+        )
 
 
 def _bytes_per_sample(packed: PackedGateKVTaps) -> torch.Tensor:
@@ -297,31 +324,58 @@ class FastWAMAdaptivePolicy(nn.Module, BasePolicy):
             reset_mask = torch.as_tensor(reset_mask, device=device, dtype=torch.bool)
         return env_ids, reset_mask
 
-    def _gate_decision(
+    def _training_gate_decision(
         self,
         *,
         logits: torch.Tensor,
-        mode: Literal["train", "eval"],
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         behavior = epsilon_mixture_bernoulli(
             logits,
             temperature=self.config.gate_temperature,
-            epsilon=self.config.gate_epsilon if mode == "train" else 0.0,
+            epsilon=self.config.gate_epsilon,
         )
-        if mode == "train":
-            route = behavior.sample()
-        else:
-            route = deterministic_idm_route(
-                logits,
-                temperature=self.config.gate_temperature,
-                threshold=self.config.eval_idm_threshold,
-            )
+        route = behavior.sample()
         logprob = behavior.log_prob(route)
         return (
             route,
             behavior.base_idm_probability,
             behavior.behavior_idm_probability,
             logprob,
+        )
+
+    def _evaluation_gate_decision(
+        self,
+        *,
+        logits: torch.Tensor,
+        env_ids: torch.Tensor,
+        episode_ids: torch.Tensor,
+        source_chunk_ids: torch.Tensor,
+    ) -> tuple[
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        EvaluationRouteSelection,
+    ]:
+        behavior = epsilon_mixture_bernoulli(
+            logits,
+            temperature=self.config.gate_temperature,
+            epsilon=0.0,
+        )
+        selection = select_evaluation_routes(
+            self.config.evaluation_routing,
+            gate_idm_probabilities=behavior.base_idm_probability,
+            env_ids=env_ids,
+            episode_ids=episode_ids,
+            source_chunk_ids=source_chunk_ids,
+        )
+        route = selection.effective_next_route
+        return (
+            route,
+            behavior.base_idm_probability,
+            behavior.behavior_idm_probability,
+            behavior.log_prob(route),
+            selection,
         )
 
     @staticmethod
@@ -377,13 +431,23 @@ class FastWAMAdaptivePolicy(nn.Module, BasePolicy):
                 collect_replay=False,
             )
             logits = self.gate(sample.gate_snapshots)
-            decisions.append(self._gate_decision(logits=logits, mode="eval"))
+            decisions.append(
+                self._evaluation_gate_decision(
+                    logits=logits,
+                    env_ids=env_ids[start:end],
+                    episode_ids=route_info.episode_ids[start:end],
+                    source_chunk_ids=route_info.chunk_ids[start:end],
+                )
+            )
             actions.append(sample.actions)
 
         next_route = torch.cat([item[0] for item in decisions], dim=0)
         base_probability = torch.cat([item[1] for item in decisions], dim=0)
         behavior_probability = torch.cat([item[2] for item in decisions], dim=0)
         gate_logprob = torch.cat([item[3] for item in decisions], dim=0)
+        evaluation_selection = EvaluationRouteSelection.cat(
+            [item[4] for item in decisions]
+        )
         self.route_tracker.emit(
             env_ids=env_ids,
             routes=next_route,
@@ -423,6 +487,7 @@ class FastWAMAdaptivePolicy(nn.Module, BasePolicy):
             "forward_inputs": {},
             "route_info": route_info,
             "emitted_gate": emitted_gate,
+            "evaluation_selection": evaluation_selection,
         }
 
     def predict_action_batch(
@@ -459,7 +524,7 @@ class FastWAMAdaptivePolicy(nn.Module, BasePolicy):
         )
         logits = self.gate(sample.gate_snapshots)
         next_route, base_probability, behavior_probability, gate_logprob = (
-            self._gate_decision(logits=logits, mode=mode)
+            self._training_gate_decision(logits=logits)
         )
         self.route_tracker.emit(
             env_ids=env_ids,
@@ -844,6 +909,35 @@ class FastWAMAdaptivePolicy(nn.Module, BasePolicy):
         ):
             raise ValueError(
                 "FastWAM evaluation checkpoint step does not match its policy version."
+            )
+        checkpoint_gate = policy_payload.get("gate")
+        if not isinstance(checkpoint_gate, Mapping):
+            raise ValueError(
+                "FastWAM evaluation checkpoint is missing its Gate state mapping."
+            )
+        current_gate = self.gate.state_dict()
+        current_keys = set(current_gate)
+        checkpoint_keys = set(checkpoint_gate)
+        missing_keys = sorted(current_keys - checkpoint_keys)
+        unexpected_keys = sorted(checkpoint_keys - current_keys)
+        shape_mismatches = sorted(
+            key
+            for key in current_keys & checkpoint_keys
+            if getattr(current_gate[key], "shape", None)
+            != getattr(checkpoint_gate[key], "shape", None)
+        )
+        if missing_keys or unexpected_keys or shape_mismatches:
+            def preview(values: list[str]) -> list[str]:
+                return values[:8]
+
+            raise ValueError(
+                "FastWAM evaluation checkpoint Gate architecture mismatch: "
+                f"current_keys={len(current_keys)}, "
+                f"checkpoint_keys={len(checkpoint_keys)}, "
+                f"missing={preview(missing_keys)}, "
+                f"unexpected={preview(unexpected_keys)}, "
+                f"shape_mismatches={preview(shape_mismatches)}. "
+                "Refusing to synthesize, replicate, or drop Gate weights."
             )
 
         self.load_trainable_state_dict(dict(policy_payload))

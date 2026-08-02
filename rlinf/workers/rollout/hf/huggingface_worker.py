@@ -54,6 +54,22 @@ def _fastwam_checkpoint_cpu_clone(value: Any) -> Any:
     return value
 
 
+def _build_evaluation_rollout_result(
+    actions: torch.Tensor,
+    result: dict[str, Any],
+) -> RolloutResult:
+    """Build the compact typed payload used by standalone FastWAM evaluation."""
+
+    if not isinstance(actions, torch.Tensor):
+        raise TypeError("FastWAM evaluation actions must be a torch.Tensor.")
+    return RolloutResult(
+        actions=actions,
+        route_info=result.get("route_info"),
+        emitted_gate=result.get("emitted_gate"),
+        evaluation_selection=result.get("evaluation_selection"),
+    )
+
+
 class MultiStepRolloutWorker(Worker):
     def __init__(self, cfg: DictConfig):
         Worker.__init__(self)
@@ -1030,7 +1046,7 @@ class MultiStepRolloutWorker(Worker):
                     timeout_time=0.02,
                     recv_queue_size=self.rollout_queue_size,
                 )
-                actions, _ = self._predict_rollout_actions(
+                actions, result = self._predict_rollout_actions(
                     env_output["obs"],
                     mode="eval",
                     final_obs=env_output.get("final_obs", None),
@@ -1041,11 +1057,20 @@ class MultiStepRolloutWorker(Worker):
                 )
                 if isinstance(actions, torch.Tensor):
                     actions = actions.detach().cpu().contiguous()
+                split_fn = None
+                payload = actions
+                if (
+                    SupportedModel(self.model_cfg.model_type)
+                    is SupportedModel.FASTWAM_ADAPTIVE
+                ):
+                    payload = _build_evaluation_rollout_result(actions, result)
+                    split_fn = self._split_rollout_result
                 self.send_to_recorded_batch_routes(
                     group_name=self.cfg.env.group_name,
                     channel=output_channel,
-                    data=actions,
+                    data=payload,
                     tag="rollout_results",
+                    split_fn=split_fn,
                     split_sizes=split_sizes,
                 )
         else:
@@ -1066,7 +1091,7 @@ class MultiStepRolloutWorker(Worker):
                             merge_fn=self._merge_obs_batches,
                             infer_batch_size_fn=self._infer_env_batch_size,
                         ).async_wait()
-                        actions, _ = self._predict_rollout_actions(
+                        actions, result = self._predict_rollout_actions(
                             env_output["obs"],
                             mode="eval",
                             final_obs=env_output.get("final_obs", None),
@@ -1077,14 +1102,23 @@ class MultiStepRolloutWorker(Worker):
                         )
                         if isinstance(actions, torch.Tensor):
                             actions = actions.detach().cpu().contiguous()
+                        split_fn = None
+                        payload = actions
+                        if (
+                            SupportedModel(self.model_cfg.model_type)
+                            is SupportedModel.FASTWAM_ADAPTIVE
+                        ):
+                            payload = _build_evaluation_rollout_result(actions, result)
+                            split_fn = self._split_rollout_result
                         self.send_to(
                             group_name=self.cfg.env.group_name,
                             channel=output_channel,
-                            data=actions,
+                            data=payload,
                             tag="eval_rollout_results",
                             route_key=stage_id,
                             async_op=True,
                             batch_size=self.eval_batch_size,
+                            split_fn=split_fn,
                         )
 
             if self.enable_offload:
@@ -1231,6 +1265,11 @@ class MultiStepRolloutWorker(Worker):
             if rollout_result.emitted_gate is None
             else rollout_result.emitted_gate.split(sizes, dim=0)
         )
+        split_evaluation_selection = (
+            (None,) * len(sizes)
+            if rollout_result.evaluation_selection is None
+            else rollout_result.evaluation_selection.split(sizes, dim=0)
+        )
         split_forward_inputs = (
             [{} for _ in sizes]
             if not rollout_result.forward_inputs
@@ -1255,6 +1294,7 @@ class MultiStepRolloutWorker(Worker):
                 versions=split_versions[idx],
                 route_info=split_route_info[idx],
                 emitted_gate=split_emitted_gate[idx],
+                evaluation_selection=split_evaluation_selection[idx],
             )
             for idx in range(len(sizes))
         ]

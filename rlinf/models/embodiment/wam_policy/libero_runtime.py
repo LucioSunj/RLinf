@@ -16,7 +16,9 @@
 
 from __future__ import annotations
 
+import hashlib
 import math
+from pathlib import Path
 from typing import Any, Literal
 
 import torch
@@ -59,6 +61,61 @@ def _format_fastwam_prompts(
         else list(task_descriptions)
     )
     return [prompt_template.format(task=str(task)) for task in descriptions]
+
+
+def _load_cached_text_contexts(
+    prompts: list[str],
+    *,
+    cache_dir: Path,
+    context_len: int,
+    expected_dim: int,
+    device: torch.device,
+    dtype: torch.dtype,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Load deterministic precomputed Wan2.2 contexts without loading UMT5."""
+
+    if context_len < 1 or expected_dim < 1:
+        raise ValueError("Cached text context length and dimension must be positive.")
+    contexts = []
+    masks = []
+    for prompt in prompts:
+        digest = hashlib.sha256(prompt.encode("utf-8")).hexdigest()
+        path = cache_dir / f"{digest}.t5_len{context_len}.wan22ti2v5b.pt"
+        if not path.is_file():
+            raise FileNotFoundError(
+                f"Missing FastWAM evaluation text context for prompt hash {digest}: "
+                f"{path}"
+            )
+        payload = torch.load(path, map_location="cpu", weights_only=True)
+        if not isinstance(payload, dict) or set(payload) != {"context", "mask"}:
+            raise ValueError(f"Cached text context has an invalid schema: {path}")
+        context = payload["context"]
+        mask = payload["mask"]
+        if not isinstance(context, torch.Tensor) or not isinstance(mask, torch.Tensor):
+            raise TypeError(f"Cached text context values must be tensors: {path}")
+        if context.shape != torch.Size([context_len, expected_dim]):
+            raise ValueError(
+                "Cached text context shape mismatch: "
+                f"expected {(context_len, expected_dim)}, got {tuple(context.shape)} "
+                f"in {path}."
+            )
+        if mask.shape != torch.Size([context_len]):
+            raise ValueError(
+                f"Cached text mask shape mismatch in {path}: {tuple(mask.shape)}."
+            )
+        if context.dtype is not torch.bfloat16 or mask.dtype is not torch.bool:
+            raise TypeError(
+                "Cached text context must use BF16 context and bool mask: "
+                f"context={context.dtype}, mask={mask.dtype}, path={path}."
+            )
+        if not torch.isfinite(context.float()).all():
+            raise ValueError(f"Cached text context contains non-finite values: {path}")
+        contexts.append(context)
+        masks.append(mask)
+    return (
+        torch.stack(contexts).to(device=device, dtype=dtype),
+        torch.stack(masks).to(device=device, dtype=torch.bool),
+    )
 
 
 def _cat_bank(banks: list[KeyValueBank]) -> KeyValueBank:
@@ -130,6 +187,54 @@ def _validate_flow_sde_sampling(
         )
 
 
+def _validate_noise_seeds(
+    value: Any,
+    *,
+    batch_size: int,
+    name: str,
+) -> torch.Tensor:
+    """Validate compact per-sample seeds without touching global RNG state."""
+
+    seeds = torch.as_tensor(value)
+    if seeds.ndim != 1:
+        raise ValueError(f"FastWAM {name} seeds must be one-dimensional.")
+    if seeds.shape[0] != batch_size:
+        raise ValueError(
+            f"FastWAM {name} seed batch must match routes: "
+            f"{seeds.shape[0]} != {batch_size}."
+        )
+    if seeds.dtype == torch.bool or seeds.dtype.is_floating_point:
+        raise TypeError(f"FastWAM {name} seeds must use an integer dtype.")
+    seeds = seeds.to(device="cpu", dtype=torch.long)
+    if bool((seeds < 0).any()):
+        raise ValueError(f"FastWAM {name} seeds must be non-negative.")
+    return seeds
+
+
+def _seeded_randn(
+    seed: int,
+    shape: tuple[int, ...],
+    *,
+    device: torch.device,
+    dtype: torch.dtype,
+) -> torch.Tensor:
+    """Generate one noise tensor from a local generator."""
+
+    seed = int(seed)
+    if seed < 0:
+        raise ValueError("FastWAM local noise seed must be non-negative.")
+    if not shape or any(int(dimension) < 1 for dimension in shape):
+        raise ValueError("FastWAM seeded noise shape must be non-empty and positive.")
+    generator = torch.Generator(device=device)
+    generator.manual_seed(seed)
+    return torch.randn(
+        shape,
+        device=device,
+        dtype=torch.float32,
+        generator=generator,
+    ).to(dtype=dtype)
+
+
 def _align_linear_normalizer(normalizer: Any, reference: torch.Tensor) -> None:
     """Move FastWAM's plain-tensor normalizer state beside its input."""
 
@@ -187,6 +292,8 @@ class LiberoFastWAMRuntime:
         tiled_vae: bool = False,
         binarize_gripper: bool = False,
         prompt_template: str = DEFAULT_FASTWAM_PROMPT_TEMPLATE,
+        text_embedding_cache_dir: str | None = None,
+        text_embedding_context_len: int = 128,
     ) -> None:
         self.actor = actor
         self.lora_adapter = lora_adapter
@@ -210,6 +317,12 @@ class LiberoFastWAMRuntime:
         self.tiled_vae = bool(tiled_vae)
         self.binarize_gripper = bool(binarize_gripper)
         self.prompt_template = str(prompt_template)
+        self.text_embedding_cache_dir = (
+            None
+            if text_embedding_cache_dir is None
+            else Path(text_embedding_cache_dir).expanduser().resolve()
+        )
+        self.text_embedding_context_len = int(text_embedding_context_len)
         if self.action_horizon < 1 or self.num_inference_steps < 1:
             raise ValueError("Action horizon and inference steps must be positive.")
         if self.num_video_frames % 4 != 1:
@@ -224,6 +337,12 @@ class LiberoFastWAMRuntime:
             raise ValueError(
                 "FastWAM processor and `processor_stats_path` must be configured together."
             )
+        if self.text_embedding_context_len < 1:
+            raise ValueError("`text_embedding_context_len` must be positive.")
+        if self.text_embedding_cache_dir is not None and not (
+            self.text_embedding_cache_dir.is_dir()
+        ):
+            raise FileNotFoundError(self.text_embedding_cache_dir)
         _format_fastwam_prompts("validation", prompt_template=self.prompt_template)
         if self.processor is not None:
             from fastwam.datasets.lerobot.utils.normalizer import (
@@ -314,7 +433,17 @@ class LiberoFastWAMRuntime:
             env_obs["task_descriptions"],
             prompt_template=self.prompt_template,
         )
-        context, context_mask = self.actor.encode_prompt(prompts)
+        if self.text_embedding_cache_dir is None:
+            context, context_mask = self.actor.encode_prompt(prompts)
+        else:
+            context, context_mask = _load_cached_text_contexts(
+                prompts,
+                cache_dir=self.text_embedding_cache_dir,
+                context_len=self.text_embedding_context_len,
+                expected_dim=int(self.actor.text_dim),
+                device=self.device,
+                dtype=self.dtype,
+            )
         proprio = self._normalized_proprio(env_obs["states"])
         context, context_mask = self.actor._append_proprio_to_context(
             context=context,
@@ -332,6 +461,7 @@ class LiberoFastWAMRuntime:
         context_mask: torch.Tensor,
         regime: PolicyRegime,
         idm_initial_latents: torch.Tensor | None = None,
+        idm_noise_seed: int | None = None,
     ) -> tuple[CachedActionCondition, torch.Tensor | None]:
         first_frame = self.actor._encode_input_image_latents_tensor(
             image,
@@ -355,12 +485,25 @@ class LiberoFastWAMRuntime:
                 latent_h,
                 latent_w,
             )
+            if idm_initial_latents is not None and idm_noise_seed is not None:
+                raise ValueError(
+                    "Specify either injected IDM latents or an IDM seed, not both."
+                )
             if idm_initial_latents is None:
-                video_latents = torch.randn(
-                    expected_shape,
-                    device=self.device,
-                    dtype=torch.float32,
-                ).to(dtype=self.dtype)
+                video_latents = (
+                    torch.randn(
+                        expected_shape,
+                        device=self.device,
+                        dtype=torch.float32,
+                    ).to(dtype=self.dtype)
+                    if idm_noise_seed is None
+                    else _seeded_randn(
+                        idm_noise_seed,
+                        expected_shape,
+                        device=self.device,
+                        dtype=self.dtype,
+                    )
+                )
             else:
                 if tuple(idm_initial_latents.shape) != expected_shape:
                     raise ValueError(
@@ -499,6 +642,17 @@ class LiberoFastWAMRuntime:
                     "Injected FastWAM action noise has shape "
                     f"{tuple(action_noise_override.shape)}, expected {expected}."
                 )
+        action_noise_seeds = env_obs.get("_fastwam_action_noise_seeds")
+        if action_noise_seeds is not None:
+            if action_noise_override is not None:
+                raise ValueError(
+                    "Specify either injected action noise or action seeds, not both."
+                )
+            action_noise_seeds = _validate_noise_seeds(
+                action_noise_seeds,
+                batch_size=routes.shape[0],
+                name="action noise",
+            )
         video_noise_override = env_obs.get("_fastwam_idm_initial_latents")
         if video_noise_override is not None:
             video_noise_override = torch.as_tensor(
@@ -510,6 +664,17 @@ class LiberoFastWAMRuntime:
                 raise ValueError(
                     "Injected FastWAM IDM video noise batch must match routes."
                 )
+        idm_noise_seeds = env_obs.get("_fastwam_idm_noise_seeds")
+        if idm_noise_seeds is not None:
+            if video_noise_override is not None:
+                raise ValueError(
+                    "Specify either injected IDM latents or IDM seeds, not both."
+                )
+            idm_noise_seeds = _validate_noise_seeds(
+                idm_noise_seeds,
+                batch_size=routes.shape[0],
+                name="IDM video noise",
+            )
         rollouts = []
         idm_initial_latents = []
         for index, route_value in enumerate(routes.tolist()):
@@ -527,6 +692,11 @@ class LiberoFastWAMRuntime:
                     video_noise_override[index : index + 1]
                     if video_noise_override is not None
                     and regime is PolicyRegime.IDM
+                    else None
+                ),
+                idm_noise_seed=(
+                    int(idm_noise_seeds[index])
+                    if idm_noise_seeds is not None and regime is PolicyRegime.IDM
                     else None
                 ),
             )
@@ -551,15 +721,25 @@ class LiberoFastWAMRuntime:
                     )
                 idm_initial_latents.append(replay_video_noise)
             if action_noise_override is None:
-                initial_noise = torch.randn(
-                    (
-                        1,
-                        self.action_horizon,
-                        self.actor.action_expert.action_dim,
-                    ),
-                    device=self.device,
-                    dtype=torch.float32,
-                ).to(dtype=self.dtype)
+                action_shape = (
+                    1,
+                    self.action_horizon,
+                    self.actor.action_expert.action_dim,
+                )
+                initial_noise = (
+                    torch.randn(
+                        action_shape,
+                        device=self.device,
+                        dtype=torch.float32,
+                    ).to(dtype=self.dtype)
+                    if action_noise_seeds is None
+                    else _seeded_randn(
+                        int(action_noise_seeds[index]),
+                        action_shape,
+                        device=self.device,
+                        dtype=self.dtype,
+                    )
+                )
             else:
                 initial_noise = action_noise_override[index : index + 1]
             rollout = sample_action_flow_sde(

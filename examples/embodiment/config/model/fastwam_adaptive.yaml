@@ -94,7 +94,10 @@ gate:
 
 gate_epsilon: 0.1
 gate_temperature: 1.0
+eval_routing_mode: learned_threshold
 eval_idm_threshold: 0.5
+eval_random_idm_probability: null
+eval_routing_seed: 0
 eval_microbatch_size: 1
 
 kv_replay:
@@ -153,6 +156,8 @@ runtime:
   tiled_vae: false
   binarize_gripper: false
   prompt_template: "A video recorded from a robot's point of view executing the following instruction: {task}"
+  text_embedding_cache_dir: null
+  text_embedding_context_len: 128
 
 critic:
   kind: pi0_5_value_after_vlm

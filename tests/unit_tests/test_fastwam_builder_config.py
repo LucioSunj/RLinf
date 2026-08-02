@@ -237,6 +237,10 @@ def test_libero_adaptive_config_composes_with_confirmed_defaults(monkeypatch) ->
     assert cfg.actor.model.gate.layer_taps.mode == "all"
     assert cfg.actor.model.gate.denoise_last_n == 1
     assert cfg.actor.model.gate_epsilon == 0.1
+    assert cfg.actor.model.eval_routing_mode == "learned_threshold"
+    assert cfg.actor.model.eval_idm_threshold == 0.5
+    assert cfg.actor.model.eval_random_idm_probability is None
+    assert cfg.actor.model.eval_routing_seed == 0
     assert cfg.actor.model.eval_microbatch_size == 1
     assert cfg.actor.model.kv_replay.backend == "stored"
     assert cfg.actor.model.uncond_lora.target_groups == [
@@ -275,6 +279,9 @@ def test_hydra_overrides_select_recompute_and_gate_subsets(monkeypatch) -> None:
                 f"{owner}.model.kv_replay.backend=recompute",
                 f"{owner}.model.gate.layer_taps.mode=last_n",
                 f"{owner}.model.gate.layer_taps.last_n=4",
+                f"{owner}.model.eval_routing_mode=matched_random",
+                f"{owner}.model.eval_random_idm_probability=0.375",
+                f"{owner}.model.eval_routing_seed=19",
             )
         )
     with initialize_config_dir(version_base=None, config_dir=str(CONFIG_ROOT)):
@@ -287,6 +294,12 @@ def test_hydra_overrides_select_recompute_and_gate_subsets(monkeypatch) -> None:
     assert cfg.rollout.model.kv_replay.backend == "recompute"
     assert cfg.actor.model.gate.layer_taps.mode == "last_n"
     assert cfg.actor.model.gate.layer_taps.last_n == 4
+    assert cfg.actor.model.eval_routing_mode == "matched_random"
+    assert cfg.rollout.model.eval_routing_mode == "matched_random"
+    assert cfg.actor.model.eval_random_idm_probability == 0.375
+    assert cfg.rollout.model.eval_random_idm_probability == 0.375
+    assert cfg.actor.model.eval_routing_seed == 19
+    assert cfg.rollout.model.eval_routing_seed == 19
 
 
 def test_standalone_eval_config_resolves_without_pi05_environment(monkeypatch) -> None:

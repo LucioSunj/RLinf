@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import hashlib
 import importlib.util
 import sys
 from enum import Enum
@@ -56,6 +57,7 @@ def _load_policy_package():
         "contracts",
         "kv_replay",
         "routing_state",
+        "evaluation",
         "adaptive_policy",
         "libero_runtime",
     ):
@@ -214,7 +216,14 @@ class _LoRA:
         self.replay_reference_version = actor_version
 
 
-def _make_policy(backend="stored", *, with_critic=True):
+def _make_policy(
+    backend="stored",
+    *,
+    with_critic=True,
+    eval_routing_mode="learned_threshold",
+    eval_random_idm_probability=None,
+    eval_routing_seed=0,
+):
     return FastWAMAdaptivePolicy(
         actor=nn.Linear(1, 1),
         runtime=_Runtime(),
@@ -224,6 +233,9 @@ def _make_policy(backend="stored", *, with_critic=True):
         config=FastWAMAdaptivePolicyConfig(
             gate_epsilon=0.0,
             eval_idm_threshold=0.5,
+            eval_routing_mode=eval_routing_mode,
+            eval_random_idm_probability=eval_random_idm_probability,
+            eval_routing_seed=eval_routing_seed,
             kv_replay=_policy.GateKVReplayConfig(
                 backend=backend,
                 pin_memory=False,
@@ -303,6 +315,69 @@ def test_policy_forces_first_idm_and_applies_gate_to_next_chunk():
     _, second = policy.predict_action_batch(obs, mode="eval")
     assert second["route_info"].route_used.tolist() == [0, 0]
     assert second["route_info"].route_source_chunk_ids.tolist() == [0, 0]
+
+
+@pytest.mark.parametrize(
+    ("mode", "random_probability", "expected_next"),
+    [
+        ("learned_threshold", None, [0, 0]),
+        ("forced_idm", None, [1, 1]),
+        ("forced_uncond", None, [0, 0]),
+        ("matched_random", 1.0, [1, 1]),
+    ],
+)
+def test_policy_eval_uses_explicit_route_control_after_forced_first_chunk(
+    mode,
+    random_probability,
+    expected_next,
+):
+    policy = _make_policy(
+        eval_routing_mode=mode,
+        eval_random_idm_probability=random_probability,
+        eval_routing_seed=41,
+    )
+    obs = {
+        "states": torch.ones(2, 3),
+        "_fastwam_env_ids": torch.tensor([11, 22]),
+        "_fastwam_reset_mask": torch.tensor([True, True]),
+    }
+
+    _, first = policy.predict_action_batch(obs, mode="eval")
+
+    assert first["route_info"].route_used.tolist() == [1, 1]
+    assert first["route_info"].route_was_forced.tolist() == [True, True]
+    assert first["emitted_gate"].next_route.tolist() == expected_next
+    assert first["emitted_gate"].epsilon.tolist() == [0.0, 0.0]
+    assert torch.allclose(
+        first["emitted_gate"].base_probability,
+        torch.full((2,), torch.sigmoid(torch.tensor(-1.0))),
+    )
+    selection = first["evaluation_selection"]
+    assert selection.mode.value == mode
+    assert selection.effective_next_route.tolist() == expected_next
+    assert selection.counterfactual_next_route.tolist() == [0, 0]
+    assert (selection.random_draws is not None) == (mode == "matched_random")
+    assert policy.critic.predict_calls == 0
+
+    obs["_fastwam_reset_mask"] = torch.tensor([False, False])
+    _, second = policy.predict_action_batch(obs, mode="eval")
+    assert second["route_info"].route_used.tolist() == expected_next
+    assert second["route_info"].route_was_forced.tolist() == [False, False]
+
+
+def test_training_gate_sampling_does_not_call_evaluation_selector(monkeypatch):
+    policy = _make_policy()
+    monkeypatch.setattr(
+        _policy,
+        "select_evaluation_routes",
+        lambda *args, **kwargs: pytest.fail("training called evaluation selector"),
+    )
+    obs = {
+        "states": torch.ones(2, 3),
+        "_fastwam_env_ids": torch.tensor([1, 2]),
+        "_fastwam_reset_mask": torch.tensor([True, True]),
+    }
+    policy.predict_action_batch(obs, mode="train", compute_values=False)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is unavailable")
@@ -417,6 +492,16 @@ def test_standalone_eval_runs_and_restores_gate_lora_without_critic():
     assert rollout["prev_values"].shape == (1, 1)
     with pytest.raises(RuntimeError, match="critic is intentionally absent"):
         policy.predict_action_batch(obs, mode="train")
+
+    incompatible_policy = dict(payload["policy"])
+    incompatible_policy["gate"] = {
+        "blocks.0.weight": torch.zeros(1),
+    }
+    with pytest.raises(ValueError, match="Gate architecture mismatch"):
+        _make_policy(with_critic=False).load_eval_checkpoint(
+            {**payload, "policy": incompatible_policy},
+            expected_parent_checkpoint_sha256=parent_sha256,
+        )
 
     with pytest.raises(ValueError, match="parent hash mismatch"):
         _make_policy(with_critic=False).load_eval_checkpoint(
@@ -588,6 +673,59 @@ def test_fastwam_prompt_format_matches_training_template() -> None:
         routes=torch.tensor([0, 0]),
         noise_level=0.0,
     )
+
+
+def test_cached_eval_text_context_is_hash_keyed_and_fail_closed(tmp_path: Path) -> None:
+    prompts = ["first prompt", "second prompt"]
+    expected_contexts = []
+    for index, prompt in enumerate(prompts):
+        context = torch.full((3, 4), float(index + 1), dtype=torch.bfloat16)
+        expected_contexts.append(context)
+        digest = hashlib.sha256(prompt.encode("utf-8")).hexdigest()
+        torch.save(
+            {"context": context, "mask": torch.tensor([True, True, False])},
+            tmp_path / f"{digest}.t5_len3.wan22ti2v5b.pt",
+        )
+
+    context, mask = _runtime_module._load_cached_text_contexts(
+        prompts,
+        cache_dir=tmp_path,
+        context_len=3,
+        expected_dim=4,
+        device=torch.device("cpu"),
+        dtype=torch.bfloat16,
+    )
+
+    assert torch.equal(context, torch.stack(expected_contexts))
+    assert torch.equal(
+        mask,
+        torch.tensor([[True, True, False], [True, True, False]]),
+    )
+    with pytest.raises(FileNotFoundError, match="prompt hash"):
+        _runtime_module._load_cached_text_contexts(
+            ["not precomputed"],
+            cache_dir=tmp_path,
+            context_len=3,
+            expected_dim=4,
+            device=torch.device("cpu"),
+            dtype=torch.bfloat16,
+        )
+
+    broken_prompt = "broken"
+    broken_digest = hashlib.sha256(broken_prompt.encode("utf-8")).hexdigest()
+    torch.save(
+        {"context": torch.zeros(2, 4, dtype=torch.bfloat16), "mask": torch.ones(2, dtype=torch.bool)},
+        tmp_path / f"{broken_digest}.t5_len3.wan22ti2v5b.pt",
+    )
+    with pytest.raises(ValueError, match="shape mismatch"):
+        _runtime_module._load_cached_text_contexts(
+            [broken_prompt],
+            cache_dir=tmp_path,
+            context_len=3,
+            expected_dim=4,
+            device=torch.device("cpu"),
+            dtype=torch.bfloat16,
+        )
 
 
 def test_action_schedule_stays_fp32_for_a_bfloat16_actor() -> None:

@@ -26,6 +26,12 @@ from .contracts import (
     WAMRoute,
     shift_emitted_gate_decisions,
 )
+from .evaluation import (
+    EvaluationRouteSelection,
+    EvaluationRoutingConfig,
+    EvaluationRoutingMode,
+    select_evaluation_routes,
+)
 
 
 def _sha256_artifact(path: str | Path) -> str:
@@ -222,9 +228,6 @@ def _validate_critic_build_config(cfg) -> bool:
 def get_model(cfg, torch_dtype):
     """Build the composite policy from explicit FastWAM/OpenPi sub-configs."""
 
-    from hydra.utils import instantiate
-    from omegaconf import OmegaConf
-
     from fastwam.adapters import (
         RegimeLoRAConfig,
         inject_action_dit_lora,
@@ -235,6 +238,8 @@ def get_model(cfg, torch_dtype):
         GateTransformerConfig,
         LayerTapConfig,
     )
+    from hydra.utils import instantiate
+    from omegaconf import OmegaConf
 
     from .adaptive_policy import (
         FastWAMAdaptivePolicy,
@@ -304,7 +309,16 @@ def get_model(cfg, torch_dtype):
     policy_config = FastWAMAdaptivePolicyConfig(
         gate_epsilon=float(cfg.get("gate_epsilon", 0.1)),
         gate_temperature=float(cfg.get("gate_temperature", 1.0)),
+        eval_routing_mode=str(
+            cfg.get("eval_routing_mode", "learned_threshold")
+        ),
         eval_idm_threshold=float(cfg.get("eval_idm_threshold", 0.5)),
+        eval_random_idm_probability=(
+            None
+            if cfg.get("eval_random_idm_probability") is None
+            else float(cfg.eval_random_idm_probability)
+        ),
+        eval_routing_seed=cfg.get("eval_routing_seed", 0),
         eval_microbatch_size=int(cfg.get("eval_microbatch_size", 1)),
         kv_replay=replay_config,
     )
@@ -374,11 +388,15 @@ def get_model(cfg, torch_dtype):
 __all__ = [
     "AlignedGateDecisions",
     "ChunkRouteRecord",
+    "EvaluationRouteSelection",
+    "EvaluationRoutingConfig",
+    "EvaluationRoutingMode",
     "GateDecisionRecord",
     "GateKVMetadata",
     "WAMMode",
     "WAMRoute",
-    "shift_emitted_gate_decisions",
-    "resolve_fastwam_adaptive_eval_checkpoint",
     "get_model",
+    "resolve_fastwam_adaptive_eval_checkpoint",
+    "select_evaluation_routes",
+    "shift_emitted_gate_decisions",
 ]

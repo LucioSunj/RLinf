@@ -44,14 +44,15 @@ class PendingRouteTracker:
 
     def __init__(self) -> None:
         self._states: dict[int, _EnvironmentRouteState] = {}
-        self._next_episode_id = 0
+        self._next_episode_ids: dict[int, int] = {}
 
     def _start_episode(self, env_id: int) -> _EnvironmentRouteState:
+        episode_id = self._next_episode_ids.get(env_id, 0)
         state = _EnvironmentRouteState(
-            episode_id=self._next_episode_id,
+            episode_id=episode_id,
             chunk_id=0,
         )
-        self._next_episode_id += 1
+        self._next_episode_ids[env_id] = episode_id + 1
         self._states[env_id] = state
         return state
 
@@ -68,7 +69,7 @@ class PendingRouteTracker:
             raise ValueError("`env_ids` must be one-dimensional.")
         if reset_mask.shape != env_ids.shape or reset_mask.dtype != torch.bool:
             raise ValueError("`reset_mask` must be bool and match `env_ids`.")
-        if len(set(int(item) for item in env_ids.tolist())) != env_ids.numel():
+        if len({int(item) for item in env_ids.tolist()}) != env_ids.numel():
             raise ValueError("`env_ids` must be unique within a policy batch.")
         if actor_version < 0:
             raise ValueError("`actor_version` must be non-negative.")
@@ -211,7 +212,10 @@ class PendingRouteTracker:
         """Return checkpointable route state with no tensor/device dependency."""
 
         return {
-            "next_episode_id": self._next_episode_id,
+            # Retain the scalar for legacy readers while the per-environment map
+            # makes episode identities independent of asynchronous reset order.
+            "next_episode_id": sum(self._next_episode_ids.values()),
+            "next_episode_ids": dict(self._next_episode_ids),
             "states": {
                 env_id: {
                     "episode_id": state.episode_id,
@@ -235,7 +239,9 @@ class PendingRouteTracker:
     def load_state_dict(self, payload: dict) -> None:
         """Restore checkpointed route schedules and reject malformed state."""
 
-        self._next_episode_id = int(payload["next_episode_id"])
+        legacy_next_episode_id = int(payload.get("next_episode_id", 0))
+        if legacy_next_episode_id < 0:
+            raise ValueError("next_episode_id must be non-negative.")
         self._states = {}
         for env_id_value, raw in payload["states"].items():
             pending_raw = raw["pending"]
@@ -255,3 +261,24 @@ class PendingRouteTracker:
                 pending=pending,
                 force_next_idm=bool(raw.get("force_next_idm", False)),
             )
+
+        raw_next_ids = payload.get("next_episode_ids")
+        if raw_next_ids is None:
+            # Legacy checkpoints used one process-global counter. Active state
+            # still gives a safe per-environment lower bound for future resets.
+            self._next_episode_ids = {
+                env_id: state.episode_id + 1
+                for env_id, state in self._states.items()
+            }
+        else:
+            self._next_episode_ids = {
+                int(env_id): int(next_id)
+                for env_id, next_id in raw_next_ids.items()
+            }
+            if any(next_id < 0 for next_id in self._next_episode_ids.values()):
+                raise ValueError("next_episode_ids must be non-negative.")
+            for env_id, state in self._states.items():
+                if self._next_episode_ids.get(env_id, -1) <= state.episode_id:
+                    raise ValueError(
+                        "next_episode_ids must advance past every active episode."
+                    )

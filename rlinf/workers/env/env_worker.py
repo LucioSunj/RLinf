@@ -14,11 +14,14 @@
 
 import asyncio
 import gc
+import time
 from collections import defaultdict
+from dataclasses import asdict, replace
 from typing import Any
 
 import numpy as np
 import torch
+from hydra.utils import instantiate
 from omegaconf import DictConfig, OmegaConf
 
 from rlinf.algorithms.registry import calculate_adv_and_returns
@@ -37,7 +40,13 @@ from rlinf.envs import get_env_cls
 from rlinf.envs.action_utils import prepare_actions
 from rlinf.envs.utils import get_env_attr
 from rlinf.envs.wrappers import RecordVideo
-from rlinf.scheduler import Channel, Cluster, CommMapper, Worker
+from rlinf.scheduler import (
+    Channel,
+    Cluster,
+    CommMapper,
+    Worker,
+    merge_batches,
+)
 from rlinf.utils.data_iter_utils import split_list
 from rlinf.utils.distributed import masked_stats, normalize_from_stats
 from rlinf.utils.metric_utils import compute_split_num
@@ -56,6 +65,61 @@ from rlinf.utils.utils import (
 from rlinf.workers.env.history_manager import HistoryManager
 
 
+def _merge_evaluation_rollout_results(items: list[Any]) -> Any:
+    """Merge typed FastWAM eval shards while preserving legacy payloads."""
+
+    if not items:
+        raise ValueError("At least one evaluation rollout shard is required.")
+    typed = [isinstance(item, RolloutResult) for item in items]
+    if any(typed) and not all(typed):
+        raise TypeError(
+            "Cannot merge mixed typed and legacy evaluation rollout payloads."
+        )
+    if all(typed):
+        return RolloutResult.merge_rollout_results(items)
+    return merge_batches(items)
+
+
+def _mark_terminal_gate_unused(
+    rollout_result: RolloutResult,
+    dones: torch.Tensor | np.ndarray,
+) -> RolloutResult:
+    """Invalidate emitted decisions that cannot control a terminal next chunk."""
+
+    emitted = rollout_result.emitted_gate
+    if emitted is None:
+        return rollout_result
+    batch_size = int(emitted.next_route.shape[0])
+    done_tensor = torch.as_tensor(dones, dtype=torch.bool)
+    if done_tensor.ndim < 1 or int(done_tensor.shape[0]) != batch_size:
+        raise ValueError(
+            "Terminal mask batch must match emitted Gate decisions; got "
+            f"{tuple(done_tensor.shape)} and {tuple(emitted.next_route.shape)}."
+        )
+    terminal = done_tensor.reshape(batch_size, -1).any(dim=1)
+    if rollout_result.route_info is not None and (
+        rollout_result.route_info.route_used.shape != emitted.next_route.shape
+    ):
+        raise ValueError("Executed routes and emitted Gate decisions are misaligned.")
+    if rollout_result.actions is not None and (
+        int(rollout_result.actions.shape[0]) != batch_size
+    ):
+        raise ValueError("Actions and emitted Gate decisions are misaligned.")
+    selection = rollout_result.evaluation_selection
+    if selection is not None and (
+        selection.effective_next_route.shape != emitted.next_route.shape
+    ):
+        raise ValueError(
+            "Evaluation selections and emitted Gate decisions are misaligned."
+        )
+    terminal = terminal.to(device=emitted.valid.device)
+    aligned_gate = replace(
+        emitted,
+        valid=emitted.valid & ~terminal,
+    )
+    return replace(rollout_result, emitted_gate=aligned_gate)
+
+
 class EnvWorker(Worker):
     def __init__(self, cfg: DictConfig):
         Worker.__init__(self)
@@ -71,6 +135,7 @@ class EnvWorker(Worker):
         self.last_obs_list = []
         self.last_intervened_info_list = []
         self._prefetched_train_bootstrap: list[EnvOutput] | None = None
+        self.evaluation_collector = None
         self._component_placement = HybridComponentPlacement(cfg, Cluster())
 
         self.collect_transitions = self.cfg.rollout.get("collect_transitions", False)
@@ -223,6 +288,27 @@ class EnvWorker(Worker):
         )
 
         self.update_env_cfg()
+
+        collector_cfg = self.cfg.runner.get("evaluation_collector", None)
+        if collector_cfg is not None:
+            if not self.only_eval:
+                raise ValueError(
+                    "The FastWAM evaluation collector requires runner.only_eval=true."
+                )
+            self.evaluation_collector = instantiate(
+                collector_cfg,
+                rank=self._rank,
+                routing_mode=self.model_cfg.eval_routing_mode,
+                idm_threshold=self.model_cfg.eval_idm_threshold,
+                random_idm_probability=self.model_cfg.get(
+                    "eval_random_idm_probability", None
+                ),
+                routing_seed=self.model_cfg.eval_routing_seed,
+            )
+            if self.eval_rollout_epoch != 1:
+                raise ValueError(
+                    "Frozen-ledger evaluation requires exactly one rollout epoch."
+                )
 
         if self.enable_train:
             train_env_cls = get_env_cls(self.cfg.env.train.env_type, self.cfg.env.train)
@@ -542,7 +628,7 @@ class EnvWorker(Worker):
         )
         env_info = {}
 
-        obs_list, _, chunk_terminations, chunk_truncations, infos_list = (
+        obs_list, chunk_rewards, chunk_terminations, chunk_truncations, infos_list = (
             self.eval_env_list[stage_id].chunk_step(chunk_actions)
         )
         if isinstance(obs_list, (list, tuple)):
@@ -584,6 +670,10 @@ class EnvWorker(Worker):
         env_output = EnvOutput(
             obs=extracted_obs,
             final_obs=final_obs,
+            dones=current_dones,
+            terminations=chunk_terminations,
+            truncations=chunk_truncations,
+            rewards=chunk_rewards,
             env_infos=infos if isinstance(infos, dict) else None,
             rlt_switch_flags=rlt_switch_flags,
         )
@@ -934,7 +1024,12 @@ class EnvWorker(Worker):
             "final_obs": env_batch["final_obs"],
         }
         if env_batch["obs"]:
-            first_value = next(iter(env_batch["obs"].values()))
+            first_value = next(
+                (value for value in env_batch["obs"].values() if value is not None),
+                None,
+            )
+            if first_value is None:
+                raise ValueError("Cannot infer batch size from empty observations.")
             batch_size = (
                 int(first_value.shape[0])
                 if isinstance(first_value, torch.Tensor)
@@ -1347,6 +1442,9 @@ class EnvWorker(Worker):
     @Worker.timer("evaluate")
     def evaluate(self, input_channel: Channel, rollout_channel: Channel):
         eval_metrics = defaultdict(list)
+        pending_snapshots = [None] * self.stage_num
+        policy_started_at = [None] * self.stage_num
+
         for eval_rollout_epoch in range(self.eval_rollout_epoch):
             if not self.cfg.env.eval.auto_reset or eval_rollout_epoch == 0:
                 for stage_id in range(self.stage_num):
@@ -1365,15 +1463,27 @@ class EnvWorker(Worker):
                         env_infos=infos if isinstance(infos, dict) else None,
                     )
                     env_batch = env_output.to_dict()
+                    rollout_input = self._build_rollout_input_data(
+                        env_batch,
+                        stage_id=stage_id,
+                        eval_mode=True,
+                        force_reset=True,
+                    )
+                    if self.evaluation_collector is not None:
+                        snapshot = self.evaluation_collector.snapshot_before_step(
+                            stage_id,
+                            self.eval_env_list[stage_id],
+                            rollout_input["fastwam_env_ids"],
+                        )
+                        rollout_input = self.evaluation_collector.augment_rollout_input(
+                            rollout_input, snapshot
+                        )
+                        pending_snapshots[stage_id] = snapshot
+                    policy_started_at[stage_id] = time.perf_counter()
                     self.send_to(
                         group_name=self.cfg.rollout.group_name,
                         channel=rollout_channel,
-                        data=self._build_rollout_input_data(
-                            env_batch,
-                            stage_id=stage_id,
-                            eval_mode=True,
-                            force_reset=True,
-                        ),
+                        data=rollout_input,
                         mode="eval",
                         tag="rollout_results",
                         route_key=stage_id if not self.env_decoupled_mode else None,
@@ -1388,10 +1498,14 @@ class EnvWorker(Worker):
                         tag="eval_rollout_results",
                         route_key=stage_id if not self.env_decoupled_mode else None,
                         batch_size=self.eval_batch_size,
-                        infer_batch_size_fn=self._infer_rollout_batch_size
-                        if self.env_decoupled_mode
-                        else None,
+                        merge_fn=_merge_evaluation_rollout_results,
+                        infer_batch_size_fn=self._infer_rollout_batch_size,
                         decoupled_mode=self.env_decoupled_mode,
+                    )
+                    policy_latency_seconds = (
+                        None
+                        if policy_started_at[stage_id] is None
+                        else time.perf_counter() - policy_started_at[stage_id]
                     )
                     raw_chunk_actions = (
                         rollout_results.actions
@@ -1402,9 +1516,33 @@ class EnvWorker(Worker):
                         raw_chunk_actions = raw_chunk_actions.detach().cpu().numpy()
                     else:
                         raw_chunk_actions = np.asarray(raw_chunk_actions)
+                    environment_started_at = time.perf_counter()
                     env_output, env_info = self.env_evaluate_step(
                         raw_chunk_actions, stage_id
                     )
+                    environment_latency_seconds = (
+                        time.perf_counter() - environment_started_at
+                    )
+                    if isinstance(rollout_results, RolloutResult):
+                        rollout_results = _mark_terminal_gate_unused(
+                            rollout_results, env_output.dones
+                        )
+                    if self.evaluation_collector is not None:
+                        snapshot = pending_snapshots[stage_id]
+                        if snapshot is None or not isinstance(
+                            rollout_results, RolloutResult
+                        ):
+                            raise TypeError(
+                                "FastWAM evaluation collector requires a pending "
+                                "identity snapshot and typed RolloutResult."
+                            )
+                        self.evaluation_collector.record_chunk(
+                            snapshot=snapshot,
+                            rollout_result=rollout_results,
+                            env_output=env_output,
+                            policy_latency_seconds=policy_latency_seconds,
+                            environment_latency_seconds=environment_latency_seconds,
+                        )
 
                     for key, value in env_info.items():
                         eval_metrics[key].append(value)
@@ -1419,14 +1557,26 @@ class EnvWorker(Worker):
                         if eval_step == self.n_eval_chunk_steps - 1:
                             continue
                     env_batch = env_output.to_dict()
+                    rollout_input = self._build_rollout_input_data(
+                        env_batch,
+                        stage_id=stage_id,
+                        eval_mode=True,
+                    )
+                    if self.evaluation_collector is not None:
+                        snapshot = self.evaluation_collector.snapshot_before_step(
+                            stage_id,
+                            self.eval_env_list[stage_id],
+                            rollout_input["fastwam_env_ids"],
+                        )
+                        rollout_input = self.evaluation_collector.augment_rollout_input(
+                            rollout_input, snapshot
+                        )
+                        pending_snapshots[stage_id] = snapshot
+                    policy_started_at[stage_id] = time.perf_counter()
                     self.send_to(
                         group_name=self.cfg.rollout.group_name,
                         channel=rollout_channel,
-                        data=self._build_rollout_input_data(
-                            env_batch,
-                            stage_id=stage_id,
-                            eval_mode=True,
-                        ),
+                        data=rollout_input,
                         mode="eval",
                         tag="rollout_results",
                         route_key=stage_id if not self.env_decoupled_mode else None,
@@ -1441,7 +1591,14 @@ class EnvWorker(Worker):
         for key, value in eval_metrics.items():
             eval_metrics[key] = torch.cat(value, dim=0).contiguous().cpu()
 
-        return eval_metrics
+        if self.evaluation_collector is None:
+            return eval_metrics
+        return {
+            "metrics": dict(eval_metrics),
+            "evaluation_artifact_shard": asdict(
+                self.evaluation_collector.finalize()
+            ),
+        }
 
     def get_actor_split_num(self):
         send_num = self._component_placement.get_world_size("env") * self.stage_num
