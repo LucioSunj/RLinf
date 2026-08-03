@@ -320,6 +320,9 @@ def get_model(cfg, torch_dtype):
         ),
         eval_routing_seed=cfg.get("eval_routing_seed", 0),
         eval_microbatch_size=int(cfg.get("eval_microbatch_size", 1)),
+        eval_timing_cuda_synchronize=bool(
+            cfg.get("eval_timing_cuda_synchronize", False)
+        ),
         kv_replay=replay_config,
     )
 

@@ -96,6 +96,8 @@ def test_compact_eval_result_keeps_only_actions_and_typed_route_metadata() -> No
         "route_info": route,
         "emitted_gate": emitted,
         "evaluation_selection": selection,
+        "gate_latency_seconds": torch.tensor([0.01, 0.02], dtype=torch.float64),
+        "gate_h2d_seconds": torch.zeros(2, dtype=torch.float64),
     }
 
     compact = _build_evaluation_rollout_result(actions, result)
@@ -110,6 +112,11 @@ def test_compact_eval_result_keeps_only_actions_and_typed_route_metadata() -> No
     assert compact.versions is None
     assert compact.forward_inputs == {}
     assert compact.emitted_gate.kv_metadata is None
+    assert torch.equal(
+        compact.gate_latency_seconds,
+        torch.tensor([0.01, 0.02], dtype=torch.float64),
+    )
+    assert torch.equal(compact.gate_h2d_seconds, torch.zeros(2, dtype=torch.float64))
 
 
 @pytest.mark.parametrize("split_sizes", ([4, 2], [2, 4]))
@@ -148,6 +155,8 @@ def test_typed_eval_result_split_merge_preserves_all_records(split_sizes) -> Non
         route_info=route,
         emitted_gate=emitted,
         evaluation_selection=selection,
+        gate_latency_seconds=torch.linspace(0.01, 0.06, 6, dtype=torch.float64),
+        gate_h2d_seconds=torch.zeros(6, dtype=torch.float64),
     )
     worker = object.__new__(MultiStepRolloutWorker)
 
@@ -165,6 +174,11 @@ def test_typed_eval_result_split_merge_preserves_all_records(split_sizes) -> Non
         merged.evaluation_selection.random_draws,
         selection.random_draws,
     )
+    assert torch.equal(
+        merged.gate_latency_seconds,
+        result.gate_latency_seconds,
+    )
+    assert torch.equal(merged.gate_h2d_seconds, result.gate_h2d_seconds)
 
 
 def test_eval_merge_accepts_typed_or_legacy_tensor_payloads_but_not_mixed() -> None:

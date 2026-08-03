@@ -181,6 +181,19 @@ class _Gate(nn.Module):
         return self.bias.expand(snapshots[0].batch_size)
 
 
+class _ThirtyBlockGate(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.blocks = nn.ModuleList(
+            nn.Linear(1, 1, bias=False) for _ in range(30)
+        )
+
+    def forward(self, snapshots):
+        return self.blocks[0].weight.reshape(()).expand(
+            snapshots[0].batch_size
+        )
+
+
 class _Critic(nn.Module):
     def __init__(self):
         super().__init__()
@@ -223,6 +236,7 @@ def _make_policy(
     eval_routing_mode="learned_threshold",
     eval_random_idm_probability=None,
     eval_routing_seed=0,
+    eval_timing_cuda_synchronize=False,
 ):
     return FastWAMAdaptivePolicy(
         actor=nn.Linear(1, 1),
@@ -236,6 +250,7 @@ def _make_policy(
             eval_routing_mode=eval_routing_mode,
             eval_random_idm_probability=eval_random_idm_probability,
             eval_routing_seed=eval_routing_seed,
+            eval_timing_cuda_synchronize=eval_timing_cuda_synchronize,
             kv_replay=_policy.GateKVReplayConfig(
                 backend=backend,
                 pin_memory=False,
@@ -315,6 +330,31 @@ def test_policy_forces_first_idm_and_applies_gate_to_next_chunk():
     _, second = policy.predict_action_batch(obs, mode="eval")
     assert second["route_info"].route_used.tolist() == [0, 0]
     assert second["route_info"].route_source_chunk_ids.tolist() == [0, 0]
+
+
+def test_policy_eval_gate_timing_is_explicit_and_finite() -> None:
+    obs = {
+        "states": torch.ones(2, 3),
+        "_fastwam_env_ids": torch.tensor([11, 22]),
+        "_fastwam_reset_mask": torch.tensor([True, True]),
+    }
+    disabled = _make_policy()
+    _, disabled_result = disabled.predict_action_batch(obs, mode="eval")
+    assert disabled_result["gate_latency_seconds"] is None
+    assert disabled_result["gate_h2d_seconds"] is None
+
+    enabled = _make_policy(eval_timing_cuda_synchronize=True)
+    _, result = enabled.predict_action_batch(obs, mode="eval")
+
+    gate_latency = result["gate_latency_seconds"]
+    gate_h2d = result["gate_h2d_seconds"]
+    assert gate_latency.shape == (2,)
+    assert gate_latency.dtype == torch.float64
+    assert torch.isfinite(gate_latency).all()
+    assert (gate_latency > 0).all()
+    assert gate_h2d.shape == (2,)
+    assert torch.equal(gate_h2d, torch.zeros(2, dtype=torch.float64))
+    assert enabled.runtime.sample_batch_sizes == [1, 1]
 
 
 @pytest.mark.parametrize(
@@ -457,6 +497,10 @@ def test_libero_critic_observation_canonicalizes_optional_camera_keys():
 def test_standalone_eval_runs_and_restores_gate_lora_without_critic():
     source = _make_policy()
     source.set_global_step(3)
+    with torch.no_grad():
+        source.gate.bias.fill_(2.0)
+        source.lora_adapter.parameter.fill_(4.0)
+        source.critic.value_head.weight.fill_(6.0)
     parent_sha256 = "a" * 64
     payload = {
         "schema": "fastwam-adaptive-rl-checkpoint-v1",
@@ -488,6 +532,8 @@ def test_standalone_eval_runs_and_restores_gate_lora_without_critic():
     assert restored_step == 3
     assert policy.actor_version == 3
     assert torch.equal(policy.gate.bias, source.gate.bias)
+    assert torch.equal(policy.lora_adapter.parameter, source.lora_adapter.parameter)
+    assert payload["policy"]["value_head"]
     assert actions.shape == (1, 2, 3)
     assert rollout["prev_values"].shape == (1, 1)
     with pytest.raises(RuntimeError, match="critic is intentionally absent"):
@@ -631,6 +677,46 @@ def test_trainable_checkpoint_excludes_frozen_actor_and_round_trips_version():
     restored.load_trainable_state_dict(payload)
     assert restored.actor_version == 3
     assert torch.equal(restored.gate.bias, policy.gate.bias)
+
+
+def test_native_all_layer_policy_payload_round_trips_without_frozen_actor() -> None:
+    policy = _make_policy()
+    policy.gate = _ThirtyBlockGate()
+    policy.set_global_step(7)
+    with torch.no_grad():
+        for index, block in enumerate(policy.gate.blocks):
+            block.weight.fill_(index + 1)
+        policy.lora_adapter.parameter.fill_(31.0)
+        policy.critic.value_head.weight.fill_(32.0)
+        policy.critic.value_head.bias.fill_(33.0)
+    policy.predict_action_batch(
+        {
+            "states": torch.ones(1, 3),
+            "_fastwam_env_ids": torch.tensor([19]),
+            "_fastwam_reset_mask": torch.tensor([True]),
+        },
+        mode="eval",
+    )
+
+    payload = policy.trainable_state_dict()
+
+    assert set(payload["gate"]) == {
+        f"blocks.{index}.weight" for index in range(30)
+    }
+    assert "actor" not in payload
+    restored = _make_policy()
+    restored.gate = _ThirtyBlockGate()
+    restored.load_trainable_state_dict(payload)
+    assert restored.actor_version == 7
+    assert restored.route_tracker.state_dict() == policy.route_tracker.state_dict()
+    assert torch.equal(
+        restored.lora_adapter.parameter,
+        policy.lora_adapter.parameter,
+    )
+    for name, expected in policy.gate.state_dict().items():
+        assert torch.equal(restored.gate.state_dict()[name], expected)
+    for name, expected in policy.critic.value_head.state_dict().items():
+        assert torch.equal(restored.critic.value_head.state_dict()[name], expected)
 
 
 def test_zero_flow_sde_noise_is_rejected_only_for_training_uncond() -> None:

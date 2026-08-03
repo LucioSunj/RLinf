@@ -30,7 +30,10 @@ from rlinf.algorithms.rlt import (
     predict_rlt_actions,
 )
 from rlinf.config import SupportedModel
-from rlinf.config_contracts import build_fastwam_checkpoint_contract
+from rlinf.config_contracts import (
+    build_fastwam_checkpoint_contract,
+    validate_fastwam_eval_checkpoint_contract,
+)
 from rlinf.data.embodied_io_struct import (
     RolloutResult,
 )
@@ -67,6 +70,8 @@ def _build_evaluation_rollout_result(
         route_info=result.get("route_info"),
         emitted_gate=result.get("emitted_gate"),
         evaluation_selection=result.get("evaluation_selection"),
+        gate_latency_seconds=result.get("gate_latency_seconds"),
+        gate_h2d_seconds=result.get("gate_h2d_seconds"),
     )
 
 
@@ -175,28 +180,41 @@ class MultiStepRolloutWorker(Worker):
             rollout_model_config.precision = self.cfg.rollout.model.precision
             rollout_model_config.model_path = self.cfg.rollout.model.model_path
 
+        fastwam_eval_payload = None
+        if self.cfg.runner.get("ckpt_path", None) and (
+            SupportedModel(self.model_cfg.model_type)
+            is SupportedModel.FASTWAM_ADAPTIVE
+        ):
+            from rlinf.models.embodiment.wam_policy import (
+                resolve_fastwam_adaptive_eval_checkpoint,
+            )
+
+            checkpoint_path = resolve_fastwam_adaptive_eval_checkpoint(
+                self.cfg.runner.ckpt_path,
+                rank=self._rank,
+            )
+            fastwam_eval_payload = torch.load(
+                checkpoint_path,
+                map_location="cpu",
+                weights_only=False,
+            )
+            validate_fastwam_eval_checkpoint_contract(
+                fastwam_eval_payload,
+                rollout_model_config,
+                expected_parent_checkpoint_sha256=str(
+                    self.model_cfg.actor_checkpoint_sha256
+                ),
+                load_critic=bool(
+                    rollout_model_config.critic.get("load_for_eval", False)
+                ),
+            )
+
         self.hf_model: BasePolicy = get_model(rollout_model_config)
 
         if self.cfg.runner.get("ckpt_path", None):
-            if (
-                SupportedModel(self.model_cfg.model_type)
-                is SupportedModel.FASTWAM_ADAPTIVE
-            ):
-                from rlinf.models.embodiment.wam_policy import (
-                    resolve_fastwam_adaptive_eval_checkpoint,
-                )
-
-                checkpoint_path = resolve_fastwam_adaptive_eval_checkpoint(
-                    self.cfg.runner.ckpt_path,
-                    rank=self._rank,
-                )
-                payload = torch.load(
-                    checkpoint_path,
-                    map_location="cpu",
-                    weights_only=False,
-                )
+            if fastwam_eval_payload is not None:
                 self.version = self.hf_model.load_eval_checkpoint(
-                    payload,
+                    fastwam_eval_payload,
                     expected_parent_checkpoint_sha256=str(
                         self.model_cfg.actor_checkpoint_sha256
                     ),
@@ -1255,6 +1273,8 @@ class MultiStepRolloutWorker(Worker):
         split_bootstrap_values = _split_optional_tensor(rollout_result.bootstrap_values)
         split_intervene_flags = _split_optional_tensor(rollout_result.intervene_flags)
         split_versions = _split_optional_tensor(rollout_result.versions)
+        split_gate_latency = _split_optional_tensor(rollout_result.gate_latency_seconds)
+        split_gate_h2d = _split_optional_tensor(rollout_result.gate_h2d_seconds)
         split_route_info = (
             (None,) * len(sizes)
             if rollout_result.route_info is None
@@ -1295,6 +1315,8 @@ class MultiStepRolloutWorker(Worker):
                 route_info=split_route_info[idx],
                 emitted_gate=split_emitted_gate[idx],
                 evaluation_selection=split_evaluation_selection[idx],
+                gate_latency_seconds=split_gate_latency[idx],
+                gate_h2d_seconds=split_gate_h2d[idx],
             )
             for idx in range(len(sizes))
         ]

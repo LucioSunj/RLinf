@@ -170,6 +170,44 @@ def test_fastwam_actor_checkpoint_rank_file_round_trip(
     assert torch.equal(restored_rng[0]["cpu"], rng_state["cpu"])
 
 
+def test_fastwam_actor_checkpoint_round_trips_native_step_zero(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    rng_state = {"cpu": torch.tensor([3], dtype=torch.uint8)}
+    restored_rng = []
+    monkeypatch.setattr(worker_module, "get_rng_state", lambda: rng_state)
+    monkeypatch.setattr(
+        worker_module,
+        "set_rng_state",
+        lambda state: restored_rng.append(state),
+    )
+    monkeypatch.setattr(torch.distributed, "is_initialized", lambda: False)
+    worker = _checkpoint_worker()
+    worker.optimizer_steps = 0
+    checkpoint_dir = tmp_path / "actor"
+
+    worker.save_checkpoint(str(checkpoint_dir), step=0)
+
+    checkpoint_path = checkpoint_dir / "rank_0.pt"
+    payload = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
+    assert payload["step"] == 0
+    assert payload["optimizer_steps"] == 0
+    assert payload["policy"]["actor_version"] == 0
+
+    worker.model.weight.fill_(9.0)
+    worker.model.set_global_step(9)
+    worker.optimizer_steps = 9
+
+    assert worker.load_checkpoint(str(checkpoint_dir)) == 0
+    assert worker.version == 0
+    assert worker.model.actor_version == 0
+    assert worker.optimizer_steps == 0
+    assert torch.equal(worker.model.weight, torch.tensor([1.0]))
+    assert len(restored_rng) == 1
+    assert torch.equal(restored_rng[0]["cpu"], rng_state["cpu"])
+
+
 def test_fastwam_actor_checkpoint_load_restores_fsdp_lazy_root_state(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

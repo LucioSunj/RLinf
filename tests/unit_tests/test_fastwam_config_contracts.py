@@ -144,3 +144,185 @@ def test_checkpoint_contract_covers_continuation_semantics_not_run_length() -> N
 
     cfg.actor.seed = 43
     assert MODULE.build_fastwam_checkpoint_contract(cfg, world_size=2) != baseline
+
+
+def _eval_model_cfg():
+    return OmegaConf.create(
+        {
+            "model_type": "fastwam_adaptive",
+            "precision": "bf16",
+            "init_device": "cpu",
+            "action_dim": 7,
+            "num_action_chunks": 16,
+            "actor_checkpoint": "/parents/fastwam.pt",
+            "actor_checkpoint_sha256": "a" * 64,
+            "model_path": "/parents/fastwam.pt",
+            "fastwam": {
+                "_target_": "fastwam.runtime.create_fastwam_idm",
+                "load_text_encoder": True,
+                "action_dit_config": {"num_layers": 30, "hidden_dim": 1024},
+            },
+            "uncond_lora": {
+                "rank": 16,
+                "alpha": 16.0,
+                "target_groups": ["self_attention_qkvo", "ffn"],
+            },
+            "gate": {
+                "hidden_dim": 256,
+                "ffn_multiplier": 4,
+                "share_blocks": False,
+                "denoise_last_n": 1,
+                "layer_taps": {
+                    "mode": "all",
+                    "last_n": None,
+                    "indices": None,
+                },
+            },
+            "gate_epsilon": 0.1,
+            "gate_temperature": 1.0,
+            "eval_routing_mode": "learned_threshold",
+            "eval_idm_threshold": 0.5,
+            "eval_random_idm_probability": None,
+            "eval_routing_seed": 0,
+            "eval_microbatch_size": 1,
+            "kv_replay": {"backend": "stored"},
+            "flow_sde": {"enabled": True, "noise_level": 0.5},
+            "runtime": {
+                "action_horizon": 16,
+                "num_inference_steps": 20,
+                "text_embedding_cache_dir": None,
+                "binarize_gripper": False,
+            },
+            "critic": {
+                "load_for_eval": False,
+                "input_dim": 2048,
+                "hidden_sizes": [1024, 512, 256],
+                "backbone_checkpoint_sha256": "b" * 64,
+                "backbone": {"model_path": "/parents/pi05"},
+            },
+        }
+    )
+
+
+def test_eval_model_contract_allows_only_declared_runtime_differences() -> None:
+    saved = _eval_model_cfg()
+    live = OmegaConf.create(OmegaConf.to_container(saved, resolve=True))
+    live.init_device = "cuda"
+    live.actor_checkpoint = "/mounted/fastwam.pt"
+    live.model_path = "/mounted/fastwam.pt"
+    live.fastwam.load_text_encoder = False
+    live.runtime.text_embedding_cache_dir = "/cache/text"
+    live.critic.load_for_eval = False
+    live.critic.backbone.model_path = ""
+    live.critic.backbone_checkpoint_sha256 = ""
+    live.gate_epsilon = 0.0
+    live.eval_routing_mode = "matched_random"
+    live.eval_idm_threshold = 0.25
+    live.eval_random_idm_probability = 0.75
+    live.eval_routing_seed = 17
+    live.eval_microbatch_size = 2
+    live.eval_timing_cuda_synchronize = True
+    live.eval_without_critic = True
+
+    expected = MODULE.build_fastwam_eval_model_contract(saved, load_critic=False)
+    actual = MODULE.build_fastwam_eval_model_contract(live, load_critic=False)
+
+    assert actual == expected
+    assert "critic" not in actual["model"]
+    assert "eval_without_critic" not in actual["model"]
+    assert "eval_timing_cuda_synchronize" not in actual["model"]
+    assert "gate_temperature" in actual["model"]
+
+
+@pytest.mark.parametrize(
+    ("path", "value"),
+    [
+        ("gate.layer_taps.mode", "indices"),
+        ("gate.share_blocks", True),
+        ("gate.denoise_last_n", 2),
+        ("gate.hidden_dim", 128),
+        ("gate.ffn_multiplier", 2),
+        ("uncond_lora.rank", 8),
+        ("uncond_lora.alpha", 8.0),
+        ("uncond_lora.target_groups", ["ffn"]),
+        ("fastwam.action_dit_config.num_layers", 29),
+        ("gate_temperature", 0.5),
+    ],
+)
+def test_eval_model_contract_rejects_structural_differences(path, value) -> None:
+    saved = _eval_model_cfg()
+    live = OmegaConf.create(OmegaConf.to_container(saved, resolve=True))
+    OmegaConf.update(live, path, value, merge=False)
+
+    with pytest.raises(ValueError, match=path.replace(".", r"\.")):
+        MODULE.validate_fastwam_eval_model_contract(
+            saved,
+            live,
+            load_critic=False,
+        )
+
+
+def test_eval_model_contract_includes_critic_when_requested() -> None:
+    saved = _eval_model_cfg()
+    live = OmegaConf.create(OmegaConf.to_container(saved, resolve=True))
+    live.critic.load_for_eval = True
+    live.critic.hidden_sizes = [512, 256]
+
+    with pytest.raises(ValueError, match=r"critic\.hidden_sizes"):
+        MODULE.validate_fastwam_eval_model_contract(
+            saved,
+            live,
+            load_critic=True,
+        )
+
+
+def test_eval_checkpoint_contract_validates_parent_hashes_before_construction() -> None:
+    saved = _eval_model_cfg()
+    live = OmegaConf.create(OmegaConf.to_container(saved, resolve=True))
+    live.critic.load_for_eval = True
+    payload = {
+        "schema": "fastwam-adaptive-rl-checkpoint-v1",
+        "parent_checkpoint_sha256": "a" * 64,
+        "critic_parent_checkpoint_sha256": "b" * 64,
+        "contract": {
+            "model": OmegaConf.to_container(saved, resolve=True),
+        },
+    }
+
+    contract = MODULE.validate_fastwam_eval_checkpoint_contract(
+        payload,
+        live,
+        expected_parent_checkpoint_sha256="a" * 64,
+        load_critic=True,
+    )
+    assert contract["model"]["critic"]["backbone_checkpoint_sha256"] == "b" * 64
+
+    wrong_outer_critic = dict(payload)
+    wrong_outer_critic["critic_parent_checkpoint_sha256"] = "c" * 64
+    with pytest.raises(ValueError, match="pi0.5 evaluation checkpoint parent"):
+        MODULE.validate_fastwam_eval_checkpoint_contract(
+            wrong_outer_critic,
+            live,
+            expected_parent_checkpoint_sha256="a" * 64,
+            load_critic=True,
+        )
+
+    wrong_contract_critic = {
+        **payload,
+        "contract": {
+            "model": {
+                **payload["contract"]["model"],
+                "critic": {
+                    **payload["contract"]["model"]["critic"],
+                    "backbone_checkpoint_sha256": "c" * 64,
+                },
+            }
+        },
+    }
+    with pytest.raises(ValueError, match="wrong critic parent hash"):
+        MODULE.validate_fastwam_eval_checkpoint_contract(
+            wrong_contract_critic,
+            live,
+            expected_parent_checkpoint_sha256="a" * 64,
+            load_critic=True,
+        )

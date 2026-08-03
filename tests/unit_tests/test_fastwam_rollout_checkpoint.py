@@ -22,6 +22,7 @@ from typing import Any
 
 import pytest
 import torch
+from omegaconf import OmegaConf
 
 from rlinf.workers.rollout.hf import huggingface_worker as worker_module
 from rlinf.workers.rollout.hf.huggingface_worker import MultiStepRolloutWorker
@@ -164,3 +165,71 @@ def test_rollout_runtime_failed_save_removes_temporary_file(
 
     assert not (checkpoint_dir / "rank_0.pt").exists()
     assert not (checkpoint_dir / "rank_0.pt.tmp").exists()
+
+
+def test_eval_checkpoint_contract_fails_before_model_construction(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    parent_sha256 = "a" * 64
+    live_model = OmegaConf.create(
+        {
+            "model_type": "fastwam_adaptive",
+            "precision": "bf16",
+            "init_device": "cpu",
+            "actor_checkpoint": "/parents/fastwam.pt",
+            "actor_checkpoint_sha256": parent_sha256,
+            "model_path": "/parents/fastwam.pt",
+            "fastwam": {
+                "load_text_encoder": False,
+                "action_dit_config": {"num_layers": 30},
+            },
+            "uncond_lora": {"rank": 16, "alpha": 16.0},
+            "gate": {
+                "hidden_dim": 256,
+                "share_blocks": False,
+                "denoise_last_n": 1,
+                "layer_taps": {
+                    "mode": "all",
+                    "last_n": None,
+                    "indices": None,
+                },
+            },
+            "gate_epsilon": 0.0,
+            "gate_temperature": 1.0,
+            "runtime": {"text_embedding_cache_dir": "/cache"},
+            "critic": {"load_for_eval": False},
+        }
+    )
+    checkpoint_model = OmegaConf.to_container(live_model, resolve=True)
+    checkpoint_model["gate"]["hidden_dim"] = 128
+    checkpoint_path = tmp_path / "rank_0.pt"
+    torch.save(
+        {
+            "schema": "fastwam-adaptive-rl-checkpoint-v1",
+            "parent_checkpoint_sha256": parent_sha256,
+            "contract": {"model": checkpoint_model},
+        },
+        checkpoint_path,
+    )
+    cfg = OmegaConf.create(
+        {
+            "runner": {"ckpt_path": str(checkpoint_path)},
+            "rollout": {"model": live_model},
+        }
+    )
+    worker = MultiStepRolloutWorker.__new__(MultiStepRolloutWorker)
+    worker.cfg = cfg
+    worker.model_cfg = cfg.rollout.model
+    worker._rank = 0
+    model_construction_calls = []
+    monkeypatch.setattr(
+        worker_module,
+        "get_model",
+        lambda _cfg: model_construction_calls.append(True),
+    )
+
+    with pytest.raises(ValueError, match=r"gate\.hidden_dim"):
+        worker.init_worker()
+
+    assert model_construction_calls == []

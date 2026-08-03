@@ -14,6 +14,8 @@
 
 """Small fail-fast contracts shared by RLinf configuration entry points."""
 
+import copy
+from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
 
@@ -71,6 +73,184 @@ def _selected_checkpoint_values(owner: Any, keys: tuple[str, ...]) -> dict[str, 
         key: _resolved_checkpoint_value(OmegaConf.select(owner, key, default=None))
         for key in keys
     }
+
+
+_FASTWAM_EVAL_RUNTIME_ONLY_PATHS = (
+    "actor_checkpoint",
+    "model_path",
+    "init_device",
+    "fastwam.load_text_encoder",
+    "runtime.text_embedding_cache_dir",
+    "gate_epsilon",
+    "eval_routing_mode",
+    "eval_idm_threshold",
+    "eval_random_idm_probability",
+    "eval_routing_seed",
+    "eval_microbatch_size",
+    "eval_timing_cuda_synchronize",
+    "eval_without_critic",
+)
+
+
+def _resolved_mapping(value: Any, *, name: str) -> dict[str, Any]:
+    resolved = _resolved_checkpoint_value(value)
+    if not isinstance(resolved, Mapping):
+        raise TypeError(f"{name} must resolve to a mapping.")
+    return copy.deepcopy(dict(resolved))
+
+
+def _remove_nested_path(mapping: dict[str, Any], dotted_path: str) -> None:
+    parts = dotted_path.split(".")
+    owner: Any = mapping
+    for part in parts[:-1]:
+        if not isinstance(owner, Mapping) or part not in owner:
+            return
+        owner = owner[part]
+    if isinstance(owner, dict):
+        owner.pop(parts[-1], None)
+
+
+def build_fastwam_eval_model_contract(
+    model_cfg: Any,
+    *,
+    load_critic: bool,
+) -> dict[str, Any]:
+    """Project the resolved model config onto standalone-eval semantics.
+
+    New model fields are compared by default. Only explicitly enumerated
+    runtime/evaluation fields are removed. A standalone evaluator without a
+    critic intentionally excludes the complete critic subtree; when the critic
+    is loaded, only its artifact path and load switch may differ.
+    """
+
+    model = _resolved_mapping(model_cfg, name="FastWAM model config")
+    for dotted_path in _FASTWAM_EVAL_RUNTIME_ONLY_PATHS:
+        _remove_nested_path(model, dotted_path)
+    if load_critic:
+        _remove_nested_path(model, "critic.load_for_eval")
+        _remove_nested_path(model, "critic.backbone.model_path")
+    else:
+        model.pop("critic", None)
+    return {
+        "schema": "fastwam-adaptive-eval-model-contract-v1",
+        "model": model,
+    }
+
+
+def _flatten_contract(value: Any, *, prefix: str = "") -> dict[str, Any]:
+    if isinstance(value, Mapping):
+        flattened: dict[str, Any] = {}
+        for key in sorted(value, key=str):
+            child_prefix = f"{prefix}.{key}" if prefix else str(key)
+            flattened.update(_flatten_contract(value[key], prefix=child_prefix))
+        return flattened
+    return {prefix: value}
+
+
+def validate_fastwam_eval_model_contract(
+    checkpoint_model_cfg: Any,
+    live_model_cfg: Any,
+    *,
+    load_critic: bool,
+) -> dict[str, Any]:
+    """Require exact standalone-eval structural compatibility."""
+
+    checkpoint_contract = build_fastwam_eval_model_contract(
+        checkpoint_model_cfg,
+        load_critic=load_critic,
+    )
+    live_contract = build_fastwam_eval_model_contract(
+        live_model_cfg,
+        load_critic=load_critic,
+    )
+    if checkpoint_contract == live_contract:
+        return live_contract
+
+    checkpoint_flat = _flatten_contract(checkpoint_contract["model"])
+    live_flat = _flatten_contract(live_contract["model"])
+    missing = object()
+    differences = []
+    for path in sorted(set(checkpoint_flat) | set(live_flat)):
+        checkpoint_value = checkpoint_flat.get(path, missing)
+        live_value = live_flat.get(path, missing)
+        if checkpoint_value != live_value:
+            checkpoint_display = (
+                "<missing>" if checkpoint_value is missing else repr(checkpoint_value)
+            )
+            live_display = "<missing>" if live_value is missing else repr(live_value)
+            differences.append(
+                f"{path}: checkpoint={checkpoint_display}, live={live_display}"
+            )
+    raise ValueError(
+        "FastWAM evaluation model contract mismatch: "
+        + "; ".join(differences[:16])
+    )
+
+
+def validate_fastwam_eval_checkpoint_contract(
+    payload: Any,
+    live_model_cfg: Any,
+    *,
+    expected_parent_checkpoint_sha256: str,
+    load_critic: bool,
+) -> dict[str, Any]:
+    """Validate a project checkpoint before allocating the FastWAM model."""
+
+    if not isinstance(payload, Mapping):
+        raise TypeError("FastWAM evaluation checkpoint payload must be a mapping.")
+    if payload.get("schema") != "fastwam-adaptive-rl-checkpoint-v1":
+        raise ValueError("Unsupported FastWAM adaptive evaluation checkpoint.")
+    expected_parent = str(expected_parent_checkpoint_sha256).strip().lower()
+    if len(expected_parent) != 64 or any(
+        character not in "0123456789abcdef" for character in expected_parent
+    ):
+        raise ValueError("Expected FastWAM parent SHA-256 is invalid.")
+    if payload.get("parent_checkpoint_sha256") != expected_parent:
+        raise ValueError("FastWAM evaluation checkpoint parent hash mismatch.")
+    contract = payload.get("contract")
+    checkpoint_model = contract.get("model") if isinstance(contract, Mapping) else None
+    if not isinstance(checkpoint_model, Mapping):
+        raise ValueError("FastWAM evaluation checkpoint is missing its model contract.")
+    if str(checkpoint_model.get("actor_checkpoint_sha256", "")).lower() != expected_parent:
+        raise ValueError(
+            "FastWAM evaluation checkpoint contract has the wrong parent hash."
+        )
+    if load_critic:
+        live_model = _resolved_mapping(
+            live_model_cfg,
+            name="FastWAM live evaluation model config",
+        )
+        live_critic = live_model.get("critic")
+        expected_critic_parent = (
+            str(
+                live_critic.get("backbone_checkpoint_sha256", "")
+                if isinstance(live_critic, Mapping)
+                else ""
+            )
+            .strip()
+            .lower()
+        )
+        if len(expected_critic_parent) != 64 or any(
+            character not in "0123456789abcdef"
+            for character in expected_critic_parent
+        ):
+            raise ValueError("Expected pi0.5 critic parent SHA-256 is invalid.")
+        if payload.get("critic_parent_checkpoint_sha256") != expected_critic_parent:
+            raise ValueError("pi0.5 evaluation checkpoint parent hash mismatch.")
+        checkpoint_critic = checkpoint_model.get("critic")
+        if not isinstance(checkpoint_critic, Mapping) or (
+            str(checkpoint_critic.get("backbone_checkpoint_sha256", "")).lower()
+            != expected_critic_parent
+        ):
+            raise ValueError(
+                "FastWAM evaluation checkpoint contract has the wrong critic "
+                "parent hash."
+            )
+    return validate_fastwam_eval_model_contract(
+        checkpoint_model,
+        live_model_cfg,
+        load_critic=load_critic,
+    )
 
 
 def build_fastwam_checkpoint_contract(cfg: Any, *, world_size: int) -> dict[str, Any]:

@@ -304,6 +304,8 @@ class RolloutResult:
     route_info: Optional["ChunkRouteRecord"] = None
     emitted_gate: Optional["GateDecisionRecord"] = None
     evaluation_selection: Optional["EvaluationRouteSelection"] = None
+    gate_latency_seconds: torch.Tensor = None  # [B]
+    gate_h2d_seconds: torch.Tensor = None  # [B]
 
     def __post_init__(self):
         if self.actions is not None:
@@ -326,6 +328,10 @@ class RolloutResult:
             self.emitted_gate = self.emitted_gate.cpu()
         if self.evaluation_selection is not None:
             self.evaluation_selection = self.evaluation_selection.cpu()
+        if self.gate_latency_seconds is not None:
+            self.gate_latency_seconds = self.gate_latency_seconds.cpu().contiguous()
+        if self.gate_h2d_seconds is not None:
+            self.gate_h2d_seconds = self.gate_h2d_seconds.cpu().contiguous()
 
     @staticmethod
     def merge_rollout_results(
@@ -365,6 +371,8 @@ class RolloutResult:
         merged_bootstrap_values = _merge_optional_tensor("bootstrap_values")
         merged_intervene_flags = _merge_optional_tensor("intervene_flags")
         merged_versions = _merge_optional_tensor("versions")
+        merged_gate_latency = _merge_optional_tensor("gate_latency_seconds")
+        merged_gate_h2d = _merge_optional_tensor("gate_h2d_seconds")
         merged_route_info = _merge_optional_record("route_info")
         merged_emitted_gate = _merge_optional_record("emitted_gate")
         merged_evaluation_selection = _merge_optional_record(
@@ -390,6 +398,8 @@ class RolloutResult:
             route_info=merged_route_info,
             emitted_gate=merged_emitted_gate,
             evaluation_selection=merged_evaluation_selection,
+            gate_latency_seconds=merged_gate_latency,
+            gate_h2d_seconds=merged_gate_h2d,
         )
 
 

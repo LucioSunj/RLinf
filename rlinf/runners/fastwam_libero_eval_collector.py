@@ -349,6 +349,20 @@ class FastWAMLiberoEvalCollector:
             raise ValueError("Evaluation route records do not match identity batch size.")
         if selection.effective_next_route.shape != route.shape:
             raise ValueError("Evaluation selection does not match route batch size.")
+        gate_latency = rollout_result.gate_latency_seconds
+        gate_h2d = rollout_result.gate_h2d_seconds
+        if (gate_latency is None) != (gate_h2d is None):
+            raise ValueError("Gate latency and H2D timing must be provided together.")
+        for name, timing in (
+            ("Gate latency", gate_latency),
+            ("Gate H2D latency", gate_h2d),
+        ):
+            if timing is None:
+                continue
+            if timing.shape != torch.Size([batch_size]):
+                raise ValueError(f"{name} must have shape [B].")
+            if not torch.isfinite(timing).all() or (timing < 0).any():
+                raise ValueError(f"{name} must be finite and non-negative.")
         if env_output.dones is None or int(env_output.dones.shape[0]) != batch_size:
             raise ValueError("Evaluation outcomes do not match route batch size.")
         if not math.isfinite(float(environment_latency_seconds)):
@@ -450,8 +464,16 @@ class FastWAMLiberoEvalCollector:
                     if policy_latency_seconds is None
                     else float(policy_latency_seconds)
                 ),
-                "gate_latency_seconds": None,
-                "gate_h2d_seconds": 0.0,
+                "gate_latency_seconds": (
+                    None
+                    if gate_latency is None
+                    else float(gate_latency[index])
+                ),
+                "gate_h2d_seconds": (
+                    0.0
+                    if gate_h2d is None
+                    else float(gate_h2d[index])
+                ),
                 "environment_latency_seconds": float(environment_latency_seconds),
                 "action_min": action_min,
                 "action_max": action_max,
@@ -548,18 +570,33 @@ class FastWAMLiberoEvalCollector:
         incomplete = [state.entry["episode_identity"] for state in self._states.values() if not state.completed]
         if incomplete:
             raise RuntimeError(f"Evaluation ended with incomplete episodes: {incomplete}.")
+        ledger_order = {
+            entry["episode_identity"]: index
+            for index, entry in enumerate(self.ledger["entries"])
+        }
         chunks = sorted(
             self._chunks,
-            key=lambda item: (item["episode_identity"], item["chunk_id"]),
+            key=lambda item: (
+                ledger_order[item["episode_identity"]],
+                item["chunk_id"],
+            ),
         )
         episodes = sorted(
             self._episodes,
-            key=lambda item: item["episode_identity"],
+            key=lambda item: ledger_order[item["episode_identity"]],
         )
         chunk_path = self.output_dir / f"chunks.rank-{self.rank}.jsonl"
         episode_path = self.output_dir / f"episodes.rank-{self.rank}.jsonl"
         self._write_jsonl_atomic(chunk_path, chunks)
         self._write_jsonl_atomic(episode_path, episodes)
+        canonical_chunks = sorted(
+            chunks,
+            key=lambda item: (item["episode_identity"], item["chunk_id"]),
+        )
+        canonical_episodes = sorted(
+            episodes,
+            key=lambda item: item["episode_identity"],
+        )
         canonical_records = {
             "chunks": [
                 {
@@ -574,7 +611,7 @@ class FastWAMLiberoEvalCollector:
                         "environment_latency_seconds",
                     }
                 }
-                for record in chunks
+                for record in canonical_chunks
             ],
             "episodes": [
                 {
@@ -588,7 +625,7 @@ class FastWAMLiberoEvalCollector:
                         "environment_latency_seconds",
                     }
                 }
-                for record in episodes
+                for record in canonical_episodes
             ],
         }
         return EvaluationArtifactShard(

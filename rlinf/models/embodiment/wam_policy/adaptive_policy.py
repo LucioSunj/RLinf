@@ -17,6 +17,7 @@
 from __future__ import annotations
 
 import math
+import time
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 from typing import Any, Literal, Protocol
@@ -122,6 +123,7 @@ class FastWAMAdaptivePolicyConfig:
     eval_random_idm_probability: float | None = None
     eval_routing_seed: int = 0
     eval_microbatch_size: int = 1
+    eval_timing_cuda_synchronize: bool = False
     kv_replay: GateKVReplayConfig = field(default_factory=GateKVReplayConfig)
 
     def __post_init__(self) -> None:
@@ -131,6 +133,10 @@ class FastWAMAdaptivePolicyConfig:
             raise ValueError("`gate_temperature` must be positive.")
         if self.eval_microbatch_size < 1:
             raise ValueError("`eval_microbatch_size` must be positive.")
+        if not isinstance(self.eval_timing_cuda_synchronize, bool):
+            raise TypeError(
+                "`eval_timing_cuda_synchronize` must be a boolean."
+            )
         evaluation = self.evaluation_routing
         object.__setattr__(self, "eval_routing_mode", evaluation.mode)
         object.__setattr__(self, "eval_idm_threshold", evaluation.idm_threshold)
@@ -416,6 +422,9 @@ class FastWAMAdaptivePolicy(nn.Module, BasePolicy):
         actions = []
         decisions = []
         microbatch = self.config.eval_microbatch_size
+        measure_gate_latency = self.config.eval_timing_cuda_synchronize
+        gate_latencies: list[torch.Tensor] = []
+        gate_h2d_latencies: list[torch.Tensor] = []
         for start in range(0, batch_size, microbatch):
             end = min(start + microbatch, batch_size)
             sample = self.runtime.sample_action_batch(
@@ -430,15 +439,33 @@ class FastWAMAdaptivePolicy(nn.Module, BasePolicy):
                 actor_version=self.actor_version,
                 collect_replay=False,
             )
+            gate_parameter = next(self.gate.parameters(), None)
+            timing_device = (
+                sample.actions.device
+                if gate_parameter is None
+                else gate_parameter.device
+            )
+            if measure_gate_latency and timing_device.type == "cuda":
+                torch.cuda.synchronize(timing_device)
+            gate_started_at = time.perf_counter()
             logits = self.gate(sample.gate_snapshots)
-            decisions.append(
-                self._evaluation_gate_decision(
+            decision = self._evaluation_gate_decision(
                     logits=logits,
                     env_ids=env_ids[start:end],
                     episode_ids=route_info.episode_ids[start:end],
                     source_chunk_ids=route_info.chunk_ids[start:end],
-                )
             )
+            if measure_gate_latency:
+                if logits.device.type == "cuda":
+                    torch.cuda.synchronize(logits.device)
+                elapsed = time.perf_counter() - gate_started_at
+                gate_latencies.append(
+                    torch.full((end - start,), elapsed, dtype=torch.float64)
+                )
+                gate_h2d_latencies.append(
+                    torch.zeros(end - start, dtype=torch.float64)
+                )
+            decisions.append(decision)
             actions.append(sample.actions)
 
         next_route = torch.cat([item[0] for item in decisions], dim=0)
@@ -488,6 +515,16 @@ class FastWAMAdaptivePolicy(nn.Module, BasePolicy):
             "route_info": route_info,
             "emitted_gate": emitted_gate,
             "evaluation_selection": evaluation_selection,
+            "gate_latency_seconds": (
+                torch.cat(gate_latencies)
+                if measure_gate_latency
+                else None
+            ),
+            "gate_h2d_seconds": (
+                torch.cat(gate_h2d_latencies)
+                if measure_gate_latency
+                else None
+            ),
         }
 
     def predict_action_batch(

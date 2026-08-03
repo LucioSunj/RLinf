@@ -115,6 +115,8 @@ def _rollout(
         route_info=route,
         emitted_gate=emitted,
         evaluation_selection=selection,
+        gate_latency_seconds=torch.tensor([0.004], dtype=torch.float64),
+        gate_h2d_seconds=torch.tensor([0.0], dtype=torch.float64),
     )
 
 
@@ -222,6 +224,8 @@ def test_collector_records_aligned_chunks_episode_and_atomic_shards(tmp_path) ->
     assert episodes[0]["idm_chunk_count_total"] == 1
     assert episodes[0]["normalized_prediction_compute"] == 0.5
     assert episodes[0]["fixed_prediction_cost"] == 0.01
+    assert [chunk["gate_latency_seconds"] for chunk in chunks] == [0.004, 0.004]
+    assert [chunk["gate_h2d_seconds"] for chunk in chunks] == [0.0, 0.0]
 
     serialized = json.dumps({"chunks": chunks, "episodes": episodes}).lower()
     for forbidden in ("gate_kv", "observation", "main_images", "model_weights"):
@@ -265,3 +269,114 @@ def test_collector_fails_closed_on_actual_ledger_identity_mismatch(tmp_path) -> 
         assert "ledger identity mismatch" in str(exc)
     else:
         raise AssertionError("collector accepted a mismatched task/reset identity")
+
+
+def test_collector_writes_parallel_episodes_in_frozen_ledger_order(tmp_path) -> None:
+    entries = []
+    for episode_index in range(2):
+        identity_fields = {
+            "task_suite": "libero_10",
+            "task_id": 0,
+            "trial_id": episode_index,
+            "reset_state_id": episode_index,
+            "environment_seed": 7,
+            "action_noise_seed": 101 + episode_index,
+            "idm_video_noise_seed": 202 + episode_index,
+            "max_primitive_steps": 512,
+            "action_horizon": 16,
+        }
+        entries.append(
+            {
+                "episode_index": episode_index,
+                **identity_fields,
+                "episode_identity": _canonical_sha(identity_fields),
+            }
+        )
+    identities = [entry["episode_identity"] for entry in entries]
+    assert identities != sorted(identities)
+    ledger_path = tmp_path / "ledger.json"
+    ledger_path.write_text(
+        json.dumps(
+            {
+                "schema": "fastwam-libero-eval-ledger-v1",
+                "kind": "preflight",
+                "task_suite": "libero_10",
+                "entries": entries,
+            }
+        ),
+        encoding="utf-8",
+    )
+    collector = FastWAMLiberoEvalCollector(
+        output_dir=str(tmp_path),
+        ledger_path=str(ledger_path),
+        run_id="parallel-order-unit",
+        rank=0,
+        routing_mode="forced_uncond",
+        idm_threshold=0.5,
+        random_idm_probability=None,
+        routing_seed=0,
+        fixed_idm_cost=0.01,
+    )
+    env = _IdentityEnv()
+    env.task_ids = [0, 0]
+    env.trial_ids = [0, 1]
+    env.reset_state_ids = [0, 1]
+    snapshot = collector.snapshot_before_step(
+        0,
+        env,
+        torch.tensor([1 << 50, (1 << 50) + 1]),
+    )
+    probability = torch.tensor([0.25, 0.25])
+    collector.record_chunk(
+        snapshot=snapshot,
+        rollout_result=RolloutResult(
+            actions=torch.zeros(2, 1, 7),
+            route_info=ChunkRouteRecord(
+                route_used=torch.tensor([1, 1]),
+                route_was_forced=torch.tensor([True, True]),
+                chunk_ids=torch.tensor([0, 0]),
+                episode_ids=torch.tensor([0, 0]),
+                route_source_chunk_ids=torch.tensor([-1, -1]),
+                actor_versions=torch.tensor([3, 3]),
+            ),
+            emitted_gate=GateDecisionRecord(
+                next_route=torch.tensor([0, 0]),
+                base_probability=probability,
+                behavior_probability=probability,
+                old_logprob=torch.log1p(-probability),
+                epsilon=torch.tensor([0.0, 0.0]),
+                temperature=torch.tensor([1.0, 1.0]),
+                valid=torch.tensor([False, False]),
+                source_chunk_ids=torch.tensor([0, 0]),
+                episode_ids=torch.tensor([0, 0]),
+                actor_versions=torch.tensor([3, 3]),
+                kv_metadata=None,
+            ),
+            evaluation_selection=EvaluationRouteSelection(
+                mode="forced_uncond",
+                effective_next_route=torch.tensor([0, 0]),
+                counterfactual_next_route=torch.tensor([0, 0]),
+            ),
+        ),
+        env_output=EnvOutput(
+            obs={"states": torch.zeros(2, 3)},
+            dones=torch.tensor([True, True]),
+            terminations=torch.tensor([[False], [False]]),
+            truncations=torch.tensor([[True], [True]]),
+            rewards=torch.zeros(2, 1),
+        ),
+        environment_latency_seconds=0.02,
+    )
+
+    collector.finalize()
+
+    episodes = [
+        json.loads(line)
+        for line in (tmp_path / "episodes.rank-0.jsonl").read_text().splitlines()
+    ]
+    chunks = [
+        json.loads(line)
+        for line in (tmp_path / "chunks.rank-0.jsonl").read_text().splitlines()
+    ]
+    assert [episode["episode_identity"] for episode in episodes] == identities
+    assert [chunk["episode_identity"] for chunk in chunks] == identities
