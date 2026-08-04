@@ -16,21 +16,35 @@
 
 from __future__ import annotations
 
+import copy
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 
 import pytest
 import torch
+from omegaconf import OmegaConf
 
 from rlinf.workers.actor import fsdp_actor_worker as worker_module
 from rlinf.workers.actor.fsdp_actor_worker import EmbodiedFSDPActor
+
+
+class _RouteTracker:
+    def __init__(self) -> None:
+        self.state = {"next_episode_ids": {0: 1}, "states": {}}
+
+    def state_dict(self) -> dict[str, Any]:
+        return copy.deepcopy(self.state)
+
+    def load_state_dict(self, state: dict[str, Any]) -> None:
+        self.state = copy.deepcopy(state)
 
 
 class _Policy:
     def __init__(self) -> None:
         self.actor_version = 0
         self.weight = torch.tensor([1.0])
+        self.route_tracker = _RouteTracker()
 
     def set_global_step(self, step: int) -> None:
         self.actor_version = int(step)
@@ -40,11 +54,13 @@ class _Policy:
             "schema": "fastwam-adaptive-policy-v1",
             "actor_version": self.actor_version,
             "weight": self.weight.clone(),
+            "route_tracker": self.route_tracker.state_dict(),
         }
 
     def load_trainable_state_dict(self, state: dict[str, Any]) -> None:
         self.actor_version = int(state["actor_version"])
         self.weight.copy_(state["weight"])
+        self.route_tracker.load_state_dict(state["route_tracker"])
 
 
 class _Stateful:
@@ -127,6 +143,7 @@ def _checkpoint_worker() -> Any:
 def test_fastwam_actor_checkpoint_rank_file_round_trip(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
 ) -> None:
     rng_state = {"cpu": torch.tensor([7], dtype=torch.uint8)}
     restored_rng = []
@@ -168,6 +185,9 @@ def test_fastwam_actor_checkpoint_rank_file_round_trip(
     assert worker.optimizer_steps == 1
     assert len(restored_rng) == 1
     assert torch.equal(restored_rng[0]["cpu"], rng_state["cpu"])
+    audit_output = capsys.readouterr().out
+    assert "FASTWAM_ACTOR_RESUME_AUDIT" in audit_output
+    assert '"route_state_sha256"' in audit_output
 
 
 def test_fastwam_actor_checkpoint_round_trips_native_step_zero(
@@ -206,6 +226,64 @@ def test_fastwam_actor_checkpoint_round_trips_native_step_zero(
     assert torch.equal(worker.model.weight, torch.tensor([1.0]))
     assert len(restored_rng) == 1
     assert torch.equal(restored_rng[0]["cpu"], rng_state["cpu"])
+
+
+def _bootstrap_worker(
+    tmp_path: Path,
+    *,
+    loaded_step: int = 0,
+    resume_dir: str | None = None,
+) -> Any:
+    worker = EmbodiedFSDPActor.__new__(EmbodiedFSDPActor)
+    worker.cfg = OmegaConf.create(
+        {
+            "runner": {
+                "ckpt_path": str(tmp_path / "actor"),
+                "resume_dir": resume_dir,
+            },
+            "actor": {"model": {"model_type": "fastwam_adaptive"}},
+        }
+    )
+    worker.enable_offload = False
+    worker.calls = []
+    worker.setup_model_and_optimizer = lambda: worker.calls.append(("setup",))
+
+    def load_checkpoint(path: str) -> int:
+        worker.calls.append(("load_checkpoint", path))
+        return loaded_step
+
+    worker.load_checkpoint = load_checkpoint
+    return worker
+
+
+def test_fastwam_actor_init_bootstraps_native_step_zero_after_setup(
+    tmp_path: Path,
+) -> None:
+    worker = _bootstrap_worker(tmp_path)
+
+    EmbodiedFSDPActor.init_worker(worker)
+
+    assert worker.calls == [
+        ("setup",),
+        ("load_checkpoint", str(tmp_path / "actor")),
+    ]
+
+
+def test_fastwam_actor_init_rejects_nonzero_bootstrap(tmp_path: Path) -> None:
+    worker = _bootstrap_worker(tmp_path, loaded_step=1)
+
+    with pytest.raises(ValueError, match="step-zero"):
+        EmbodiedFSDPActor.init_worker(worker)
+
+
+def test_fastwam_actor_init_rejects_bootstrap_plus_resume(tmp_path: Path) -> None:
+    worker = _bootstrap_worker(
+        tmp_path,
+        resume_dir=str(tmp_path / "global_step_1"),
+    )
+
+    with pytest.raises(ValueError, match="ckpt_path.*resume_dir"):
+        EmbodiedFSDPActor.init_worker(worker)
 
 
 def test_fastwam_actor_checkpoint_load_restores_fsdp_lazy_root_state(

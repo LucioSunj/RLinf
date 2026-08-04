@@ -39,6 +39,9 @@ runner:
     ledger_path: ${oc.env:FASTWAM_EVAL_LEDGER}
     run_id: ${oc.env:FASTWAM_EVAL_RUN_ID}
     fixed_idm_cost: 0.01
+    # Preserve the preregistered protocol unless an explicit diagnostic run
+    # requests the official evaluator's fixed-per-episode reseeding.
+    noise_seed_mode: stateless_per_chunk
 
 env:
   group_name: EnvGroup

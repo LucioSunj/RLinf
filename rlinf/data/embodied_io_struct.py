@@ -29,6 +29,7 @@ from rlinf.utils.nested_dict_process import (
 )
 
 if TYPE_CHECKING:
+    from rlinf.envs.action_contract import ActionExecutionTrace
     from rlinf.models.embodiment.wam_policy.contracts import (
         ChunkRouteRecord,
         GateDecisionRecord,
@@ -67,6 +68,7 @@ class EnvOutput:
     truncations: Optional[torch.Tensor] = None  # [B]
     rewards: Optional[torch.Tensor] = None  # [B]
     env_infos: Optional[dict[str, Any]] = None
+    action_execution_trace: Optional["ActionExecutionTrace"] = None
 
     intervene_actions: Optional[torch.Tensor] = None  # [B]
     intervene_flags: Optional[torch.Tensor] = None  # [B]
@@ -98,6 +100,8 @@ class EnvOutput:
             if self.env_infos is not None
             else None
         )
+        if self.action_execution_trace is not None:
+            self.action_execution_trace = self.action_execution_trace.cpu()
         self.intervene_actions = (
             self.intervene_actions.cpu().contiguous()
             if self.intervene_actions is not None
@@ -306,6 +310,7 @@ class RolloutResult:
     evaluation_selection: Optional["EvaluationRouteSelection"] = None
     gate_latency_seconds: torch.Tensor = None  # [B]
     gate_h2d_seconds: torch.Tensor = None  # [B]
+    action_execution_trace: Optional["ActionExecutionTrace"] = None
 
     def __post_init__(self):
         if self.actions is not None:
@@ -332,6 +337,8 @@ class RolloutResult:
             self.gate_latency_seconds = self.gate_latency_seconds.cpu().contiguous()
         if self.gate_h2d_seconds is not None:
             self.gate_h2d_seconds = self.gate_h2d_seconds.cpu().contiguous()
+        if self.action_execution_trace is not None:
+            self.action_execution_trace = self.action_execution_trace.cpu()
 
     @staticmethod
     def merge_rollout_results(
@@ -375,9 +382,8 @@ class RolloutResult:
         merged_gate_h2d = _merge_optional_tensor("gate_h2d_seconds")
         merged_route_info = _merge_optional_record("route_info")
         merged_emitted_gate = _merge_optional_record("emitted_gate")
-        merged_evaluation_selection = _merge_optional_record(
-            "evaluation_selection"
-        )
+        merged_evaluation_selection = _merge_optional_record("evaluation_selection")
+        merged_action_execution_trace = _merge_optional_record("action_execution_trace")
 
         forward_inputs_list = [
             rollout_result.forward_inputs for rollout_result in rollout_results
@@ -400,6 +406,7 @@ class RolloutResult:
             evaluation_selection=merged_evaluation_selection,
             gate_latency_seconds=merged_gate_latency,
             gate_h2d_seconds=merged_gate_h2d,
+            action_execution_trace=merged_action_execution_trace,
         )
 
 

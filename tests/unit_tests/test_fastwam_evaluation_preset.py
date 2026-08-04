@@ -49,10 +49,13 @@ def test_standard_libero_fastwam_eval_preset_is_one_env_no_critic(monkeypatch) -
     assert cfg.rollout.model.eval_routing_mode == "learned_threshold"
     assert cfg.rollout.model.gate_epsilon == 0.0
     assert cfg.rollout.model.kv_replay.backend == "stored"
+    assert cfg.rollout.model.runtime.binarize_gripper is True
+    assert cfg.rollout.model.runtime.num_inference_steps == 10
+    assert cfg.rollout.model.runtime.seeded_noise_device == "cpu"
+    assert cfg.rollout.model.runtime.camera_resize_mode == "official_pil_center_crop"
+    assert cfg.runner.evaluation_collector.noise_seed_mode == "stateless_per_chunk"
     assert cfg.rollout.model.fastwam.load_text_encoder is False
-    assert (
-        cfg.rollout.model.runtime.text_embedding_cache_dir == "/tmp/text-contexts"
-    )
+    assert cfg.rollout.model.runtime.text_embedding_cache_dir == "/tmp/text-contexts"
     assert cfg.rollout.model.critic.load_for_eval is False
     assert cfg.rollout.collect_prev_infos is False
     assert cfg.critic.use_critic_model is False

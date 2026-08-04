@@ -182,8 +182,7 @@ def validate_fastwam_eval_model_contract(
                 f"{path}: checkpoint={checkpoint_display}, live={live_display}"
             )
     raise ValueError(
-        "FastWAM evaluation model contract mismatch: "
-        + "; ".join(differences[:16])
+        "FastWAM evaluation model contract mismatch: " + "; ".join(differences[:16])
     )
 
 
@@ -211,7 +210,10 @@ def validate_fastwam_eval_checkpoint_contract(
     checkpoint_model = contract.get("model") if isinstance(contract, Mapping) else None
     if not isinstance(checkpoint_model, Mapping):
         raise ValueError("FastWAM evaluation checkpoint is missing its model contract.")
-    if str(checkpoint_model.get("actor_checkpoint_sha256", "")).lower() != expected_parent:
+    if (
+        str(checkpoint_model.get("actor_checkpoint_sha256", "")).lower()
+        != expected_parent
+    ):
         raise ValueError(
             "FastWAM evaluation checkpoint contract has the wrong parent hash."
         )
@@ -231,8 +233,7 @@ def validate_fastwam_eval_checkpoint_contract(
             .lower()
         )
         if len(expected_critic_parent) != 64 or any(
-            character not in "0123456789abcdef"
-            for character in expected_critic_parent
+            character not in "0123456789abcdef" for character in expected_critic_parent
         ):
             raise ValueError("Expected pi0.5 critic parent SHA-256 is invalid.")
         if payload.get("critic_parent_checkpoint_sha256") != expected_critic_parent:
@@ -253,6 +254,38 @@ def validate_fastwam_eval_checkpoint_contract(
     )
 
 
+def _normalized_fastwam_actor_contract(cfg: Any) -> dict[str, Any]:
+    actor_keys = (
+        "seed",
+        "micro_batch_size",
+        "global_batch_size",
+        "training_backend",
+        "enable_offload",
+        "fsdp_config",
+        "optim",
+    )
+    actor = _selected_checkpoint_values(cfg.actor, actor_keys)
+    fsdp = _resolved_mapping(actor["fsdp_config"], name="FSDP config")
+    amp_autocast = fsdp.get("amp_autoc") or {}
+    grad_scaler = fsdp.get("grad_scaler") or {}
+    if not isinstance(amp_autocast, Mapping) or not isinstance(
+        grad_scaler,
+        Mapping,
+    ):
+        raise TypeError("FSDP AMP and GradScaler configs must be mappings.")
+    fsdp["amp_autocast"] = {
+        "enabled": amp_autocast.get("enabled", False),
+        "precision": amp_autocast.get("precision", "bf16"),
+    }
+    fsdp["grad_scaler"] = {
+        "enabled": grad_scaler.get("enabled", False),
+        "init_scale": grad_scaler.get("init_scale"),
+        "growth_interval": grad_scaler.get("growth_interval"),
+    }
+    actor["fsdp_config"] = fsdp
+    return actor
+
+
 def build_fastwam_checkpoint_contract(cfg: Any, *, world_size: int) -> dict[str, Any]:
     """Build the resolved continuation contract shared by actor and rollout.
 
@@ -263,15 +296,6 @@ def build_fastwam_checkpoint_contract(cfg: Any, *, world_size: int) -> dict[str,
     included and compared exactly on load.
     """
 
-    actor_keys = (
-        "seed",
-        "micro_batch_size",
-        "global_batch_size",
-        "training_backend",
-        "enable_offload",
-        "fsdp_config",
-        "optim",
-    )
     rollout_keys = (
         "generation_backend",
         "recompute_logprobs",
@@ -306,14 +330,22 @@ def build_fastwam_checkpoint_contract(cfg: Any, *, world_size: int) -> dict[str,
         "overlap_env_bootstrap",
         "use_training_pipeline",
     )
+    runner = _selected_checkpoint_values(cfg.runner, runner_keys)
+    if runner["weight_sync_interval"] is None:
+        runner["weight_sync_interval"] = 1
+    overlap = runner["overlap_env_bootstrap"]
+    if overlap is None:
+        overlap = False
+    env_offload = bool(OmegaConf.select(cfg, "env.train.enable_offload", default=False))
+    runner["overlap_env_bootstrap"] = bool(overlap) and not env_offload
     return {
         "schema": "fastwam-adaptive-checkpoint-contract-v2",
         "model": _resolved_checkpoint_value(cfg.actor.model),
         "algorithm": _resolved_checkpoint_value(cfg.algorithm),
-        "actor": _selected_checkpoint_values(cfg.actor, actor_keys),
+        "actor": _normalized_fastwam_actor_contract(cfg),
         "rollout": _selected_checkpoint_values(cfg.rollout, rollout_keys),
         "env_train": _selected_checkpoint_values(cfg.env.train, env_keys),
-        "runner": _selected_checkpoint_values(cfg.runner, runner_keys),
+        "runner": runner,
         "weight_syncer": _resolved_checkpoint_value(cfg.weight_syncer),
         "component_placement": _resolved_checkpoint_value(
             cfg.cluster.component_placement

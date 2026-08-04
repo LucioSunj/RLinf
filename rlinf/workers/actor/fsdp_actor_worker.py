@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import json
 import os
 import time
 from functools import partial
@@ -26,8 +27,12 @@ from torch.multiprocessing.reductions import reduce_tensor
 
 import rlinf.algorithms  # noqa: F401
 from rlinf.algorithms.advantages import (
+    FASTWAM_REWARD_AUDIT_SENTINEL,
+    FASTWAM_ROLLOUT_STATE_AUDIT_SENTINEL,
     align_fastwam_policy_advantages,
     apply_fastwam_chunk_cost,
+    summarize_fastwam_environment_rewards,
+    summarize_fastwam_rollout_state,
 )
 from rlinf.algorithms.expert import build_expert_model_config
 from rlinf.algorithms.fastwam_dual_ppo import (
@@ -63,6 +68,11 @@ from rlinf.models import get_model
 from rlinf.models.embodiment.base_policy import ForwardType
 from rlinf.models.embodiment.wam_policy.contracts import WAMRoute
 from rlinf.scheduler import Channel, Cluster, CommMapper, Worker
+from rlinf.utils.checkpoint_state import (
+    FASTWAM_ACTOR_RESUME_AUDIT_SENTINEL,
+    FASTWAM_RESUME_AUDIT_SCHEMA,
+    checkpoint_state_sha256,
+)
 from rlinf.utils.data_iter_utils import (
     get_iterator_k_split,
     get_reverse_idx,
@@ -1206,6 +1216,25 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
         """
         self.setup_model_and_optimizer()
 
+        model_type = str(self.cfg.actor.model.get("model_type", ""))
+        bootstrap_path = self.cfg.runner.get("ckpt_path", None)
+        if (
+            model_type == SupportedModel.FASTWAM_ADAPTIVE.value
+            and bootstrap_path is not None
+        ):
+            if self.cfg.runner.get("resume_dir", None) is not None:
+                raise ValueError(
+                    "FastWAM training cannot set both runner.ckpt_path and "
+                    "runner.resume_dir. Use ckpt_path only for native step-zero "
+                    "bootstrap and resume_dir for paired nonzero resume."
+                )
+            loaded_step = self.load_checkpoint(str(bootstrap_path))
+            if loaded_step != 0:
+                raise ValueError(
+                    "FastWAM runner.ckpt_path training bootstrap requires a "
+                    f"native step-zero checkpoint, got step {loaded_step}."
+                )
+
         if self.enable_offload:
             self.offload_param_and_grad()
             self.offload_optimizer()
@@ -1215,11 +1244,13 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
         if model is None:
             model = super().model_provider_func()
 
-        if self.cfg.runner.get("ckpt_path", None):
+        model_type = str(self.cfg.actor.model.get("model_type", ""))
+        if self.cfg.runner.get("ckpt_path", None) and (
+            model_type != SupportedModel.FASTWAM_ADAPTIVE.value
+        ):
             model_dict = torch.load(self.cfg.runner.ckpt_path)
             model.load_state_dict(model_dict)
 
-        model_type = str(self.cfg.actor.model.get("model_type", ""))
         if model_type == SupportedModel.FASTWAM_ADAPTIVE.value:
             if not bool(self.cfg.actor.fsdp_config.get("use_orig_params", False)):
                 raise RuntimeError(
@@ -1430,6 +1461,15 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
                     )
 
                 policy = self._fastwam_policy_module()
+                saved_policy = payload["policy"]
+                if "route_tracker" not in saved_policy:
+                    raise ValueError(
+                        "FastWAM actor checkpoint omits delayed-route state."
+                    )
+                saved_route_sha256 = checkpoint_state_sha256(
+                    saved_policy["route_tracker"]
+                )
+                saved_rng_sha256 = checkpoint_state_sha256(payload["rng"])
                 policy.load_trainable_state_dict(payload["policy"])
                 self.optimizer.load_state_dict(payload["optimizer"])
                 self.lr_scheduler.load_state_dict(payload["lr_scheduler"])
@@ -1440,7 +1480,35 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
                     raise ValueError(
                         "FastWAM checkpoint policy version does not match its step."
                     )
+                restored_route_sha256 = checkpoint_state_sha256(
+                    policy.route_tracker.state_dict()
+                )
+                if restored_route_sha256 != saved_route_sha256:
+                    raise ValueError(
+                        "FastWAM actor delayed-route state changed during load."
+                    )
                 set_rng_state(payload["rng"])
+                restored_rng_sha256 = checkpoint_state_sha256(get_rng_state())
+                if restored_rng_sha256 != saved_rng_sha256:
+                    raise ValueError("FastWAM actor RNG state changed during load.")
+                print(
+                    f"{FASTWAM_ACTOR_RESUME_AUDIT_SENTINEL} "
+                    + json.dumps(
+                        {
+                            "schema": FASTWAM_RESUME_AUDIT_SCHEMA,
+                            "owner": "actor",
+                            "rank": int(self._rank),
+                            "step": int(self.version),
+                            "optimizer_steps": int(self.optimizer_steps),
+                            "actor_version": int(policy.actor_version),
+                            "route_state_sha256": restored_route_sha256,
+                            "rng_sha256": restored_rng_sha256,
+                            "status": "PASS",
+                        },
+                        sort_keys=True,
+                    ),
+                    flush=True,
+                )
                 loaded_version = self.version
             except Exception as error:
                 local_error = error
@@ -1651,6 +1719,23 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
                 raise KeyError("FastWAM advantage computation requires route_info.")
             if "emitted_gate" not in self.rollout_batch:
                 raise KeyError("FastWAM advantage computation requires emitted_gate.")
+            if bool(
+                self.cfg.runner.get(
+                    "short_rl_canary_require_success_signal",
+                    False,
+                )
+            ):
+                reward_audit = summarize_fastwam_environment_rewards(
+                    environment_rewards=self.rollout_batch["rewards"],
+                    route_used=self.rollout_batch["route_info"].route_used,
+                    valid_mask=self.rollout_batch.get("loss_mask", None),
+                )
+                print(
+                    f"{FASTWAM_REWARD_AUDIT_SENTINEL} "
+                    + json.dumps(reward_audit.to_artifact(), sort_keys=True),
+                    flush=True,
+                )
+                reward_audit.require_success_signal()
             cost_cfg = self.cfg.algorithm.get("fixed_branch_cost", {})
             if bool(cost_cfg.get("enabled", False)):
                 if "fastwam_branch_costs" in self.rollout_batch:
@@ -1703,6 +1788,26 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
                     "gate_valid_mask": alignment.gate_valid_mask,
                 }
             )
+            if bool(
+                self.cfg.runner.get(
+                    "short_rl_canary_require_success_signal",
+                    False,
+                )
+            ):
+                kv_cfg = self.cfg.actor.model.kv_replay
+                rollout_state_audit = summarize_fastwam_rollout_state(
+                    route=self.rollout_batch["route_info"],
+                    emitted=self.rollout_batch["emitted_gate"],
+                    eligible_gate_mask=alignment.gate_valid_mask,
+                    valid_mask=self.rollout_batch.get("loss_mask", None),
+                    kv_replay_backend=str(kv_cfg.backend),
+                    max_bytes_per_sample=kv_cfg.get("max_bytes_per_sample", None),
+                )
+                print(
+                    f"{FASTWAM_ROLLOUT_STATE_AUDIT_SENTINEL} "
+                    + json.dumps(rollout_state_audit.to_artifact(), sort_keys=True),
+                    flush=True,
+                )
         if kwargs["loss_mask"] is not None:
             self.rollout_batch.update({"loss_mask": kwargs["loss_mask"]})
         if kwargs["loss_mask_sum"] is not None:

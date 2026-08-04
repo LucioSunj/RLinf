@@ -15,6 +15,7 @@
 import asyncio
 import copy
 import gc
+import json
 import os
 import time
 from typing import Any, Callable, Literal, Optional
@@ -41,6 +42,11 @@ from rlinf.hybrid_engines.weight_syncer import WeightSyncer
 from rlinf.models import get_model
 from rlinf.models.embodiment.base_policy import BasePolicy
 from rlinf.scheduler import Channel, Cluster, Worker, split_channel_message
+from rlinf.utils.checkpoint_state import (
+    FASTWAM_RESUME_AUDIT_SCHEMA,
+    FASTWAM_ROLLOUT_RESUME_AUDIT_SENTINEL,
+    checkpoint_state_sha256,
+)
 from rlinf.utils.placement import HybridComponentPlacement
 from rlinf.utils.utils import get_rng_state, set_rng_state
 
@@ -72,6 +78,7 @@ def _build_evaluation_rollout_result(
         evaluation_selection=result.get("evaluation_selection"),
         gate_latency_seconds=result.get("gate_latency_seconds"),
         gate_h2d_seconds=result.get("gate_h2d_seconds"),
+        action_execution_trace=result.get("action_execution_trace"),
     )
 
 
@@ -182,8 +189,7 @@ class MultiStepRolloutWorker(Worker):
 
         fastwam_eval_payload = None
         if self.cfg.runner.get("ckpt_path", None) and (
-            SupportedModel(self.model_cfg.model_type)
-            is SupportedModel.FASTWAM_ADAPTIVE
+            SupportedModel(self.model_cfg.model_type) is SupportedModel.FASTWAM_ADAPTIVE
         ):
             from rlinf.models.embodiment.wam_policy import (
                 resolve_fastwam_adaptive_eval_checkpoint,
@@ -390,9 +396,39 @@ class MultiStepRolloutWorker(Worker):
             or int(policy_runtime.get("actor_version", -1)) != rollout_actor_version
         ):
             raise ValueError("FastWAM rollout-runtime policy/worker version mismatch.")
+        if "route_tracker" not in policy_runtime:
+            raise ValueError("FastWAM rollout checkpoint omits delayed-route state.")
+        saved_route_sha256 = checkpoint_state_sha256(policy_runtime["route_tracker"])
+        saved_rng_sha256 = checkpoint_state_sha256(payload["rng"])
         self.hf_model.load_rollout_runtime_state_dict(policy_runtime)
         self.version = rollout_actor_version
+        restored_runtime = self.hf_model.rollout_runtime_state_dict()
+        restored_route_sha256 = checkpoint_state_sha256(
+            restored_runtime["route_tracker"]
+        )
+        if restored_route_sha256 != saved_route_sha256:
+            raise ValueError("FastWAM rollout delayed-route state changed during load.")
         set_rng_state(payload["rng"])
+        restored_rng_sha256 = checkpoint_state_sha256(get_rng_state())
+        if restored_rng_sha256 != saved_rng_sha256:
+            raise ValueError("FastWAM rollout RNG state changed during load.")
+        print(
+            f"{FASTWAM_ROLLOUT_RESUME_AUDIT_SENTINEL} "
+            + json.dumps(
+                {
+                    "schema": FASTWAM_RESUME_AUDIT_SCHEMA,
+                    "owner": "rollout",
+                    "rank": int(self._rank),
+                    "step": step,
+                    "actor_version": rollout_actor_version,
+                    "route_state_sha256": restored_route_sha256,
+                    "rng_sha256": restored_rng_sha256,
+                    "status": "PASS",
+                },
+                sort_keys=True,
+            ),
+            flush=True,
+        )
         return step
 
     def setup_sample_params(self):
@@ -816,6 +852,7 @@ class MultiStepRolloutWorker(Worker):
             ),
             route_info=result.get("route_info"),
             emitted_gate=result.get("emitted_gate"),
+            action_execution_trace=result.get("action_execution_trace"),
         )
 
     def get_bootstrap_values(
@@ -1275,6 +1312,11 @@ class MultiStepRolloutWorker(Worker):
         split_versions = _split_optional_tensor(rollout_result.versions)
         split_gate_latency = _split_optional_tensor(rollout_result.gate_latency_seconds)
         split_gate_h2d = _split_optional_tensor(rollout_result.gate_h2d_seconds)
+        split_action_execution_trace = (
+            (None,) * len(sizes)
+            if rollout_result.action_execution_trace is None
+            else rollout_result.action_execution_trace.split(sizes, dim=0)
+        )
         split_route_info = (
             (None,) * len(sizes)
             if rollout_result.route_info is None
@@ -1317,6 +1359,7 @@ class MultiStepRolloutWorker(Worker):
                 evaluation_selection=split_evaluation_selection[idx],
                 gate_latency_seconds=split_gate_latency[idx],
                 gate_h2d_seconds=split_gate_h2d[idx],
+                action_execution_trace=(split_action_execution_trace[idx]),
             )
             for idx in range(len(sizes))
         ]

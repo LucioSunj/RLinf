@@ -112,7 +112,10 @@ class MetricLogger:
 
         if "tensorboard" in self.logger_backends:
             tensorboard_log_path = os.path.join(
-                log_path, "tensorboard", log_path_suffix
+                log_path,
+                experiment_name,
+                "tensorboard",
+                log_path_suffix,
             )
             os.makedirs(tensorboard_log_path, exist_ok=True)
 

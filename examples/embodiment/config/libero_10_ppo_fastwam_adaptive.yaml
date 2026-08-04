@@ -34,6 +34,9 @@ runner:
   save_interval: 40
   resume_dir: null
   ckpt_path: null
+  # Diagnostic-only guard. The audited short-RL launcher enables this so a
+  # zero-success rollout stops before branch cost, GAE, or any optimizer step.
+  short_rl_canary_require_success_signal: false
 
   bootstrap_project_checkpoint_dir: null
 algorithm:
@@ -78,8 +81,8 @@ algorithm:
   fixed_branch_cost:
     enabled: true
     # Sweep with `algorithm.fixed_branch_cost.idm_cost=<value>`.
-    # A 512-step episode contains at most 32 16-action chunks. Keep the smoke
-    # default below 1/32 so an all-IDM successful trajectory can remain positive.
+    # A 700-step episode contains 70 executed 10-action chunks. Keep the smoke
+    # default below 1/70 so an all-IDM successful trajectory can remain positive.
     idm_cost: 0.01
     uncond_cost: 0.0
 

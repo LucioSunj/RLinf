@@ -37,7 +37,13 @@ from rlinf.data.embodied_io_struct import (
     convert_trajectories_to_batch,
 )
 from rlinf.envs import get_env_cls
+from rlinf.envs.action_contract import (
+    PREPARED_LIBERO_ACTION_STAGE,
+    ActionExecutionTrace,
+    ActionStageStatistics,
+)
 from rlinf.envs.action_utils import prepare_actions
+from rlinf.envs.libero.action_contract import LiberoActionContract
 from rlinf.envs.utils import get_env_attr
 from rlinf.envs.wrappers import RecordVideo
 from rlinf.scheduler import (
@@ -626,10 +632,35 @@ class EnvWorker(Worker):
             wm_env_type=self.cfg.env.eval.get("wm_env_type", None),
             env_cfg=self.cfg.env.eval,
         )
+        action_execution_trace = None
+        eval_env = self.eval_env_list[stage_id]
+        if getattr(self, "evaluation_collector", None) is not None:
+            action_contract = get_env_attr(eval_env, "action_contract")
+            if not isinstance(action_contract, LiberoActionContract):
+                raise TypeError(
+                    "FastWAM evaluation requires a typed live LIBERO Action contract."
+                )
+            prepared_statistics = ActionStageStatistics.from_values(
+                stage=PREPARED_LIBERO_ACTION_STAGE,
+                values=chunk_actions,
+                low=action_contract.low,
+                high=action_contract.high,
+                gripper_dimension_index=(action_contract.gripper_dimension_index),
+                action_contract_sha256=(action_contract.canonical_sha256),
+            )
+            chunk_result, submitted_statistics = eval_env.chunk_step_with_action_trace(
+                chunk_actions,
+                action_contract,
+            )
+            action_execution_trace = ActionExecutionTrace(
+                stages=(prepared_statistics, submitted_statistics)
+            )
+        else:
+            chunk_result = eval_env.chunk_step(chunk_actions)
         env_info = {}
 
         obs_list, chunk_rewards, chunk_terminations, chunk_truncations, infos_list = (
-            self.eval_env_list[stage_id].chunk_step(chunk_actions)
+            chunk_result
         )
         if isinstance(obs_list, (list, tuple)):
             extracted_obs = obs_list[-1] if obs_list else None
@@ -676,6 +707,7 @@ class EnvWorker(Worker):
             rewards=chunk_rewards,
             env_infos=infos if isinstance(infos, dict) else None,
             rlt_switch_flags=rlt_switch_flags,
+            action_execution_trace=action_execution_trace,
         )
         return env_output, env_info
 
@@ -1595,9 +1627,7 @@ class EnvWorker(Worker):
             return eval_metrics
         return {
             "metrics": dict(eval_metrics),
-            "evaluation_artifact_shard": asdict(
-                self.evaluation_collector.finalize()
-            ),
+            "evaluation_artifact_shard": asdict(self.evaluation_collector.finalize()),
         }
 
     def get_actor_split_num(self):

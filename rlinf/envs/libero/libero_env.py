@@ -24,6 +24,16 @@ import numpy as np
 import torch
 from omegaconf.omegaconf import OmegaConf
 
+from rlinf.envs.action_contract import (
+    SUBMITTED_LIBERO_ACTION_STAGE,
+    ActionStageStatistics,
+)
+from rlinf.envs.libero.action_contract import (
+    LiberoActionContract,
+    inspect_libero_action_contract,
+    merge_libero_action_contracts,
+)
+from rlinf.envs.libero.egl import instantiate_with_isolated_egl
 from rlinf.envs.libero.reward_utils import mask_rewards_after_first_done
 from rlinf.envs.libero.utils import (
     build_interleaved_eval_reset_state_ids,
@@ -107,10 +117,17 @@ class LiberoEnv(gym.Env):
         if self.ordered_reset_state_ids is not None:
             self.ordered_reset_state_ids = list(self.ordered_reset_state_ids)
 
-
         self.ignore_terminations = cfg.ignore_terminations
         self.auto_reset = cfg.auto_reset
         self.is_eval = cfg.get("is_eval", False)
+        reset_wait_steps = cfg.get("reset_wait_steps", 15)
+        if (
+            isinstance(reset_wait_steps, bool)
+            or int(reset_wait_steps) != reset_wait_steps
+            or int(reset_wait_steps) < 1
+        ):
+            raise ValueError("LIBERO reset_wait_steps must be a positive integer.")
+        self.reset_wait_steps = int(reset_wait_steps)
 
         self._generator = np.random.default_rng(seed=self.seed)
         self._generator_ordered = np.random.default_rng(seed=0)
@@ -128,6 +145,7 @@ class LiberoEnv(gym.Env):
         self.update_reset_state_ids()
         self._init_task_and_trial_ids()
         self._init_env()
+        self._action_submission_capture = None
 
         self.prev_step_reward = np.zeros(self.num_envs)
         self.use_rel_reward = cfg.use_rel_reward
@@ -154,6 +172,17 @@ class LiberoEnv(gym.Env):
     def _init_env(self):
         env_fns = self.get_env_fns()
         self.env = ReconfigureSubprocEnv(env_fns)
+
+    @property
+    def action_contract(self) -> LiberoActionContract:
+        """Return the exact contract from every currently instantiated worker."""
+
+        payloads = self.env.get_env_attr("_rlinf_action_contract")
+        if not payloads or any(payload is None for payload in payloads):
+            raise RuntimeError(
+                "LIBERO worker did not expose an exact live Action contract."
+            )
+        return merge_libero_action_contracts(payloads)
 
     def get_env_fns(self):
         env_fn_params = self.get_env_fn_params()
@@ -203,7 +232,10 @@ class LiberoEnv(gym.Env):
                 else:
                     from libero.libero.envs import OffScreenRenderEnv as WorkerEnv
 
-                env = WorkerEnv(**param)
+                env = instantiate_with_isolated_egl(WorkerEnv, param)
+                env._rlinf_action_contract = inspect_libero_action_contract(
+                    env
+                ).to_artifact()
                 env.seed(seed)
                 return env
 
@@ -742,7 +774,7 @@ class LiberoEnv(gym.Env):
             reset_state_ids = self._get_random_reset_state_ids(num_reset_states)
 
         self._reconfigure(reset_state_ids, env_idx)
-        for _ in range(15):
+        for _ in range(self.reset_wait_steps):
             zero_actions = np.zeros((len(env_idx), 7))
             if self.cfg.reset_gripper_open:
                 zero_actions[:, -1] = -1
@@ -763,6 +795,20 @@ class LiberoEnv(gym.Env):
         """Step the environment with the given actions."""
         if isinstance(actions, torch.Tensor):
             actions = actions.detach().cpu().numpy()
+
+        capture = self._action_submission_capture
+        if capture is not None:
+            contract, records = capture
+            records.append(
+                ActionStageStatistics.from_values(
+                    stage=SUBMITTED_LIBERO_ACTION_STAGE,
+                    values=np.asarray(actions)[:, None, :],
+                    low=contract.low,
+                    high=contract.high,
+                    gripper_dimension_index=(contract.gripper_dimension_index),
+                    action_contract_sha256=contract.canonical_sha256,
+                )
+            )
 
         self._elapsed_steps += 1
         raw_obs, _reward, terminations, info_lists = self.env.step(actions)
@@ -789,6 +835,31 @@ class LiberoEnv(gym.Env):
             to_tensor(truncations),
             infos,
         )
+
+    def chunk_step_with_action_trace(
+        self,
+        chunk_actions,
+        action_contract: LiberoActionContract,
+    ):
+        """Execute a chunk while reducing final submitted Actions in place."""
+
+        if not isinstance(action_contract, LiberoActionContract):
+            raise TypeError("LIBERO chunk tracing requires a typed Action contract.")
+        if self._action_submission_capture is not None:
+            raise RuntimeError("Nested LIBERO Action submission capture is forbidden.")
+        records: list[ActionStageStatistics] = []
+        self._action_submission_capture = (action_contract, records)
+        try:
+            result = self.chunk_step(chunk_actions)
+        finally:
+            self._action_submission_capture = None
+        expected_steps = int(chunk_actions.shape[1])
+        if len(records) != expected_steps:
+            raise RuntimeError(
+                "Final LIBERO Action capture did not observe every primitive step: "
+                f"{len(records)} != {expected_steps}."
+            )
+        return result, ActionStageStatistics.merge_time(records)
 
     def chunk_step(self, chunk_actions):
         # chunk_actions: [num_envs, chunk_step, action_dim]

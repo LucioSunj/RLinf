@@ -27,6 +27,7 @@ import torch.nn as nn
 from fastwam.models.wan22.gate_transformer import epsilon_mixture_bernoulli
 from fastwam.models.wan22.kv_tap import GateKVSnapshot
 
+from rlinf.envs.action_contract import ActionExecutionTrace
 from rlinf.models.embodiment.base_policy import BasePolicy, ForwardType
 
 from .contracts import (
@@ -59,6 +60,7 @@ class FastWAMChunkSample:
     denoise_indices: torch.Tensor
     gate_snapshots: tuple[GateKVSnapshot, ...]
     forward_inputs: dict[str, torch.Tensor] = field(default_factory=dict)
+    action_execution_trace: ActionExecutionTrace | None = None
 
     def __post_init__(self) -> None:
         batch_size = self.actions.shape[0]
@@ -72,6 +74,11 @@ class FastWAMChunkSample:
             raise ValueError("Gate snapshots are required after every chunk.")
         if any(snapshot.batch_size != batch_size for snapshot in self.gate_snapshots):
             raise ValueError("Gate snapshot batch must match actions.")
+        if (
+            self.action_execution_trace is not None
+            and self.action_execution_trace.batch_size != batch_size
+        ):
+            raise ValueError("Action trace batch must match actions.")
 
 
 class FastWAMPolicyRuntime(Protocol):
@@ -134,9 +141,7 @@ class FastWAMAdaptivePolicyConfig:
         if self.eval_microbatch_size < 1:
             raise ValueError("`eval_microbatch_size` must be positive.")
         if not isinstance(self.eval_timing_cuda_synchronize, bool):
-            raise TypeError(
-                "`eval_timing_cuda_synchronize` must be a boolean."
-            )
+            raise TypeError("`eval_timing_cuda_synchronize` must be a boolean.")
         evaluation = self.evaluation_routing
         object.__setattr__(self, "eval_routing_mode", evaluation.mode)
         object.__setattr__(self, "eval_idm_threshold", evaluation.idm_threshold)
@@ -421,6 +426,7 @@ class FastWAMAdaptivePolicy(nn.Module, BasePolicy):
         batch_size = route_info.route_used.shape[0]
         actions = []
         decisions = []
+        action_traces: list[ActionExecutionTrace | None] = []
         microbatch = self.config.eval_microbatch_size
         measure_gate_latency = self.config.eval_timing_cuda_synchronize
         gate_latencies: list[torch.Tensor] = []
@@ -450,10 +456,10 @@ class FastWAMAdaptivePolicy(nn.Module, BasePolicy):
             gate_started_at = time.perf_counter()
             logits = self.gate(sample.gate_snapshots)
             decision = self._evaluation_gate_decision(
-                    logits=logits,
-                    env_ids=env_ids[start:end],
-                    episode_ids=route_info.episode_ids[start:end],
-                    source_chunk_ids=route_info.chunk_ids[start:end],
+                logits=logits,
+                env_ids=env_ids[start:end],
+                episode_ids=route_info.episode_ids[start:end],
+                source_chunk_ids=route_info.chunk_ids[start:end],
             )
             if measure_gate_latency:
                 if logits.device.type == "cuda":
@@ -462,11 +468,10 @@ class FastWAMAdaptivePolicy(nn.Module, BasePolicy):
                 gate_latencies.append(
                     torch.full((end - start,), elapsed, dtype=torch.float64)
                 )
-                gate_h2d_latencies.append(
-                    torch.zeros(end - start, dtype=torch.float64)
-                )
+                gate_h2d_latencies.append(torch.zeros(end - start, dtype=torch.float64))
             decisions.append(decision)
             actions.append(sample.actions)
+            action_traces.append(sample.action_execution_trace)
 
         next_route = torch.cat([item[0] for item in decisions], dim=0)
         base_probability = torch.cat([item[1] for item in decisions], dim=0)
@@ -498,6 +503,19 @@ class FastWAMAdaptivePolicy(nn.Module, BasePolicy):
             actor_versions=torch.full_like(next_route, self.actor_version),
             kv_metadata=None,
         )
+        if any(trace is None for trace in action_traces) and not all(
+            trace is None for trace in action_traces
+        ):
+            raise ValueError(
+                "FastWAM eval microbatches returned partial Action traces."
+            )
+        action_execution_trace = (
+            None
+            if all(trace is None for trace in action_traces)
+            else ActionExecutionTrace.cat(
+                [trace for trace in action_traces if trace is not None], dim=0
+            )
+        )
         return torch.cat(actions, dim=0), {
             "prev_logprobs": torch.empty(
                 batch_size,
@@ -516,15 +534,12 @@ class FastWAMAdaptivePolicy(nn.Module, BasePolicy):
             "emitted_gate": emitted_gate,
             "evaluation_selection": evaluation_selection,
             "gate_latency_seconds": (
-                torch.cat(gate_latencies)
-                if measure_gate_latency
-                else None
+                torch.cat(gate_latencies) if measure_gate_latency else None
             ),
             "gate_h2d_seconds": (
-                torch.cat(gate_h2d_latencies)
-                if measure_gate_latency
-                else None
+                torch.cat(gate_h2d_latencies) if measure_gate_latency else None
             ),
+            "action_execution_trace": action_execution_trace,
         }
 
     def predict_action_batch(
@@ -660,6 +675,7 @@ class FastWAMAdaptivePolicy(nn.Module, BasePolicy):
             "forward_inputs": forward_inputs,
             "route_info": route_info,
             "emitted_gate": emitted_gate,
+            "action_execution_trace": sample.action_execution_trace,
         }
         return sample.actions, result
 
@@ -964,6 +980,7 @@ class FastWAMAdaptivePolicy(nn.Module, BasePolicy):
             != getattr(checkpoint_gate[key], "shape", None)
         )
         if missing_keys or unexpected_keys or shape_mismatches:
+
             def preview(values: list[str]) -> list[str]:
                 return values[:8]
 

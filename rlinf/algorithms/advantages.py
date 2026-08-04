@@ -26,6 +26,11 @@ from rlinf.models.embodiment.wam_policy.contracts import (
 )
 from rlinf.utils.utils import masked_mean
 
+FASTWAM_REWARD_AUDIT_SCHEMA = "fastwam-environment-reward-audit-v1"
+FASTWAM_REWARD_AUDIT_SENTINEL = "FASTWAM_SHORT_RL_REWARD_AUDIT"
+FASTWAM_ROLLOUT_STATE_AUDIT_SCHEMA = "fastwam-rollout-state-audit-v1"
+FASTWAM_ROLLOUT_STATE_AUDIT_SENTINEL = "FASTWAM_SHORT_RL_ROLLOUT_STATE_AUDIT"
+
 
 @dataclass(frozen=True, slots=True, kw_only=True)
 class FastWAMChunkCost:
@@ -33,6 +38,148 @@ class FastWAMChunkCost:
 
     rewards: torch.Tensor
     costs: torch.Tensor
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
+class FastWAMEnvironmentRewardAudit:
+    """Compact raw-environment reward evidence with no trajectory payload."""
+
+    reward_shape: tuple[int, ...]
+    reward_dtype: str
+    total_value_count: int
+    valid_value_count: int
+    finite_value_count: int
+    nonfinite_value_count: int
+    positive_success_signal_count: int
+    successful_trajectory_count: int
+    total_chunk_count: int
+    valid_chunk_count: int
+    valid_idm_chunk_count: int
+    valid_uncond_chunk_count: int
+    valid_reward_min: float | None
+    valid_reward_max: float | None
+    valid_reward_sum: float
+
+    def to_artifact(self) -> dict[str, object]:
+        """Return a JSON-safe aggregate without individual rewards."""
+
+        return {
+            "schema": FASTWAM_REWARD_AUDIT_SCHEMA,
+            "reward_shape": list(self.reward_shape),
+            "reward_dtype": self.reward_dtype,
+            "total_value_count": self.total_value_count,
+            "valid_value_count": self.valid_value_count,
+            "finite_value_count": self.finite_value_count,
+            "nonfinite_value_count": self.nonfinite_value_count,
+            "positive_success_signal_count": self.positive_success_signal_count,
+            "successful_trajectory_count": self.successful_trajectory_count,
+            "total_chunk_count": self.total_chunk_count,
+            "valid_chunk_count": self.valid_chunk_count,
+            "valid_idm_chunk_count": self.valid_idm_chunk_count,
+            "valid_uncond_chunk_count": self.valid_uncond_chunk_count,
+            "valid_reward_min": self.valid_reward_min,
+            "valid_reward_max": self.valid_reward_max,
+            "valid_reward_sum": self.valid_reward_sum,
+        }
+
+    def require_success_signal(self) -> None:
+        """Fail before optimization when the audited rollout is unsafe to train."""
+
+        if self.nonfinite_value_count:
+            raise RuntimeError(
+                "FastWAM short-RL raw environment rewards contain non-finite "
+                f"values ({self.nonfinite_value_count})."
+            )
+        if self.positive_success_signal_count < 1:
+            raise RuntimeError(
+                "FastWAM short-RL rollout contains zero positive sparse-success "
+                "signals; refusing to optimize Gate/LoRA/value parameters."
+            )
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
+class FastWAMRolloutStateAudit:
+    """Compact route-probability and stored-K/V evidence without payloads."""
+
+    decision_shape: tuple[int, ...]
+    total_decision_count: int
+    valid_chunk_count: int
+    valid_idm_chunk_count: int
+    valid_uncond_chunk_count: int
+    emitted_decision_count: int
+    eligible_gate_decision_count: int
+    unused_emitted_decision_count: int
+    base_probability_min: float
+    base_probability_max: float
+    base_probability_mean: float
+    behavior_probability_min: float
+    behavior_probability_max: float
+    behavior_probability_mean: float
+    kv_replay_backend: str
+    kv_storage_dtype: str
+    kv_layer_indices: tuple[int, ...]
+    kv_denoise_tap_count: int
+    kv_configured_max_bytes_per_sample: int | None
+    kv_all_emitted_sample_count: int
+    kv_all_emitted_nonzero_sample_count: int
+    kv_all_emitted_total_bytes: int
+    kv_all_emitted_maximum_bytes_per_sample: int
+    kv_eligible_sample_count: int
+    kv_eligible_nonzero_sample_count: int
+    kv_eligible_total_bytes: int
+    kv_eligible_maximum_bytes_per_sample: int
+
+    def to_artifact(self) -> dict[str, object]:
+        """Return JSON-safe aggregates without K/V tensors or trajectories."""
+
+        probability_count = self.eligible_gate_decision_count
+        return {
+            "schema": FASTWAM_ROLLOUT_STATE_AUDIT_SCHEMA,
+            "decision_shape": list(self.decision_shape),
+            "total_decision_count": self.total_decision_count,
+            "valid_chunk_count": self.valid_chunk_count,
+            "valid_idm_chunk_count": self.valid_idm_chunk_count,
+            "valid_uncond_chunk_count": self.valid_uncond_chunk_count,
+            "executed_idm_fraction": (
+                self.valid_idm_chunk_count / self.valid_chunk_count
+            ),
+            "emitted_decision_count": self.emitted_decision_count,
+            "eligible_gate_decision_count": self.eligible_gate_decision_count,
+            "unused_emitted_decision_count": self.unused_emitted_decision_count,
+            "base_probability": {
+                "count": probability_count,
+                "minimum": self.base_probability_min,
+                "maximum": self.base_probability_max,
+                "mean": self.base_probability_mean,
+            },
+            "behavior_probability": {
+                "count": probability_count,
+                "minimum": self.behavior_probability_min,
+                "maximum": self.behavior_probability_max,
+                "mean": self.behavior_probability_mean,
+            },
+            "kv_replay_backend": self.kv_replay_backend,
+            "kv_storage_dtype": self.kv_storage_dtype,
+            "kv_layer_indices": list(self.kv_layer_indices),
+            "kv_denoise_tap_count": self.kv_denoise_tap_count,
+            "kv_configured_max_bytes_per_sample": (
+                self.kv_configured_max_bytes_per_sample
+            ),
+            "kv_all_emitted": {
+                "sample_count": self.kv_all_emitted_sample_count,
+                "nonzero_sample_count": self.kv_all_emitted_nonzero_sample_count,
+                "total_bytes": self.kv_all_emitted_total_bytes,
+                "maximum_bytes_per_sample": (
+                    self.kv_all_emitted_maximum_bytes_per_sample
+                ),
+            },
+            "kv_eligible": {
+                "sample_count": self.kv_eligible_sample_count,
+                "nonzero_sample_count": self.kv_eligible_nonzero_sample_count,
+                "total_bytes": self.kv_eligible_total_bytes,
+                "maximum_bytes_per_sample": (self.kv_eligible_maximum_bytes_per_sample),
+            },
+        }
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
@@ -87,6 +234,248 @@ def _chunk_mask(
     return value.reshape(*shape, -1).any(dim=-1)
 
 
+def _primitive_reward_mask(
+    value: torch.Tensor | None,
+    *,
+    reward_shape: torch.Size,
+    device: torch.device,
+) -> torch.Tensor:
+    if value is None:
+        return torch.ones(reward_shape, dtype=torch.bool, device=device)
+    if value.dtype != torch.bool:
+        raise TypeError(f"valid_mask must use torch.bool, got {value.dtype}.")
+    if value.shape[:2] != reward_shape[:2]:
+        raise ValueError(
+            "valid_mask must match reward [time, batch] dimensions; got "
+            f"{tuple(value.shape)} and {tuple(reward_shape)}."
+        )
+    if value.ndim == 2:
+        value = value.unsqueeze(-1)
+    elif value.ndim != 3:
+        raise ValueError(
+            "valid_mask must have shape [time, batch] or "
+            "[time, batch, 1|action_chunks]."
+        )
+    if value.shape[-1] not in {1, reward_shape[-1]}:
+        raise ValueError(
+            "valid_mask trailing dimension must be one or match action chunks; "
+            f"got {value.shape[-1]} and {reward_shape[-1]}."
+        )
+    return value.expand(reward_shape)
+
+
+def summarize_fastwam_environment_rewards(
+    *,
+    environment_rewards: torch.Tensor,
+    route_used: torch.Tensor,
+    valid_mask: torch.Tensor | None = None,
+) -> FastWAMEnvironmentRewardAudit:
+    """Summarize raw primitive rewards before applying any branch cost.
+
+    Positive finite raw LIBERO rewards are the sparse task-success signal. The
+    audit deliberately applies the actor loss mask first, so rewards in padded
+    or post-terminal chunks cannot unlock training. It retains only aggregates.
+    """
+
+    if not environment_rewards.is_floating_point():
+        raise TypeError("environment_rewards must use a floating dtype.")
+    if environment_rewards.ndim != 3:
+        raise ValueError(
+            "FastWAM environment rewards must have shape "
+            "[time, batch, action_chunks], "
+            f"got {tuple(environment_rewards.shape)}."
+        )
+    if route_used.shape != environment_rewards.shape[:2]:
+        raise ValueError(
+            "route_used must match the reward [time, batch] dimensions; got "
+            f"{tuple(route_used.shape)} and {tuple(environment_rewards.shape)}."
+        )
+    if route_used.dtype not in {
+        torch.uint8,
+        torch.int8,
+        torch.int16,
+        torch.int32,
+        torch.int64,
+    }:
+        raise TypeError("route_used must use an integer dtype.")
+    invalid_route = (route_used != int(WAMRoute.UNCOND)) & (
+        route_used != int(WAMRoute.IDM)
+    )
+    if bool(invalid_route.any().item()):
+        raise ValueError("route_used contains a value outside WAMRoute.")
+
+    primitive_mask = _primitive_reward_mask(
+        valid_mask,
+        reward_shape=environment_rewards.shape,
+        device=environment_rewards.device,
+    )
+    chunk_mask = primitive_mask.any(dim=-1)
+    finite_mask = torch.isfinite(environment_rewards)
+    valid_finite_mask = primitive_mask & finite_mask
+    positive_mask = valid_finite_mask & (environment_rewards > 0)
+    valid_finite_rewards = environment_rewards[valid_finite_mask]
+    if valid_finite_rewards.numel():
+        reward_min = float(valid_finite_rewards.min().item())
+        reward_max = float(valid_finite_rewards.max().item())
+        reward_sum = float(valid_finite_rewards.to(torch.float64).sum().item())
+    else:
+        reward_min = None
+        reward_max = None
+        reward_sum = 0.0
+
+    return FastWAMEnvironmentRewardAudit(
+        reward_shape=tuple(int(size) for size in environment_rewards.shape),
+        reward_dtype=str(environment_rewards.dtype),
+        total_value_count=int(environment_rewards.numel()),
+        valid_value_count=int(primitive_mask.sum().item()),
+        finite_value_count=int(finite_mask.sum().item()),
+        nonfinite_value_count=int((~finite_mask).sum().item()),
+        positive_success_signal_count=int(positive_mask.sum().item()),
+        successful_trajectory_count=int(positive_mask.any(dim=(0, 2)).sum().item()),
+        total_chunk_count=int(route_used.numel()),
+        valid_chunk_count=int(chunk_mask.sum().item()),
+        valid_idm_chunk_count=int(
+            (chunk_mask & (route_used == int(WAMRoute.IDM))).sum().item()
+        ),
+        valid_uncond_chunk_count=int(
+            (chunk_mask & (route_used == int(WAMRoute.UNCOND))).sum().item()
+        ),
+        valid_reward_min=reward_min,
+        valid_reward_max=reward_max,
+        valid_reward_sum=reward_sum,
+    )
+
+
+def summarize_fastwam_rollout_state(
+    *,
+    route: ChunkRouteRecord,
+    emitted: GateDecisionRecord,
+    eligible_gate_mask: torch.Tensor,
+    valid_mask: torch.Tensor | None,
+    kv_replay_backend: str,
+    max_bytes_per_sample: int | None,
+) -> FastWAMRolloutStateAudit:
+    """Summarize routed chunks, Gate probabilities, and actual K/V byte volume."""
+
+    if len(route.shape) != 2 or emitted.shape != route.shape:
+        raise ValueError(
+            "FastWAM rollout-state audit requires matching [time, batch] "
+            "route and emitted decision records."
+        )
+    if eligible_gate_mask.dtype != torch.bool:
+        raise TypeError("eligible_gate_mask must use torch.bool.")
+    if eligible_gate_mask.shape != route.shape:
+        raise ValueError("eligible_gate_mask must match the route shape.")
+    chunk_mask = _chunk_mask(
+        valid_mask,
+        shape=route.shape,
+        name="valid_mask",
+        device=route.route_used.device,
+    )
+    if bool((eligible_gate_mask & ~emitted.valid).any().item()):
+        raise ValueError("Eligible Gate decisions must be valid emitted decisions.")
+    if bool((eligible_gate_mask & ~chunk_mask).any().item()):
+        raise ValueError("Eligible Gate decisions must belong to valid chunks.")
+
+    valid_chunk_count = int(chunk_mask.sum().item())
+    if valid_chunk_count < 1:
+        raise ValueError("FastWAM rollout-state audit has no valid chunks.")
+    emitted_count = int(emitted.valid.sum().item())
+    eligible_count = int(eligible_gate_mask.sum().item())
+    if eligible_count < 1:
+        raise ValueError("FastWAM rollout-state audit has no eligible Gate decisions.")
+
+    metadata = emitted.kv_metadata
+    backend = str(kv_replay_backend).strip().lower()
+    if backend not in {"stored", "recompute"}:
+        raise ValueError(f"Unsupported FastWAM K/V replay backend {backend!r}.")
+    if metadata is None:
+        raise ValueError(f"FastWAM {backend} K/V metadata is missing.")
+    byte_limit = max_bytes_per_sample
+    if byte_limit is not None:
+        if isinstance(byte_limit, bool) or int(byte_limit) < 1:
+            raise ValueError("K/V max_bytes_per_sample must be a positive integer.")
+        byte_limit = int(byte_limit)
+
+    byte_values = metadata.total_bytes.to(emitted.valid.device)
+    emitted_bytes = byte_values[emitted.valid]
+    eligible_bytes = byte_values[eligible_gate_mask]
+    if backend == "stored":
+        if emitted_bytes.numel() == 0 or bool((emitted_bytes <= 0).any().item()):
+            raise ValueError(
+                "FastWAM stored K/V bytes must be positive for every emitted decision."
+            )
+        if byte_limit is None:
+            raise ValueError("FastWAM stored K/V requires max_bytes_per_sample.")
+        if int(emitted_bytes.max().item()) > byte_limit:
+            raise ValueError("FastWAM stored K/V exceeds max_bytes_per_sample.")
+    elif bool((emitted_bytes != 0).any().item()):
+        raise ValueError(
+            "FastWAM recompute metadata must report zero stored K/V bytes."
+        )
+
+    def probability_summary(value: torch.Tensor) -> tuple[float, float, float]:
+        selected = value[eligible_gate_mask].to(torch.float64)
+        if not bool(torch.isfinite(selected).all().item()):
+            raise ValueError("Eligible Gate probability contains non-finite values.")
+        return (
+            float(selected.min().item()),
+            float(selected.max().item()),
+            float(selected.mean().item()),
+        )
+
+    def byte_summary(values: torch.Tensor) -> tuple[int, int, int, int]:
+        sample_count = int(values.numel())
+        nonzero_count = int((values > 0).sum().item())
+        total_bytes = int(values.to(torch.int64).sum().item())
+        maximum = int(values.max().item()) if sample_count else 0
+        return sample_count, nonzero_count, total_bytes, maximum
+
+    base_min, base_max, base_mean = probability_summary(emitted.base_probability)
+    behavior_min, behavior_max, behavior_mean = probability_summary(
+        emitted.behavior_probability
+    )
+    all_count, all_nonzero, all_total, all_max = byte_summary(emitted_bytes)
+    eligible_byte_count, eligible_nonzero, eligible_total, eligible_max = byte_summary(
+        eligible_bytes
+    )
+    valid_idm_count = int(
+        (chunk_mask & (route.route_used == int(WAMRoute.IDM))).sum().item()
+    )
+    valid_uncond_count = int(
+        (chunk_mask & (route.route_used == int(WAMRoute.UNCOND))).sum().item()
+    )
+    return FastWAMRolloutStateAudit(
+        decision_shape=tuple(int(size) for size in route.shape),
+        total_decision_count=int(route.route_used.numel()),
+        valid_chunk_count=valid_chunk_count,
+        valid_idm_chunk_count=valid_idm_count,
+        valid_uncond_chunk_count=valid_uncond_count,
+        emitted_decision_count=emitted_count,
+        eligible_gate_decision_count=eligible_count,
+        unused_emitted_decision_count=emitted_count - eligible_count,
+        base_probability_min=base_min,
+        base_probability_max=base_max,
+        base_probability_mean=base_mean,
+        behavior_probability_min=behavior_min,
+        behavior_probability_max=behavior_max,
+        behavior_probability_mean=behavior_mean,
+        kv_replay_backend=backend,
+        kv_storage_dtype=metadata.storage_dtype,
+        kv_layer_indices=metadata.layer_indices,
+        kv_denoise_tap_count=int(metadata.denoise_timesteps.shape[-1]),
+        kv_configured_max_bytes_per_sample=byte_limit,
+        kv_all_emitted_sample_count=all_count,
+        kv_all_emitted_nonzero_sample_count=all_nonzero,
+        kv_all_emitted_total_bytes=all_total,
+        kv_all_emitted_maximum_bytes_per_sample=all_max,
+        kv_eligible_sample_count=eligible_byte_count,
+        kv_eligible_nonzero_sample_count=eligible_nonzero,
+        kv_eligible_total_bytes=eligible_total,
+        kv_eligible_maximum_bytes_per_sample=eligible_max,
+    )
+
+
 def apply_fastwam_chunk_cost(
     *,
     environment_rewards: torch.Tensor,
@@ -139,9 +528,9 @@ def apply_fastwam_chunk_cost(
     ).unsqueeze(-1)
     if valid_mask is not None:
         costs = torch.where(
-            _chunk_mask(valid_mask, shape=route_used.shape, name="valid_mask").unsqueeze(
-                -1
-            ),
+            _chunk_mask(
+                valid_mask, shape=route_used.shape, name="valid_mask"
+            ).unsqueeze(-1),
             costs,
             torch.zeros_like(costs),
         )
@@ -264,9 +653,7 @@ def align_fastwam_policy_advantages(
     episode_changed = target_episode != source_episode
     source_done = done_mask[source_times + 1, source_columns]
     target_forced = route.route_was_forced[target_times, target_columns]
-    target_is_idm = (
-        route.route_used[target_times, target_columns] == int(WAMRoute.IDM)
-    )
+    target_is_idm = route.route_used[target_times, target_columns] == int(WAMRoute.IDM)
     target_is_first_chunk = route.chunk_ids[target_times, target_columns] == 0
 
     _raise_first_pair(

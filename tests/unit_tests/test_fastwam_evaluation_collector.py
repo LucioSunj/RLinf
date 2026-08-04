@@ -18,9 +18,20 @@ import hashlib
 import json
 from pathlib import Path
 
+import pytest
 import torch
 
 from rlinf.data.embodied_io_struct import EnvOutput, RolloutResult
+from rlinf.envs.action_contract import (
+    DENORMALIZED_ACTION_STAGE,
+    GRIPPER_CONVERTED_ACTION_STAGE,
+    NORMALIZED_ACTION_STAGE,
+    PREPARED_LIBERO_ACTION_STAGE,
+    SUBMITTED_LIBERO_ACTION_STAGE,
+    ActionExecutionTrace,
+    ActionStageStatistics,
+)
+from rlinf.envs.libero.action_contract import LiberoActionContract
 from rlinf.models.embodiment.wam_policy.contracts import (
     ChunkRouteRecord,
     GateDecisionRecord,
@@ -28,6 +39,7 @@ from rlinf.models.embodiment.wam_policy.contracts import (
 from rlinf.models.embodiment.wam_policy.evaluation import EvaluationRouteSelection
 from rlinf.runners.fastwam_libero_eval_collector import (
     FastWAMLiberoEvalCollector,
+    _load_ledger,
 )
 
 
@@ -39,6 +51,61 @@ def _canonical_sha(payload) -> str:
         ensure_ascii=True,
     ).encode("utf-8")
     return hashlib.sha256(encoded).hexdigest()
+
+
+def _action_contract() -> LiberoActionContract:
+    return LiberoActionContract(
+        low=(-1.0,) * 7,
+        high=(1.0,) * 7,
+        dimension_names=(
+            "delta_x",
+            "delta_y",
+            "delta_z",
+            "delta_axis_angle_x",
+            "delta_axis_angle_y",
+            "delta_axis_angle_z",
+            "gripper",
+        ),
+        gripper_dimension_index=6,
+        outer_environment_classes=("unit.OffScreenRenderEnv",),
+        underlying_environment_classes=("unit.LiberoTask",),
+        robot_class="unit.SingleArm",
+        robot_model="OnTheGroundPanda",
+        controller_class="unit.OperationalSpaceController",
+        controller_name="OSC_POSE",
+        controller_input_low=(-1.0,) * 6,
+        controller_input_high=(1.0,) * 6,
+        controller_output_low=(-0.05, -0.05, -0.05, -0.5, -0.5, -0.5),
+        controller_output_high=(0.05, 0.05, 0.05, 0.5, 0.5, 0.5),
+        gripper_class="unit.PandaGripper",
+        gripper_dof=1,
+        gripper_speed=0.01,
+        control_frequency_hz=20,
+        environment_horizon=1000,
+        dependency_versions=(("robosuite_version", "1.4.0"),),
+    )
+
+
+def _action_trace(
+    stages: tuple[str, ...],
+    *,
+    batch_size: int = 1,
+) -> ActionExecutionTrace:
+    contract = _action_contract()
+    values = torch.zeros(batch_size, 2, 7)
+    return ActionExecutionTrace(
+        stages=tuple(
+            ActionStageStatistics.from_values(
+                stage=stage,
+                values=values,
+                low=contract.low,
+                high=contract.high,
+                gripper_dimension_index=contract.gripper_dimension_index,
+                action_contract_sha256=contract.canonical_sha256,
+            )
+            for stage in stages
+        )
+    )
 
 
 def _ledger(path: Path) -> dict:
@@ -73,6 +140,7 @@ class _IdentityEnv:
     task_ids = [0]
     trial_ids = [0]
     reset_state_ids = [0]
+    action_contract = _action_contract()
 
 
 def _rollout(
@@ -111,10 +179,17 @@ def _rollout(
         counterfactual_next_route=torch.tensor([0]),
     )
     return RolloutResult(
-        actions=torch.tensor([[[0.1] * 7, [1.1] * 7]]),
+        actions=torch.tensor([[[0.1] * 7, [0.9] * 7]]),
         route_info=route,
         emitted_gate=emitted,
         evaluation_selection=selection,
+        action_execution_trace=_action_trace(
+            (
+                NORMALIZED_ACTION_STAGE,
+                DENORMALIZED_ACTION_STAGE,
+                GRIPPER_CONVERTED_ACTION_STAGE,
+            )
+        ),
         gate_latency_seconds=torch.tensor([0.004], dtype=torch.float64),
         gate_h2d_seconds=torch.tensor([0.0], dtype=torch.float64),
     )
@@ -129,10 +204,20 @@ def _outcome(*, terminal: bool, success: bool = False) -> EnvOutput:
         terminations=terminations,
         truncations=truncations,
         rewards=torch.tensor([[0.0, float(success)]]),
+        action_execution_trace=_action_trace(
+            (
+                PREPARED_LIBERO_ACTION_STAGE,
+                SUBMITTED_LIBERO_ACTION_STAGE,
+            )
+        ),
     )
 
 
-def _collector(tmp_path: Path) -> FastWAMLiberoEvalCollector:
+def _collector(
+    tmp_path: Path,
+    *,
+    noise_seed_mode: str = "stateless_per_chunk",
+) -> FastWAMLiberoEvalCollector:
     tmp_path.mkdir(parents=True, exist_ok=True)
     ledger_path = tmp_path / "ledger.json"
     if not ledger_path.exists():
@@ -147,6 +232,7 @@ def _collector(tmp_path: Path) -> FastWAMLiberoEvalCollector:
         random_idm_probability=None,
         routing_seed=0,
         fixed_idm_cost=0.01,
+        noise_seed_mode=noise_seed_mode,
     )
 
 
@@ -258,6 +344,46 @@ def test_collector_seed_augmentation_is_reproducible(tmp_path) -> None:
     )
 
 
+def test_collector_fixed_episode_noise_matches_official_reseeding(tmp_path) -> None:
+    collector = _collector(tmp_path, noise_seed_mode="fixed_per_episode")
+    env = _IdentityEnv()
+    env_ids = torch.tensor([1 << 50])
+
+    first_snapshot = collector.snapshot_before_step(0, env, env_ids)
+    first = collector.augment_rollout_input(
+        {"obs": {"states": torch.zeros(1, 3)}},
+        first_snapshot,
+    )
+    collector.record_chunk(
+        snapshot=first_snapshot,
+        rollout_result=_rollout(
+            chunk_id=0,
+            route_used=1,
+            forced=True,
+            source_chunk_id=-1,
+            terminal=False,
+        ),
+        env_output=_outcome(terminal=False),
+        environment_latency_seconds=0.02,
+    )
+    second_snapshot = collector.snapshot_before_step(0, env, env_ids)
+    second = collector.augment_rollout_input(
+        {"obs": {"states": torch.zeros(1, 3)}},
+        second_snapshot,
+    )
+
+    assert first["obs"]["_fastwam_action_noise_seeds"].tolist() == [101]
+    assert first["obs"]["_fastwam_idm_noise_seeds"].tolist() == [202]
+    assert torch.equal(
+        first["obs"]["_fastwam_action_noise_seeds"],
+        second["obs"]["_fastwam_action_noise_seeds"],
+    )
+    assert torch.equal(
+        first["obs"]["_fastwam_idm_noise_seeds"],
+        second["obs"]["_fastwam_idm_noise_seeds"],
+    )
+
+
 def test_collector_fails_closed_on_actual_ledger_identity_mismatch(tmp_path) -> None:
     collector = _collector(tmp_path)
     env = _IdentityEnv()
@@ -357,6 +483,14 @@ def test_collector_writes_parallel_episodes_in_frozen_ledger_order(tmp_path) -> 
                 effective_next_route=torch.tensor([0, 0]),
                 counterfactual_next_route=torch.tensor([0, 0]),
             ),
+            action_execution_trace=_action_trace(
+                (
+                    NORMALIZED_ACTION_STAGE,
+                    DENORMALIZED_ACTION_STAGE,
+                    GRIPPER_CONVERTED_ACTION_STAGE,
+                ),
+                batch_size=2,
+            ),
         ),
         env_output=EnvOutput(
             obs={"states": torch.zeros(2, 3)},
@@ -364,6 +498,13 @@ def test_collector_writes_parallel_episodes_in_frozen_ledger_order(tmp_path) -> 
             terminations=torch.tensor([[False], [False]]),
             truncations=torch.tensor([[True], [True]]),
             rewards=torch.zeros(2, 1),
+            action_execution_trace=_action_trace(
+                (
+                    PREPARED_LIBERO_ACTION_STAGE,
+                    SUBMITTED_LIBERO_ACTION_STAGE,
+                ),
+                batch_size=2,
+            ),
         ),
         environment_latency_seconds=0.02,
     )
@@ -380,3 +521,49 @@ def test_collector_writes_parallel_episodes_in_frozen_ledger_order(tmp_path) -> 
     ]
     assert [episode["episode_identity"] for episode in episodes] == identities
     assert [chunk["episode_identity"] for chunk in chunks] == identities
+
+
+def _ledger_v2(path: Path, *, max_primitive_steps: int = 700) -> dict:
+    identity_fields = {
+        "task_suite": "libero_10",
+        "task_id": 0,
+        "trial_id": 0,
+        "reset_state_id": 0,
+        "environment_seed": 7,
+        "action_noise_seed": 101,
+        "idm_video_noise_seed": 202,
+        "max_primitive_steps": max_primitive_steps,
+        "generation_horizon": 32,
+        "execution_horizon": 10,
+        "prediction_video_frames": 9,
+        "reset_wait_steps": 30,
+    }
+    payload = {
+        "schema": "fastwam-libero-eval-ledger-v2",
+        "kind": "validation",
+        "task_suite": "libero_10",
+        "entries": [
+            {
+                "episode_index": 0,
+                **identity_fields,
+                "episode_identity": _canonical_sha(identity_fields),
+            }
+        ],
+    }
+    path.write_text(json.dumps(payload), encoding="utf-8")
+    return payload
+
+
+def test_collector_loads_explicit_ledger_v2_protocol(tmp_path) -> None:
+    path = tmp_path / "ledger-v2.json"
+    expected = _ledger_v2(path)
+
+    assert _load_ledger(path) == expected
+
+
+def test_collector_rejects_malformed_ledger_v2_protocol(tmp_path) -> None:
+    path = tmp_path / "ledger-v2-invalid.json"
+    _ledger_v2(path, max_primitive_steps=701)
+
+    with pytest.raises(ValueError, match="inconsistent"):
+        _load_ledger(path)

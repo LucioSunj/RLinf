@@ -146,6 +146,28 @@ def test_checkpoint_contract_covers_continuation_semantics_not_run_length() -> N
     assert MODULE.build_fastwam_checkpoint_contract(cfg, world_size=2) != baseline
 
 
+def test_checkpoint_contract_normalizes_validate_cfg_inserted_defaults() -> None:
+    unvalidated = _checkpoint_cfg()
+    del unvalidated.runner.weight_sync_interval
+    del unvalidated.runner.overlap_env_bootstrap
+
+    validated = _checkpoint_cfg()
+    validated.actor.fsdp_config.amp_autocast = {
+        "enabled": False,
+        "precision": "bf16",
+    }
+    validated.actor.fsdp_config.grad_scaler = {
+        "enabled": False,
+        "init_scale": None,
+        "growth_interval": None,
+    }
+
+    assert MODULE.build_fastwam_checkpoint_contract(
+        unvalidated,
+        world_size=2,
+    ) == MODULE.build_fastwam_checkpoint_contract(validated, world_size=2)
+
+
 def _eval_model_cfg():
     return OmegaConf.create(
         {
@@ -153,7 +175,7 @@ def _eval_model_cfg():
             "precision": "bf16",
             "init_device": "cpu",
             "action_dim": 7,
-            "num_action_chunks": 16,
+            "num_action_chunks": 10,
             "actor_checkpoint": "/parents/fastwam.pt",
             "actor_checkpoint_sha256": "a" * 64,
             "model_path": "/parents/fastwam.pt",
@@ -188,9 +210,15 @@ def _eval_model_cfg():
             "kv_replay": {"backend": "stored"},
             "flow_sde": {"enabled": True, "noise_level": 0.5},
             "runtime": {
-                "action_horizon": 16,
-                "num_inference_steps": 20,
+                "generation_horizon": 32,
+                "execution_horizon": 10,
+                "num_video_frames": 9,
+                "reset_wait_steps": 30,
+                "max_episode_steps": 700,
+                "num_inference_steps": 10,
+                "seeded_noise_device": "cpu",
                 "text_embedding_cache_dir": None,
+                "camera_resize_mode": "official_pil_center_crop",
                 "binarize_gripper": False,
             },
             "critic": {
@@ -247,6 +275,14 @@ def test_eval_model_contract_allows_only_declared_runtime_differences() -> None:
         ("uncond_lora.target_groups", ["ffn"]),
         ("fastwam.action_dit_config.num_layers", 29),
         ("gate_temperature", 0.5),
+        ("runtime.generation_horizon", 16),
+        ("runtime.execution_horizon", 8),
+        ("runtime.num_video_frames", 33),
+        ("runtime.reset_wait_steps", 15),
+        ("runtime.max_episode_steps", 512),
+        ("runtime.num_inference_steps", 20),
+        ("runtime.seeded_noise_device", "model"),
+        ("runtime.camera_resize_mode", "torch_bilinear"),
     ],
 )
 def test_eval_model_contract_rejects_structural_differences(path, value) -> None:

@@ -22,7 +22,6 @@ from pathlib import Path
 from typing import Any, Literal
 
 import torch
-import torch.nn.functional as F
 from fastwam.adapters import PolicyRegime
 from fastwam.models.wan22.adaptive_action import (
     CachedActionCondition,
@@ -36,6 +35,23 @@ from fastwam.models.wan22.kv_tap import (
     GateKVSnapshot,
     GateLayerKV,
     KeyValueBank,
+)
+
+from rlinf.envs.action_contract import (
+    DENORMALIZED_ACTION_STAGE,
+    GRIPPER_CONVERTED_ACTION_STAGE,
+    NORMALIZED_ACTION_STAGE,
+    ActionExecutionTrace,
+    ActionStageStatistics,
+)
+from rlinf.envs.libero.action_protocol import (
+    LiberoActionProtocol,
+    select_executed_action_prefix,
+    select_executed_flow_statistics,
+)
+from rlinf.envs.libero.image_preprocessing import (
+    OFFICIAL_LIBERO_CAMERA_RESIZE_MODE,
+    prepare_libero_camera_batch,
 )
 
 from .adaptive_policy import FastWAMChunkSample
@@ -110,8 +126,15 @@ def _load_cached_text_contexts(
             )
         if not torch.isfinite(context.float()).all():
             raise ValueError(f"Cached text context contains non-finite values: {path}")
-        contexts.append(context)
+        # Match both FastWAM training and ``FastWAM.encode_prompt``: the UMT5
+        # padding embeddings remain present in the raw cache, but consumers
+        # must zero them and then expose an all-valid mask because Wan2.2's
+        # original cross-attention behavior sees the zero padding tokens.
+        context = context.clone()
+        context[~mask] = 0
+        mask = torch.ones_like(mask)
         masks.append(mask)
+        contexts.append(context)
     return (
         torch.stack(contexts).to(device=device, dtype=dtype),
         torch.stack(masks).to(device=device, dtype=torch.bool),
@@ -122,8 +145,7 @@ def _cat_bank(banks: list[KeyValueBank]) -> KeyValueBank:
     first = banks[0]
     if any(
         bank.source is not first.source
-        or bank.contains_generated_future_video
-        != first.contains_generated_future_video
+        or bank.contains_generated_future_video != first.contains_generated_future_video
         for bank in banks[1:]
     ):
         raise ValueError("Cannot batch Gate K/V banks with different sources.")
@@ -140,9 +162,7 @@ def _cat_snapshots(snapshots: list[GateKVSnapshot]) -> GateKVSnapshot:
     first = snapshots[0]
     if any(snapshot.layer_indices != first.layer_indices for snapshot in snapshots[1:]):
         raise ValueError("Cannot batch Gate snapshots with different layer taps.")
-    actor_versions = {
-        snapshot.layers[0].actor_version for snapshot in snapshots
-    }
+    actor_versions = {snapshot.layers[0].actor_version for snapshot in snapshots}
     if len(actor_versions) != 1:
         raise ValueError("Cannot batch Gate snapshots from different actor versions.")
     layers = []
@@ -217,6 +237,7 @@ def _seeded_randn(
     *,
     device: torch.device,
     dtype: torch.dtype,
+    rand_device: str = "cpu",
 ) -> torch.Tensor:
     """Generate one noise tensor from a local generator."""
 
@@ -225,14 +246,17 @@ def _seeded_randn(
         raise ValueError("FastWAM local noise seed must be non-negative.")
     if not shape or any(int(dimension) < 1 for dimension in shape):
         raise ValueError("FastWAM seeded noise shape must be non-empty and positive.")
-    generator = torch.Generator(device=device)
+    if rand_device not in {"cpu", "model"}:
+        raise ValueError("FastWAM seeded noise device must be either 'cpu' or 'model'.")
+    generation_device = device if rand_device == "model" else torch.device("cpu")
+    generator = torch.Generator(device=generation_device)
     generator.manual_seed(seed)
     return torch.randn(
         shape,
-        device=device,
+        device=generation_device,
         dtype=torch.float32,
         generator=generator,
-    ).to(dtype=dtype)
+    ).to(device=device, dtype=dtype)
 
 
 def _align_linear_normalizer(normalizer: Any, reference: torch.Tensor) -> None:
@@ -268,6 +292,56 @@ def _convert_fastwam_gripper_to_libero(
     return result
 
 
+def _action_contract_metadata(
+    env_obs: dict[str, Any],
+    *,
+    actions: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor, int, str] | None:
+    """Validate compact exact-spec metadata supplied by the eval collector."""
+
+    keys = (
+        "_fastwam_action_contract_low",
+        "_fastwam_action_contract_high",
+        "_fastwam_action_gripper_indices",
+        "_fastwam_action_contract_sha256",
+    )
+    present = [key in env_obs for key in keys]
+    if not any(present):
+        return None
+    if not all(present):
+        missing = [key for key, exists in zip(keys, present) if not exists]
+        raise ValueError(f"Incomplete FastWAM Action contract metadata: {missing}.")
+    batch_size = int(actions.shape[0])
+    action_dim = int(actions.shape[-1])
+    low = torch.as_tensor(env_obs[keys[0]], device=actions.device, dtype=torch.float32)
+    high = torch.as_tensor(env_obs[keys[1]], device=actions.device, dtype=torch.float32)
+    if low.shape != (batch_size, action_dim) or high.shape != low.shape:
+        raise ValueError("FastWAM Action contract bounds must have shape [B, D].")
+    gripper_indices = torch.as_tensor(env_obs[keys[2]], dtype=torch.long)
+    if gripper_indices.shape != (batch_size,):
+        raise ValueError("FastWAM gripper indices must have shape [B].")
+    unique_gripper = torch.unique(gripper_indices)
+    if unique_gripper.numel() != 1:
+        raise ValueError("One FastWAM Action batch cannot mix gripper indices.")
+    gripper_index = int(unique_gripper.item())
+    if not 0 <= gripper_index < action_dim:
+        raise ValueError("FastWAM gripper index is outside the Action dimension.")
+    hashes = env_obs[keys[3]]
+    if isinstance(hashes, str):
+        hashes = [hashes] * batch_size
+    if not isinstance(hashes, (list, tuple)) or len(hashes) != batch_size:
+        raise ValueError("FastWAM Action contract hashes must align with the batch.")
+    hashes = [str(item) for item in hashes]
+    if len(set(hashes)) != 1:
+        raise ValueError("One FastWAM Action batch cannot mix contract hashes.")
+    contract_hash = hashes[0]
+    if len(contract_hash) != 64 or any(
+        character not in "0123456789abcdef" for character in contract_hash
+    ):
+        raise ValueError("FastWAM Action contract SHA256 is invalid.")
+    return low, high, gripper_index, contract_hash
+
+
 class LiberoFastWAMRuntime:
     """Correctness-first mixed-route runtime using the checked-out FastWAM."""
 
@@ -278,9 +352,13 @@ class LiberoFastWAMRuntime:
         lora_adapter,
         processor: Any | None = None,
         processor_stats_path: str | None = None,
-        action_horizon: int = 16,
-        num_video_frames: int = 33,
-        num_inference_steps: int = 20,
+        generation_horizon: int = 32,
+        execution_horizon: int = 10,
+        num_video_frames: int = 9,
+        reset_wait_steps: int = 30,
+        max_episode_steps: int = 700,
+        num_inference_steps: int = 10,
+        seeded_noise_device: str = "cpu",
         sigma_shift: float | None = None,
         flow_sde_noise_level: float = 0.5,
         gate_layer_indices: tuple[int, ...] | list[int] | None = None,
@@ -290,6 +368,7 @@ class LiberoFastWAMRuntime:
         camera_width: int = 224,
         camera_concat: str = "horizontal",
         tiled_vae: bool = False,
+        camera_resize_mode: str = OFFICIAL_LIBERO_CAMERA_RESIZE_MODE,
         binarize_gripper: bool = False,
         prompt_template: str = DEFAULT_FASTWAM_PROMPT_TEMPLATE,
         text_embedding_cache_dir: str | None = None,
@@ -299,9 +378,16 @@ class LiberoFastWAMRuntime:
         self.lora_adapter = lora_adapter
         self.processor = processor
         self.processor_stats_path = processor_stats_path
-        self.action_horizon = int(action_horizon)
         self.num_video_frames = int(num_video_frames)
         self.num_inference_steps = int(num_inference_steps)
+        self.seeded_noise_device = str(seeded_noise_device)
+        self.action_protocol = LiberoActionProtocol(
+            generation_horizon=generation_horizon,
+            execution_horizon=execution_horizon,
+            prediction_video_frames=num_video_frames,
+            reset_wait_steps=reset_wait_steps,
+            max_episode_steps=max_episode_steps,
+        )
         self.sigma_shift = sigma_shift
         self.flow_sde_noise_level = float(flow_sde_noise_level)
         self.gate_layer_indices = (
@@ -315,6 +401,7 @@ class LiberoFastWAMRuntime:
         self.camera_width = int(camera_width)
         self.camera_concat = str(camera_concat)
         self.tiled_vae = bool(tiled_vae)
+        self.camera_resize_mode = str(camera_resize_mode)
         self.binarize_gripper = bool(binarize_gripper)
         self.prompt_template = str(prompt_template)
         self.text_embedding_cache_dir = (
@@ -323,16 +410,25 @@ class LiberoFastWAMRuntime:
             else Path(text_embedding_cache_dir).expanduser().resolve()
         )
         self.text_embedding_context_len = int(text_embedding_context_len)
-        if self.action_horizon < 1 or self.num_inference_steps < 1:
-            raise ValueError("Action horizon and inference steps must be positive.")
+        if self.num_inference_steps < 1:
+            raise ValueError("Inference steps must be positive.")
+        if self.seeded_noise_device not in {"cpu", "model"}:
+            raise ValueError("seeded_noise_device must be either 'cpu' or 'model'.")
         if self.num_video_frames % 4 != 1:
             raise ValueError("`num_video_frames` must satisfy T % 4 == 1.")
-        if not math.isfinite(self.flow_sde_noise_level) or self.flow_sde_noise_level < 0:
+        if (
+            not math.isfinite(self.flow_sde_noise_level)
+            or self.flow_sde_noise_level < 0
+        ):
             raise ValueError("Flow-SDE noise level must be finite and non-negative.")
         if self.gate_denoise_last_n < 1:
             raise ValueError("`gate_denoise_last_n` must be positive.")
         if self.camera_concat not in {"horizontal", "vertical", "main_only"}:
             raise ValueError("Unsupported camera concatenation.")
+        if self.camera_resize_mode != OFFICIAL_LIBERO_CAMERA_RESIZE_MODE:
+            raise ValueError(
+                f"Unsupported LIBERO camera resize mode: {self.camera_resize_mode!r}."
+            )
         if (self.processor is None) != (self.processor_stats_path is None):
             raise ValueError(
                 "FastWAM processor and `processor_stats_path` must be configured together."
@@ -362,21 +458,13 @@ class LiberoFastWAMRuntime:
         return next(self.actor.parameters()).dtype
 
     def _camera_tensor(self, image: torch.Tensor) -> torch.Tensor:
-        image = torch.as_tensor(image, device=self.device)
-        if image.ndim != 4:
-            raise ValueError(f"LIBERO images must be rank four, got {image.shape}.")
-        if image.shape[-1] == 3:
-            image = image.permute(0, 3, 1, 2)
-        elif image.shape[1] != 3:
-            raise ValueError(f"Cannot identify RGB channel in shape {image.shape}.")
-        image = image.to(dtype=torch.float32)
-        image = F.interpolate(
+        image = prepare_libero_camera_batch(
             image,
-            size=(self.camera_height, self.camera_width),
-            mode="bilinear",
-            align_corners=False,
+            height=self.camera_height,
+            width=self.camera_width,
+            resize_mode=self.camera_resize_mode,
         )
-        return image
+        return image.to(device=self.device, dtype=torch.float32)
 
     def _model_images(self, env_obs: dict[str, Any]) -> torch.Tensor:
         main = self._camera_tensor(env_obs["main_images"])
@@ -407,22 +495,62 @@ class LiberoFastWAMRuntime:
         batch = self.processor.normalizer.forward(batch)
         return batch["state"][state_key].to(device=self.device, dtype=self.dtype)
 
-    def _denormalize_actions(self, actions: torch.Tensor) -> torch.Tensor:
+    def _denormalize_action_stages(
+        self,
+        actions: torch.Tensor,
+        *,
+        env_obs: dict[str, Any],
+    ) -> tuple[torch.Tensor, ActionExecutionTrace | None]:
+        metadata = _action_contract_metadata(env_obs, actions=actions)
         if self.processor is None:
             denormalized = actions.float()
         else:
             action_meta = self.processor.shape_meta["action"]
             if len(action_meta) != 1:
-                raise ValueError("FastWAM LIBERO runtime expects one merged action key.")
+                raise ValueError(
+                    "FastWAM LIBERO runtime expects one merged action key."
+                )
             action_key = action_meta[0]["key"]
             normalizer = self.processor.normalizer.normalizers["action"][action_key]
-            actions = actions.float()
-            _align_linear_normalizer(normalizer, actions)
-            denormalized = normalizer.backward(actions).to(device=actions.device)
-        return _convert_fastwam_gripper_to_libero(
+            float_actions = actions.float()
+            _align_linear_normalizer(normalizer, float_actions)
+            denormalized = normalizer.backward(float_actions).to(device=actions.device)
+        converted = _convert_fastwam_gripper_to_libero(
             denormalized,
             binarize=self.binarize_gripper,
         )
+        if metadata is None:
+            return converted, None
+        low, high, gripper_index, contract_hash = metadata
+        trace = ActionExecutionTrace(
+            stages=tuple(
+                ActionStageStatistics.from_values(
+                    stage=stage,
+                    values=values,
+                    low=low,
+                    high=high,
+                    gripper_dimension_index=gripper_index,
+                    action_contract_sha256=contract_hash,
+                )
+                for stage, values in (
+                    (NORMALIZED_ACTION_STAGE, actions),
+                    (DENORMALIZED_ACTION_STAGE, denormalized),
+                    (GRIPPER_CONVERTED_ACTION_STAGE, converted),
+                )
+            )
+        )
+        return converted, trace
+
+    def _denormalize_actions(self, actions: torch.Tensor) -> torch.Tensor:
+        """Preserve the production conversion API outside instrumented eval."""
+
+        converted, trace = self._denormalize_action_stages(
+            actions,
+            env_obs={},
+        )
+        if trace is not None:
+            raise AssertionError("Uninstrumented conversion unexpectedly made a trace.")
+        return converted
 
     def _encode_condition(
         self,
@@ -502,6 +630,7 @@ class LiberoFastWAMRuntime:
                         expected_shape,
                         device=self.device,
                         dtype=self.dtype,
+                        rand_device=self.seeded_noise_device,
                     )
                 )
             else:
@@ -552,7 +681,7 @@ class LiberoFastWAMRuntime:
         tokens_per_frame = int(video_pre["meta"]["tokens_per_frame"])
         attention_mask = self.actor._build_mot_attention_mask(
             video_seq_len=video_seq_len,
-            action_seq_len=self.action_horizon,
+            action_seq_len=self.action_protocol.generation_horizon,
             video_tokens_per_frame=tokens_per_frame,
             device=self.device,
         )
@@ -634,7 +763,7 @@ class LiberoFastWAMRuntime:
             )
             expected = (
                 routes.shape[0],
-                self.action_horizon,
+                self.action_protocol.generation_horizon,
                 self.actor.action_expert.action_dim,
             )
             if tuple(action_noise_override.shape) != expected:
@@ -690,8 +819,7 @@ class LiberoFastWAMRuntime:
                 regime=regime,
                 idm_initial_latents=(
                     video_noise_override[index : index + 1]
-                    if video_noise_override is not None
-                    and regime is PolicyRegime.IDM
+                    if video_noise_override is not None and regime is PolicyRegime.IDM
                     else None
                 ),
                 idm_noise_seed=(
@@ -723,7 +851,7 @@ class LiberoFastWAMRuntime:
             if action_noise_override is None:
                 action_shape = (
                     1,
-                    self.action_horizon,
+                    self.action_protocol.generation_horizon,
                     self.actor.action_expert.action_dim,
                 )
                 initial_noise = (
@@ -738,6 +866,7 @@ class LiberoFastWAMRuntime:
                         action_shape,
                         device=self.device,
                         dtype=self.dtype,
+                        rand_device=self.seeded_noise_device,
                     )
                 )
             else:
@@ -763,14 +892,20 @@ class LiberoFastWAMRuntime:
             rollouts.append(rollout)
 
         gate_snapshots = tuple(
-            _cat_snapshots(
-                [rollout.gate_taps[tap_index] for rollout in rollouts]
-            )
+            _cat_snapshots([rollout.gate_taps[tap_index] for rollout in rollouts])
             for tap_index in range(self.gate_denoise_last_n)
         )
         normalized_actions = torch.cat(
             [rollout.actions for rollout in rollouts],
             dim=0,
+        )
+        executed_normalized_actions = select_executed_action_prefix(
+            normalized_actions,
+            protocol=self.action_protocol,
+        )
+        processed_actions, action_execution_trace = self._denormalize_action_stages(
+            executed_normalized_actions,
+            env_obs=env_obs,
         )
         replay_inputs = {}
         if collect_replay:
@@ -779,19 +914,19 @@ class LiberoFastWAMRuntime:
                 "fastwam_context": context.detach(),
                 "fastwam_context_mask": context_mask.detach(),
             }
-        if (
-            collect_replay
-            and self.gate_replay_backend is GateKVReplayBackend.RECOMPUTE
-        ):
+        if collect_replay and self.gate_replay_backend is GateKVReplayBackend.RECOMPUTE:
             replay_inputs["fastwam_idm_initial_latents"] = torch.cat(
                 idm_initial_latents,
                 dim=0,
             ).detach()
         return FastWAMChunkSample(
-            actions=self._denormalize_actions(normalized_actions),
-            old_flow_logprobs=torch.cat(
-                [rollout.old_log_probs for rollout in rollouts],
-                dim=0,
+            actions=processed_actions,
+            old_flow_logprobs=select_executed_flow_statistics(
+                torch.cat(
+                    [rollout.old_log_probs for rollout in rollouts],
+                    dim=0,
+                ),
+                protocol=self.action_protocol,
             ),
             flow_chains=torch.cat([rollout.chains for rollout in rollouts], dim=0),
             denoise_indices=torch.cat(
@@ -800,6 +935,7 @@ class LiberoFastWAMRuntime:
             ),
             gate_snapshots=gate_snapshots,
             forward_inputs=replay_inputs,
+            action_execution_trace=action_execution_trace,
         )
 
     def replay_action_batch(
@@ -878,19 +1014,28 @@ class LiberoFastWAMRuntime:
                         ),
                         noise_level=self.flow_sde_noise_level,
                     )
-                base_kl[index : index + 1] = 0.5 * (
-                    (
-                        current_replay.mean.float()
-                        - base_replay.mean.float()
-                    )
-                    / current_replay.std.float()
-                ).square()
+                base_kl[index : index + 1] = (
+                    0.5
+                    * (
+                        (current_replay.mean.float() - base_replay.mean.float())
+                        / current_replay.std.float()
+                    ).square()
+                )
         result = {
-            "flow_logprobs": logprobs,
-            "flow_entropy": entropies,
+            "flow_logprobs": select_executed_action_prefix(
+                logprobs,
+                protocol=self.action_protocol,
+            ),
+            "flow_entropy": select_executed_action_prefix(
+                entropies,
+                protocol=self.action_protocol,
+            ),
         }
         if base_kl is not None:
-            result["base_uncond_kl"] = base_kl
+            result["base_uncond_kl"] = select_executed_action_prefix(
+                base_kl,
+                protocol=self.action_protocol,
+            )
         return result
 
     @torch.no_grad()
@@ -922,7 +1067,9 @@ class LiberoFastWAMRuntime:
         video_noise = forward_inputs["fastwam_idm_initial_latents"]
         timesteps, _ = self._action_schedule()
         if chains.shape[1] != timesteps.numel() + 1:
-            raise ValueError("Stored action chain does not match the current scheduler.")
+            raise ValueError(
+                "Stored action chain does not match the current scheduler."
+            )
         if self.gate_denoise_last_n > timesteps.numel():
             raise ValueError("Gate denoising tap count exceeds the action schedule.")
 
@@ -933,9 +1080,7 @@ class LiberoFastWAMRuntime:
             )
         replay_actor_version = int(actor_versions.item())
         snapshots: list[GateKVSnapshot] = []
-        with self.lora_adapter.use_replay_reference(
-            actor_version=replay_actor_version
-        ):
+        with self.lora_adapter.use_replay_reference(actor_version=replay_actor_version):
             first_step = timesteps.numel() - self.gate_denoise_last_n
             for step_index in range(first_step, timesteps.numel()):
                 per_sample: list[GateKVSnapshot] = []
@@ -956,10 +1101,14 @@ class LiberoFastWAMRuntime:
                             else None
                         ),
                     )
-                    timestep = timesteps[step_index].to(
-                        device=self.device,
-                        dtype=self.dtype,
-                    ).expand(1)
+                    timestep = (
+                        timesteps[step_index]
+                        .to(
+                            device=self.device,
+                            dtype=self.dtype,
+                        )
+                        .expand(1)
+                    )
                     output = self._velocity(
                         condition,
                         regime=regime,

@@ -28,13 +28,21 @@ import numpy as np
 import torch
 
 from rlinf.data.embodied_io_struct import EnvOutput, RolloutResult
+from rlinf.envs.action_contract import (
+    FASTWAM_LIBERO_ACTION_STAGES,
+    ActionExecutionTrace,
+)
+from rlinf.envs.libero.action_contract import LiberoActionContract
 from rlinf.envs.utils import get_env_attr
 from rlinf.models.embodiment.wam_policy.evaluation import EvaluationRoutingMode
 
-LEDGER_SCHEMA = "fastwam-libero-eval-ledger-v1"
-CHUNK_SCHEMA = "fastwam-libero-eval-chunk-v1"
+LEDGER_SCHEMA_V1 = "fastwam-libero-eval-ledger-v1"
+LEDGER_SCHEMA_V2 = "fastwam-libero-eval-ledger-v2"
+LEDGER_SCHEMAS = {LEDGER_SCHEMA_V1, LEDGER_SCHEMA_V2}
+CHUNK_SCHEMA = "fastwam-libero-eval-chunk-v2"
 EPISODE_SCHEMA = "fastwam-libero-eval-episode-v1"
-_IDENTITY_FIELDS = (
+NOISE_SEED_MODES = {"stateless_per_chunk", "fixed_per_episode"}
+_IDENTITY_FIELDS_V1 = (
     "task_suite",
     "task_id",
     "trial_id",
@@ -44,6 +52,20 @@ _IDENTITY_FIELDS = (
     "idm_video_noise_seed",
     "max_primitive_steps",
     "action_horizon",
+)
+_IDENTITY_FIELDS_V2 = (
+    "task_suite",
+    "task_id",
+    "trial_id",
+    "reset_state_id",
+    "environment_seed",
+    "action_noise_seed",
+    "idm_video_noise_seed",
+    "max_primitive_steps",
+    "generation_horizon",
+    "execution_horizon",
+    "prediction_video_frames",
+    "reset_wait_steps",
 )
 
 
@@ -71,20 +93,30 @@ def _sha256_file(path: Path) -> str:
 
 def _load_ledger(path: Path) -> dict[str, Any]:
     payload = json.loads(path.read_text(encoding="utf-8"))
-    if payload.get("schema") != LEDGER_SCHEMA:
+    schema = payload.get("schema")
+    if schema not in LEDGER_SCHEMAS:
         raise ValueError(f"Unsupported evaluation ledger schema in {path}.")
     if payload.get("kind") not in {"preflight", "validation", "final"}:
-        raise ValueError("Evaluation ledger kind must be preflight, validation, or final.")
+        raise ValueError(
+            "Evaluation ledger kind must be preflight, validation, or final."
+        )
     entries = payload.get("entries")
     if not isinstance(entries, list) or not entries:
         raise ValueError("Evaluation ledger must contain at least one entry.")
     identities = set()
+    identity_fields = (
+        _IDENTITY_FIELDS_V1 if schema == LEDGER_SCHEMA_V1 else _IDENTITY_FIELDS_V2
+    )
     reset_ids = set()
     for index, entry in enumerate(entries):
-        missing = [field_name for field_name in _IDENTITY_FIELDS if field_name not in entry]
+        missing = [
+            field_name for field_name in identity_fields if field_name not in entry
+        ]
         if missing:
             raise ValueError(f"Ledger entry {index} is missing {missing}.")
-        identity_payload = {field_name: entry[field_name] for field_name in _IDENTITY_FIELDS}
+        identity_payload = {
+            field_name: entry[field_name] for field_name in identity_fields
+        }
         expected = _sha256_payload(identity_payload)
         if entry.get("episode_identity") != expected:
             raise ValueError(f"Ledger entry {index} episode identity mismatch.")
@@ -94,6 +126,22 @@ def _load_ledger(path: Path) -> dict[str, Any]:
         if reset_id in reset_ids:
             raise ValueError("Evaluation ledger contains duplicate reset-state IDs.")
         identities.add(expected)
+        if schema == LEDGER_SCHEMA_V2:
+            generation = int(entry["generation_horizon"])
+            execution = int(entry["execution_horizon"])
+            prediction_frames = int(entry["prediction_video_frames"])
+            wait_steps = int(entry["reset_wait_steps"])
+            max_steps = int(entry["max_primitive_steps"])
+            if min(generation, execution, prediction_frames, max_steps) < 1:
+                raise ValueError(
+                    "Evaluation ledger protocol horizons must be positive."
+                )
+            if wait_steps < 0:
+                raise ValueError("Evaluation ledger reset wait must be non-negative.")
+            if execution > generation or max_steps % execution:
+                raise ValueError(
+                    "Evaluation ledger generated/executed horizons are inconsistent."
+                )
         reset_ids.add(reset_id)
     return payload
 
@@ -116,7 +164,9 @@ def _route_name(value: int) -> str:
     raise ValueError(f"Invalid FastWAM route {value}.")
 
 
-def _derive_chunk_seed(base_seed: int, episode_identity: str, chunk_id: int, kind: str) -> int:
+def _derive_chunk_seed(
+    base_seed: int, episode_identity: str, chunk_id: int, kind: str
+) -> int:
     payload = b"\0".join(
         (
             b"fastwam-libero-eval-noise-v1",
@@ -145,6 +195,7 @@ class EvaluationIdentityBatch:
     """Batch of identities captured before an auto-resetting environment step."""
 
     slots: tuple[EvaluationEpisodeSlot, ...]
+    action_contract: LiberoActionContract
 
 
 @dataclass(frozen=True, slots=True)
@@ -154,10 +205,12 @@ class EvaluationArtifactShard:
     rank: int
     chunk_path: str
     episode_path: str
+    action_contract_path: str
     chunk_record_count: int
     episode_record_count: int
     chunk_sha256: str
     episode_sha256: str
+    action_contract_sha256: str
     canonical_content_sha256: str
     status: str = "PASS"
 
@@ -189,6 +242,7 @@ class FastWAMLiberoEvalCollector:
         random_idm_probability: float | None,
         routing_seed: int,
         fixed_idm_cost: float,
+        noise_seed_mode: str = "stateless_per_chunk",
     ) -> None:
         self.output_dir = Path(output_dir).expanduser().resolve()
         self.output_dir.mkdir(parents=True, exist_ok=True)
@@ -201,12 +255,15 @@ class FastWAMLiberoEvalCollector:
         self.routing_mode = EvaluationRoutingMode(routing_mode)
         self.idm_threshold = float(idm_threshold)
         self.random_idm_probability = (
-            None
-            if random_idm_probability is None
-            else float(random_idm_probability)
+            None if random_idm_probability is None else float(random_idm_probability)
         )
         self.routing_seed = int(routing_seed)
         self.fixed_idm_cost = float(fixed_idm_cost)
+        self.noise_seed_mode = str(noise_seed_mode)
+        if self.noise_seed_mode not in NOISE_SEED_MODES:
+            raise ValueError(
+                f"Unsupported FastWAM evaluation noise seed mode {noise_seed_mode!r}."
+            )
         if not math.isfinite(self.fixed_idm_cost) or self.fixed_idm_cost < 0:
             raise ValueError("fixed_idm_cost must be finite and non-negative.")
         self._entries_by_reset = {
@@ -215,6 +272,7 @@ class FastWAMLiberoEvalCollector:
         self._states: dict[tuple[int, int], _EpisodeState] = {}
         self._chunks: list[dict[str, Any]] = []
         self._episodes: list[dict[str, Any]] = []
+        self._action_contract: LiberoActionContract | None = None
 
     def snapshot_before_step(
         self,
@@ -224,6 +282,15 @@ class FastWAMLiberoEvalCollector:
     ) -> EvaluationIdentityBatch:
         """Capture task/trial/reset identity before LiberoEnv may auto-reset."""
 
+        action_contract = get_env_attr(env, "action_contract")
+        if not isinstance(action_contract, LiberoActionContract):
+            raise TypeError(
+                "Evaluation environment must expose a typed live Action contract."
+            )
+        if self._action_contract is None:
+            self._action_contract = action_contract
+        elif self._action_contract.canonical_sha256 != action_contract.canonical_sha256:
+            raise ValueError("Live LIBERO Action contract changed within one run.")
         task_ids = _int_list(get_env_attr(env, "task_ids"), name="task_ids")
         trial_ids = _int_list(get_env_attr(env, "trial_ids"), name="trial_ids")
         reset_ids = _int_list(
@@ -232,10 +299,10 @@ class FastWAMLiberoEvalCollector:
         )
         environment_ids = _int_list(env_ids, name="env_ids")
         batch_size = len(environment_ids)
-        if not (
-            len(task_ids) == len(trial_ids) == len(reset_ids) == batch_size
-        ):
-            raise ValueError("Environment identity fields have inconsistent batch sizes.")
+        if not (len(task_ids) == len(trial_ids) == len(reset_ids) == batch_size):
+            raise ValueError(
+                "Environment identity fields have inconsistent batch sizes."
+            )
 
         slots = []
         for local_index, (env_id, task_id, trial_id, reset_id) in enumerate(
@@ -245,13 +312,18 @@ class FastWAMLiberoEvalCollector:
             state = self._states.get(key)
             if state is None or int(state.entry["reset_state_id"]) != reset_id:
                 if state is not None and not state.completed:
-                    raise RuntimeError("Environment reset before its prior episode terminated.")
+                    raise RuntimeError(
+                        "Environment reset before its prior episode terminated."
+                    )
                 entry = self._entries_by_reset.get(reset_id)
                 if entry is None:
                     raise ValueError(
                         f"Reset-state id {reset_id} is absent from the frozen ledger."
                     )
-                if int(entry["task_id"]) != task_id or int(entry["trial_id"]) != trial_id:
+                if (
+                    int(entry["task_id"]) != task_id
+                    or int(entry["trial_id"]) != trial_id
+                ):
                     raise ValueError(
                         "Actual LIBERO task/trial/reset ledger identity mismatch: "
                         f"actual=({task_id}, {trial_id}, {reset_id}), "
@@ -266,7 +338,9 @@ class FastWAMLiberoEvalCollector:
                 )
                 self._states[key] = state
             elif state.env_id != env_id:
-                raise ValueError("Stable FastWAM env id changed within one worker slot.")
+                raise ValueError(
+                    "Stable FastWAM env id changed within one worker slot."
+                )
 
             slots.append(
                 EvaluationEpisodeSlot(
@@ -277,7 +351,10 @@ class FastWAMLiberoEvalCollector:
                     entry=None if state.completed else state.entry,
                 )
             )
-        return EvaluationIdentityBatch(slots=tuple(slots))
+        return EvaluationIdentityBatch(
+            slots=tuple(slots),
+            action_contract=action_contract,
+        )
 
     def augment_rollout_input(
         self,
@@ -295,23 +372,27 @@ class FastWAMLiberoEvalCollector:
             if entry is None:
                 state = self._states[(slot.stage_id, slot.local_env_index)]
                 entry = state.entry
-            identity = str(entry["episode_identity"])
-            action_seeds.append(
-                _derive_chunk_seed(
-                    int(entry["action_noise_seed"]),
-                    identity,
-                    slot.chunk_id,
-                    "action",
+            if self.noise_seed_mode == "fixed_per_episode":
+                action_seeds.append(int(entry["action_noise_seed"]))
+                idm_seeds.append(int(entry["idm_video_noise_seed"]))
+            else:
+                identity = str(entry["episode_identity"])
+                action_seeds.append(
+                    _derive_chunk_seed(
+                        int(entry["action_noise_seed"]),
+                        identity,
+                        slot.chunk_id,
+                        "action",
+                    )
                 )
-            )
-            idm_seeds.append(
-                _derive_chunk_seed(
-                    int(entry["idm_video_noise_seed"]),
-                    identity,
-                    slot.chunk_id,
-                    "idm_video",
+                idm_seeds.append(
+                    _derive_chunk_seed(
+                        int(entry["idm_video_noise_seed"]),
+                        identity,
+                        slot.chunk_id,
+                        "idm_video",
+                    )
                 )
-            )
         result["obs"]["_fastwam_action_noise_seeds"] = torch.tensor(
             action_seeds,
             dtype=torch.long,
@@ -320,6 +401,24 @@ class FastWAMLiberoEvalCollector:
             idm_seeds,
             dtype=torch.long,
         )
+        batch_size = len(snapshot.slots)
+        contract = snapshot.action_contract
+        result["obs"]["_fastwam_action_contract_low"] = (
+            torch.tensor(contract.low, dtype=torch.float32)
+            .expand(batch_size, -1)
+            .clone()
+        )
+        result["obs"]["_fastwam_action_contract_high"] = (
+            torch.tensor(contract.high, dtype=torch.float32)
+            .expand(batch_size, -1)
+            .clone()
+        )
+        result["obs"]["_fastwam_action_gripper_indices"] = torch.full(
+            (batch_size,), contract.gripper_dimension_index, dtype=torch.long
+        )
+        result["obs"]["_fastwam_action_contract_sha256"] = [
+            contract.canonical_sha256
+        ] * batch_size
         return result
 
     @staticmethod
@@ -343,10 +442,14 @@ class FastWAMLiberoEvalCollector:
         emitted = rollout_result.emitted_gate
         selection = rollout_result.evaluation_selection
         if route is None or emitted is None or selection is None:
-            raise ValueError("FastWAM evaluation collector requires all typed route records.")
+            raise ValueError(
+                "FastWAM evaluation collector requires all typed route records."
+            )
         batch_size = len(snapshot.slots)
         if route.shape != torch.Size([batch_size]) or emitted.shape != route.shape:
-            raise ValueError("Evaluation route records do not match identity batch size.")
+            raise ValueError(
+                "Evaluation route records do not match identity batch size."
+            )
         if selection.effective_next_route.shape != route.shape:
             raise ValueError("Evaluation selection does not match route batch size.")
         gate_latency = rollout_result.gate_latency_seconds
@@ -372,6 +475,27 @@ class FastWAMLiberoEvalCollector:
         ):
             raise ValueError("Policy latency must be finite when recorded.")
 
+        rollout_action_trace = rollout_result.action_execution_trace
+        environment_action_trace = env_output.action_execution_trace
+        if rollout_action_trace is None or environment_action_trace is None:
+            raise ValueError(
+                "Schema-v2 evaluation requires model and environment Action traces."
+            )
+        action_trace = ActionExecutionTrace.combine(
+            rollout_action_trace,
+            environment_action_trace,
+        )
+        if action_trace.stage_names != FASTWAM_LIBERO_ACTION_STAGES:
+            raise ValueError(
+                "FastWAM Action trace stages differ from the canonical pipeline."
+            )
+        if (
+            action_trace.batch_size != batch_size
+            or action_trace.action_contract_sha256
+            != snapshot.action_contract.canonical_sha256
+        ):
+            raise ValueError("FastWAM Action trace does not match its live contract.")
+
         for index, slot in enumerate(snapshot.slots):
             if slot.entry is None:
                 continue
@@ -388,7 +512,9 @@ class FastWAMLiberoEvalCollector:
                 route_episode_id != state.route_episode_id
                 or actor_version != state.actor_version
             ):
-                raise ValueError("Episode id or actor version changed within an episode.")
+                raise ValueError(
+                    "Episode id or actor version changed within an episode."
+                )
 
             terminal = bool(torch.as_tensor(env_output.dones[index]).any().item())
             terminations = self._batch_outcome(env_output.terminations, index)
@@ -452,7 +578,9 @@ class FastWAMLiberoEvalCollector:
                 "emitted_decision_consumed": valid,
                 "emitted_decision_discarded": not valid,
                 "eligible_decision": valid,
-                "primitive_steps_executed": int(entry["action_horizon"]),
+                "primitive_steps_executed": int(
+                    entry.get("execution_horizon", entry.get("action_horizon", -1))
+                ),
                 "reward": reward,
                 "success_observed": success,
                 "terminal": terminal,
@@ -465,18 +593,16 @@ class FastWAMLiberoEvalCollector:
                     else float(policy_latency_seconds)
                 ),
                 "gate_latency_seconds": (
-                    None
-                    if gate_latency is None
-                    else float(gate_latency[index])
+                    None if gate_latency is None else float(gate_latency[index])
                 ),
                 "gate_h2d_seconds": (
-                    0.0
-                    if gate_h2d is None
-                    else float(gate_h2d[index])
+                    0.0 if gate_h2d is None else float(gate_h2d[index])
                 ),
                 "environment_latency_seconds": float(environment_latency_seconds),
                 "action_min": action_min,
                 "action_max": action_max,
+                "action_contract_sha256": (snapshot.action_contract.canonical_sha256),
+                "action_trace": action_trace.record_for_batch_index(index),
             }
             _canonical_bytes(record)
             state.chunks.append(record)
@@ -497,8 +623,7 @@ class FastWAMLiberoEvalCollector:
         executed = len(chunks)
         idm_total = sum(chunk["route"] == "idm" for chunk in chunks)
         forced_initial = sum(
-            chunk["route_was_forced"] and chunk["chunk_id"] == 0
-            for chunk in chunks
+            chunk["route_was_forced"] and chunk["chunk_id"] == 0 for chunk in chunks
         )
         eligible_chunks = [chunk for chunk in chunks if not chunk["route_was_forced"]]
         eligible_idm = sum(chunk["route"] == "idm" for chunk in eligible_chunks)
@@ -564,12 +689,34 @@ class FastWAMLiberoEvalCollector:
             if temporary.exists():
                 temporary.unlink()
 
+    @staticmethod
+    def _write_json_atomic(path: Path, payload: dict[str, Any]) -> None:
+        temporary = Path(f"{path}.tmp")
+        try:
+            with temporary.open("w", encoding="utf-8") as handle:
+                json.dump(payload, handle, sort_keys=True, indent=2, allow_nan=False)
+                handle.write("\n")
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(temporary, path)
+        finally:
+            if temporary.exists():
+                temporary.unlink()
+
     def finalize(self) -> EvaluationArtifactShard:
         """Atomically write completed local shards and return their hashes."""
 
-        incomplete = [state.entry["episode_identity"] for state in self._states.values() if not state.completed]
+        if self._action_contract is None:
+            raise RuntimeError("Evaluation collected no live Action contract.")
+        incomplete = [
+            state.entry["episode_identity"]
+            for state in self._states.values()
+            if not state.completed
+        ]
         if incomplete:
-            raise RuntimeError(f"Evaluation ended with incomplete episodes: {incomplete}.")
+            raise RuntimeError(
+                f"Evaluation ended with incomplete episodes: {incomplete}."
+            )
         ledger_order = {
             entry["episode_identity"]: index
             for index, entry in enumerate(self.ledger["entries"])
@@ -587,8 +734,13 @@ class FastWAMLiberoEvalCollector:
         )
         chunk_path = self.output_dir / f"chunks.rank-{self.rank}.jsonl"
         episode_path = self.output_dir / f"episodes.rank-{self.rank}.jsonl"
+        action_contract_path = (
+            self.output_dir / f"action_contract.rank-{self.rank}.json"
+        )
+        action_contract_payload = self._action_contract.to_artifact()
         self._write_jsonl_atomic(chunk_path, chunks)
         self._write_jsonl_atomic(episode_path, episodes)
+        self._write_json_atomic(action_contract_path, action_contract_payload)
         canonical_chunks = sorted(
             chunks,
             key=lambda item: (item["episode_identity"], item["chunk_id"]),
@@ -627,15 +779,18 @@ class FastWAMLiberoEvalCollector:
                 }
                 for record in canonical_episodes
             ],
+            "action_contract": action_contract_payload,
         }
         return EvaluationArtifactShard(
             rank=self.rank,
             chunk_path=str(chunk_path),
             episode_path=str(episode_path),
+            action_contract_path=str(action_contract_path),
             chunk_record_count=len(chunks),
             episode_record_count=len(episodes),
             chunk_sha256=_sha256_file(chunk_path),
             episode_sha256=_sha256_file(episode_path),
+            action_contract_sha256=_sha256_file(action_contract_path),
             canonical_content_sha256=_sha256_payload(canonical_records),
         )
 

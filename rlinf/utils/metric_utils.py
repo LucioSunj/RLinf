@@ -432,6 +432,24 @@ def compute_rollout_metrics(data_buffer: dict) -> dict:
         }
         rollout_metrics.update(returns_metrics)
 
+    if data_buffer.get("prev_values", None) is not None:
+        values = data_buffer["prev_values"]
+        if (
+            loss_mask is not None
+            and values.ndim > 0
+            and values.shape[0] == loss_mask.shape[0] + 1
+        ):
+            values = values[:-1]
+        values = valid_values(values)
+        mean_value, min_value, max_value = reduce_metrics(values)
+        rollout_metrics.update(
+            {
+                "values_mean": mean_value,
+                "values_max": max_value,
+                "values_min": min_value,
+            }
+        )
+
     return rollout_metrics
 
 

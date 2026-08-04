@@ -73,9 +73,7 @@ def _load_policy_package():
 
 
 _policy = _load_policy_package()
-_runtime_module = sys.modules[
-    "fastwam_policy_composite_under_test.libero_runtime"
-]
+_runtime_module = sys.modules["fastwam_policy_composite_under_test.libero_runtime"]
 FastWAMAdaptivePolicy = _policy.FastWAMAdaptivePolicy
 FastWAMAdaptivePolicyConfig = _policy.FastWAMAdaptivePolicyConfig
 FastWAMChunkSample = _policy.FastWAMChunkSample
@@ -94,8 +92,7 @@ def _bank(source, value, batch=2):
 def _snapshots(routes):
     batch = len(routes)
     modes = tuple(
-        PolicyRegime.IDM if int(route) else PolicyRegime.UNCOND
-        for route in routes
+        PolicyRegime.IDM if int(route) else PolicyRegime.UNCOND for route in routes
     )
     result = []
     for timestep, action_value in ((900.0, 3.0), (100.0, 4.0)):
@@ -109,12 +106,8 @@ def _snapshots(routes):
                         current_frame_video=_bank(
                             KVSource.CURRENT_FRAME_VIDEO, 1.0, batch=batch
                         ),
-                        action=_bank(
-                            KVSource.ACTION, action_value, batch=batch
-                        ),
-                        context=_bank(
-                            KVSource.TEXT_STATE_CONTEXT, 2.0, batch=batch
-                        ),
+                        action=_bank(KVSource.ACTION, action_value, batch=batch),
+                        context=_bank(KVSource.TEXT_STATE_CONTEXT, 2.0, batch=batch),
                         actor_version=5,
                     ),
                 )
@@ -184,14 +177,10 @@ class _Gate(nn.Module):
 class _ThirtyBlockGate(nn.Module):
     def __init__(self):
         super().__init__()
-        self.blocks = nn.ModuleList(
-            nn.Linear(1, 1, bias=False) for _ in range(30)
-        )
+        self.blocks = nn.ModuleList(nn.Linear(1, 1, bias=False) for _ in range(30))
 
     def forward(self, snapshots):
-        return self.blocks[0].weight.reshape(()).expand(
-            snapshots[0].batch_size
-        )
+        return self.blocks[0].weight.reshape(()).expand(snapshots[0].batch_size)
 
 
 class _Critic(nn.Module):
@@ -567,11 +556,14 @@ def test_standalone_eval_runs_and_restores_gate_lora_without_critic():
             expected_critic_parent_checkpoint_sha256="d" * 64,
         )
 
-    assert _make_policy().load_eval_checkpoint(
-        payload,
-        expected_parent_checkpoint_sha256=parent_sha256,
-        expected_critic_parent_checkpoint_sha256=critic_parent_sha256,
-    ) == 3
+    assert (
+        _make_policy().load_eval_checkpoint(
+            payload,
+            expected_parent_checkpoint_sha256=parent_sha256,
+            expected_critic_parent_checkpoint_sha256=critic_parent_sha256,
+        )
+        == 3
+    )
 
 
 def test_policy_update_invalidates_pending_route_and_forces_idm_boundary():
@@ -700,9 +692,7 @@ def test_native_all_layer_policy_payload_round_trips_without_frozen_actor() -> N
 
     payload = policy.trainable_state_dict()
 
-    assert set(payload["gate"]) == {
-        f"blocks.{index}.weight" for index in range(30)
-    }
+    assert set(payload["gate"]) == {f"blocks.{index}.weight" for index in range(30)}
     assert "actor" not in payload
     restored = _make_policy()
     restored.gate = _ThirtyBlockGate()
@@ -761,12 +751,16 @@ def test_fastwam_prompt_format_matches_training_template() -> None:
     )
 
 
-def test_cached_eval_text_context_is_hash_keyed_and_fail_closed(tmp_path: Path) -> None:
+def test_cached_eval_text_context_matches_fastwam_padding_and_fails_closed(
+    tmp_path: Path,
+) -> None:
     prompts = ["first prompt", "second prompt"]
     expected_contexts = []
     for index, prompt in enumerate(prompts):
         context = torch.full((3, 4), float(index + 1), dtype=torch.bfloat16)
-        expected_contexts.append(context)
+        expected_context = context.clone()
+        expected_context[-1] = 0
+        expected_contexts.append(expected_context)
         digest = hashlib.sha256(prompt.encode("utf-8")).hexdigest()
         torch.save(
             {"context": context, "mask": torch.tensor([True, True, False])},
@@ -785,7 +779,7 @@ def test_cached_eval_text_context_is_hash_keyed_and_fail_closed(tmp_path: Path) 
     assert torch.equal(context, torch.stack(expected_contexts))
     assert torch.equal(
         mask,
-        torch.tensor([[True, True, False], [True, True, False]]),
+        torch.ones((2, 3), dtype=torch.bool),
     )
     with pytest.raises(FileNotFoundError, match="prompt hash"):
         _runtime_module._load_cached_text_contexts(
@@ -800,7 +794,10 @@ def test_cached_eval_text_context_is_hash_keyed_and_fail_closed(tmp_path: Path) 
     broken_prompt = "broken"
     broken_digest = hashlib.sha256(broken_prompt.encode("utf-8")).hexdigest()
     torch.save(
-        {"context": torch.zeros(2, 4, dtype=torch.bfloat16), "mask": torch.ones(2, dtype=torch.bool)},
+        {
+            "context": torch.zeros(2, 4, dtype=torch.bfloat16),
+            "mask": torch.ones(2, dtype=torch.bool),
+        },
         tmp_path / f"{broken_digest}.t5_len3.wan22ti2v5b.pt",
     )
     with pytest.raises(ValueError, match="shape mismatch"):

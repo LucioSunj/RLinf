@@ -5,8 +5,10 @@ total_num_envs: null
 
 auto_reset: False
 ignore_terminations: False
-max_steps_per_rollout_epoch: 512
-max_episode_steps: 512 # max episode steps for truncation
+max_steps_per_rollout_epoch: 700
+max_episode_steps: 700 # official FastWAM LIBERO-10 primitive-action budget
+# Applied after set_init_state and excluded from episode length/reward metrics.
+reset_wait_steps: 30
 use_fixed_reset_state_ids: True
 use_ordered_reset_state_ids: False
 ordered_reset_state_ids: null

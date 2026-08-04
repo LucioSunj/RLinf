@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import importlib.util
+import json
 import sys
 import types
 from dataclasses import replace
@@ -20,7 +21,6 @@ from pathlib import Path
 
 import pytest
 import torch
-
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 
@@ -227,12 +227,186 @@ def test_fixed_route_cost_is_subtracted_once_after_reward_aggregation():
     )
 
     assert result.rewards.shape == (2, 2, 1)
-    assert torch.equal(
-        result.costs[..., 0], torch.tensor([[2.0, 0.25], [0.25, 2.0]])
-    )
+    assert torch.equal(result.costs[..., 0], torch.tensor([[2.0, 0.25], [0.25, 2.0]]))
     assert torch.equal(
         result.rewards[..., 0], torch.tensor([[4.0, 14.75], [1.25, 1.0]])
     )
+
+
+def test_environment_reward_audit_counts_only_valid_success_signals():
+    rewards = torch.zeros(3, 2, 4)
+    rewards[1, 0, 2] = 1.0
+    rewards[2, 1, 1] = 1.0
+    rewards[0, 1, 0] = -0.5
+    routes = torch.tensor(
+        [
+            [WAMRoute.IDM, WAMRoute.UNCOND],
+            [WAMRoute.UNCOND, WAMRoute.IDM],
+            [WAMRoute.IDM, WAMRoute.UNCOND],
+        ]
+    )
+    valid_mask = torch.ones(3, 2, 1, dtype=torch.bool)
+    valid_mask[2, 1] = False
+
+    audit = advantages.summarize_fastwam_environment_rewards(
+        environment_rewards=rewards,
+        route_used=routes,
+        valid_mask=valid_mask,
+    )
+    artifact = audit.to_artifact()
+
+    assert artifact["schema"] == "fastwam-environment-reward-audit-v1"
+    assert artifact["reward_shape"] == [3, 2, 4]
+    assert artifact["reward_dtype"] == "torch.float32"
+    assert artifact["total_value_count"] == 24
+    assert artifact["valid_value_count"] == 20
+    assert artifact["finite_value_count"] == 24
+    assert artifact["nonfinite_value_count"] == 0
+    assert artifact["positive_success_signal_count"] == 1
+    assert artifact["successful_trajectory_count"] == 1
+    assert artifact["total_chunk_count"] == 6
+    assert artifact["valid_chunk_count"] == 5
+    assert artifact["valid_idm_chunk_count"] == 3
+    assert artifact["valid_uncond_chunk_count"] == 2
+    assert artifact["valid_reward_min"] == -0.5
+    assert artifact["valid_reward_max"] == 1.0
+    assert artifact["valid_reward_sum"] == 0.5
+    json.dumps(artifact, sort_keys=True)
+    audit.require_success_signal()
+
+
+def test_rollout_state_audit_records_route_probabilities_and_stored_kv_bytes():
+    route, emitted, dones = _alignment_records()
+    alignment = advantages.align_fastwam_policy_advantages(
+        advantages=torch.ones(3, 4, 1),
+        route=route,
+        emitted=emitted,
+        dones=dones,
+        rollout_epoch=2,
+        carry_pending_across_epochs=True,
+    )
+
+    audit = advantages.summarize_fastwam_rollout_state(
+        route=route,
+        emitted=emitted,
+        eligible_gate_mask=alignment.gate_valid_mask,
+        valid_mask=torch.ones(3, 4, 1, dtype=torch.bool),
+        kv_replay_backend="stored",
+        max_bytes_per_sample=256,
+    )
+    artifact = audit.to_artifact()
+
+    assert artifact["schema"] == "fastwam-rollout-state-audit-v1"
+    assert artifact["decision_shape"] == [3, 4]
+    assert artifact["total_decision_count"] == 12
+    assert artifact["valid_chunk_count"] == 12
+    assert artifact["valid_idm_chunk_count"] == 4
+    assert artifact["valid_uncond_chunk_count"] == 8
+    assert artifact["executed_idm_fraction"] == pytest.approx(1 / 3)
+    assert artifact["emitted_decision_count"] == 12
+    assert artifact["eligible_gate_decision_count"] == 8
+    assert artifact["unused_emitted_decision_count"] == 4
+    assert artifact["base_probability"] == {
+        "count": 8,
+        "minimum": pytest.approx(0.375),
+        "maximum": pytest.approx(0.375),
+        "mean": pytest.approx(0.375),
+    }
+    assert artifact["behavior_probability"] == {
+        "count": 8,
+        "minimum": pytest.approx(0.4),
+        "maximum": pytest.approx(0.4),
+        "mean": pytest.approx(0.4),
+    }
+    assert artifact["kv_replay_backend"] == "stored"
+    assert artifact["kv_storage_dtype"] == "bfloat16"
+    assert artifact["kv_layer_indices"] == [0, 2]
+    assert artifact["kv_denoise_tap_count"] == 1
+    assert artifact["kv_configured_max_bytes_per_sample"] == 256
+    assert artifact["kv_all_emitted"] == {
+        "sample_count": 12,
+        "nonzero_sample_count": 12,
+        "total_bytes": 768,
+        "maximum_bytes_per_sample": 64,
+    }
+    assert artifact["kv_eligible"] == {
+        "sample_count": 8,
+        "nonzero_sample_count": 8,
+        "total_bytes": 512,
+        "maximum_bytes_per_sample": 64,
+    }
+    json.dumps(artifact, sort_keys=True)
+
+
+@pytest.mark.parametrize("missing_metadata", [True, False])
+def test_rollout_state_audit_fails_closed_for_missing_or_zero_stored_kv(
+    missing_metadata: bool,
+) -> None:
+    route, emitted, _ = _alignment_records()
+    metadata = emitted.kv_metadata
+    if not missing_metadata:
+        metadata = replace(metadata, total_bytes=torch.zeros_like(metadata.total_bytes))
+    emitted = replace(emitted, kv_metadata=None if missing_metadata else metadata)
+
+    with pytest.raises(ValueError, match="stored K/V"):
+        advantages.summarize_fastwam_rollout_state(
+            route=route,
+            emitted=emitted,
+            eligible_gate_mask=torch.ones_like(emitted.valid),
+            valid_mask=None,
+            kv_replay_backend="stored",
+            max_bytes_per_sample=256,
+        )
+
+
+def test_environment_reward_audit_zero_success_fails_closed():
+    audit = advantages.summarize_fastwam_environment_rewards(
+        environment_rewards=torch.zeros(2, 1, 3),
+        route_used=torch.tensor([[WAMRoute.IDM], [WAMRoute.UNCOND]]),
+    )
+
+    with pytest.raises(RuntimeError, match="zero positive sparse-success"):
+        audit.require_success_signal()
+
+
+def test_environment_reward_audit_nonfinite_fails_closed_after_reporting():
+    rewards = torch.tensor([[[float("nan"), 1.0]]])
+    audit = advantages.summarize_fastwam_environment_rewards(
+        environment_rewards=rewards,
+        route_used=torch.tensor([[WAMRoute.IDM]]),
+    )
+
+    assert audit.nonfinite_value_count == 1
+    assert audit.positive_success_signal_count == 1
+    with pytest.raises(RuntimeError, match="non-finite"):
+        audit.require_success_signal()
+
+
+@pytest.mark.parametrize(
+    ("rewards", "routes", "valid_mask", "message"),
+    [
+        (torch.ones(1, 1, 1, dtype=torch.long), torch.ones(1, 1), None, "floating"),
+        (torch.ones(1, 1, 1), torch.ones(2, 1), None, "match"),
+        (
+            torch.ones(1, 1, 1),
+            torch.ones(1, 1, dtype=torch.long),
+            torch.ones(1, 1),
+            "torch.bool",
+        ),
+    ],
+)
+def test_environment_reward_audit_rejects_malformed_inputs(
+    rewards: torch.Tensor,
+    routes: torch.Tensor,
+    valid_mask: torch.Tensor | None,
+    message: str,
+):
+    with pytest.raises((TypeError, ValueError), match=message):
+        advantages.summarize_fastwam_environment_rewards(
+            environment_rewards=rewards,
+            route_used=routes,
+            valid_mask=valid_mask,
+        )
 
 
 def test_route_and_gate_dataclasses_survive_mapping_device_and_chunking():
@@ -254,8 +428,10 @@ def test_route_records_survive_epoch_fold_and_train_flatten():
     route, emitted, _ = _alignment_records()
 
     def unfold_epoch_batch(tensor):
-        return tensor.reshape(3, 2, 2, *tensor.shape[2:]).transpose(0, 1).reshape(
-            6, 2, *tensor.shape[2:]
+        return (
+            tensor.reshape(3, 2, 2, *tensor.shape[2:])
+            .transpose(0, 1)
+            .reshape(6, 2, *tensor.shape[2:])
         )
 
     raw = nested.map_nested_tensors(

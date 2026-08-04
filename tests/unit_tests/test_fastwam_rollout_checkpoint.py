@@ -80,6 +80,7 @@ def _worker() -> MultiStepRolloutWorker:
 def test_rollout_runtime_checkpoint_round_trip(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
 ) -> None:
     rng_state = {"cpu": torch.tensor([7], dtype=torch.uint8)}
     restored_rng: list[dict[str, Any]] = []
@@ -119,6 +120,9 @@ def test_rollout_runtime_checkpoint_round_trip(
     assert worker.hf_model.route_state["next_episode_id"] == 1
     assert len(restored_rng) == 1
     assert torch.equal(restored_rng[0]["cpu"], rng_state["cpu"])
+    audit_output = capsys.readouterr().out
+    assert "FASTWAM_ROLLOUT_RESUME_AUDIT" in audit_output
+    assert '"route_state_sha256"' in audit_output
 
 
 def test_rollout_runtime_checkpoint_rejects_extra_payload(

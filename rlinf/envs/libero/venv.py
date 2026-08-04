@@ -20,6 +20,7 @@ from typing import Any, Callable, Optional, Union
 import gym
 import numpy as np
 
+from rlinf.envs.libero.action_contract import inspect_libero_action_contract
 from rlinf.envs.libero.utils import get_libero_type
 from rlinf.envs.venv import (
     BaseVectorEnv,
@@ -157,6 +158,9 @@ def _worker(
                 env.close()
                 seed = data.pop("seed")
                 env = OffScreenRenderEnv(**data)
+                env._rlinf_action_contract = inspect_libero_action_contract(
+                    env
+                ).to_artifact()
                 env.seed(seed)
                 p.send(None)
             else:
