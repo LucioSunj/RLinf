@@ -39,6 +39,8 @@ runner:
   short_rl_canary_require_success_signal: false
 
   bootstrap_project_checkpoint_dir: null
+  bootstrap_uncond_lora_sidecar: null
+  bootstrap_uncond_lora_sidecar_sha256: null
 algorithm:
   normalize_advantages: true
   group_size: 1

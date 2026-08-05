@@ -14,10 +14,61 @@
 
 """Native step-zero FastWAM adaptive project-checkpoint export."""
 
+import hashlib
 from pathlib import Path
 from typing import Any
 
 from omegaconf import OmegaConf
+
+
+def _sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _resolve_uncond_lora_bootstrap(
+    cfg: Any,
+) -> tuple[Path, str] | None:
+    sidecar_value = OmegaConf.select(
+        cfg,
+        "runner.bootstrap_uncond_lora_sidecar",
+        default=None,
+    )
+    hash_value = OmegaConf.select(
+        cfg,
+        "runner.bootstrap_uncond_lora_sidecar_sha256",
+        default=None,
+    )
+    sidecar_set = sidecar_value is not None and bool(str(sidecar_value).strip())
+    hash_set = hash_value is not None and bool(str(hash_value).strip())
+    if sidecar_set != hash_set:
+        raise ValueError(
+            "runner.bootstrap_uncond_lora_sidecar and its SHA-256 must be set together."
+        )
+    if not sidecar_set:
+        return None
+
+    expected_hash = str(hash_value).strip().lower()
+    if len(expected_hash) != 64 or any(
+        character not in "0123456789abcdef" for character in expected_hash
+    ):
+        raise ValueError(
+            "runner.bootstrap_uncond_lora_sidecar_sha256 must be a 64-character "
+            "hexadecimal SHA-256."
+        )
+    sidecar = Path(str(sidecar_value)).expanduser().resolve()
+    if not sidecar.is_file():
+        raise FileNotFoundError(f"BC LoRA sidecar does not exist: {sidecar}")
+    actual_hash = _sha256_file(sidecar)
+    if actual_hash != expected_hash:
+        raise ValueError(
+            "BC LoRA sidecar hash mismatch: "
+            f"expected {expected_hash}, got {actual_hash}."
+        )
+    return sidecar, expected_hash
 
 
 def validate_initial_checkpoint_export_config(
@@ -52,28 +103,31 @@ def validate_initial_checkpoint_export_config(
     )
     if num_layers != 30:
         raise ValueError("E4 step-zero export requires exactly 30 MoT layers.")
-    if bool(
-        OmegaConf.select(cfg, "actor.model.gate.share_blocks", default=True)
-    ):
+    if bool(OmegaConf.select(cfg, "actor.model.gate.share_blocks", default=True)):
         raise ValueError("E4 step-zero export requires independent Gate blocks.")
-    if int(
-        OmegaConf.select(cfg, "actor.model.gate.denoise_last_n", default=-1)
-    ) != 1:
+    if int(OmegaConf.select(cfg, "actor.model.gate.denoise_last_n", default=-1)) != 1:
         raise ValueError("E4 step-zero export requires gate.denoise_last_n=1.")
-    if str(
-        OmegaConf.select(cfg, "actor.model.gate.layer_taps.mode", default="")
-    ) != "all":
+    if (
+        str(OmegaConf.select(cfg, "actor.model.gate.layer_taps.mode", default=""))
+        != "all"
+    ):
         raise ValueError("E4 step-zero export requires the native all-layer Gate.")
-    if OmegaConf.select(
-        cfg,
-        "actor.model.gate.layer_taps.last_n",
-        default=None,
-    ) is not None or OmegaConf.select(
-        cfg,
-        "actor.model.gate.layer_taps.indices",
-        default=None,
-    ) is not None:
+    if (
+        OmegaConf.select(
+            cfg,
+            "actor.model.gate.layer_taps.last_n",
+            default=None,
+        )
+        is not None
+        or OmegaConf.select(
+            cfg,
+            "actor.model.gate.layer_taps.indices",
+            default=None,
+        )
+        is not None
+    ):
         raise ValueError("E4 all-layer export forbids layer subset arguments.")
+    _resolve_uncond_lora_bootstrap(cfg)
     return Path(str(output_value)).expanduser().resolve()
 
 
@@ -96,5 +150,9 @@ def export_initial_actor_checkpoint(
     output_dir.mkdir(parents=True, exist_ok=True)
     actor_dir = output_dir / "actor"
     actor_group.init_worker().wait()
+    bootstrap = _resolve_uncond_lora_bootstrap(cfg)
+    if bootstrap is not None:
+        sidecar, sidecar_sha256 = bootstrap
+        actor_group.bootstrap_fastwam_uncond_lora(str(sidecar), sidecar_sha256).wait()
     actor_group.save_checkpoint(str(actor_dir), 0).wait()
     return actor_dir

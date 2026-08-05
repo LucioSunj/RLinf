@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import json
+import hashlib
 import os
 import time
 from functools import partial
@@ -124,6 +125,75 @@ from rlinf.workers.actor.fastwam_selective_sync import (
     prepare_fastwam_sync_tensors,
 )
 from rlinf.workers.rollout.utils import RankMapper
+
+_FASTWAM_BC_BOOTSTRAP_SCHEMA = "fastwam-uncond-bc-bootstrap-v1"
+_FASTWAM_BC_BOOTSTRAP_KEYS = {
+    "schema",
+    "bc_step",
+    "bc_config_sha256",
+    "sidecar_sha256",
+    "parent_checkpoint_sha256",
+}
+
+
+def _fastwam_sha256_file(path: str) -> str:
+    digest = hashlib.sha256()
+    with open(path, "rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _validate_sha256(value: object, *, name: str) -> str:
+    normalized = str(value).strip().lower()
+    if len(normalized) != 64 or any(
+        character not in "0123456789abcdef" for character in normalized
+    ):
+        raise ValueError(f"{name} must be a 64-character hexadecimal SHA-256.")
+    return normalized
+
+
+def _validate_fastwam_bc_bootstrap_provenance(
+    payload: object,
+    *,
+    expected_parent_checkpoint_sha256: str,
+) -> dict:
+    if not isinstance(payload, dict) or set(payload) != (_FASTWAM_BC_BOOTSTRAP_KEYS):
+        keys = sorted(payload) if isinstance(payload, dict) else type(payload)
+        raise ValueError(f"FastWAM BC bootstrap provenance keys changed: {keys}.")
+    if payload.get("schema") != _FASTWAM_BC_BOOTSTRAP_SCHEMA:
+        raise ValueError("Unsupported FastWAM BC bootstrap provenance schema.")
+    bc_step = payload.get("bc_step")
+    if isinstance(bc_step, bool) or not isinstance(bc_step, int) or bc_step <= 0:
+        raise ValueError("FastWAM BC bootstrap bc_step must be a positive integer.")
+    bc_config_sha256 = _validate_sha256(
+        payload.get("bc_config_sha256"),
+        name="FastWAM BC bootstrap bc_config_sha256",
+    )
+    sidecar_sha256 = _validate_sha256(
+        payload.get("sidecar_sha256"),
+        name="FastWAM BC bootstrap sidecar_sha256",
+    )
+    expected_parent = _validate_sha256(
+        expected_parent_checkpoint_sha256,
+        name="FastWAM parent checkpoint SHA-256",
+    )
+    parent_sha256 = _validate_sha256(
+        payload.get("parent_checkpoint_sha256"),
+        name="FastWAM BC bootstrap parent checkpoint SHA-256",
+    )
+    if parent_sha256 != expected_parent:
+        raise ValueError(
+            "FastWAM BC bootstrap parent hash mismatch: "
+            f"expected {expected_parent}, got {parent_sha256}."
+        )
+    return {
+        "schema": _FASTWAM_BC_BOOTSTRAP_SCHEMA,
+        "bc_step": bc_step,
+        "bc_config_sha256": bc_config_sha256,
+        "sidecar_sha256": sidecar_sha256,
+        "parent_checkpoint_sha256": parent_sha256,
+    }
 
 
 def _raise_fastwam_collective_checkpoint_error(
@@ -1329,6 +1399,80 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
             world_size=int(self._world_size),
         )
 
+    def bootstrap_fastwam_uncond_lora(
+        self,
+        sidecar_path: str,
+        expected_sidecar_sha256: str,
+    ) -> dict:
+        """Load one trained UNCOND LoRA before a pristine RL step-zero save."""
+
+        if (
+            SupportedModel(self.cfg.actor.model.model_type)
+            is not SupportedModel.FASTWAM_ADAPTIVE
+        ):
+            raise ValueError("BC LoRA bootstrap requires fastwam_adaptive.")
+        runner_cfg = getattr(self.cfg, "runner", None)
+        if getattr(runner_cfg, "resume_dir", None) is not None:
+            raise ValueError("BC LoRA bootstrap is forbidden together with resume.")
+
+        policy = self._fastwam_policy_module()
+        if int(self.version) != 0 or int(policy.actor_version) != 0:
+            raise ValueError(
+                "BC LoRA bootstrap requires RL step/version and actor_version 0."
+            )
+        if int(self.optimizer_steps) != 0:
+            raise ValueError("BC LoRA bootstrap requires optimizer_steps == 0.")
+
+        expected_hash = _validate_sha256(
+            expected_sidecar_sha256,
+            name="Expected BC LoRA sidecar SHA-256",
+        )
+        resolved_path = os.path.abspath(os.path.expanduser(str(sidecar_path)))
+        if not os.path.isfile(resolved_path):
+            raise FileNotFoundError(f"BC LoRA sidecar does not exist: {resolved_path}")
+        actual_hash = _fastwam_sha256_file(resolved_path)
+        if actual_hash != expected_hash:
+            raise ValueError(
+                "BC LoRA sidecar hash mismatch: "
+                f"expected {expected_hash}, got {actual_hash}."
+            )
+
+        adapter = getattr(policy, "lora_adapter", None)
+        if adapter is None:
+            raise TypeError("FastWAM adaptive policy has no LoRA adapter.")
+        previous_lora = adapter.lora_state_dict()
+        try:
+            metadata = adapter.load_sidecar(
+                resolved_path,
+                expected_parent_checkpoint_sha256=str(
+                    self.cfg.actor.model.actor_checkpoint_sha256
+                ).lower(),
+                strict=True,
+            )
+            extra = metadata.get("extra") if isinstance(metadata, dict) else None
+            if not isinstance(extra, dict):
+                raise ValueError("BC LoRA sidecar requires mapping metadata.extra.")
+            provenance = _validate_fastwam_bc_bootstrap_provenance(
+                {
+                    "schema": _FASTWAM_BC_BOOTSTRAP_SCHEMA,
+                    "bc_step": extra.get("bc_step"),
+                    "bc_config_sha256": extra.get("bc_config_sha256"),
+                    "sidecar_sha256": actual_hash,
+                    "parent_checkpoint_sha256": metadata.get(
+                        "parent_checkpoint_sha256"
+                    ),
+                },
+                expected_parent_checkpoint_sha256=str(
+                    self.cfg.actor.model.actor_checkpoint_sha256
+                ).lower(),
+            )
+        except Exception:
+            adapter.load_lora_state_dict(previous_lora, strict=True)
+            raise
+
+        self._fastwam_bc_bootstrap = provenance
+        return dict(provenance)
+
     def save_checkpoint(self, save_path: str, step: int = 0) -> None:
         if (
             SupportedModel(self.cfg.actor.model.model_type)
@@ -1365,6 +1509,14 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
                     "grad_scaler": self.grad_scaler.state_dict(),
                     "rng": get_rng_state(),
                 }
+                bc_bootstrap = getattr(self, "_fastwam_bc_bootstrap", None)
+                if bc_bootstrap is not None:
+                    payload["bc_bootstrap"] = _validate_fastwam_bc_bootstrap_provenance(
+                        bc_bootstrap,
+                        expected_parent_checkpoint_sha256=payload[
+                            "parent_checkpoint_sha256"
+                        ],
+                    )
                 payload = self._checkpoint_cpu_clone(payload)
                 os.makedirs(save_path, exist_ok=True)
                 target = os.path.join(save_path, f"rank_{self._rank}.pt")
@@ -1424,7 +1576,9 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
                     "grad_scaler",
                     "rng",
                 }
-                if set(payload) != expected_keys:
+                checkpoint_keys = set(payload)
+                allowed_keys = (expected_keys, expected_keys | {"bc_bootstrap"})
+                if checkpoint_keys not in allowed_keys:
                     raise ValueError(
                         "FastWAM adaptive RL checkpoint keys changed: "
                         f"{sorted(payload)}."
@@ -1441,6 +1595,12 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
                         "FastWAM checkpoint parent hash mismatch: "
                         f"expected {expected_parent}, got "
                         f"{payload.get('parent_checkpoint_sha256')}."
+                    )
+                bc_bootstrap = None
+                if "bc_bootstrap" in payload:
+                    bc_bootstrap = _validate_fastwam_bc_bootstrap_provenance(
+                        payload["bc_bootstrap"],
+                        expected_parent_checkpoint_sha256=expected_parent,
                     )
                 expected_critic_parent = str(
                     self.cfg.actor.model.critic.backbone_checkpoint_sha256
@@ -1509,6 +1669,7 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
                     ),
                     flush=True,
                 )
+                self._fastwam_bc_bootstrap = bc_bootstrap
                 loaded_version = self.version
             except Exception as error:
                 local_error = error

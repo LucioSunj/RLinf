@@ -17,6 +17,7 @@
 from __future__ import annotations
 
 import copy
+import hashlib
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -74,6 +75,47 @@ class _Stateful:
         self.value.copy_(state["value"])
 
 
+class _SidecarAdapter:
+    def __init__(self, parameter: torch.Tensor) -> None:
+        self.parameter = parameter
+
+    def lora_state_dict(self) -> dict[str, torch.Tensor]:
+        return {"blocks.0.self_attn.q.lora_B": self.parameter.clone()}
+
+    def load_lora_state_dict(
+        self,
+        state: dict[str, torch.Tensor],
+        *,
+        strict: bool,
+    ) -> None:
+        expected = {"blocks.0.self_attn.q.lora_B"}
+        if strict and set(state) != expected:
+            raise ValueError("LoRA state key mismatch")
+        self.parameter.copy_(state["blocks.0.self_attn.q.lora_B"])
+
+    def load_sidecar(
+        self,
+        path: str,
+        *,
+        expected_parent_checkpoint_sha256: str,
+        strict: bool,
+    ) -> dict[str, Any]:
+        payload = torch.load(path, map_location="cpu", weights_only=True)
+        metadata = payload["metadata"]
+        if metadata["parent_checkpoint_sha256"] != (expected_parent_checkpoint_sha256):
+            raise ValueError("LoRA sidecar parent checkpoint mismatch")
+        self.load_lora_state_dict(payload["state_dict"], strict=strict)
+        return metadata
+
+
+class _BootstrapPolicy(_Policy):
+    def __init__(self) -> None:
+        super().__init__()
+        self.lora_adapter = _SidecarAdapter(self.weight)
+        self.gate = _Stateful(11.0)
+        self.critic = SimpleNamespace(value_head=_Stateful(12.0))
+
+
 _FAKE_MISSING = object()
 
 
@@ -111,6 +153,7 @@ def _checkpoint_worker() -> Any:
     class CheckpointWorker:
         _checkpoint_cpu_clone = staticmethod(EmbodiedFSDPActor._checkpoint_cpu_clone)
         _fastwam_policy_module = EmbodiedFSDPActor._fastwam_policy_module
+        bootstrap_fastwam_uncond_lora = EmbodiedFSDPActor.bootstrap_fastwam_uncond_lora
         save_checkpoint = EmbodiedFSDPActor.save_checkpoint
         load_checkpoint = EmbodiedFSDPActor.load_checkpoint
 
@@ -120,13 +163,14 @@ def _checkpoint_worker() -> Any:
     worker = CheckpointWorker()
     worker.model = _Policy()
     worker.cfg = SimpleNamespace(
+        runner=SimpleNamespace(resume_dir=None),
         actor=SimpleNamespace(
             model=SimpleNamespace(
                 model_type="fastwam_adaptive",
                 actor_checkpoint_sha256="a" * 64,
                 critic=SimpleNamespace(backbone_checkpoint_sha256="b" * 64),
             )
-        )
+        ),
     )
     worker.optimizer = _Stateful(2.0)
     worker.lr_scheduler = _Stateful(3.0)
@@ -138,6 +182,38 @@ def _checkpoint_worker() -> Any:
     worker.is_weight_offloaded = False
     worker.is_optimizer_offloaded = False
     return worker
+
+
+def _write_bc_sidecar(
+    path: Path,
+    *,
+    parent_sha256: str = "a" * 64,
+    bc_step: int = 17,
+    bc_config_sha256: str = "c" * 64,
+) -> str:
+    torch.save(
+        {
+            "metadata": {
+                "schema": "fastwam-regime-lora-v1",
+                "parent_checkpoint_sha256": parent_sha256,
+                "active_regime": "uncond",
+                "rank": 16,
+                "alpha": 16.0,
+                "dropout": 0.0,
+                "target_groups": [],
+                "target_names": ["blocks.0.self_attn.q"],
+                "extra": {
+                    "bc_step": bc_step,
+                    "bc_config_sha256": bc_config_sha256,
+                },
+            },
+            "state_dict": {
+                "blocks.0.self_attn.q.lora_B": torch.tensor([7.0]),
+            },
+        },
+        path,
+    )
+    return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
 def test_fastwam_actor_checkpoint_rank_file_round_trip(
@@ -396,3 +472,95 @@ def test_collective_checkpoint_success_is_one_collective(
         context="actor checkpoint save",
     )
     assert calls == [None]
+
+
+def test_fastwam_actor_bc_bootstrap_preserves_fresh_gate_and_value_head(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        worker_module,
+        "get_rng_state",
+        lambda: {"cpu": torch.tensor([5], dtype=torch.uint8)},
+    )
+    monkeypatch.setattr(worker_module, "set_rng_state", lambda _state: None)
+    monkeypatch.setattr(torch.distributed, "is_initialized", lambda: False)
+    worker = _checkpoint_worker()
+    worker.optimizer_steps = 0
+    worker.model = _BootstrapPolicy()
+    sidecar = tmp_path / "bc-lora.pt"
+    digest = _write_bc_sidecar(sidecar)
+    gate_before = worker.model.gate.value.clone()
+    value_before = worker.model.critic.value_head.value.clone()
+
+    provenance = worker.bootstrap_fastwam_uncond_lora(str(sidecar), digest)
+
+    assert torch.equal(worker.model.weight, torch.tensor([7.0]))
+    assert torch.equal(worker.model.gate.value, gate_before)
+    assert torch.equal(worker.model.critic.value_head.value, value_before)
+    assert provenance == {
+        "schema": "fastwam-uncond-bc-bootstrap-v1",
+        "bc_step": 17,
+        "bc_config_sha256": "c" * 64,
+        "sidecar_sha256": digest,
+        "parent_checkpoint_sha256": "a" * 64,
+    }
+
+    checkpoint_dir = tmp_path / "actor"
+    worker.save_checkpoint(str(checkpoint_dir), step=0)
+    payload = torch.load(
+        checkpoint_dir / "rank_0.pt",
+        map_location="cpu",
+        weights_only=False,
+    )
+    assert payload["step"] == 0
+    assert payload["optimizer_steps"] == 0
+    assert payload["bc_bootstrap"] == provenance
+
+    worker.model.weight.fill_(3.0)
+    worker._fastwam_bc_bootstrap = None
+    assert worker.load_checkpoint(str(checkpoint_dir)) == 0
+    assert torch.equal(worker.model.weight, torch.tensor([7.0]))
+    assert worker._fastwam_bc_bootstrap == provenance
+
+
+def test_fastwam_actor_bc_bootstrap_failure_is_atomic(tmp_path: Path) -> None:
+    worker = _checkpoint_worker()
+    worker.optimizer_steps = 0
+    worker.model = _BootstrapPolicy()
+    sidecar = tmp_path / "bad-metadata.pt"
+    digest = _write_bc_sidecar(sidecar, bc_config_sha256="invalid")
+
+    with pytest.raises(ValueError, match="bc_config_sha256"):
+        worker.bootstrap_fastwam_uncond_lora(str(sidecar), digest)
+
+    assert torch.equal(worker.model.weight, torch.tensor([1.0]))
+    assert not hasattr(worker, "_fastwam_bc_bootstrap")
+
+
+@pytest.mark.parametrize(
+    ("version", "optimizer_steps", "resume_dir", "message"),
+    [
+        (1, 0, None, "RL step/version"),
+        (0, 1, None, "optimizer_steps"),
+        (0, 0, "/resume", "resume"),
+    ],
+)
+def test_fastwam_actor_bc_bootstrap_requires_pristine_rl_state(
+    tmp_path: Path,
+    version: int,
+    optimizer_steps: int,
+    resume_dir: str | None,
+    message: str,
+) -> None:
+    worker = _checkpoint_worker()
+    worker.model = _BootstrapPolicy()
+    worker.version = version
+    worker.model.actor_version = version
+    worker.optimizer_steps = optimizer_steps
+    worker.cfg.runner.resume_dir = resume_dir
+    sidecar = tmp_path / "bc-lora.pt"
+    digest = _write_bc_sidecar(sidecar)
+
+    with pytest.raises(ValueError, match=message):
+        worker.bootstrap_fastwam_uncond_lora(str(sidecar), digest)
