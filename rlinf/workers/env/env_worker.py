@@ -14,6 +14,7 @@
 
 import asyncio
 import gc
+import json
 import time
 from collections import defaultdict
 from dataclasses import asdict, replace
@@ -32,6 +33,7 @@ from rlinf.data.embodied_io_struct import (
     EmbodiedLerobotRolloutResult,
     EmbodiedRolloutResult,
     EnvOutput,
+    EvaluationRolloutControl,
     RolloutResult,
     Trajectory,
     convert_trajectories_to_batch,
@@ -70,6 +72,9 @@ from rlinf.utils.utils import (
 )
 from rlinf.workers.env.history_manager import HistoryManager
 
+FASTWAM_TRAINING_ACTION_AUDIT_SENTINEL = "FASTWAM_TRAINING_ACTION_AUDIT"
+FASTWAM_TRAINING_ACTION_AUDIT_SCHEMA = "fastwam-training-action-audit-v1"
+
 
 def _merge_evaluation_rollout_results(items: list[Any]) -> Any:
     """Merge typed FastWAM eval shards while preserving legacy payloads."""
@@ -84,6 +89,17 @@ def _merge_evaluation_rollout_results(items: list[Any]) -> Any:
     if all(typed):
         return RolloutResult.merge_rollout_results(items)
     return merge_batches(items)
+
+
+def _split_evaluation_rollout_control(
+    control: EvaluationRolloutControl,
+    split_sizes: list[int],
+) -> list[EvaluationRolloutControl]:
+    """Split a typed stop control according to the normal route plan."""
+
+    if not isinstance(control, EvaluationRolloutControl):
+        raise TypeError("Evaluation stop split requires typed control.")
+    return control.split(split_sizes)
 
 
 def _mark_terminal_gate_unused(
@@ -526,7 +542,10 @@ class EnvWorker(Worker):
 
     @Worker.timer("env_interact_step")
     def env_interact_step(
-        self, chunk_actions: torch.Tensor, stage_id: int
+        self,
+        chunk_actions: torch.Tensor,
+        stage_id: int,
+        action_execution_trace: ActionExecutionTrace | None = None,
     ) -> tuple[EnvOutput, dict[str, Any], dict[str, Any]]:
         """
         This function is used to interact with the environment.
@@ -549,8 +568,45 @@ class EnvWorker(Worker):
             chunk_actions = exec_actions
         env_info = {}
 
+        training_action_audit = bool(
+            self.cfg.runner.get("fastwam_training_guard", {}).get("enabled", False)
+        )
+        combined_action_trace = None
+        if training_action_audit:
+            if str(self.model_cfg.model_type) != "fastwam_adaptive":
+                raise ValueError(
+                    "FastWAM training Action audit requires fastwam_adaptive."
+                )
+            if action_execution_trace is None:
+                raise ValueError(
+                    "FastWAM guarded training requires the typed model Action trace."
+                )
+            action_contract = get_env_attr(self.env_list[stage_id], "action_contract")
+            if not isinstance(action_contract, LiberoActionContract):
+                raise TypeError(
+                    "FastWAM training requires a typed live LIBERO Action contract."
+                )
+            prepared_statistics = ActionStageStatistics.from_values(
+                stage=PREPARED_LIBERO_ACTION_STAGE,
+                values=exec_actions,
+                low=action_contract.low,
+                high=action_contract.high,
+                gripper_dimension_index=action_contract.gripper_dimension_index,
+                action_contract_sha256=action_contract.canonical_sha256,
+            )
+            chunk_result, submitted_statistics = self.env_list[
+                stage_id
+            ].chunk_step_with_action_trace(exec_actions, action_contract)
+            environment_trace = ActionExecutionTrace(
+                stages=(prepared_statistics, submitted_statistics)
+            )
+            combined_action_trace = ActionExecutionTrace.combine(
+                action_execution_trace, environment_trace
+            )
+        else:
+            chunk_result = self.env_list[stage_id].chunk_step(chunk_actions)
         obs_list, chunk_rewards, chunk_terminations, chunk_truncations, infos_list = (
-            self.env_list[stage_id].chunk_step(chunk_actions)
+            chunk_result
         )
         if isinstance(obs_list, (list, tuple)):
             extracted_obs = obs_list[-1] if obs_list else None
@@ -613,11 +669,16 @@ class EnvWorker(Worker):
             "terminations": chunk_terminations,
             "truncations": chunk_truncations,
             "infos_list": infos_list,
+            "action_execution_trace": combined_action_trace,
         }
         return env_output, env_info, chunk_step_payload
 
     def env_evaluate_step(
-        self, raw_actions: torch.Tensor, stage_id: int
+        self,
+        raw_actions: torch.Tensor,
+        stage_id: int,
+        *,
+        active_mask: tuple[bool, ...] | None = None,
     ) -> tuple[EnvOutput, dict[str, Any]]:
         """
         This function is used to evaluate the environment.
@@ -651,12 +712,19 @@ class EnvWorker(Worker):
             chunk_result, submitted_statistics = eval_env.chunk_step_with_action_trace(
                 chunk_actions,
                 action_contract,
+                active_mask=active_mask,
             )
             action_execution_trace = ActionExecutionTrace(
                 stages=(prepared_statistics, submitted_statistics)
             )
         else:
-            chunk_result = eval_env.chunk_step(chunk_actions)
+            if active_mask is None:
+                chunk_result = eval_env.chunk_step(chunk_actions)
+            else:
+                chunk_result = eval_env.chunk_step(
+                    chunk_actions,
+                    active_mask=active_mask,
+                )
         env_info = {}
 
         obs_list, chunk_rewards, chunk_terminations, chunk_truncations, infos_list = (
@@ -678,8 +746,20 @@ class EnvWorker(Worker):
         )
 
         current_dones = chunk_dones.any(dim=1)  # [num_envs] bool
+        active_outcomes = torch.ones_like(current_dones)
+        if active_mask is not None:
+            active_outcomes = torch.as_tensor(
+                active_mask,
+                dtype=torch.bool,
+                device=current_dones.device,
+            )
+            if active_outcomes.shape != current_dones.shape:
+                raise ValueError(
+                    "Evaluation ledger active mask does not match the environment "
+                    "batch."
+                )
         if self.cfg.env.eval.auto_reset:
-            newly_done = current_dones
+            newly_done = current_dones & active_outcomes
         else:
             prev = self.eval_prev_done[stage_id].to(current_dones.device)
             newly_done = current_dones & ~prev
@@ -1067,6 +1147,44 @@ class EnvWorker(Worker):
                 if isinstance(first_value, torch.Tensor)
                 else len(first_value)
             )
+            training_action_audit = bool(
+                not eval_mode
+                and self.cfg.get("runner", {})
+                .get("fastwam_training_guard", {})
+                .get("enabled", False)
+            )
+            if training_action_audit:
+                if str(self.model_cfg.model_type) != "fastwam_adaptive":
+                    raise ValueError(
+                        "FastWAM training Action audit requires fastwam_adaptive."
+                    )
+                action_contract = get_env_attr(
+                    self.env_list[stage_id], "action_contract"
+                )
+                if not isinstance(action_contract, LiberoActionContract):
+                    raise TypeError(
+                        "FastWAM training requires a typed live LIBERO Action contract."
+                    )
+                rollout_obs = dict(data["obs"])
+                rollout_obs["_fastwam_action_contract_low"] = (
+                    torch.tensor(action_contract.low, dtype=torch.float32)
+                    .expand(batch_size, -1)
+                    .clone()
+                )
+                rollout_obs["_fastwam_action_contract_high"] = (
+                    torch.tensor(action_contract.high, dtype=torch.float32)
+                    .expand(batch_size, -1)
+                    .clone()
+                )
+                rollout_obs["_fastwam_action_gripper_indices"] = torch.full(
+                    (batch_size,),
+                    action_contract.gripper_dimension_index,
+                    dtype=torch.long,
+                )
+                rollout_obs["_fastwam_action_contract_sha256"] = [
+                    action_contract.canonical_sha256
+                ] * batch_size
+                data["obs"] = rollout_obs
             per_stage = (
                 self.eval_num_envs_per_stage
                 if eval_mode
@@ -1218,6 +1336,9 @@ class EnvWorker(Worker):
         )
         env_metrics = defaultdict(list)
         rlt_pending_obs: list[dict[str, Any] | None] = [None] * self.stage_num
+        training_action_traces: list[list[ActionExecutionTrace]] = [
+            [] for _ in range(self.stage_num)
+        ]
 
         for epoch in range(self.rollout_epoch):
             if epoch == 0 and self._prefetched_train_bootstrap is not None:
@@ -1310,8 +1431,15 @@ class EnvWorker(Worker):
                         )
 
                     env_output, env_info, chunk_step_payload = self.env_interact_step(
-                        rollout_result.actions, stage_id
+                        rollout_result.actions,
+                        stage_id,
+                        action_execution_trace=rollout_result.action_execution_trace,
                     )
+                    action_trace = chunk_step_payload.pop(
+                        "action_execution_trace", None
+                    )
+                    if action_trace is not None:
+                        training_action_traces[stage_id].append(action_trace)
                     stage_rollout = self.rollout_results[stage_id]
                     if isinstance(stage_rollout, EmbodiedLerobotRolloutResult):
                         stage_rollout.append_chunk_episode_data(
@@ -1444,6 +1572,38 @@ class EnvWorker(Worker):
                         stage_id=stage_id,
                     )
 
+        training_action_audit = bool(
+            self.cfg.runner.get("fastwam_training_guard", {}).get("enabled", False)
+        )
+        if training_action_audit:
+            for stage_id, traces in enumerate(training_action_traces):
+                if not traces:
+                    raise RuntimeError(
+                        "FastWAM training Action audit collected no execution traces."
+                    )
+                merged_trace = ActionExecutionTrace.merge_time(traces)
+                contract = get_env_attr(self.env_list[stage_id], "action_contract")
+                if not isinstance(contract, LiberoActionContract):
+                    raise TypeError(
+                        "FastWAM training Action audit lost its live contract."
+                    )
+                payload = {
+                    "schema": FASTWAM_TRAINING_ACTION_AUDIT_SCHEMA,
+                    "worker_rank": int(self._rank),
+                    "pipeline_stage_id": int(stage_id),
+                    "stage_order": list(merged_trace.stage_names),
+                    "action_contract": contract.to_artifact(),
+                    "records": [
+                        merged_trace.record_for_batch_index(index)
+                        for index in range(merged_trace.batch_size)
+                    ],
+                }
+                print(
+                    f"{FASTWAM_TRAINING_ACTION_AUDIT_SENTINEL} "
+                    + json.dumps(payload, sort_keys=True),
+                    flush=True,
+                )
+
         for key, value in env_metrics.items():
             env_metrics[key] = torch.cat(value, dim=0).contiguous().cpu()
 
@@ -1523,6 +1683,7 @@ class EnvWorker(Worker):
                     )
 
             for eval_step in range(self.n_eval_chunk_steps):
+                evaluation_complete = False
                 for stage_id in range(self.stage_num):
                     rollout_results = self.recv_from(
                         group_name=self.cfg.rollout.group_name,
@@ -1548,10 +1709,27 @@ class EnvWorker(Worker):
                         raw_chunk_actions = raw_chunk_actions.detach().cpu().numpy()
                     else:
                         raw_chunk_actions = np.asarray(raw_chunk_actions)
-                    environment_started_at = time.perf_counter()
-                    env_output, env_info = self.env_evaluate_step(
-                        raw_chunk_actions, stage_id
+                    snapshot = (
+                        pending_snapshots[stage_id]
+                        if self.evaluation_collector is not None
+                        else None
                     )
+                    if self.evaluation_collector is not None and snapshot is None:
+                        raise TypeError(
+                            "FastWAM evaluation collector requires a pending "
+                            "identity snapshot."
+                        )
+                    environment_started_at = time.perf_counter()
+                    if snapshot is None:
+                        env_output, env_info = self.env_evaluate_step(
+                            raw_chunk_actions, stage_id
+                        )
+                    else:
+                        env_output, env_info = self.env_evaluate_step(
+                            raw_chunk_actions,
+                            stage_id,
+                            active_mask=snapshot.active_mask,
+                        )
                     environment_latency_seconds = (
                         time.perf_counter() - environment_started_at
                     )
@@ -1560,13 +1738,10 @@ class EnvWorker(Worker):
                             rollout_results, env_output.dones
                         )
                     if self.evaluation_collector is not None:
-                        snapshot = pending_snapshots[stage_id]
-                        if snapshot is None or not isinstance(
-                            rollout_results, RolloutResult
-                        ):
+                        if not isinstance(rollout_results, RolloutResult):
                             raise TypeError(
-                                "FastWAM evaluation collector requires a pending "
-                                "identity snapshot and typed RolloutResult."
+                                "FastWAM evaluation collector requires typed "
+                                "RolloutResult."
                             )
                         self.evaluation_collector.record_chunk(
                             snapshot=snapshot,
@@ -1578,6 +1753,39 @@ class EnvWorker(Worker):
 
                     for key, value in env_info.items():
                         eval_metrics[key].append(value)
+
+                    if (
+                        self.evaluation_collector is not None
+                        and self.evaluation_collector.is_complete
+                    ):
+                        if self.stage_num != 1:
+                            raise RuntimeError(
+                                "Ledger-complete FastWAM evaluation termination "
+                                "currently requires one environment stage."
+                            )
+                        if self.env_decoupled_mode:
+                            raise RuntimeError(
+                                "Ledger-complete FastWAM evaluation termination "
+                                "requires coupled env/rollout transport."
+                            )
+                        if eval_step < self.n_eval_chunk_steps - 1:
+                            stop_control = (
+                                self.evaluation_collector.build_rollout_stop_control(
+                                    logical_batch_size=self.eval_batch_size
+                                )
+                            )
+                            self.send_to(
+                                group_name=self.cfg.rollout.group_name,
+                                channel=rollout_channel,
+                                data=stop_control,
+                                mode="eval",
+                                tag="rollout_results",
+                                route_key=stage_id,
+                                batch_size=self.eval_batch_size,
+                                split_fn=_split_evaluation_rollout_control,
+                            )
+                        evaluation_complete = True
+                        continue
 
                     if self.cfg.env.eval.auto_reset:
                         if (
@@ -1614,6 +1822,9 @@ class EnvWorker(Worker):
                         route_key=stage_id if not self.env_decoupled_mode else None,
                         decoupled_mode=self.env_decoupled_mode,
                     )
+
+                if evaluation_complete:
+                    break
 
             self.finish_rollout(mode="eval")
         for stage_id in range(self.stage_num):

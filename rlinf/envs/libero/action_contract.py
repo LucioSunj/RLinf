@@ -25,7 +25,13 @@ from typing import Any, Iterable, Mapping
 
 import numpy as np
 
-LIBERO_ACTION_CONTRACT_SCHEMA = "fastwam-libero-action-contract-v1"
+LIBERO_ACTION_CONTRACT_SCHEMA_V1 = "fastwam-libero-action-contract-v1"
+LIBERO_ACTION_CONTRACT_SCHEMA_V2 = "fastwam-libero-action-contract-v2"
+LIBERO_ACTION_CONTRACT_SCHEMA = LIBERO_ACTION_CONTRACT_SCHEMA_V2
+LIBERO_ACTION_CONTRACT_SCHEMAS = {
+    LIBERO_ACTION_CONTRACT_SCHEMA_V1,
+    LIBERO_ACTION_CONTRACT_SCHEMA_V2,
+}
 _OSC_POSE_DIMENSION_NAMES = (
     "delta_x",
     "delta_y",
@@ -102,6 +108,8 @@ class LiberoActionContract:
     environment_horizon: int
     dependency_versions: tuple[tuple[str, str], ...]
     source: str = "underlying_env.action_spec"
+    schema: str = LIBERO_ACTION_CONTRACT_SCHEMA
+    robot_models: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
         action_dim = len(self.low)
@@ -133,6 +141,17 @@ class LiberoActionContract:
             raise ValueError("LIBERO horizon/gripper metadata is invalid.")
         if tuple(sorted(self.dependency_versions)) != self.dependency_versions:
             raise ValueError("Dependency version entries must be sorted.")
+        if self.schema not in LIBERO_ACTION_CONTRACT_SCHEMAS:
+            raise ValueError("Unsupported LIBERO Action contract schema.")
+        models = self.all_robot_models
+        if (
+            not models
+            or tuple(sorted(set(models))) != models
+            or any(not model for model in models)
+        ):
+            raise ValueError("LIBERO robot model provenance must be sorted and unique.")
+        if self.schema == LIBERO_ACTION_CONTRACT_SCHEMA_V1 and len(models) != 1:
+            raise ValueError("Legacy LIBERO Action contracts support one robot model.")
 
     @property
     def action_dim(self) -> int:
@@ -140,9 +159,24 @@ class LiberoActionContract:
 
         return len(self.low)
 
+    @property
+    def all_robot_models(self) -> tuple[str, ...]:
+        """Return every live robot model represented by this contract."""
+
+        return self.robot_models or (self.robot_model,)
+
     def _payload(self) -> dict[str, Any]:
+        robot = {
+            "class": self.robot_class,
+            "action_low": list(self.low),
+            "action_high": list(self.high),
+        }
+        if self.schema == LIBERO_ACTION_CONTRACT_SCHEMA_V1:
+            robot["model"] = self.robot_model
+        else:
+            robot["models"] = list(self.all_robot_models)
         return {
-            "schema": LIBERO_ACTION_CONTRACT_SCHEMA,
+            "schema": self.schema,
             "source": self.source,
             "action_dim": self.action_dim,
             "dimension_names": list(self.dimension_names),
@@ -155,12 +189,7 @@ class LiberoActionContract:
                 "control_frequency_hz": self.control_frequency_hz,
                 "horizon": self.environment_horizon,
             },
-            "robot": {
-                "class": self.robot_class,
-                "model": self.robot_model,
-                "action_low": list(self.low),
-                "action_high": list(self.high),
-            },
+            "robot": robot,
             "controller": {
                 "class": self.controller_class,
                 "name": self.controller_name,
@@ -183,6 +212,23 @@ class LiberoActionContract:
             "dependency_versions": dict(self.dependency_versions),
         }
 
+    def executable_spec_payload(self) -> dict[str, Any]:
+        """Return the exact semantics that must agree across live environments."""
+
+        payload = self._payload()
+        payload["schema"] = LIBERO_ACTION_CONTRACT_SCHEMA_V2
+        payload["environment"]["outer_classes"] = []
+        payload["environment"]["underlying_classes"] = []
+        payload["robot"].pop("model", None)
+        payload["robot"]["models"] = []
+        return payload
+
+    @property
+    def executable_spec_sha256(self) -> str:
+        """Hash the shared executable spec while excluding instance identity."""
+
+        return _canonical_sha256(self.executable_spec_payload())
+
     @property
     def canonical_sha256(self) -> str:
         """Return the hash of the contract excluding its self-declared hash."""
@@ -200,7 +246,8 @@ class LiberoActionContract:
     def from_artifact(cls, payload: Mapping[str, Any]) -> "LiberoActionContract":
         """Parse and verify a serialized live contract."""
 
-        if payload.get("schema") != LIBERO_ACTION_CONTRACT_SCHEMA:
+        schema = str(payload.get("schema", ""))
+        if schema not in LIBERO_ACTION_CONTRACT_SCHEMAS:
             raise ValueError("Unsupported LIBERO Action contract schema.")
         environment = payload.get("environment")
         robot = payload.get("robot")
@@ -212,6 +259,15 @@ class LiberoActionContract:
             for item in (environment, robot, controller, gripper, dependencies)
         ):
             raise TypeError("LIBERO Action contract provenance sections are required.")
+        if schema == LIBERO_ACTION_CONTRACT_SCHEMA_V1:
+            robot_model = str(robot.get("model", ""))
+            robot_models = ()
+        else:
+            raw_models = robot.get("models")
+            if not isinstance(raw_models, list):
+                raise TypeError("LIBERO v2 robot models must be an array.")
+            robot_models = tuple(str(item) for item in raw_models)
+            robot_model = robot_models[0] if robot_models else ""
         contract = cls(
             low=_float_tuple(payload.get("low"), name="Action low"),
             high=_float_tuple(payload.get("high"), name="Action high"),
@@ -226,7 +282,7 @@ class LiberoActionContract:
                 str(item) for item in environment.get("underlying_classes", ())
             ),
             robot_class=str(robot.get("class", "")),
-            robot_model=str(robot.get("model", "")),
+            robot_model=robot_model,
             controller_class=str(controller.get("class", "")),
             controller_name=str(controller.get("name", "")),
             controller_input_low=_float_tuple(
@@ -250,6 +306,8 @@ class LiberoActionContract:
                 sorted((str(key), str(value)) for key, value in dependencies.items())
             ),
             source=str(payload.get("source", "")),
+            schema=schema,
+            robot_models=robot_models,
         )
         if int(payload.get("action_dim", -1)) != contract.action_dim:
             raise ValueError("Serialized LIBERO Action dimension does not reconcile.")
@@ -339,6 +397,7 @@ def inspect_libero_action_contract(
         underlying_environment_classes=(_qualified_name(underlying),),
         robot_class=_qualified_name(robot),
         robot_model=type(robot_model).__name__,
+        robot_models=(type(robot_model).__name__,),
         controller_class=_qualified_name(controller),
         controller_name=controller_name,
         controller_input_low=controller_low,
@@ -372,17 +431,14 @@ def merge_libero_action_contracts(
     if not parsed:
         raise ValueError("No live LIBERO Action contracts were provided.")
     first = parsed[0]
-    comparable = first._payload()
-    comparable["environment"]["outer_classes"] = []
-    comparable["environment"]["underlying_classes"] = []
+    comparable = first.executable_spec_payload()
     for item in parsed[1:]:
-        candidate = item._payload()
-        candidate["environment"]["outer_classes"] = []
-        candidate["environment"]["underlying_classes"] = []
+        candidate = item.executable_spec_payload()
         if candidate != comparable:
             raise ValueError(
                 "Vector LIBERO environments expose different Action contracts."
             )
+    models = tuple(sorted({name for item in parsed for name in item.all_robot_models}))
     return replace(
         first,
         outer_environment_classes=tuple(
@@ -397,4 +453,7 @@ def merge_libero_action_contracts(
                 }
             )
         ),
+        robot_model=models[0],
+        robot_models=models,
+        schema=LIBERO_ACTION_CONTRACT_SCHEMA_V2,
     )

@@ -106,8 +106,10 @@ class FastWAMRolloutStateAudit:
     valid_chunk_count: int
     valid_idm_chunk_count: int
     valid_uncond_chunk_count: int
+    forced_route_count: int
     emitted_decision_count: int
     eligible_gate_decision_count: int
+    eligible_idm_decision_count: int
     unused_emitted_decision_count: int
     base_probability_min: float
     base_probability_max: float
@@ -140,11 +142,16 @@ class FastWAMRolloutStateAudit:
             "valid_chunk_count": self.valid_chunk_count,
             "valid_idm_chunk_count": self.valid_idm_chunk_count,
             "valid_uncond_chunk_count": self.valid_uncond_chunk_count,
+            "forced_route_count": self.forced_route_count,
             "executed_idm_fraction": (
                 self.valid_idm_chunk_count / self.valid_chunk_count
             ),
             "emitted_decision_count": self.emitted_decision_count,
             "eligible_gate_decision_count": self.eligible_gate_decision_count,
+            "eligible_idm_decision_count": self.eligible_idm_decision_count,
+            "eligible_idm_fraction": (
+                self.eligible_idm_decision_count / self.eligible_gate_decision_count
+            ),
             "unused_emitted_decision_count": self.unused_emitted_decision_count,
             "base_probability": {
                 "count": probability_count,
@@ -445,14 +452,20 @@ def summarize_fastwam_rollout_state(
     valid_uncond_count = int(
         (chunk_mask & (route.route_used == int(WAMRoute.UNCOND))).sum().item()
     )
+    eligible_idm_count = int(
+        (eligible_gate_mask & (emitted.next_route == int(WAMRoute.IDM))).sum().item()
+    )
+    forced_route_count = int((chunk_mask & route.route_was_forced).sum().item())
     return FastWAMRolloutStateAudit(
         decision_shape=tuple(int(size) for size in route.shape),
         total_decision_count=int(route.route_used.numel()),
         valid_chunk_count=valid_chunk_count,
         valid_idm_chunk_count=valid_idm_count,
         valid_uncond_chunk_count=valid_uncond_count,
+        forced_route_count=forced_route_count,
         emitted_decision_count=emitted_count,
         eligible_gate_decision_count=eligible_count,
+        eligible_idm_decision_count=eligible_idm_count,
         unused_emitted_decision_count=emitted_count - eligible_count,
         base_probability_min=base_min,
         base_probability_max=base_max,

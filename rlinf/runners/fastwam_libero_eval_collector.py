@@ -27,7 +27,11 @@ from typing import Any
 import numpy as np
 import torch
 
-from rlinf.data.embodied_io_struct import EnvOutput, RolloutResult
+from rlinf.data.embodied_io_struct import (
+    EnvOutput,
+    EvaluationRolloutControl,
+    RolloutResult,
+)
 from rlinf.envs.action_contract import (
     FASTWAM_LIBERO_ACTION_STAGES,
     ActionExecutionTrace,
@@ -197,6 +201,12 @@ class EvaluationIdentityBatch:
     slots: tuple[EvaluationEpisodeSlot, ...]
     action_contract: LiberoActionContract
 
+    @property
+    def active_mask(self) -> tuple[bool, ...]:
+        """Return which slots still own an unfinished frozen-ledger episode."""
+
+        return tuple(slot.entry is not None for slot in self.slots)
+
 
 @dataclass(frozen=True, slots=True)
 class EvaluationArtifactShard:
@@ -205,12 +215,14 @@ class EvaluationArtifactShard:
     rank: int
     chunk_path: str
     episode_path: str
-    action_contract_path: str
+    action_contract_paths: tuple[str, ...]
     chunk_record_count: int
     episode_record_count: int
     chunk_sha256: str
     episode_sha256: str
-    action_contract_sha256: str
+    action_contract_file_sha256s: tuple[str, ...]
+    action_contract_canonical_sha256s: tuple[str, ...]
+    executable_action_contract_sha256: str
     canonical_content_sha256: str
     status: str = "PASS"
 
@@ -272,7 +284,8 @@ class FastWAMLiberoEvalCollector:
         self._states: dict[tuple[int, int], _EpisodeState] = {}
         self._chunks: list[dict[str, Any]] = []
         self._episodes: list[dict[str, Any]] = []
-        self._action_contract: LiberoActionContract | None = None
+        self._action_contracts: dict[str, LiberoActionContract] = {}
+        self._executable_action_contract_sha256: str | None = None
 
     def snapshot_before_step(
         self,
@@ -287,10 +300,13 @@ class FastWAMLiberoEvalCollector:
             raise TypeError(
                 "Evaluation environment must expose a typed live Action contract."
             )
-        if self._action_contract is None:
-            self._action_contract = action_contract
-        elif self._action_contract.canonical_sha256 != action_contract.canonical_sha256:
-            raise ValueError("Live LIBERO Action contract changed within one run.")
+        executable_sha256 = action_contract.executable_spec_sha256
+        if self._executable_action_contract_sha256 is None:
+            self._executable_action_contract_sha256 = executable_sha256
+        elif self._executable_action_contract_sha256 != executable_sha256:
+            raise ValueError(
+                "Live LIBERO executable Action contract changed within one run."
+            )
         task_ids = _int_list(get_env_attr(env, "task_ids"), name="task_ids")
         trial_ids = _int_list(get_env_attr(env, "trial_ids"), name="trial_ids")
         reset_ids = _int_list(
@@ -421,6 +437,31 @@ class FastWAMLiberoEvalCollector:
         ] * batch_size
         return result
 
+    @property
+    def is_complete(self) -> bool:
+        """Return whether every frozen ledger episode has terminated once."""
+
+        expected = {entry["episode_identity"] for entry in self.ledger["entries"]}
+        completed = {episode["episode_identity"] for episode in self._episodes}
+        return completed == expected
+
+    def build_rollout_stop_control(
+        self, *, logical_batch_size: int
+    ) -> EvaluationRolloutControl:
+        """Build a provenance-bound stop only after the ledger is complete."""
+
+        if not self.is_complete:
+            raise RuntimeError(
+                "Cannot stop evaluation before the frozen ledger is complete."
+            )
+        episode_count = len(self.ledger["entries"])
+        return EvaluationRolloutControl(
+            logical_batch_size=int(logical_batch_size),
+            completed_episode_count=len(self._episodes),
+            ledger_episode_count=episode_count,
+            ledger_sha256=_sha256_file(self.ledger_path),
+        )
+
     @staticmethod
     def _batch_outcome(value: torch.Tensor | None, index: int) -> torch.Tensor:
         if value is None:
@@ -495,6 +536,11 @@ class FastWAMLiberoEvalCollector:
             != snapshot.action_contract.canonical_sha256
         ):
             raise ValueError("FastWAM Action trace does not match its live contract.")
+        if any(slot.entry is not None for slot in snapshot.slots):
+            self._action_contracts.setdefault(
+                snapshot.action_contract.canonical_sha256,
+                snapshot.action_contract,
+            )
 
         for index, slot in enumerate(snapshot.slots):
             if slot.entry is None:
@@ -706,7 +752,10 @@ class FastWAMLiberoEvalCollector:
     def finalize(self) -> EvaluationArtifactShard:
         """Atomically write completed local shards and return their hashes."""
 
-        if self._action_contract is None:
+        if (
+            not self._action_contracts
+            or self._executable_action_contract_sha256 is None
+        ):
             raise RuntimeError("Evaluation collected no live Action contract.")
         incomplete = [
             state.entry["episode_identity"]
@@ -716,6 +765,18 @@ class FastWAMLiberoEvalCollector:
         if incomplete:
             raise RuntimeError(
                 f"Evaluation ended with incomplete episodes: {incomplete}."
+            )
+        completed_identities = {
+            episode["episode_identity"] for episode in self._episodes
+        }
+        missing = [
+            entry["episode_identity"]
+            for entry in self.ledger["entries"]
+            if entry["episode_identity"] not in completed_identities
+        ]
+        if missing:
+            raise RuntimeError(
+                f"Evaluation ended without starting ledger episodes: {missing}."
             )
         ledger_order = {
             entry["episode_identity"]: index
@@ -734,13 +795,27 @@ class FastWAMLiberoEvalCollector:
         )
         chunk_path = self.output_dir / f"chunks.rank-{self.rank}.jsonl"
         episode_path = self.output_dir / f"episodes.rank-{self.rank}.jsonl"
-        action_contract_path = (
-            self.output_dir / f"action_contract.rank-{self.rank}.json"
-        )
-        action_contract_payload = self._action_contract.to_artifact()
+        contract_items = sorted(self._action_contracts.items())
+        action_contract_payloads = [
+            contract.to_artifact() for _, contract in contract_items
+        ]
+        if len(contract_items) == 1:
+            action_contract_paths = (
+                self.output_dir / f"action_contract.rank-{self.rank}.json",
+            )
+        else:
+            action_contract_paths = tuple(
+                self.output_dir
+                / f"action_contract.rank-{self.rank}.{canonical_sha256}.json"
+                for canonical_sha256, _ in contract_items
+            )
         self._write_jsonl_atomic(chunk_path, chunks)
         self._write_jsonl_atomic(episode_path, episodes)
-        self._write_json_atomic(action_contract_path, action_contract_payload)
+        for path, payload in zip(
+            action_contract_paths,
+            action_contract_payloads,
+        ):
+            self._write_json_atomic(path, payload)
         canonical_chunks = sorted(
             chunks,
             key=lambda item: (item["episode_identity"], item["chunk_id"]),
@@ -779,18 +854,24 @@ class FastWAMLiberoEvalCollector:
                 }
                 for record in canonical_episodes
             ],
-            "action_contract": action_contract_payload,
+            "action_contracts": action_contract_payloads,
         }
         return EvaluationArtifactShard(
             rank=self.rank,
             chunk_path=str(chunk_path),
             episode_path=str(episode_path),
-            action_contract_path=str(action_contract_path),
+            action_contract_paths=tuple(str(path) for path in action_contract_paths),
             chunk_record_count=len(chunks),
             episode_record_count=len(episodes),
             chunk_sha256=_sha256_file(chunk_path),
             episode_sha256=_sha256_file(episode_path),
-            action_contract_sha256=_sha256_file(action_contract_path),
+            action_contract_file_sha256s=tuple(
+                _sha256_file(path) for path in action_contract_paths
+            ),
+            action_contract_canonical_sha256s=tuple(
+                canonical_sha256 for canonical_sha256, _ in contract_items
+            ),
+            executable_action_contract_sha256=(self._executable_action_contract_sha256),
             canonical_content_sha256=_sha256_payload(canonical_records),
         )
 

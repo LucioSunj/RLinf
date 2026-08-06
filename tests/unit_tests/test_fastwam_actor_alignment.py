@@ -302,9 +302,12 @@ def test_rollout_state_audit_records_route_probabilities_and_stored_kv_bytes():
     assert artifact["valid_chunk_count"] == 12
     assert artifact["valid_idm_chunk_count"] == 4
     assert artifact["valid_uncond_chunk_count"] == 8
+    assert artifact["forced_route_count"] == 4
     assert artifact["executed_idm_fraction"] == pytest.approx(1 / 3)
     assert artifact["emitted_decision_count"] == 12
     assert artifact["eligible_gate_decision_count"] == 8
+    assert artifact["eligible_idm_decision_count"] == 0
+    assert artifact["eligible_idm_fraction"] == 0.0
     assert artifact["unused_emitted_decision_count"] == 4
     assert artifact["base_probability"] == {
         "count": 8,

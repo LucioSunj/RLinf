@@ -36,6 +36,7 @@ from rlinf.config_contracts import (
     validate_fastwam_eval_checkpoint_contract,
 )
 from rlinf.data.embodied_io_struct import (
+    EvaluationRolloutControl,
     RolloutResult,
 )
 from rlinf.hybrid_engines.weight_syncer import WeightSyncer
@@ -1129,6 +1130,7 @@ class MultiStepRolloutWorker(Worker):
                     split_sizes=split_sizes,
                 )
         else:
+            evaluation_complete = False
             for _ in tqdm(
                 range(self.eval_rollout_epoch),
                 desc="Evaluating Rollout Epochs",
@@ -1143,9 +1145,27 @@ class MultiStepRolloutWorker(Worker):
                             route_key=stage_id,
                             async_op=True,
                             batch_size=self.eval_batch_size,
-                            merge_fn=self._merge_obs_batches,
-                            infer_batch_size_fn=self._infer_env_batch_size,
+                            merge_fn=self._merge_evaluation_env_inputs,
+                            infer_batch_size_fn=(
+                                self._infer_evaluation_env_input_batch_size
+                            ),
                         ).async_wait()
+                        if isinstance(env_output, EvaluationRolloutControl):
+                            if (
+                                SupportedModel(self.model_cfg.model_type)
+                                is not SupportedModel.FASTWAM_ADAPTIVE
+                            ):
+                                raise RuntimeError(
+                                    "Only FastWAM evaluation may consume a ledger "
+                                    "stop control."
+                                )
+                            evaluation_complete = True
+                            break
+                        if not isinstance(env_output, dict):
+                            raise TypeError(
+                                "Evaluation rollout input must be observations or "
+                                "a typed stop control."
+                            )
                         actions, result = self._predict_rollout_actions(
                             env_output["obs"],
                             mode="eval",
@@ -1175,6 +1195,10 @@ class MultiStepRolloutWorker(Worker):
                             batch_size=self.eval_batch_size,
                             split_fn=split_fn,
                         )
+                    if evaluation_complete:
+                        break
+                if evaluation_complete:
+                    break
 
             if self.enable_offload:
                 self.offload_model()
@@ -1200,6 +1224,32 @@ class MultiStepRolloutWorker(Worker):
                 train_batch_size=self.per_node_train_batch_size,
                 eval_batch_size=self.per_node_eval_batch_size,
             )
+
+    @staticmethod
+    def _infer_evaluation_env_input_batch_size(value: Any) -> int:
+        if isinstance(value, EvaluationRolloutControl):
+            return value.logical_batch_size
+        if not isinstance(value, dict):
+            raise TypeError(
+                "Evaluation input must be observations or typed stop control."
+            )
+        return MultiStepRolloutWorker._infer_env_batch_size(value)
+
+    def _merge_evaluation_env_inputs(self, items: list[Any]) -> Any:
+        if not items:
+            raise ValueError("At least one evaluation input shard is required.")
+        controls = [isinstance(item, EvaluationRolloutControl) for item in items]
+        if any(controls) and not all(controls):
+            raise TypeError(
+                "Cannot merge mixed observation and evaluation-control shards."
+            )
+        if all(controls):
+            return EvaluationRolloutControl.merge(items)
+        if not all(isinstance(item, dict) for item in items):
+            raise TypeError(
+                "Evaluation input shards must be observations or typed controls."
+            )
+        return self._merge_obs_batches(items)
 
     @staticmethod
     def _infer_env_batch_size(obs_batch: dict[str, Any]) -> int:

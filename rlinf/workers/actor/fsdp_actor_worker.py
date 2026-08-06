@@ -12,8 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import json
 import hashlib
+import json
 import os
 import time
 from functools import partial
@@ -118,6 +118,7 @@ from rlinf.utils.utils import (
     masked_mean,
     reshape_entropy,
     retrieve_model_state_dict_in_cpu,
+    seed_everything,
     set_rng_state,
 )
 from rlinf.workers.actor.fastwam_selective_sync import (
@@ -1284,6 +1285,13 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
         Initialize the actor worker. build the model and use corresponding training backend,
         if needed, offload model parameters and optimizer states to CPU.
         """
+        bootstrap_output_dir = self.cfg.runner.get(
+            "bootstrap_project_checkpoint_dir",
+            None,
+        )
+        if bootstrap_output_dir is not None:
+            seed_everything(int(self.cfg.actor.seed) + int(self._rank))
+
         self.setup_model_and_optimizer()
 
         model_type = str(self.cfg.actor.model.get("model_type", ""))
@@ -1870,6 +1878,8 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
         if self.cfg.algorithm.adv_type == "opd":
             self.compute_opd_teacher_logprobs()
 
+        reward_audit = None
+        rollout_state_audit = None
         model_type = SupportedModel(self.cfg.actor.model.model_type)
         if model_type is SupportedModel.FASTWAM_ADAPTIVE:
             if self.cfg.algorithm.reward_type != "chunk_level":
@@ -1880,12 +1890,16 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
                 raise KeyError("FastWAM advantage computation requires route_info.")
             if "emitted_gate" not in self.rollout_batch:
                 raise KeyError("FastWAM advantage computation requires emitted_gate.")
-            if bool(
+            short_canary_guard = bool(
                 self.cfg.runner.get(
                     "short_rl_canary_require_success_signal",
                     False,
                 )
-            ):
+            )
+            training_guard = self.cfg.runner.get("fastwam_training_guard", {})
+            scientific_guard = bool(training_guard.get("enabled", False))
+            audit_enabled = short_canary_guard or scientific_guard
+            if audit_enabled:
                 reward_audit = summarize_fastwam_environment_rewards(
                     environment_rewards=self.rollout_batch["rewards"],
                     route_used=self.rollout_batch["route_info"].route_used,
@@ -1896,7 +1910,8 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
                     + json.dumps(reward_audit.to_artifact(), sort_keys=True),
                     flush=True,
                 )
-                reward_audit.require_success_signal()
+                if short_canary_guard:
+                    reward_audit.require_success_signal()
             cost_cfg = self.cfg.algorithm.get("fixed_branch_cost", {})
             if bool(cost_cfg.get("enabled", False)):
                 if "fastwam_branch_costs" in self.rollout_batch:
@@ -1949,12 +1964,7 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
                     "gate_valid_mask": alignment.gate_valid_mask,
                 }
             )
-            if bool(
-                self.cfg.runner.get(
-                    "short_rl_canary_require_success_signal",
-                    False,
-                )
-            ):
+            if audit_enabled:
                 kv_cfg = self.cfg.actor.model.kv_replay
                 rollout_state_audit = summarize_fastwam_rollout_state(
                     route=self.rollout_batch["route_info"],
@@ -1975,6 +1985,35 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
             self.rollout_batch.update({"loss_mask_sum": kwargs["loss_mask_sum"]})
 
         rollout_metrics = compute_rollout_metrics(self.rollout_batch)
+        if reward_audit is not None:
+            rollout_metrics.update(
+                {
+                    "fastwam/raw_positive_success_signal_count": float(
+                        reward_audit.positive_success_signal_count
+                    ),
+                    "fastwam/successful_trajectory_count": float(
+                        reward_audit.successful_trajectory_count
+                    ),
+                }
+            )
+        if rollout_state_audit is not None:
+            rollout_metrics.update(
+                {
+                    "fastwam/eligible_idm_fraction": (
+                        rollout_state_audit.eligible_idm_decision_count
+                        / rollout_state_audit.eligible_gate_decision_count
+                    ),
+                    "fastwam/eligible_gate_decision_count": float(
+                        rollout_state_audit.eligible_gate_decision_count
+                    ),
+                    "fastwam/eligible_idm_decision_count": float(
+                        rollout_state_audit.eligible_idm_decision_count
+                    ),
+                    "fastwam/valid_uncond_chunk_count": float(
+                        rollout_state_audit.valid_uncond_chunk_count
+                    ),
+                }
+            )
         return rollout_metrics
 
     @Worker.timer("actor/compute_opd_teacher_logprobs")

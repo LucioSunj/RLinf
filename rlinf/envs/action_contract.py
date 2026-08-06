@@ -525,6 +525,28 @@ class ActionExecutionTrace:
         )
 
     @classmethod
+    def merge_time(
+        cls,
+        items: Iterable["ActionExecutionTrace"],
+    ) -> "ActionExecutionTrace":
+        """Merge compact per-chunk traces without retaining raw Actions."""
+
+        traces = tuple(items)
+        if not traces:
+            raise ValueError("Cannot time-merge an empty Action trace sequence.")
+        names = traces[0].stage_names
+        if any(item.stage_names != names for item in traces[1:]):
+            raise ValueError("Cannot time-merge Action traces with different stages.")
+        return cls(
+            tuple(
+                ActionStageStatistics.merge_time(
+                    trace.stages[index] for trace in traces
+                )
+                for index in range(len(names))
+            )
+        )
+
+    @classmethod
     def combine(
         cls,
         *items: "ActionExecutionTrace",

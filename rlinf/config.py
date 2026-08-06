@@ -958,6 +958,16 @@ def _validate_fastwam_adaptive_cfg(cfg, *, only_eval: bool) -> None:
             "FastWAM action and Gate likelihoods are replayed together on the actor; "
             "`rollout.recompute_logprobs` must remain false."
         )
+    training_guard = cfg.runner.get("fastwam_training_guard", {})
+    if bool(training_guard.get("enabled", False)):
+        from rlinf.runners.fastwam_training_guard import FastWAMTrainingGuard
+
+        FastWAMTrainingGuard(training_guard)
+        if bool(cfg.runner.get("short_rl_canary_require_success_signal", False)):
+            raise ValueError(
+                "FastWAM scientific and short-canary training guards are mutually "
+                "exclusive."
+            )
     kv_backend = str(actor_model.kv_replay.get("backend", "stored")).lower()
     weight_sync_interval = int(cfg.runner.get("weight_sync_interval", 1))
     validate_fastwam_kv_weight_sync(kv_backend, weight_sync_interval)

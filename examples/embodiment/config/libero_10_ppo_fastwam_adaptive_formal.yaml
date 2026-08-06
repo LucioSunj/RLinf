@@ -25,7 +25,7 @@ runner:
   logger:
     log_path: ../results
     project_name: rlinf
-    experiment_name: libero_10_ppo_fastwam_adaptive
+    experiment_name: libero_10_ppo_fastwam_adaptive_formal
     logger_backends: [tensorboard]
   max_epochs: 1000
   max_steps: -1
@@ -41,7 +41,7 @@ runner:
   # Disabled in the base preset. Formal capacity/pilot launchers enable this
   # fail-closed guard and bind it into the continuation contract.
   fastwam_training_guard:
-    enabled: false
+    enabled: true
     zero_success_patience: 1
     window_size: 3
     eligible_idm_fraction_min: 0.05
@@ -53,8 +53,6 @@ runner:
     gate_clip_single_max: 0.8
 
   bootstrap_project_checkpoint_dir: null
-  bootstrap_uncond_lora_sidecar: null
-  bootstrap_uncond_lora_sidecar_sha256: null
 algorithm:
   normalize_advantages: true
   group_size: 1
@@ -133,7 +131,7 @@ actor:
   group_name: ActorGroup
   training_backend: fsdp
   micro_batch_size: 1
-  global_batch_size: 8
+  global_batch_size: 7
   seed: 42
   enable_offload: false
   optim:

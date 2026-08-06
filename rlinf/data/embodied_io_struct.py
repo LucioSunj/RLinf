@@ -14,7 +14,7 @@
 
 import copy
 import uuid
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import TYPE_CHECKING, Any, Optional
 
 import numpy as np
@@ -40,6 +40,78 @@ if TYPE_CHECKING:
 
 
 ACTOR_TRAJECTORY_CHANNEL_TAG = "actor_trajectory"
+EVALUATION_ROLLOUT_CONTROL_SCHEMA = "fastwam-evaluation-rollout-control-v1"
+
+
+@dataclass(frozen=True, slots=True)
+class EvaluationRolloutControl:
+    """Typed environment-to-policy control for bounded evaluation transport."""
+
+    logical_batch_size: int
+    completed_episode_count: int
+    ledger_episode_count: int
+    ledger_sha256: str
+    schema: str = EVALUATION_ROLLOUT_CONTROL_SCHEMA
+    command: str = "stop"
+    reason: str = "ledger_complete"
+
+    def __post_init__(self) -> None:
+        if self.schema != EVALUATION_ROLLOUT_CONTROL_SCHEMA:
+            raise ValueError(f"Unsupported evaluation control schema {self.schema!r}.")
+        if self.command != "stop" or self.reason != "ledger_complete":
+            raise ValueError("Evaluation control must be a ledger-complete stop.")
+        if self.logical_batch_size < 1:
+            raise ValueError("Evaluation control batch size must be positive.")
+        if self.ledger_episode_count < 1:
+            raise ValueError("Evaluation control ledger must contain episodes.")
+        if self.completed_episode_count != self.ledger_episode_count:
+            raise ValueError("Evaluation stop requires the complete frozen ledger.")
+        if len(self.ledger_sha256) != 64 or any(
+            character not in "0123456789abcdef" for character in self.ledger_sha256
+        ):
+            raise ValueError("Evaluation control ledger SHA256 must be lowercase hex.")
+
+    def split(self, split_sizes: list[int]) -> list["EvaluationRolloutControl"]:
+        """Split transport batch ownership while retaining control provenance."""
+
+        if not split_sizes or any(int(size) < 1 for size in split_sizes):
+            raise ValueError("Evaluation control split sizes must be positive.")
+        if sum(int(size) for size in split_sizes) != self.logical_batch_size:
+            raise ValueError("Evaluation control split sizes do not match its batch.")
+        return [replace(self, logical_batch_size=int(size)) for size in split_sizes]
+
+    @classmethod
+    def merge(
+        cls, controls: list["EvaluationRolloutControl"]
+    ) -> "EvaluationRolloutControl":
+        """Merge consistently-provenanced control shards."""
+
+        if not controls or not all(isinstance(control, cls) for control in controls):
+            raise TypeError("Evaluation control merge requires typed control shards.")
+        first = controls[0]
+        provenance = (
+            first.schema,
+            first.command,
+            first.reason,
+            first.completed_episode_count,
+            first.ledger_episode_count,
+            first.ledger_sha256,
+        )
+        for control in controls[1:]:
+            observed = (
+                control.schema,
+                control.command,
+                control.reason,
+                control.completed_episode_count,
+                control.ledger_episode_count,
+                control.ledger_sha256,
+            )
+            if observed != provenance:
+                raise ValueError("Evaluation control shards have different provenance.")
+        return replace(
+            first,
+            logical_batch_size=sum(control.logical_batch_size for control in controls),
+        )
 
 
 def get_model_weights_id(versions: torch.Tensor) -> str:

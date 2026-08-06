@@ -345,6 +345,75 @@ def test_fastwam_actor_init_bootstraps_native_step_zero_after_setup(
     ]
 
 
+def _step_zero_export_worker(
+    tmp_path: Path,
+    *,
+    seed: int,
+    idm_cost: float,
+) -> Any:
+    worker = EmbodiedFSDPActor.__new__(EmbodiedFSDPActor)
+    worker.cfg = OmegaConf.create(
+        {
+            "runner": {
+                "bootstrap_project_checkpoint_dir": str(tmp_path / "step0"),
+                "ckpt_path": None,
+                "resume_dir": None,
+            },
+            "actor": {
+                "seed": seed,
+                "model": {"model_type": "fastwam_adaptive"},
+            },
+            "algorithm": {
+                "fixed_branch_cost": {"idm_cost": idm_cost},
+            },
+        }
+    )
+    worker.enable_offload = False
+    worker._rank = 0
+
+    def setup_model_and_optimizer() -> None:
+        worker.initial_adaptive_state = {
+            "gate": torch.rand(8),
+            "lora_a": torch.rand(8),
+            "lora_b": torch.zeros(8),
+            "value_head": torch.rand(8),
+        }
+
+    worker.setup_model_and_optimizer = setup_model_and_optimizer
+    return worker
+
+
+def test_step_zero_export_seeds_adaptive_initialization_before_setup(
+    tmp_path: Path,
+) -> None:
+    low_cost = _step_zero_export_worker(tmp_path, seed=42, idm_cost=0.001)
+    high_cost = _step_zero_export_worker(tmp_path, seed=42, idm_cost=0.01)
+
+    EmbodiedFSDPActor.init_worker(low_cost)
+    EmbodiedFSDPActor.init_worker(high_cost)
+
+    assert low_cost.initial_adaptive_state.keys() == (
+        high_cost.initial_adaptive_state.keys()
+    )
+    for key, low_tensor in low_cost.initial_adaptive_state.items():
+        assert torch.equal(low_tensor, high_cost.initial_adaptive_state[key])
+
+
+def test_step_zero_export_different_seeds_change_random_initialization(
+    tmp_path: Path,
+) -> None:
+    first = _step_zero_export_worker(tmp_path, seed=11, idm_cost=0.001)
+    second = _step_zero_export_worker(tmp_path, seed=29, idm_cost=0.001)
+
+    EmbodiedFSDPActor.init_worker(first)
+    EmbodiedFSDPActor.init_worker(second)
+
+    assert not torch.equal(
+        first.initial_adaptive_state["gate"],
+        second.initial_adaptive_state["gate"],
+    )
+
+
 def test_fastwam_actor_init_rejects_nonzero_bootstrap(tmp_path: Path) -> None:
     worker = _bootstrap_worker(tmp_path, loaded_step=1)
 

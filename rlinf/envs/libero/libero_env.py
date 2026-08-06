@@ -17,6 +17,7 @@ import glob
 import importlib
 import os
 import sys
+from dataclasses import replace
 from typing import Optional, Union
 
 import gym
@@ -791,33 +792,170 @@ class LiberoEnv(gym.Env):
         infos = {}
         return obs, infos
 
-    def step(self, actions=None, auto_reset=True):
-        """Step the environment with the given actions."""
+    @staticmethod
+    def _normalize_active_mask(active_mask, *, batch_size):
+        """Validate a batch-aligned mask for frozen-ledger evaluation slots."""
+
+        if active_mask is None:
+            return np.ones(int(batch_size), dtype=bool)
+        if isinstance(active_mask, torch.Tensor):
+            if active_mask.dtype != torch.bool:
+                raise TypeError("LIBERO active mask must have boolean dtype.")
+            mask = active_mask.detach().cpu().numpy()
+        else:
+            mask = np.asarray(active_mask)
+            if mask.dtype != np.bool_:
+                raise TypeError("LIBERO active mask must have boolean dtype.")
+        if mask.shape != (int(batch_size),):
+            raise ValueError(
+                "LIBERO active mask must have shape "
+                f"[{int(batch_size)}], got {tuple(mask.shape)}."
+            )
+        return mask.astype(bool, copy=True)
+
+    @staticmethod
+    def _mask_action_statistics(
+        statistics: ActionStageStatistics,
+        active_mask: np.ndarray,
+    ) -> ActionStageStatistics:
+        """Zero compact counts for slots whose Actions were never submitted."""
+
+        row_mask = torch.as_tensor(
+            active_mask,
+            dtype=torch.bool,
+            device=statistics.minimum.device,
+        ).reshape(-1, 1)
+        return replace(
+            statistics,
+            minimum=statistics.minimum.masked_fill(~row_mask, 0.0),
+            maximum=statistics.maximum.masked_fill(~row_mask, 0.0),
+            finite_count=statistics.finite_count.masked_fill(~row_mask, 0),
+            below_low_count=statistics.below_low_count.masked_fill(~row_mask, 0),
+            above_high_count=statistics.above_high_count.masked_fill(~row_mask, 0),
+            total_value_count=statistics.total_value_count.masked_fill(~row_mask, 0),
+        )
+
+    @staticmethod
+    def _validate_submitted_actions(
+        statistics: ActionStageStatistics,
+        contract: LiberoActionContract,
+    ) -> None:
+        """Reject invalid active-slot Actions before the underlying env step."""
+
+        invalid = (
+            (statistics.finite_count != statistics.total_value_count)
+            | (statistics.below_low_count > 0)
+            | (statistics.above_high_count > 0)
+        )
+        if not bool(invalid.any()):
+            return
+        violations = []
+        for batch_index, dimension_index in invalid.nonzero(as_tuple=False).tolist():
+            finite_count = int(statistics.finite_count[batch_index, dimension_index])
+            violations.append(
+                {
+                    "environment_index": int(batch_index),
+                    "dimension_index": int(dimension_index),
+                    "dimension_name": contract.dimension_names[dimension_index],
+                    "minimum": (
+                        float(statistics.minimum[batch_index, dimension_index])
+                        if finite_count
+                        else None
+                    ),
+                    "maximum": (
+                        float(statistics.maximum[batch_index, dimension_index])
+                        if finite_count
+                        else None
+                    ),
+                    "low": float(contract.low[dimension_index]),
+                    "high": float(contract.high[dimension_index]),
+                    "finite_count": finite_count,
+                    "total_value_count": int(
+                        statistics.total_value_count[batch_index, dimension_index]
+                    ),
+                    "below_low_count": int(
+                        statistics.below_low_count[batch_index, dimension_index]
+                    ),
+                    "above_high_count": int(
+                        statistics.above_high_count[batch_index, dimension_index]
+                    ),
+                }
+            )
+        raise ValueError(
+            "Refusing to submit Action values outside the exact live LIBERO "
+            f"contract: {violations}. No clamp was applied."
+        )
+
+    def step(self, actions=None, auto_reset=True, active_mask=None):
+        """Step only active frozen-ledger slots while preserving batch alignment."""
+
         if isinstance(actions, torch.Tensor):
             actions = actions.detach().cpu().numpy()
+        actions = np.asarray(actions)
+        if actions.ndim < 2 or int(actions.shape[0]) != self.num_envs:
+            raise ValueError(
+                "LIBERO Actions must preserve the configured environment batch."
+            )
+        active_mask = self._normalize_active_mask(
+            active_mask,
+            batch_size=self.num_envs,
+        )
+        active_indices = np.flatnonzero(active_mask)
 
         capture = self._action_submission_capture
         if capture is not None:
             contract, records = capture
-            records.append(
-                ActionStageStatistics.from_values(
-                    stage=SUBMITTED_LIBERO_ACTION_STAGE,
-                    values=np.asarray(actions)[:, None, :],
-                    low=contract.low,
-                    high=contract.high,
-                    gripper_dimension_index=(contract.gripper_dimension_index),
-                    action_contract_sha256=contract.canonical_sha256,
-                )
+            statistics = ActionStageStatistics.from_values(
+                stage=SUBMITTED_LIBERO_ACTION_STAGE,
+                values=actions[:, None, :],
+                low=contract.low,
+                high=contract.high,
+                gripper_dimension_index=contract.gripper_dimension_index,
+                action_contract_sha256=contract.canonical_sha256,
             )
+            submitted_statistics = (
+                self._mask_action_statistics(statistics, active_mask)
+                if not active_mask.all()
+                else statistics
+            )
+            records.append(submitted_statistics)
+            self._validate_submitted_actions(submitted_statistics, contract)
 
-        self._elapsed_steps += 1
-        raw_obs, _reward, terminations, info_lists = self.env.step(actions)
-        self.current_raw_obs = raw_obs
-        infos = list_of_dict_to_dict_of_list(info_lists)
-        truncations = self.elapsed_steps >= self.cfg.max_episode_steps
-        obs = self._wrap_obs(raw_obs)
+        self._elapsed_steps[active_indices] += 1
+        if active_mask.all():
+            raw_obs, _reward, terminations, info_lists = self.env.step(actions)
+            self.current_raw_obs = raw_obs
+            infos = list_of_dict_to_dict_of_list(info_lists)
+        else:
+            if self.current_raw_obs is None:
+                raise RuntimeError(
+                    "LIBERO inactive slots require a prior reset observation."
+                )
+            raw_obs = list(self.current_raw_obs)
+            terminations = np.zeros(self.num_envs, dtype=bool)
+            infos = {}
+            if active_indices.size:
+                active_obs, _reward, active_terminations, _info_lists = self.env.step(
+                    actions[active_indices],
+                    active_indices,
+                )
+                for result_index, env_index in enumerate(active_indices):
+                    raw_obs[int(env_index)] = active_obs[result_index]
+                terminations[active_indices] = np.asarray(
+                    active_terminations,
+                    dtype=bool,
+                )
+            self.current_raw_obs = raw_obs
 
-        step_reward = self._calc_step_reward(terminations)
+        truncations = (self.elapsed_steps >= self.cfg.max_episode_steps) & active_mask
+        obs = self._wrap_obs(self.current_raw_obs)
+
+        previous_step_reward = self.prev_step_reward.copy()
+        step_reward = np.asarray(self._calc_step_reward(terminations))
+        if not active_mask.all():
+            self.prev_step_reward[~active_mask] = previous_step_reward[~active_mask]
+            step_reward = step_reward.copy()
+            step_reward[~active_mask] = 0
 
         infos = self._record_metrics(step_reward, terminations, infos)
         if self.ignore_terminations:
@@ -840,17 +978,25 @@ class LiberoEnv(gym.Env):
         self,
         chunk_actions,
         action_contract: LiberoActionContract,
+        active_mask=None,
     ):
-        """Execute a chunk while reducing final submitted Actions in place."""
+        """Execute a chunk while reducing only actually submitted Actions."""
 
         if not isinstance(action_contract, LiberoActionContract):
             raise TypeError("LIBERO chunk tracing requires a typed Action contract.")
         if self._action_submission_capture is not None:
             raise RuntimeError("Nested LIBERO Action submission capture is forbidden.")
+        normalized_mask = self._normalize_active_mask(
+            active_mask,
+            batch_size=self.num_envs,
+        )
         records: list[ActionStageStatistics] = []
         self._action_submission_capture = (action_contract, records)
         try:
-            result = self.chunk_step(chunk_actions)
+            result = self.chunk_step(
+                chunk_actions,
+                active_mask=normalized_mask,
+            )
         finally:
             self._action_submission_capture = None
         expected_steps = int(chunk_actions.shape[1])
@@ -861,9 +1007,22 @@ class LiberoEnv(gym.Env):
             )
         return result, ActionStageStatistics.merge_time(records)
 
-    def chunk_step(self, chunk_actions):
+    def chunk_step(self, chunk_actions, active_mask=None):
         # chunk_actions: [num_envs, chunk_step, action_dim]
-        chunk_size = chunk_actions.shape[1]
+        if (
+            len(chunk_actions.shape) != 3
+            or int(chunk_actions.shape[0]) != self.num_envs
+        ):
+            raise ValueError(
+                "LIBERO chunk Actions must have shape [num_envs, horizon, action_dim]."
+            )
+        chunk_size = int(chunk_actions.shape[1])
+        if chunk_size < 1:
+            raise ValueError("LIBERO Action chunks must contain at least one step.")
+        active_mask = self._normalize_active_mask(
+            active_mask,
+            batch_size=self.num_envs,
+        )
         obs_list = []
         infos_list = []
 
@@ -874,7 +1033,9 @@ class LiberoEnv(gym.Env):
         for i in range(chunk_size):
             actions = chunk_actions[:, i]
             extracted_obs, step_reward, terminations, truncations, infos = self.step(
-                actions, auto_reset=False
+                actions,
+                auto_reset=False,
+                active_mask=active_mask,
             )
             obs_list.append(extracted_obs)
             infos_list.append(infos)
@@ -883,13 +1044,9 @@ class LiberoEnv(gym.Env):
             raw_chunk_terminations.append(terminations)
             raw_chunk_truncations.append(truncations)
 
-        chunk_rewards = torch.stack(chunk_rewards, dim=1)  # [num_envs, chunk_steps]
-        raw_chunk_terminations = torch.stack(
-            raw_chunk_terminations, dim=1
-        )  # [num_envs, chunk_steps]
-        raw_chunk_truncations = torch.stack(
-            raw_chunk_truncations, dim=1
-        )  # [num_envs, chunk_steps]
+        chunk_rewards = torch.stack(chunk_rewards, dim=1)
+        raw_chunk_terminations = torch.stack(raw_chunk_terminations, dim=1)
+        raw_chunk_truncations = torch.stack(raw_chunk_truncations, dim=1)
         raw_chunk_dones = torch.logical_or(
             raw_chunk_terminations,
             raw_chunk_truncations,
@@ -928,6 +1085,17 @@ class LiberoEnv(gym.Env):
         else:
             chunk_terminations = raw_chunk_terminations.clone()
             chunk_truncations = raw_chunk_truncations.clone()
+
+        inactive = torch.as_tensor(
+            ~active_mask,
+            dtype=torch.bool,
+            device=chunk_rewards.device,
+        )
+        if inactive.any():
+            chunk_rewards[inactive] = 0
+            chunk_terminations[inactive] = False
+            chunk_truncations[inactive] = False
+            chunk_truncations[inactive, -1] = True
         return (
             obs_list,
             chunk_rewards,

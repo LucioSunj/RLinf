@@ -23,6 +23,7 @@ import pytest
 from omegaconf import OmegaConf
 
 from rlinf.runners.embodied_runner import EmbodiedRunner
+from rlinf.runners.fastwam_training_guard import FastWAMTrainingGuard
 
 
 class _Handle:
@@ -51,12 +52,29 @@ class _WorkerGroup:
         return _Handle()
 
 
-def _runner_cfg(tmp_path: Path, *, resume_dir: str | None = None):
+def _runner_cfg(
+    tmp_path: Path,
+    *,
+    resume_dir: str | None = None,
+    guard_enabled: bool = False,
+):
     return OmegaConf.create(
         {
             "actor": {"model": {"model_type": "fastwam_adaptive"}},
             "runner": {
                 "resume_dir": resume_dir,
+                "fastwam_training_guard": {
+                    "enabled": guard_enabled,
+                    "zero_success_patience": 3,
+                    "window_size": 3,
+                    "eligible_idm_fraction_min": 0.05,
+                    "eligible_idm_fraction_max": 0.95,
+                    "gate_entropy_min": 0.1,
+                    "gate_kl_median_max": 0.05,
+                    "gate_kl_single_max": 0.1,
+                    "gate_clip_median_max": 0.6,
+                    "gate_clip_single_max": 0.8,
+                },
                 "logger": {
                     "log_path": str(tmp_path),
                     "experiment_name": "l12",
@@ -75,6 +93,9 @@ def _bare_runner(cfg, *, actor, rollout, env=None):
     runner.reward = None
     runner.logger = SimpleNamespace(info=lambda *_args, **_kwargs: None)
     runner.global_step = 0
+    runner.fastwam_training_guard = FastWAMTrainingGuard(
+        cfg.runner.fastwam_training_guard
+    )
     return runner
 
 
@@ -91,6 +112,44 @@ def test_fastwam_save_pairs_actor_and_rollout_checkpoints(tmp_path: Path) -> Non
     assert rollout.calls == [("save_checkpoint", str(checkpoint / "rollout"), 3)]
     assert (checkpoint / "actor").is_dir()
     assert (checkpoint / "rollout").is_dir()
+
+
+def test_worker_global_step_is_awaited_before_training_continues(
+    tmp_path: Path,
+) -> None:
+    events = []
+
+    class _StepHandle:
+        def __init__(self, owner: str) -> None:
+            self.owner = owner
+
+        def wait(self):
+            events.append(("wait", self.owner))
+
+    class _StepWorkerGroup(_WorkerGroup):
+        def __init__(self, owner: str) -> None:
+            super().__init__()
+            self.owner = owner
+
+        def set_global_step(self, step: int):
+            events.append(("dispatch", self.owner, step))
+            return _StepHandle(self.owner)
+
+    runner = _bare_runner(
+        _runner_cfg(tmp_path),
+        actor=_StepWorkerGroup("actor"),
+        rollout=_StepWorkerGroup("rollout"),
+    )
+    runner.global_step = 7
+
+    runner._set_worker_global_step()
+
+    assert events == [
+        ("dispatch", "actor", 7),
+        ("dispatch", "rollout", 7),
+        ("wait", "actor"),
+        ("wait", "rollout"),
+    ]
 
 
 def test_fastwam_resume_restores_paired_actor_and_rollout_steps(tmp_path: Path) -> None:
@@ -135,4 +194,73 @@ def test_fastwam_resume_rejects_missing_actor_checkpoint(tmp_path: Path) -> None
     )
 
     with pytest.raises(FileNotFoundError, match="does not exist"):
+        runner.init_workers()
+
+
+def test_fastwam_guard_state_is_saved_and_restored_with_runner_step(
+    tmp_path: Path,
+) -> None:
+    cfg = _runner_cfg(tmp_path, guard_enabled=True)
+    source = _bare_runner(cfg, actor=_WorkerGroup(), rollout=_WorkerGroup())
+    source.fastwam_training_guard.observe_rollout(
+        [
+            {
+                "fastwam/raw_positive_success_signal_count": 0.0,
+                "fastwam/successful_trajectory_count": 0.0,
+                "fastwam/eligible_idm_fraction": 0.5,
+                "fastwam/eligible_gate_decision_count": 10.0,
+                "fastwam/eligible_idm_decision_count": 5.0,
+                "fastwam/valid_uncond_chunk_count": 4.0,
+                "rewards": 0.0,
+                "advantages_max": 1.0,
+                "advantages_mean": 0.0,
+                "advantages_min": -1.0,
+                "returns_max": 1.0,
+                "returns_mean": 0.5,
+                "returns_min": 0.0,
+                "values_max": 0.5,
+                "values_mean": 0.25,
+                "values_min": 0.0,
+            }
+        ]
+    )
+    source.global_step = 3
+    source._save_checkpoint()
+
+    checkpoint = tmp_path / "l12/checkpoints/global_step_3"
+    assert (checkpoint / "training_guard.json").is_file()
+
+    resumed = _bare_runner(
+        _runner_cfg(
+            tmp_path,
+            resume_dir=str(checkpoint),
+            guard_enabled=True,
+        ),
+        actor=_WorkerGroup(loaded_steps=[3]),
+        rollout=_WorkerGroup(loaded_steps=[3]),
+    )
+    resumed.init_workers()
+
+    assert resumed.fastwam_training_guard.state_dict() == (
+        source.fastwam_training_guard.state_dict()
+    )
+
+
+def test_fastwam_guard_resume_fails_closed_when_state_is_missing(
+    tmp_path: Path,
+) -> None:
+    checkpoint = tmp_path / "global_step_3"
+    (checkpoint / "actor").mkdir(parents=True)
+    (checkpoint / "rollout").mkdir()
+    runner = _bare_runner(
+        _runner_cfg(
+            tmp_path,
+            resume_dir=str(checkpoint),
+            guard_enabled=True,
+        ),
+        actor=_WorkerGroup(loaded_steps=[3]),
+        rollout=_WorkerGroup(loaded_steps=[3]),
+    )
+
+    with pytest.raises(FileNotFoundError, match="training_guard.json"):
         runner.init_workers()

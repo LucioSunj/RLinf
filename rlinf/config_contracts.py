@@ -329,6 +329,7 @@ def build_fastwam_checkpoint_contract(cfg: Any, *, world_size: int) -> dict[str,
         "weight_sync_interval",
         "overlap_env_bootstrap",
         "use_training_pipeline",
+        "fastwam_training_guard",
     )
     runner = _selected_checkpoint_values(cfg.runner, runner_keys)
     if runner["weight_sync_interval"] is None:

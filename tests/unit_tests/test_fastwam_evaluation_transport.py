@@ -21,7 +21,10 @@ import pytest
 import torch
 from omegaconf import OmegaConf
 
-from rlinf.data.embodied_io_struct import RolloutResult
+from rlinf.data.embodied_io_struct import (
+    EvaluationRolloutControl,
+    RolloutResult,
+)
 from rlinf.models.embodiment.wam_policy.contracts import (
     ChunkRouteRecord,
     GateDecisionRecord,
@@ -31,6 +34,7 @@ from rlinf.models.embodiment.wam_policy.evaluation import (
     EvaluationRoutingMode,
 )
 from rlinf.models.embodiment.wam_policy.routing_state import PendingRouteTracker
+from rlinf.runners.fastwam_libero_eval_collector import EvaluationArtifactShard
 from rlinf.workers.env import env_worker as env_worker_module
 from rlinf.workers.env.env_worker import (
     EnvWorker,
@@ -414,7 +418,7 @@ def test_coupled_env_eval_validates_typed_rollout_batch_size() -> None:
         return typed_result
 
     worker.recv_from = recv_from
-    worker.env_evaluate_step = lambda _actions, _stage_id: (
+    worker.env_evaluate_step = lambda _actions, _stage_id, **_kwargs: (
         env_worker_module.EnvOutput(
             obs={
                 "states": torch.zeros(2, 3),
@@ -432,6 +436,166 @@ def test_coupled_env_eval_validates_typed_rollout_batch_size() -> None:
     metrics = evaluate_impl(worker, input_channel=object(), rollout_channel=object())
 
     assert metrics == {}
+
+
+class _SnapshotWithActiveSlots:
+    active_mask = (True, True)
+
+
+class _CompleteAfterOneCollector:
+    def __init__(self) -> None:
+        self.is_complete = False
+        self.finalized = False
+
+    def snapshot_before_step(self, stage_id, env, env_ids):
+        del stage_id, env, env_ids
+        return _SnapshotWithActiveSlots()
+
+    def augment_rollout_input(self, data, snapshot):
+        del snapshot
+        return data
+
+    def record_chunk(self, **_kwargs) -> None:
+        self.is_complete = True
+
+    def build_rollout_stop_control(
+        self, *, logical_batch_size: int
+    ) -> EvaluationRolloutControl:
+        return EvaluationRolloutControl(
+            logical_batch_size=logical_batch_size,
+            completed_episode_count=1,
+            ledger_episode_count=1,
+            ledger_sha256="a" * 64,
+        )
+
+    def finalize(self) -> EvaluationArtifactShard:
+        self.finalized = True
+        return EvaluationArtifactShard(
+            rank=0,
+            chunk_path="chunks.jsonl",
+            episode_path="episodes.jsonl",
+            action_contract_paths=("action-contract.json",),
+            chunk_record_count=1,
+            episode_record_count=1,
+            chunk_sha256="a" * 64,
+            episode_sha256="b" * 64,
+            action_contract_file_sha256s=("c" * 64,),
+            action_contract_canonical_sha256s=("d" * 64,),
+            executable_action_contract_sha256="e" * 64,
+            canonical_content_sha256="f" * 64,
+        )
+
+
+class _SnapshotWithInactiveSlot:
+    active_mask = (True, False)
+
+
+class _InactiveSlotCollector(_CompleteAfterOneCollector):
+    def snapshot_before_step(self, stage_id, env, env_ids):
+        del stage_id, env, env_ids
+        return _SnapshotWithInactiveSlot()
+
+
+def test_coupled_env_eval_passes_ledger_active_mask_to_environment_step() -> None:
+    worker = object.__new__(EnvWorker)
+    worker.cfg = OmegaConf.create(
+        {
+            "rollout": {"group_name": "rollout"},
+            "env": {"eval": {"auto_reset": True}},
+        }
+    )
+    worker.eval_rollout_epoch = 1
+    worker.n_eval_chunk_steps = 1
+    worker.stage_num = 1
+    worker.eval_batch_size = 2
+    worker.eval_num_envs_per_stage = 2
+    worker.eval_prev_done = [torch.zeros(2, dtype=torch.bool)]
+    worker.env_decoupled_mode = False
+    worker.eval_enable_offload = False
+    worker.evaluation_collector = _InactiveSlotCollector()
+    worker.eval_env_list = [_ResetOnlyEvalEnv()]
+    worker._build_rollout_input_data = lambda _env_batch, **_kwargs: {
+        "fastwam_env_ids": torch.tensor([10, 20])
+    }
+    worker.send_to = lambda **_kwargs: None
+    worker.recv_from = lambda **_kwargs: RolloutResult(actions=torch.ones(2, 2, 3))
+    received_masks = []
+
+    def env_evaluate_step(_actions, _stage_id, *, active_mask=None):
+        received_masks.append(tuple(active_mask))
+        return (
+            env_worker_module.EnvOutput(
+                obs={
+                    "states": torch.zeros(2, 3),
+                    "task_descriptions": ["first", "second"],
+                },
+                dones=torch.ones(2, dtype=torch.bool),
+            ),
+            {},
+        )
+
+    worker.env_evaluate_step = env_evaluate_step
+    worker.finish_rollout = lambda mode: None
+
+    evaluate_impl = EnvWorker.evaluate
+    while hasattr(evaluate_impl, "__wrapped__"):
+        evaluate_impl = evaluate_impl.__wrapped__
+    evaluate_impl(worker, input_channel=object(), rollout_channel=object())
+
+    assert received_masks == [(True, False)]
+
+
+def test_coupled_env_eval_stops_when_frozen_ledger_is_complete() -> None:
+    worker = object.__new__(EnvWorker)
+    worker.cfg = OmegaConf.create(
+        {
+            "rollout": {"group_name": "rollout"},
+            "env": {"eval": {"auto_reset": True}},
+        }
+    )
+    worker.eval_rollout_epoch = 1
+    worker.n_eval_chunk_steps = 4
+    worker.stage_num = 1
+    worker.eval_batch_size = 2
+    worker.eval_num_envs_per_stage = 2
+    worker.eval_prev_done = [torch.zeros(2, dtype=torch.bool)]
+    worker.env_decoupled_mode = False
+    worker.eval_enable_offload = False
+    collector = _CompleteAfterOneCollector()
+    worker.evaluation_collector = collector
+    worker.eval_env_list = [_ResetOnlyEvalEnv()]
+    worker._build_rollout_input_data = lambda _env_batch, **_kwargs: {
+        "fastwam_env_ids": torch.tensor([10, 20])
+    }
+    sends = []
+    worker.send_to = lambda **kwargs: sends.append(kwargs)
+    receives = []
+    typed_result = RolloutResult(actions=torch.ones(2, 2, 3))
+    worker.recv_from = lambda **kwargs: receives.append(kwargs) or typed_result
+    worker.env_evaluate_step = lambda _actions, _stage_id, **_kwargs: (
+        env_worker_module.EnvOutput(
+            obs={
+                "states": torch.zeros(2, 3),
+                "task_descriptions": ["first", "second"],
+            },
+            dones=torch.ones(2, dtype=torch.bool),
+        ),
+        {},
+    )
+    worker.finish_rollout = lambda mode: None
+
+    evaluate_impl = EnvWorker.evaluate
+    while hasattr(evaluate_impl, "__wrapped__"):
+        evaluate_impl = evaluate_impl.__wrapped__
+    result = evaluate_impl(worker, input_channel=object(), rollout_channel=object())
+
+    assert len(sends) == 2
+    assert isinstance(sends[1]["data"], EvaluationRolloutControl)
+    assert sends[1]["data"].completed_episode_count == 1
+    assert len(receives) == 1
+    assert collector.finalized is True
+    assert result["evaluation_artifact_shard"]["episode_record_count"] == 1
+
 
 class _ImmediateAsyncValue:
     def __init__(self, value) -> None:
@@ -504,3 +668,105 @@ def test_coupled_eval_loop_sends_typed_fastwam_and_legacy_generic_payloads(
         assert isinstance(payload, torch.Tensor)
         assert payload.shape == (2, 2, 3)
         assert sends[0]["split_fn"] is None
+
+
+def test_evaluation_rollout_control_split_merge_is_strict() -> None:
+    control = EvaluationRolloutControl(
+        logical_batch_size=3,
+        completed_episode_count=30,
+        ledger_episode_count=30,
+        ledger_sha256="a" * 64,
+    )
+
+    shards = control.split([1, 2])
+    merged = EvaluationRolloutControl.merge(shards)
+
+    assert [shard.logical_batch_size for shard in shards] == [1, 2]
+    assert merged == control
+    with pytest.raises(ValueError, match="split sizes"):
+        control.split([1, 1])
+    with pytest.raises(ValueError, match="different provenance"):
+        EvaluationRolloutControl.merge(
+            [
+                shards[0],
+                EvaluationRolloutControl(
+                    logical_batch_size=2,
+                    completed_episode_count=30,
+                    ledger_episode_count=30,
+                    ledger_sha256="b" * 64,
+                ),
+            ]
+        )
+    with pytest.raises(ValueError, match="ledger-complete stop"):
+        EvaluationRolloutControl(
+            logical_batch_size=1,
+            completed_episode_count=1,
+            ledger_episode_count=1,
+            ledger_sha256="a" * 64,
+            command="continue",
+        )
+
+
+def test_coupled_rollout_eval_consumes_typed_ledger_stop() -> None:
+    worker = object.__new__(MultiStepRolloutWorker)
+    worker.enable_offload = False
+    worker.env_decoupled_mode = False
+    worker.eval_rollout_epoch = 1
+    worker.n_eval_chunk_steps = 4
+    worker.num_pipeline_stages = 1
+    worker.eval_batch_size = 2
+    worker._rank = 0
+    worker.cfg = OmegaConf.create({"env": {"group_name": "env"}})
+    worker.model_cfg = OmegaConf.create({"model_type": "fastwam_adaptive"})
+    env_output = {
+        "obs": {"states": torch.ones(2, 3)},
+        "final_obs": None,
+        "fastwam_env_ids": torch.tensor([1, 2]),
+        "fastwam_reset_mask": torch.tensor([True, True]),
+    }
+    stop = EvaluationRolloutControl(
+        logical_batch_size=2,
+        completed_episode_count=30,
+        ledger_episode_count=30,
+        ledger_sha256="a" * 64,
+    )
+    inputs = iter((env_output, stop))
+    receives = []
+
+    def recv_from(**kwargs):
+        receives.append(kwargs)
+        return _ImmediateAsyncValue(next(inputs))
+
+    worker.recv_from = recv_from
+    route, emitted, selection = _records()
+    predictions = []
+
+    def predict(*_args, **_kwargs):
+        predictions.append(True)
+        return (
+            torch.ones(2, 2, 3),
+            {
+                "route_info": route,
+                "emitted_gate": emitted,
+                "evaluation_selection": selection,
+            },
+        )
+
+    worker._predict_rollout_actions = predict
+    sends = []
+    worker.send_to = lambda **kwargs: sends.append(kwargs)
+
+    evaluate_impl = MultiStepRolloutWorker.evaluate
+    while hasattr(evaluate_impl, "__wrapped__"):
+        evaluate_impl = evaluate_impl.__wrapped__
+    asyncio.run(
+        evaluate_impl(
+            worker,
+            input_channel=object(),
+            output_channel=object(),
+        )
+    )
+
+    assert len(receives) == 2
+    assert len(predictions) == 1
+    assert len(sends) == 1

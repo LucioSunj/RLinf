@@ -16,15 +16,32 @@
 
 from __future__ import annotations
 
+import inspect
+from dataclasses import replace
+
 import numpy as np
 import pytest
 import torch
 from fastwam.datasets.lerobot.utils.normalizer import SingleFieldLinearNormalizer
+from omegaconf import OmegaConf
 from PIL import Image
 
-from rlinf.envs.action_contract import ActionExecutionTrace, ActionStageStatistics
+from rlinf.envs.action_contract import (
+    DENORMALIZED_ACTION_STAGE,
+    GRIPPER_CONVERTED_ACTION_STAGE,
+    NORMALIZED_ACTION_STAGE,
+    PREPARED_LIBERO_ACTION_STAGE,
+    SUBMITTED_LIBERO_ACTION_STAGE,
+    ActionExecutionTrace,
+    ActionStageStatistics,
+)
 from rlinf.envs.action_utils import prepare_actions_for_libero
-from rlinf.envs.libero.action_contract import inspect_libero_action_contract
+from rlinf.envs.libero.action_contract import (
+    LIBERO_ACTION_CONTRACT_SCHEMA_V1,
+    LiberoActionContract,
+    inspect_libero_action_contract,
+    merge_libero_action_contracts,
+)
 from rlinf.envs.libero.image_preprocessing import (
     OFFICIAL_LIBERO_CAMERA_RESIZE_MODE,
     prepare_libero_camera_batch,
@@ -33,6 +50,7 @@ from rlinf.models.embodiment.wam_policy.libero_runtime import (
     _convert_fastwam_gripper_to_libero,
     _seeded_randn,
 )
+from rlinf.workers.env.env_worker import EnvWorker
 
 
 class _Controller:
@@ -101,10 +119,60 @@ def test_live_libero_contract_records_exact_spec_and_provenance() -> None:
     artifact = contract.to_artifact()
     assert artifact["source"] == "underlying_env.action_spec"
     assert artifact["controller"]["name"] == "OSC_POSE"
-    assert artifact["robot"]["model"] == "_RobotModel"
+    assert artifact["robot"]["models"] == ["_RobotModel"]
     assert artifact["dependency_versions"]["robosuite_version"] == "1.4.0"
     assert artifact["canonical_sha256"] == contract.canonical_sha256
     assert len(contract.canonical_sha256) == 64
+
+
+def test_live_contract_v1_round_trip_remains_supported() -> None:
+    legacy = replace(
+        _contract(),
+        schema=LIBERO_ACTION_CONTRACT_SCHEMA_V1,
+        robot_models=(),
+    )
+    artifact = legacy.to_artifact()
+
+    restored = LiberoActionContract.from_artifact(artifact)
+
+    assert restored == legacy
+    assert artifact["robot"]["model"] == "_RobotModel"
+    assert "models" not in artifact["robot"]
+
+
+def test_vector_contract_merge_aggregates_robot_identity_not_action_semantics() -> None:
+    first = replace(
+        _contract(),
+        robot_model="OnTheGroundPanda",
+        robot_models=("OnTheGroundPanda",),
+        underlying_environment_classes=("unit.LivingRoomTask",),
+    )
+    second = replace(
+        first,
+        robot_model="MountedPanda",
+        robot_models=("MountedPanda",),
+        underlying_environment_classes=("unit.KitchenTask",),
+    )
+
+    merged = merge_libero_action_contracts((first.to_artifact(), second))
+
+    assert merged.all_robot_models == ("MountedPanda", "OnTheGroundPanda")
+    assert merged.underlying_environment_classes == (
+        "unit.KitchenTask",
+        "unit.LivingRoomTask",
+    )
+    assert merged.low == (-1.0,) * 7
+    assert LiberoActionContract.from_artifact(merged.to_artifact()) == merged
+
+    incompatible = replace(
+        second,
+        controller_output_high=(
+            0.10,
+            *second.controller_output_high[1:],
+        ),
+    )
+    with pytest.raises(ValueError, match="different Action contracts"):
+        merge_libero_action_contracts((first, incompatible))
 
 
 def test_live_libero_contract_fails_closed_when_robot_limits_disagree() -> None:
@@ -148,6 +216,14 @@ def test_action_stage_statistics_are_per_dimension_and_batch_round_trip() -> Non
     trace = ActionExecutionTrace(stages=(stats,))
     merged = ActionExecutionTrace.cat(trace.split((1, 1), dim=0), dim=0)
     assert merged == trace.cpu()
+    time_merged = ActionExecutionTrace.merge_time((trace, trace))
+    assert time_merged.stages[0].per_sample_shape == (4, 3)
+    assert torch.equal(time_merged.stages[0].minimum, stats.minimum)
+    assert torch.equal(time_merged.stages[0].maximum, stats.maximum)
+    assert torch.equal(time_merged.stages[0].finite_count, stats.finite_count * 2)
+    assert torch.equal(
+        time_merged.stages[0].total_value_count, stats.total_value_count * 2
+    )
     dimension = trace.record_for_batch_index(0)["stages"]["normalized_action"][
         "dimensions"
     ][2]
@@ -294,3 +370,195 @@ def test_seeded_noise_matches_official_cpu_generator() -> None:
     )
 
     assert torch.equal(actual, expected)
+
+
+class _TrainingActionTraceEnv:
+    def __init__(self, contract):
+        self.action_contract = contract
+        self.submitted = None
+
+    def chunk_step_with_action_trace(self, actions, contract):
+        assert contract is self.action_contract
+        self.submitted = torch.as_tensor(actions).clone()
+        submitted = ActionStageStatistics.from_values(
+            stage=SUBMITTED_LIBERO_ACTION_STAGE,
+            values=actions,
+            low=contract.low,
+            high=contract.high,
+            gripper_dimension_index=contract.gripper_dimension_index,
+            action_contract_sha256=contract.canonical_sha256,
+        )
+        batch, horizon = actions.shape[:2]
+        observations = [{"state": torch.zeros(batch, 1)}]
+        rewards = torch.zeros(batch, horizon)
+        terminations = torch.zeros(batch, horizon, dtype=torch.bool)
+        truncations = torch.zeros_like(terminations)
+        return (observations, rewards, terminations, truncations, [{}]), submitted
+
+
+def _three_stage_model_trace(actions, contract) -> ActionExecutionTrace:
+    return ActionExecutionTrace(
+        tuple(
+            ActionStageStatistics.from_values(
+                stage=stage,
+                values=actions,
+                low=contract.low,
+                high=contract.high,
+                gripper_dimension_index=contract.gripper_dimension_index,
+                action_contract_sha256=contract.canonical_sha256,
+            )
+            for stage in (
+                NORMALIZED_ACTION_STAGE,
+                DENORMALIZED_ACTION_STAGE,
+                GRIPPER_CONVERTED_ACTION_STAGE,
+            )
+        )
+    )
+
+
+def test_guarded_env_step_combines_exact_five_stage_trace_without_clamp(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    contract = _contract()
+    environment = _TrainingActionTraceEnv(contract)
+    worker = object.__new__(EnvWorker)
+    worker.cfg = OmegaConf.create(
+        {
+            "runner": {"fastwam_training_guard": {"enabled": True}},
+            "env": {
+                "train": {
+                    "env_type": "libero",
+                    "auto_reset": False,
+                    "ignore_terminations": False,
+                }
+            },
+        }
+    )
+    worker.model_cfg = OmegaConf.create(
+        {
+            "model_type": "fastwam_adaptive",
+            "num_action_chunks": 10,
+            "action_dim": 7,
+        }
+    )
+    worker.env_list = [environment]
+    worker.use_external_reward_model = False
+    monkeypatch.setattr(
+        "rlinf.workers.env.env_worker.prepare_actions",
+        lambda *, raw_chunk_actions, **_: raw_chunk_actions,
+    )
+    monkeypatch.setattr(
+        "rlinf.workers.env.env_worker.get_env_attr",
+        lambda owner, name: getattr(owner, name),
+    )
+    actions = torch.linspace(-0.75, 0.75, 70).reshape(1, 10, 7)
+    model_trace = _three_stage_model_trace(actions, contract)
+
+    _, _, payload = inspect.unwrap(EnvWorker.env_interact_step)(
+        worker, actions, 0, action_execution_trace=model_trace
+    )
+
+    trace = payload["action_execution_trace"]
+    assert trace.stage_names == (
+        NORMALIZED_ACTION_STAGE,
+        DENORMALIZED_ACTION_STAGE,
+        GRIPPER_CONVERTED_ACTION_STAGE,
+        PREPARED_LIBERO_ACTION_STAGE,
+        SUBMITTED_LIBERO_ACTION_STAGE,
+    )
+    assert torch.equal(environment.submitted, actions)
+    assert trace.stages[-2].record_for_batch_index(0) == (
+        trace.stages[-1].record_for_batch_index(0)
+    )
+
+
+def test_guarded_env_step_requires_typed_model_action_trace(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    contract = _contract()
+    worker = object.__new__(EnvWorker)
+    worker.cfg = OmegaConf.create(
+        {
+            "runner": {"fastwam_training_guard": {"enabled": True}},
+            "env": {"train": {"env_type": "libero"}},
+        }
+    )
+    worker.model_cfg = OmegaConf.create(
+        {"model_type": "fastwam_adaptive", "num_action_chunks": 10, "action_dim": 7}
+    )
+    worker.env_list = [_TrainingActionTraceEnv(contract)]
+    monkeypatch.setattr(
+        "rlinf.workers.env.env_worker.prepare_actions",
+        lambda *, raw_chunk_actions, **_: raw_chunk_actions,
+    )
+    actions = torch.zeros(1, 10, 7)
+    with pytest.raises(ValueError, match="typed model Action trace"):
+        inspect.unwrap(EnvWorker.env_interact_step)(worker, actions, 0)
+
+
+def test_guarded_training_rollout_input_injects_live_action_contract() -> None:
+    contract = _contract()
+    worker = object.__new__(EnvWorker)
+    worker.cfg = OmegaConf.create(
+        {"runner": {"fastwam_training_guard": {"enabled": True}}}
+    )
+    worker.model_cfg = OmegaConf.create({"model_type": "fastwam_adaptive"})
+    worker.env_list = [_TrainingActionTraceEnv(contract)]
+    worker.stage_num = 1
+    worker.train_num_envs_per_stage = 2
+    worker.eval_num_envs_per_stage = 2
+    worker._rank = 0
+    worker.enable_rlt = False
+    observations = {
+        "states": torch.zeros(2, 8),
+        "task_descriptions": ["first", "second"],
+    }
+
+    rollout_input = worker._build_rollout_input_data(
+        {
+            "obs": observations,
+            "final_obs": None,
+            "dones": torch.zeros(2, 10, dtype=torch.bool),
+        },
+        stage_id=0,
+    )
+
+    rollout_obs = rollout_input["obs"]
+    assert "_fastwam_action_contract_low" not in observations
+    assert torch.equal(
+        rollout_obs["_fastwam_action_contract_low"],
+        torch.tensor(contract.low).expand(2, -1),
+    )
+    assert torch.equal(
+        rollout_obs["_fastwam_action_contract_high"],
+        torch.tensor(contract.high).expand(2, -1),
+    )
+    assert rollout_obs["_fastwam_action_gripper_indices"].tolist() == [6, 6]
+    assert rollout_obs["_fastwam_action_contract_sha256"] == [
+        contract.canonical_sha256,
+        contract.canonical_sha256,
+    ]
+
+
+def test_guarded_training_rollout_input_requires_typed_live_contract() -> None:
+    worker = object.__new__(EnvWorker)
+    worker.cfg = OmegaConf.create(
+        {"runner": {"fastwam_training_guard": {"enabled": True}}}
+    )
+    worker.model_cfg = OmegaConf.create({"model_type": "fastwam_adaptive"})
+    worker.env_list = [object()]
+    worker.stage_num = 1
+    worker.train_num_envs_per_stage = 1
+    worker.eval_num_envs_per_stage = 1
+    worker._rank = 0
+    worker.enable_rlt = False
+
+    with pytest.raises(TypeError, match="typed live LIBERO Action contract"):
+        worker._build_rollout_input_data(
+            {
+                "obs": {"states": torch.zeros(1, 8)},
+                "final_obs": None,
+                "dones": torch.zeros(1, 10, dtype=torch.bool),
+            },
+            stage_id=0,
+        )

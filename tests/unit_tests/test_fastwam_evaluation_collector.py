@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
@@ -90,8 +91,9 @@ def _action_trace(
     stages: tuple[str, ...],
     *,
     batch_size: int = 1,
+    contract: LiberoActionContract | None = None,
 ) -> ActionExecutionTrace:
-    contract = _action_contract()
+    contract = _action_contract() if contract is None else contract
     values = torch.zeros(batch_size, 2, 7)
     return ActionExecutionTrace(
         stages=tuple(
@@ -150,6 +152,7 @@ def _rollout(
     forced: bool,
     source_chunk_id: int,
     terminal: bool,
+    contract: LiberoActionContract | None = None,
 ) -> RolloutResult:
     route = ChunkRouteRecord(
         route_used=torch.tensor([route_used]),
@@ -188,14 +191,20 @@ def _rollout(
                 NORMALIZED_ACTION_STAGE,
                 DENORMALIZED_ACTION_STAGE,
                 GRIPPER_CONVERTED_ACTION_STAGE,
-            )
+            ),
+            contract=contract,
         ),
         gate_latency_seconds=torch.tensor([0.004], dtype=torch.float64),
         gate_h2d_seconds=torch.tensor([0.0], dtype=torch.float64),
     )
 
 
-def _outcome(*, terminal: bool, success: bool = False) -> EnvOutput:
+def _outcome(
+    *,
+    terminal: bool,
+    success: bool = False,
+    contract: LiberoActionContract | None = None,
+) -> EnvOutput:
     terminations = torch.tensor([[False, success]])
     truncations = torch.tensor([[False, terminal and not success]])
     return EnvOutput(
@@ -208,7 +217,8 @@ def _outcome(*, terminal: bool, success: bool = False) -> EnvOutput:
             (
                 PREPARED_LIBERO_ACTION_STAGE,
                 SUBMITTED_LIBERO_ACTION_STAGE,
-            )
+            ),
+            contract=contract,
         ),
     )
 
@@ -258,6 +268,7 @@ def test_collector_records_aligned_chunks_episode_and_atomic_shards(tmp_path) ->
         env_output=_outcome(terminal=False),
         environment_latency_seconds=0.02,
     )
+    assert collector.is_complete is False
 
     second_snapshot = collector.snapshot_before_step(0, env, env_ids)
     second_input = collector.augment_rollout_input(
@@ -276,6 +287,7 @@ def test_collector_records_aligned_chunks_episode_and_atomic_shards(tmp_path) ->
         env_output=_outcome(terminal=True),
         environment_latency_seconds=0.03,
     )
+    assert collector.is_complete is True
     shard = collector.finalize()
 
     assert first_input["obs"]["_fastwam_action_noise_seeds"].shape == (1,)
@@ -316,6 +328,102 @@ def test_collector_records_aligned_chunks_episode_and_atomic_shards(tmp_path) ->
     serialized = json.dumps({"chunks": chunks, "episodes": episodes}).lower()
     for forbidden in ("gate_kv", "observation", "main_images", "model_weights"):
         assert forbidden not in serialized
+
+
+def test_collector_writes_each_equivalent_live_contract(tmp_path) -> None:
+    entries = []
+    for episode_index in range(2):
+        identity_fields = {
+            "task_suite": "libero_10",
+            "task_id": 0,
+            "trial_id": episode_index,
+            "reset_state_id": episode_index,
+            "environment_seed": 7,
+            "action_noise_seed": 101 + episode_index,
+            "idm_video_noise_seed": 202 + episode_index,
+            "max_primitive_steps": 512,
+            "action_horizon": 16,
+        }
+        entries.append(
+            {
+                "episode_index": episode_index,
+                **identity_fields,
+                "episode_identity": _canonical_sha(identity_fields),
+            }
+        )
+    ledger_path = tmp_path / "ledger.json"
+    ledger_path.write_text(
+        json.dumps(
+            {
+                "schema": "fastwam-libero-eval-ledger-v1",
+                "kind": "preflight",
+                "task_suite": "libero_10",
+                "entries": entries,
+            }
+        ),
+        encoding="utf-8",
+    )
+    collector = FastWAMLiberoEvalCollector(
+        output_dir=str(tmp_path),
+        ledger_path=str(ledger_path),
+        run_id="multi-contract-unit",
+        rank=0,
+        routing_mode="forced_idm",
+        idm_threshold=0.5,
+        random_idm_probability=None,
+        routing_seed=0,
+        fixed_idm_cost=0.01,
+    )
+    first_contract = _action_contract()
+    second_contract = replace(
+        first_contract,
+        robot_model="MountedPanda",
+        robot_models=("MountedPanda",),
+        underlying_environment_classes=("unit.KitchenTask",),
+    )
+    env = _IdentityEnv()
+    env_ids = torch.tensor([1 << 50])
+    for episode_index, contract in enumerate((first_contract, second_contract)):
+        env.trial_ids = [episode_index]
+        env.reset_state_ids = [episode_index]
+        env.action_contract = contract
+        snapshot = collector.snapshot_before_step(0, env, env_ids)
+        collector.record_chunk(
+            snapshot=snapshot,
+            rollout_result=_rollout(
+                chunk_id=0,
+                route_used=1,
+                forced=True,
+                source_chunk_id=-1,
+                terminal=True,
+                contract=contract,
+            ),
+            env_output=_outcome(terminal=True, contract=contract),
+            environment_latency_seconds=0.02,
+        )
+
+    shard = collector.finalize()
+
+    assert len(shard.action_contract_paths) == 2
+    assert len(shard.action_contract_file_sha256s) == 2
+    assert set(shard.action_contract_canonical_sha256s) == {
+        first_contract.canonical_sha256,
+        second_contract.canonical_sha256,
+    }
+    payloads = [
+        json.loads(Path(path).read_text(encoding="utf-8"))
+        for path in shard.action_contract_paths
+    ]
+    assert {payload["canonical_sha256"] for payload in payloads} == set(
+        shard.action_contract_canonical_sha256s
+    )
+    chunks = [
+        json.loads(line)
+        for line in (tmp_path / "chunks.rank-0.jsonl").read_text().splitlines()
+    ]
+    assert {chunk["action_contract_sha256"] for chunk in chunks} == set(
+        shard.action_contract_canonical_sha256s
+    )
 
 
 def test_collector_seed_augmentation_is_reproducible(tmp_path) -> None:
@@ -395,6 +503,47 @@ def test_collector_fails_closed_on_actual_ledger_identity_mismatch(tmp_path) -> 
         assert "ledger identity mismatch" in str(exc)
     else:
         raise AssertionError("collector accepted a mismatched task/reset identity")
+
+
+def test_collector_fails_closed_when_ledger_episode_never_starts(tmp_path) -> None:
+    ledger_path = tmp_path / "ledger.json"
+    payload = _ledger(ledger_path)
+    second_identity = {
+        **{
+            key: value
+            for key, value in payload["entries"][0].items()
+            if key not in {"episode_index", "episode_identity"}
+        },
+        "trial_id": 1,
+        "reset_state_id": 1,
+    }
+    payload["entries"].append(
+        {
+            "episode_index": 1,
+            **second_identity,
+            "episode_identity": _canonical_sha(second_identity),
+        }
+    )
+    ledger_path.write_text(json.dumps(payload), encoding="utf-8")
+    collector = _collector(tmp_path)
+    env = _IdentityEnv()
+    snapshot = collector.snapshot_before_step(0, env, torch.tensor([1 << 50]))
+    collector.record_chunk(
+        snapshot=snapshot,
+        rollout_result=_rollout(
+            chunk_id=0,
+            route_used=1,
+            forced=True,
+            source_chunk_id=-1,
+            terminal=True,
+        ),
+        env_output=_outcome(terminal=True),
+        environment_latency_seconds=0.02,
+    )
+
+    assert collector.is_complete is False
+    with pytest.raises(RuntimeError, match="without starting ledger episodes"):
+        collector.finalize()
 
 
 def test_collector_writes_parallel_episodes_in_frozen_ledger_order(tmp_path) -> None:

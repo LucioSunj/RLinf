@@ -12,17 +12,20 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import json
 import logging
 import os
 import queue
 import threading
 import time
 from collections import defaultdict
+from pathlib import Path
 from typing import TYPE_CHECKING, Union
 
 from omegaconf.dictconfig import DictConfig
 
 from rlinf.config_contracts import validate_fastwam_resume_steps
+from rlinf.runners.fastwam_training_guard import FastWAMTrainingGuard
 from rlinf.scheduler import Channel
 from rlinf.scheduler import WorkerGroupFuncResult as Handle
 from rlinf.utils.distributed import ScopedTimer
@@ -74,6 +77,9 @@ class EmbodiedRunner:
         self.weight_sync_interval = self.cfg.runner.weight_sync_interval
         self.overlap_env_bootstrap = bool(
             self.cfg.runner.get("overlap_env_bootstrap", False)
+        )
+        self.fastwam_training_guard = FastWAMTrainingGuard(
+            self.cfg.runner.get("fastwam_training_guard", None)
         )
 
         # Step-gated profiling: ``cluster.profiling.steps`` lists the global step
@@ -210,10 +216,19 @@ class EmbodiedRunner:
             self.global_step = actor_step
         else:
             self.global_step = int(resume_dir.split("global_step_")[-1])
+        self._load_fastwam_training_guard(resume_dir)
 
     def update_rollout_weights(self):
         rollout_handle: Handle = self.rollout.sync_model_from_actor()
         actor_handle: Handle = self.actor.sync_model_to_rollout()
+        actor_handle.wait()
+        rollout_handle.wait()
+
+    def _set_worker_global_step(self) -> None:
+        """Publish the runner step before weight sync or rollout generation."""
+
+        actor_handle: Handle = self.actor.set_global_step(self.global_step)
+        rollout_handle: Handle = self.rollout.set_global_step(self.global_step)
         actor_handle.wait()
         rollout_handle.wait()
 
@@ -510,8 +525,7 @@ class EmbodiedRunner:
         start_time = time.time()
         for _step in range(start_step, self.max_steps):
             # set global step
-            self.actor.set_global_step(self.global_step)
-            self.rollout.set_global_step(self.global_step)
+            self._set_worker_global_step()
 
             profiled_step = (
                 self.global_step
@@ -554,6 +568,7 @@ class EmbodiedRunner:
                     actor_rollout_metrics = (
                         self.actor.compute_advantages_and_returns().wait()
                     )
+                    self.fastwam_training_guard.observe_rollout(actor_rollout_metrics)
 
                 # actor training.
                 with self.timer("actor_training"):
@@ -565,6 +580,7 @@ class EmbodiedRunner:
                         )
 
                     actor_training_metrics = actor_training_handle.wait()
+                    self.fastwam_training_guard.observe_training(actor_training_metrics)
                     if env_bootstrap_handle is not None:
                         env_bootstrap_handle.wait()
 
@@ -594,8 +610,7 @@ class EmbodiedRunner:
         start_time = time.time()
         for _step in range(start_step, self.max_steps):
             # set global step
-            self.actor.set_global_step(self.global_step)
-            self.rollout.set_global_step(self.global_step)
+            self._set_worker_global_step()
 
             profiled_step = (
                 self.global_step
@@ -682,6 +697,7 @@ class EmbodiedRunner:
         self.actor.save_checkpoint(actor_save_path, self.global_step).wait()
         if str(self.cfg.actor.model.model_type) == "fastwam_adaptive":
             self.rollout.save_checkpoint(rollout_save_path, self.global_step).wait()
+        self._save_fastwam_training_guard(base_output_dir)
 
     def set_max_steps(self):
         self.num_steps_per_epoch = 1
@@ -693,3 +709,46 @@ class EmbodiedRunner:
     @property
     def epoch(self):
         return self.global_step // self.num_steps_per_epoch
+
+    def _save_fastwam_training_guard(self, checkpoint_dir: str) -> None:
+        if not self.fastwam_training_guard.enabled:
+            return
+        path = Path(checkpoint_dir) / "training_guard.json"
+        temporary = path.with_name(f".{path.name}.tmp")
+        payload = {
+            "schema": "fastwam-training-guard-checkpoint-v1",
+            "global_step": int(self.global_step),
+            "state": self.fastwam_training_guard.state_dict(),
+        }
+        try:
+            with temporary.open("w", encoding="utf-8") as stream:
+                json.dump(payload, stream, sort_keys=True, indent=2)
+                stream.write("\n")
+                stream.flush()
+                os.fsync(stream.fileno())
+            os.replace(temporary, path)
+        finally:
+            if temporary.exists():
+                temporary.unlink()
+
+    def _load_fastwam_training_guard(self, checkpoint_dir: str) -> None:
+        if not self.fastwam_training_guard.enabled:
+            return
+        path = Path(checkpoint_dir) / "training_guard.json"
+        if not path.is_file():
+            raise FileNotFoundError(
+                f"FastWAM guarded resume requires training_guard.json at {path}."
+            )
+        with path.open("r", encoding="utf-8") as stream:
+            payload = json.load(stream)
+        if payload.get("schema") != "fastwam-training-guard-checkpoint-v1":
+            raise ValueError("FastWAM training guard checkpoint schema mismatch.")
+        if int(payload.get("global_step", -1)) != int(self.global_step):
+            raise ValueError(
+                "FastWAM training guard checkpoint step does not match the "
+                "actor/rollout checkpoint."
+            )
+        state = payload.get("state")
+        if not isinstance(state, dict):
+            raise TypeError("FastWAM training guard checkpoint state is malformed.")
+        self.fastwam_training_guard.load_state_dict(state)
