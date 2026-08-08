@@ -567,7 +567,7 @@ class FastWAMAdaptivePolicy(nn.Module, BasePolicy):
                 env_ids=env_ids,
             )
 
-        sample = self.runtime.sample_action_batch(
+        sample = self.runtime.sample_action_batch(  # 这里会有 liberoRuntime / robotwinRuntime
             env_obs=env_obs,
             routes=route_info.route_used,
             mode=mode,
