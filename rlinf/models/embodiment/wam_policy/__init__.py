@@ -252,11 +252,20 @@ def get_model(cfg, torch_dtype):
     )
     from .kv_replay import GateKVReplayConfig
     from .pi05_critic import Pi05ValueAfterVLMCritic
+    from .visual_config import validate_p7_combination_config
 
     if torch_dtype is None:
         raise ValueError(
             "FastWAM adaptive policy requires an explicit model precision."
         )
+
+    visual_node = cfg.get("dual_visual_reader", None)
+    visual_payload = (
+        None
+        if visual_node is None
+        else OmegaConf.to_container(visual_node, resolve=True)
+    )
+    visual_build = validate_p7_combination_config(visual_payload)
 
     # Validate the complete lightweight contract before allocating either large
     # pretrained backbone.
@@ -363,6 +372,96 @@ def get_model(cfg, torch_dtype):
     )
     gate = GateTransformer(gate_config).to(dtype=torch_dtype)
 
+    visual_encoder = None
+    visual_reader = None
+    visual_replay_config = None
+    visual_memory_identity = None
+    visual_geometry = None
+    visual_input_contract_sha256 = None
+    if visual_build.enabled:
+        # These imports and all local DINO/transport file access are deliberately
+        # unreachable under the default-off configuration.
+        from fastwam.models.wan22.dinov3_memory import (
+            DinoV3AssetSpec,
+            FrozenDinoV3Encoder,
+            native_memory_contract_sha256,
+        )
+        from fastwam.models.wan22.dual_visual_reader import (
+            DualDinoWanReaderConfig,
+            build_dual_dino_wan_reader,
+            load_dino_wan_transport,
+        )
+
+        from .visual_replay import (
+            DualVisualReplayConfig,
+            NativeMemoryIdentity,
+        )
+
+        dino_payload = dict(visual_build.dinov3_asset)
+        visual_input_contract_sha256 = str(
+            dino_payload.pop("input_contract_sha256", "")
+        ).lower()
+        dino_asset = DinoV3AssetSpec.from_mapping(dino_payload)
+        reader_config = DualDinoWanReaderConfig.from_mapping(visual_build.reader)
+        actual_action_hidden_dim = int(actor.action_expert.hidden_dim)
+        if reader_config.action_hidden_dim != actual_action_hidden_dim:
+            raise ValueError(
+                "P7 reader action width differs from the constructed ActionDiT: "
+                f"configured={reader_config.action_hidden_dim}, "
+                f"actual={actual_action_hidden_dim}."
+            )
+        invalid_reader_layers = tuple(
+            layer_index
+            for layer_index in reader_config.layer_indices
+            if layer_index >= int(actor.mot.num_layers)
+        )
+        if invalid_reader_layers:
+            raise ValueError(
+                "P7 reader layer indices exceed the constructed MoT depth: "
+                f"invalid={invalid_reader_layers}, depth={actor.mot.num_layers}."
+            )
+        memory_contract = native_memory_contract_sha256(
+            dino_asset,
+            camera_ids=reader_config.camera_ids,
+            input_contract_sha256=visual_input_contract_sha256,
+        )
+        if reader_config.memory_contract_sha256 != memory_contract:
+            raise ValueError(
+                "P7 reader native-memory hash differs from its DINO/camera contract."
+            )
+        transport_payload = dict(visual_build.transport_asset)
+        if set(transport_payload) != {
+            "path",
+            "asset_sha256",
+            "transport_sha256",
+        }:
+            raise ValueError(
+                "P7 transport asset requires exactly path/asset/transport hashes."
+            )
+        visual_geometry = load_dino_wan_transport(
+            transport_payload["path"],
+            expected_asset_sha256=transport_payload["asset_sha256"],
+            expected_transport_sha256=transport_payload["transport_sha256"],
+        )
+        visual_reader = build_dual_dino_wan_reader(
+            reader_config,
+            visual_geometry,
+        ).to(dtype=torch_dtype)
+        visual_encoder = FrozenDinoV3Encoder.from_local_asset(
+            dino_asset,
+            device=init_device,
+        )
+        visual_replay_config = DualVisualReplayConfig(**visual_build.replay)
+        visual_memory_identity = NativeMemoryIdentity(
+            camera_ids=reader_config.camera_ids,
+            source_revision=dino_asset.source_revision,
+            weights_sha256=dino_asset.weights_sha256,
+            input_contract_sha256=visual_input_contract_sha256,
+            preprocess_sha256=dino_asset.preprocess_sha256,
+            output_contract_sha256=dino_asset.output_contract_sha256,
+            memory_contract_sha256=memory_contract,
+        )
+
     critic = None
     if load_critic:
         from rlinf.models.embodiment.openpi import get_model as get_openpi_model
@@ -385,6 +484,12 @@ def get_model(cfg, torch_dtype):
         flow_sde_ignore_last_transition=bool(
             cfg.flow_sde.get("ignore_last_transition", False)
         ),
+        visual_encoder=visual_encoder,
+        visual_reader=visual_reader,
+        visual_replay_config=visual_replay_config,
+        visual_memory_identity=visual_memory_identity,
+        visual_geometry=visual_geometry,
+        visual_input_contract_sha256=visual_input_contract_sha256,
     )
     return FastWAMAdaptivePolicy(
         actor=actor,
@@ -392,6 +497,9 @@ def get_model(cfg, torch_dtype):
         lora_adapter=lora_adapter,
         gate=gate,
         critic=critic,
+        visual_encoder=visual_encoder,
+        visual_reader=visual_reader,
+        visual_replay_config=visual_replay_config,
         config=policy_config,
     )
 

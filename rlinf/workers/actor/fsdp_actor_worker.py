@@ -135,6 +135,8 @@ from rlinf.workers.actor.fastwam_selective_sync import (
 from rlinf.workers.rollout.utils import RankMapper
 
 _FASTWAM_BC_BOOTSTRAP_SCHEMA = "fastwam-uncond-bc-bootstrap-v1"
+_FASTWAM_RL_CHECKPOINT_SCHEMA = "fastwam-adaptive-rl-checkpoint-v1"
+_FASTWAM_P7_RL_CHECKPOINT_SCHEMA = "fastwam-adaptive-rl-checkpoint-v2-p7"
 _FASTWAM_BC_BOOTSTRAP_KEYS = {
     "schema",
     "bc_step",
@@ -1584,8 +1586,14 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
                 policy = self._fastwam_policy_module()
                 policy.set_global_step(int(step))
                 self.version = int(step)
+                policy_state = policy.trainable_state_dict()
+                p7_enabled = bool(getattr(policy, "visual_reader_enabled", False))
                 payload = {
-                    "schema": "fastwam-adaptive-rl-checkpoint-v1",
+                    "schema": (
+                        _FASTWAM_P7_RL_CHECKPOINT_SCHEMA
+                        if p7_enabled
+                        else _FASTWAM_RL_CHECKPOINT_SCHEMA
+                    ),
                     "step": int(step),
                     "optimizer_steps": int(self.optimizer_steps),
                     "parent_checkpoint_sha256": str(
@@ -1595,12 +1603,14 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
                         self.cfg.actor.model.critic.backbone_checkpoint_sha256
                     ).lower(),
                     "contract": self._fastwam_checkpoint_contract(),
-                    "policy": policy.trainable_state_dict(),
+                    "policy": policy_state,
                     "optimizer": self.optimizer.state_dict(),
                     "lr_scheduler": self.lr_scheduler.state_dict(),
                     "grad_scaler": self.grad_scaler.state_dict(),
                     "rng": get_rng_state(),
                 }
+                if p7_enabled:
+                    payload["p7"] = policy.p7_project_checkpoint_contract()
                 bc_bootstrap = getattr(self, "_fastwam_bc_bootstrap", None)
                 if bc_bootstrap is not None:
                     payload["bc_bootstrap"] = _validate_fastwam_bc_bootstrap_provenance(
@@ -1668,6 +1678,15 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
                     "grad_scaler",
                     "rng",
                 }
+                policy = self._fastwam_policy_module()
+                p7_enabled = bool(getattr(policy, "visual_reader_enabled", False))
+                expected_schema = (
+                    _FASTWAM_P7_RL_CHECKPOINT_SCHEMA
+                    if p7_enabled
+                    else _FASTWAM_RL_CHECKPOINT_SCHEMA
+                )
+                if p7_enabled:
+                    expected_keys.add("p7")
                 checkpoint_keys = set(payload)
                 allowed_keys = (expected_keys, expected_keys | {"bc_bootstrap"})
                 if checkpoint_keys not in allowed_keys:
@@ -1675,10 +1694,15 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
                         "FastWAM adaptive RL checkpoint keys changed: "
                         f"{sorted(payload)}."
                     )
-                if payload.get("schema") != "fastwam-adaptive-rl-checkpoint-v1":
+                if payload.get("schema") != expected_schema:
                     raise ValueError(
                         "Unsupported FastWAM adaptive RL checkpoint schema."
                     )
+                if (
+                    p7_enabled
+                    and payload.get("p7") != policy.p7_project_checkpoint_contract()
+                ):
+                    raise ValueError("FastWAM P7 project checkpoint contract mismatch.")
                 expected_parent = str(
                     self.cfg.actor.model.actor_checkpoint_sha256
                 ).lower()
@@ -1712,7 +1736,6 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
                         "FastWAM adaptive checkpoint/config contract mismatch."
                     )
 
-                policy = self._fastwam_policy_module()
                 saved_policy = payload["policy"]
                 if "route_tracker" not in saved_policy:
                     raise ValueError(
@@ -2343,6 +2366,11 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
                 for group in self.optimizer.param_groups
             }
             expected = {"gate", "uncond_lora", "value_head"}
+            p7_enabled = bool(
+                self.cfg.actor.model.get("dual_visual_reader", {}).get("enabled", False)
+            )
+            if p7_enabled:
+                expected.add("dual_visual_reader")
             if set(lr_by_name) != expected:
                 raise RuntimeError(
                     "FastWAM adaptive optimizer groups changed unexpectedly: "
@@ -2355,6 +2383,8 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
                     "critic/lr": lr_by_name["value_head"],
                 }
             )
+            if p7_enabled:
+                data["dual_visual_reader/lr"] = lr_by_name["dual_visual_reader"]
             return data
         data["actor/lr"] = lr_list[0]
         if len(lr_list) > 1:
@@ -2415,6 +2445,24 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
         with torch.no_grad():
             self.rollout_batch = process_nested_dict_for_train(
                 self.rollout_batch, shuffle_id
+            )
+        if SupportedModel(
+            self.cfg.actor.model.model_type
+        ) is SupportedModel.FASTWAM_ADAPTIVE and bool(
+            self.cfg.actor.model.get("dual_visual_reader", {}).get("enabled", False)
+        ):
+            from rlinf.models.embodiment.wam_policy.visual_replay import (
+                pin_dual_visual_forward_inputs,
+                validate_dual_visual_aggregate_bytes,
+            )
+
+            visual_replay_cfg = self.cfg.actor.model.dual_visual_reader.replay
+            validate_dual_visual_aggregate_bytes(
+                self.rollout_batch.get("forward_inputs", {}),
+                max_bytes_aggregate=int(visual_replay_cfg.max_bytes_aggregate),
+            )
+            self.rollout_batch["forward_inputs"] = pin_dual_visual_forward_inputs(
+                self.rollout_batch.get("forward_inputs", {})
             )
         if (
             SupportedModel(self.cfg.actor.model.model_type)

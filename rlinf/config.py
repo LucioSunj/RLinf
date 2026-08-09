@@ -845,6 +845,15 @@ def _validate_fastwam_adaptive_cfg(cfg, *, only_eval: bool) -> None:
     from rlinf.models.embodiment.wam_policy.evaluation import (
         EvaluationRoutingConfig,
     )
+    from rlinf.models.embodiment.wam_policy.visual_config import (
+        validate_p7_combination_config,
+    )
+
+    p7_node = model_cfg.get("dual_visual_reader", None)
+    p7_payload = (
+        None if p7_node is None else OmegaConf.to_container(p7_node, resolve=True)
+    )
+    p7_config = validate_p7_combination_config(p7_payload)
 
     random_probability = model_cfg.get("eval_random_idm_probability", None)
     EvaluationRoutingConfig(
@@ -905,6 +914,7 @@ def _validate_fastwam_adaptive_cfg(cfg, *, only_eval: bool) -> None:
         "flow_sde",
         "runtime",
         "critic",
+        "dual_visual_reader",
     )
 
     def _resolved_value(owner, key):
@@ -1073,6 +1083,24 @@ def _validate_fastwam_adaptive_cfg(cfg, *, only_eval: bool) -> None:
         value = OmegaConf.select(cfg, path)
         if value is None or float(value) <= 0:
             raise ValueError(f"FastWAM requires a positive `{path}`.")
+    if p7_config.enabled:
+        reader_lr = OmegaConf.select(cfg, "actor.optim.reader_lr")
+        if (
+            reader_lr is None
+            or not math.isfinite(float(reader_lr))
+            or float(reader_lr) <= 0
+        ):
+            raise ValueError("Enabled P7 requires a positive `actor.optim.reader_lr`.")
+        reader_weight_decay = OmegaConf.select(cfg, "actor.optim.reader_weight_decay")
+        if (
+            reader_weight_decay is None
+            or not math.isfinite(float(reader_weight_decay))
+            or float(reader_weight_decay) < 0
+        ):
+            raise ValueError(
+                "Enabled P7 requires an explicit nonnegative "
+                "`actor.optim.reader_weight_decay`."
+            )
 
 
 def validate_embodied_cfg(cfg):

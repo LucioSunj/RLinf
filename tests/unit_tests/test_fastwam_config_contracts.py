@@ -362,3 +362,39 @@ def test_eval_checkpoint_contract_validates_parent_hashes_before_construction() 
             expected_parent_checkpoint_sha256="a" * 64,
             load_critic=True,
         )
+
+
+def test_eval_checkpoint_contract_uses_distinct_p7_outer_schema() -> None:
+    live = _eval_model_cfg()
+    live.dual_visual_reader = {"enabled": True, "reader": {"kind": "p7"}}
+    payload = {
+        "schema": "fastwam-adaptive-rl-checkpoint-v2-p7",
+        "parent_checkpoint_sha256": "a" * 64,
+        "contract": {"model": OmegaConf.to_container(live, resolve=True)},
+        "p7": {
+            "schema": "fastwam-p7-project-checkpoint-contract-v1",
+            "reader": {"reader_contract_sha256": "c" * 64},
+        },
+    }
+
+    MODULE.validate_fastwam_eval_checkpoint_contract(
+        payload,
+        live,
+        expected_parent_checkpoint_sha256="a" * 64,
+        load_critic=False,
+    )
+    with pytest.raises(ValueError, match="Unsupported"):
+        MODULE.validate_fastwam_eval_checkpoint_contract(
+            {**payload, "schema": "fastwam-adaptive-rl-checkpoint-v1"},
+            live,
+            expected_parent_checkpoint_sha256="a" * 64,
+            load_critic=False,
+        )
+    baseline = _eval_model_cfg()
+    with pytest.raises(ValueError, match="Unsupported"):
+        MODULE.validate_fastwam_eval_checkpoint_contract(
+            payload,
+            baseline,
+            expected_parent_checkpoint_sha256="a" * 64,
+            load_critic=False,
+        )

@@ -198,6 +198,9 @@ class FastWAMAdaptivePolicy(nn.Module, BasePolicy):
         lora_adapter: Any,
         gate: nn.Module,
         critic: nn.Module | None,
+        visual_encoder: nn.Module | None = None,
+        visual_reader: nn.Module | None = None,
+        visual_replay_config: Any | None = None,
         config: FastWAMAdaptivePolicyConfig | None = None,
     ) -> None:
         super().__init__()
@@ -206,10 +209,14 @@ class FastWAMAdaptivePolicy(nn.Module, BasePolicy):
         self.lora_adapter = lora_adapter
         self.gate = gate
         self.critic = critic
+        self.visual_encoder = visual_encoder
+        self.visual_reader = visual_reader
+        self.visual_replay_config = visual_replay_config
         self.config = config or FastWAMAdaptivePolicyConfig()
         self.route_tracker = PendingRouteTracker()
         self.actor_version = 0
         self._enforce_frozen_actor()
+        self._enforce_visual_ownership()
         self.actor.eval()
 
     def _require_critic(self) -> nn.Module:
@@ -240,12 +247,57 @@ class FastWAMAdaptivePolicy(nn.Module, BasePolicy):
                 f"FastWAM actor has trainable non-LoRA parameters: {unexpected}."
             )
 
+    def _enforce_visual_ownership(self) -> None:
+        """Keep DINO frozen and expose P7 as one disjoint trainable family."""
+
+        values = (
+            self.visual_encoder,
+            self.visual_reader,
+            self.visual_replay_config,
+        )
+        if all(value is None for value in values):
+            return
+        if any(value is None for value in values):
+            raise ValueError(
+                "P7 encoder, reader, and replay config must be supplied together."
+            )
+        for parameter in self.visual_encoder.parameters():
+            parameter.requires_grad_(False)
+        self.visual_encoder.eval()
+        if any(
+            parameter.requires_grad for parameter in self.visual_encoder.parameters()
+        ):
+            raise RuntimeError("The P7 DINO encoder must remain fully frozen.")
+        manifest = self.visual_reader.trainable_parameter_manifest()
+        if tuple(manifest) != ("dual_visual_reader",):
+            raise RuntimeError(
+                "P7 reader must own exactly the `dual_visual_reader` family."
+            )
+        named = dict(self.visual_reader.named_parameters())
+        expected = tuple(manifest["dual_visual_reader"])
+        if tuple(
+            name for name, parameter in named.items() if parameter.requires_grad
+        ) != (expected):
+            raise RuntimeError(
+                "P7 reader trainable manifest disagrees with parameters."
+            )
+
+    @property
+    def visual_reader_enabled(self) -> bool:
+        """Return whether the P7 sidecar is part of this policy contract."""
+
+        return self.visual_reader is not None
+
     def train(self, mode: bool = True) -> FastWAMAdaptivePolicy:
         """Train adaptive modules while keeping the frozen actor in eval mode."""
 
         super().train(mode)
         self.actor.eval()
         self.gate.train(mode)
+        if self.visual_encoder is not None:
+            self.visual_encoder.eval()
+        if self.visual_reader is not None:
+            self.visual_reader.train(mode)
         if self.critic is not None:
             self.critic.train(mode)
         return self
@@ -314,6 +366,10 @@ class FastWAMAdaptivePolicy(nn.Module, BasePolicy):
         self.lora_adapter.capture_replay_reference(
             actor_version=self.actor_version,
         )
+        if self.visual_reader is not None:
+            self.visual_reader.capture_replay_reference(
+                actor_version=self.actor_version,
+            )
 
     @staticmethod
     def _routing_metadata(
@@ -775,6 +831,7 @@ class FastWAMAdaptivePolicy(nn.Module, BasePolicy):
         gate_lr: float,
         lora_lr: float,
         value_lr: float,
+        reader_lr: float | None = None,
     ) -> list[dict[str, Any]]:
         """Return disjoint Gate, LoRA, and fresh-value-head optimizer groups."""
 
@@ -808,6 +865,20 @@ class FastWAMAdaptivePolicy(nn.Module, BasePolicy):
                 "lr": value_lr,
             },
         ]
+        if self.visual_reader is not None:
+            if reader_lr is None or not math.isfinite(reader_lr) or reader_lr <= 0:
+                raise ValueError("Enabled P7 requires a positive `reader_lr`.")
+            groups.append(
+                {
+                    "name": "dual_visual_reader",
+                    "params": [
+                        parameter
+                        for parameter in self.visual_reader.parameters()
+                        if parameter.requires_grad
+                    ],
+                    "lr": reader_lr,
+                }
+            )
         empty_groups = [group["name"] for group in groups if not group["params"]]
         if empty_groups:
             raise RuntimeError(f"FastWAM optimizer groups are empty: {empty_groups}.")
@@ -822,13 +893,61 @@ class FastWAMAdaptivePolicy(nn.Module, BasePolicy):
         """Save only adaptive state plus delayed-route schedules."""
 
         critic = self._require_critic()
-        return {
+        payload = {
             "schema": "fastwam-adaptive-policy-v1",
             "actor_version": self.actor_version,
             "gate": self.gate.state_dict(),
             "lora": self.lora_adapter.lora_state_dict(),
             "value_head": critic.value_head.state_dict(),
             "route_tracker": self.route_tracker.state_dict(),
+        }
+        if self.visual_reader is not None:
+            payload["schema"] = "fastwam-adaptive-policy-v2-p7"
+            payload["dual_visual_reader"] = {
+                "contract": self._visual_reader_checkpoint_contract(),
+                "state": self.visual_reader.export_trainable_state(),
+            }
+        return payload
+
+    def _visual_reader_checkpoint_contract(self) -> dict[str, Any]:
+        """Return strict DINO/geometry/replay provenance without frozen weights."""
+
+        if self.visual_reader is None or self.visual_encoder is None:
+            raise RuntimeError("P7 checkpoint contract requested while disabled.")
+        asset = getattr(self.visual_encoder, "asset", None)
+        if asset is None:
+            raise TypeError("P7 encoder does not expose its frozen asset contract.")
+        checkpoint_contract = getattr(self.visual_reader, "checkpoint_contract", None)
+        if not callable(checkpoint_contract):
+            raise TypeError("P7 reader does not expose checkpoint provenance.")
+        replay = self.visual_replay_config
+        return {
+            "schema": "fastwam-p7-dual-visual-checkpoint-contract-v1",
+            "reader_kind": self.visual_reader.reader_kind,
+            "reader_contract_sha256": self.visual_reader.reader_contract_sha256,
+            "parameter_family": self.visual_reader.parameter_family,
+            "injection_layer_indices": self.visual_reader.injection_layer_indices,
+            "memory_contract_sha256": self.visual_reader.memory_contract_sha256,
+            "reader_provenance": checkpoint_contract(),
+            "dino_source_revision": asset.source_revision,
+            "dino_weights_sha256": asset.weights_sha256,
+            "dino_preprocess_sha256": asset.preprocess_sha256,
+            "dino_output_contract_sha256": asset.output_contract_sha256,
+            "replay_backend": replay.backend.value,
+            "replay_storage_dtype": replay.storage_dtype,
+            "replay_pin_memory": replay.pin_memory,
+            "replay_max_bytes_per_sample": replay.max_bytes_per_sample,
+            "replay_max_bytes_aggregate": replay.max_bytes_aggregate,
+        }
+
+    def p7_project_checkpoint_contract(self) -> dict[str, Any]:
+        """Return the outer-project P7 discriminator and nested provenance."""
+
+        if self.visual_reader is None:
+            raise RuntimeError("P7 project contract requested while disabled.")
+        return {
+            "schema": "fastwam-p7-project-checkpoint-contract-v1",
+            "reader": self._visual_reader_checkpoint_contract(),
         }
 
     def load_trainable_state_dict(self, payload: dict[str, Any]) -> None:
@@ -840,12 +959,26 @@ class FastWAMAdaptivePolicy(nn.Module, BasePolicy):
             "value_head",
             "route_tracker",
         }
+        expected_schema = "fastwam-adaptive-policy-v1"
+        if self.visual_reader is not None:
+            expected_keys.add("dual_visual_reader")
+            expected_schema = "fastwam-adaptive-policy-v2-p7"
         if set(payload) != expected_keys:
             raise ValueError(
                 f"FastWAM adaptive-policy checkpoint keys changed: {sorted(payload)}."
             )
-        if payload.get("schema") != "fastwam-adaptive-policy-v1":
+        if payload.get("schema") != expected_schema:
             raise ValueError("Unsupported FastWAM adaptive-policy checkpoint.")
+        if self.visual_reader is not None:
+            visual_payload = payload["dual_visual_reader"]
+            if not isinstance(visual_payload, Mapping) or set(visual_payload) != {
+                "contract",
+                "state",
+            }:
+                raise ValueError("P7 reader checkpoint payload has invalid keys.")
+            if visual_payload["contract"] != self._visual_reader_checkpoint_contract():
+                raise ValueError("P7 reader checkpoint contract mismatch.")
+            self.visual_reader.load_trainable_state(visual_payload["state"])
         self.gate.load_state_dict(payload["gate"], strict=True)
         self.lora_adapter.load_lora_state_dict(payload["lora"], strict=True)
         if self.critic is not None:
@@ -861,22 +994,38 @@ class FastWAMAdaptivePolicy(nn.Module, BasePolicy):
     def rollout_runtime_state_dict(self) -> dict[str, Any]:
         """Serialize only delayed-route runtime state owned by rollout workers."""
 
-        return {
+        payload = {
             "schema": "fastwam-adaptive-rollout-policy-runtime-v1",
             "actor_version": self.actor_version,
             "route_tracker": self.route_tracker.state_dict(),
         }
+        if self.visual_reader is not None:
+            payload["schema"] = "fastwam-adaptive-rollout-policy-runtime-v2-p7"
+            payload["dual_visual_reader_contract"] = (
+                self._visual_reader_checkpoint_contract()
+            )
+        return payload
 
     def load_rollout_runtime_state_dict(self, payload: dict[str, Any]) -> None:
         """Restore rollout-owned delayed routes without duplicating trainables."""
 
         expected_keys = {"schema", "actor_version", "route_tracker"}
+        expected_schema = "fastwam-adaptive-rollout-policy-runtime-v1"
+        if self.visual_reader is not None:
+            expected_keys.add("dual_visual_reader_contract")
+            expected_schema = "fastwam-adaptive-rollout-policy-runtime-v2-p7"
         if set(payload) != expected_keys:
             raise ValueError(
                 f"FastWAM rollout-runtime policy keys changed: {sorted(payload)}."
             )
-        if payload.get("schema") != ("fastwam-adaptive-rollout-policy-runtime-v1"):
+        if payload.get("schema") != expected_schema:
             raise ValueError("Unsupported FastWAM rollout-runtime policy schema.")
+        if (
+            self.visual_reader is not None
+            and payload["dual_visual_reader_contract"]
+            != self._visual_reader_checkpoint_contract()
+        ):
+            raise ValueError("P7 rollout-runtime checkpoint contract mismatch.")
         actor_version = int(payload["actor_version"])
         if actor_version < 0:
             raise ValueError("Rollout-runtime actor version must be non-negative.")
@@ -895,8 +1044,18 @@ class FastWAMAdaptivePolicy(nn.Module, BasePolicy):
     ) -> int:
         """Restore adaptive policy state from one actor-rank project checkpoint."""
 
-        if payload.get("schema") != "fastwam-adaptive-rl-checkpoint-v1":
+        expected_outer_schema = (
+            "fastwam-adaptive-rl-checkpoint-v2-p7"
+            if self.visual_reader is not None
+            else "fastwam-adaptive-rl-checkpoint-v1"
+        )
+        if payload.get("schema") != expected_outer_schema:
             raise ValueError("Unsupported FastWAM adaptive evaluation checkpoint.")
+        if self.visual_reader is not None:
+            if payload.get("p7") != self.p7_project_checkpoint_contract():
+                raise ValueError("FastWAM P7 project checkpoint contract mismatch.")
+        elif "p7" in payload:
+            raise ValueError("Baseline FastWAM cannot load a P7 project checkpoint.")
         expected_parent = str(expected_parent_checkpoint_sha256).strip().lower()
         if len(expected_parent) != 64 or any(
             character not in "0123456789abcdef" for character in expected_parent

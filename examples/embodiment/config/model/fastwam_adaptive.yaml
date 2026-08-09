@@ -114,6 +114,25 @@ kv_replay:
   # Fail closed if a shape/config change exceeds the measured all-layer budget.
   max_bytes_per_sample: 268435456
 
+# Candidate P7 is intentionally unavailable to normal runs. Keeping every
+# asset-bearing field null guarantees that the default path neither imports nor
+# loads DINOv3. Enabling this subtree is rejected until all four independent
+# prerequisite manifests and a separate combination-training authorization are
+# hash-bound here.
+dual_visual_reader:
+  enabled: false
+  scientific_status: NOT-RUN
+  combination_training_authorized: false
+  prerequisites:
+    p7_0_assets_and_contracts: {passed: false, evidence_sha256: null}
+    p7_1_p1_endpoint: {passed: false, evidence_sha256: null}
+    p7_2_p6_endpoint: {passed: false, evidence_sha256: null}
+    p7_3_combination_authorization: {passed: false, evidence_sha256: null}
+  dinov3_asset: null
+  transport_asset: null
+  reader: null
+  replay: null
+
 flow_sde:
   enabled: true
   joint_logprob: false

@@ -51,6 +51,9 @@ from rlinf.utils.checkpoint_state import (
 from rlinf.utils.placement import HybridComponentPlacement
 from rlinf.utils.utils import get_rng_state, set_rng_state
 
+_FASTWAM_ROLLOUT_RUNTIME_SCHEMA = "fastwam-adaptive-rollout-runtime-v1"
+_FASTWAM_P7_ROLLOUT_RUNTIME_SCHEMA = "fastwam-adaptive-rollout-runtime-v2-p7"
+
 
 def _fastwam_checkpoint_cpu_clone(value: Any) -> Any:
     if isinstance(value, torch.Tensor):
@@ -377,8 +380,15 @@ class MultiStepRolloutWorker(Worker):
             raise ValueError(
                 "FastWAM rollout worker and policy versions disagree at save."
             )
+        p7_enabled = bool(getattr(self.hf_model, "visual_reader_enabled", False))
+        if p7_enabled and "dual_visual_reader_contract" not in policy_runtime:
+            raise ValueError("P7 rollout policy runtime omits its reader contract.")
         payload = {
-            "schema": "fastwam-adaptive-rollout-runtime-v1",
+            "schema": (
+                _FASTWAM_P7_ROLLOUT_RUNTIME_SCHEMA
+                if p7_enabled
+                else _FASTWAM_ROLLOUT_RUNTIME_SCHEMA
+            ),
             "rank": int(self._rank),
             "world_size": int(self._world_size),
             "step": step,
@@ -393,6 +403,8 @@ class MultiStepRolloutWorker(Worker):
             "policy_runtime": policy_runtime,
             "rng": get_rng_state(),
         }
+        if p7_enabled:
+            payload["p7"] = policy_runtime["dual_visual_reader_contract"]
         payload = _fastwam_checkpoint_cpu_clone(payload)
         os.makedirs(save_path, exist_ok=True)
         target = os.path.join(save_path, f"rank_{self._rank}.pt")
@@ -435,11 +447,19 @@ class MultiStepRolloutWorker(Worker):
             "policy_runtime",
             "rng",
         }
+        p7_enabled = bool(getattr(self.hf_model, "visual_reader_enabled", False))
+        expected_schema = (
+            _FASTWAM_P7_ROLLOUT_RUNTIME_SCHEMA
+            if p7_enabled
+            else _FASTWAM_ROLLOUT_RUNTIME_SCHEMA
+        )
+        if p7_enabled:
+            expected_keys.add("p7")
         if set(payload) != expected_keys:
             raise ValueError(
                 f"FastWAM rollout-runtime checkpoint keys changed: {sorted(payload)}."
             )
-        if payload.get("schema") != "fastwam-adaptive-rollout-runtime-v1":
+        if payload.get("schema") != expected_schema:
             raise ValueError("Unsupported FastWAM rollout-runtime schema.")
         if int(payload.get("rank", -1)) != int(self._rank) or int(
             payload.get("world_size", -1)
@@ -467,6 +487,10 @@ class MultiStepRolloutWorker(Worker):
             or int(policy_runtime.get("actor_version", -1)) != rollout_actor_version
         ):
             raise ValueError("FastWAM rollout-runtime policy/worker version mismatch.")
+        if p7_enabled and (
+            policy_runtime.get("dual_visual_reader_contract") != payload.get("p7")
+        ):
+            raise ValueError("FastWAM P7 rollout-runtime contract mismatch.")
         if "route_tracker" not in policy_runtime:
             raise ValueError("FastWAM rollout checkpoint omits delayed-route state.")
         saved_route_sha256 = checkpoint_state_sha256(policy_runtime["route_tracker"])

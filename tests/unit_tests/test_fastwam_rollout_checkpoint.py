@@ -62,14 +62,39 @@ class _Policy:
         self.route_state = payload["route_tracker"]
 
 
-def _worker() -> MultiStepRolloutWorker:
+class _P7Policy(_Policy):
+    visual_reader_enabled = True
+
+    @staticmethod
+    def _reader_contract() -> dict[str, Any]:
+        return {
+            "schema": "fastwam-p7-dual-visual-checkpoint-contract-v1",
+            "reader_contract_sha256": "c" * 64,
+        }
+
+    def rollout_runtime_state_dict(self) -> dict[str, Any]:
+        payload = super().rollout_runtime_state_dict()
+        payload["schema"] = "fastwam-adaptive-rollout-policy-runtime-v2-p7"
+        payload["dual_visual_reader_contract"] = self._reader_contract()
+        return payload
+
+    def load_rollout_runtime_state_dict(self, payload: dict[str, Any]) -> None:
+        if payload.get("schema") != ("fastwam-adaptive-rollout-policy-runtime-v2-p7"):
+            raise ValueError("bad P7 policy runtime schema")
+        if payload.get("dual_visual_reader_contract") != self._reader_contract():
+            raise ValueError("bad P7 reader contract")
+        self.actor_version = int(payload["actor_version"])
+        self.route_state = payload["route_tracker"]
+
+
+def _worker(*, p7: bool = False) -> MultiStepRolloutWorker:
     worker = MultiStepRolloutWorker.__new__(MultiStepRolloutWorker)
     worker.model_cfg = SimpleNamespace(
         model_type="fastwam_adaptive",
         actor_checkpoint_sha256="a" * 64,
         critic=SimpleNamespace(backbone_checkpoint_sha256="b" * 64),
     )
-    worker.hf_model = _Policy()
+    worker.hf_model = _P7Policy() if p7 else _Policy()
     worker.version = 0
     worker._rank = 0
     worker._world_size = 1
@@ -123,6 +148,57 @@ def test_rollout_runtime_checkpoint_round_trip(
     audit_output = capsys.readouterr().out
     assert "FASTWAM_ROLLOUT_RESUME_AUDIT" in audit_output
     assert '"route_state_sha256"' in audit_output
+
+
+def test_p7_rollout_runtime_uses_distinct_outer_schema_and_rejects_v1(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    rng_state = {"cpu": torch.tensor([7], dtype=torch.uint8)}
+    monkeypatch.setattr(worker_module, "get_rng_state", lambda: rng_state)
+    monkeypatch.setattr(worker_module, "set_rng_state", lambda _state: None)
+    checkpoint_dir = tmp_path / "p7-rollout"
+    p7_worker = _worker(p7=True)
+
+    p7_worker.save_checkpoint(str(checkpoint_dir), step=1)
+    payload = torch.load(
+        checkpoint_dir / "rank_0.pt",
+        map_location="cpu",
+        weights_only=False,
+    )
+    assert payload["schema"] == "fastwam-adaptive-rollout-runtime-v2-p7"
+    assert payload["p7"] == payload["policy_runtime"]["dual_visual_reader_contract"]
+    assert p7_worker.load_checkpoint(str(checkpoint_dir)) == 1
+
+    with pytest.raises(ValueError, match="keys changed|schema"):
+        _worker().load_checkpoint(str(checkpoint_dir))
+
+    baseline_dir = tmp_path / "baseline-rollout"
+    baseline_worker = _worker()
+    baseline_worker.save_checkpoint(str(baseline_dir), step=1)
+    with pytest.raises(ValueError, match="keys changed|schema"):
+        p7_worker.load_checkpoint(str(baseline_dir))
+
+
+def test_p7_rollout_runtime_rejects_outer_inner_contract_tamper(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        worker_module,
+        "get_rng_state",
+        lambda: {"cpu": torch.tensor([7], dtype=torch.uint8)},
+    )
+    worker = _worker(p7=True)
+    checkpoint_dir = tmp_path / "p7-rollout"
+    worker.save_checkpoint(str(checkpoint_dir), step=1)
+    checkpoint_path = checkpoint_dir / "rank_0.pt"
+    payload = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
+    payload["p7"] = {**payload["p7"], "reader_contract_sha256": "0" * 64}
+    torch.save(payload, checkpoint_path)
+
+    with pytest.raises(ValueError, match="P7 rollout-runtime contract mismatch"):
+        worker.load_checkpoint(str(checkpoint_dir))
 
 
 def test_step_zero_training_bootstrap_restores_rollout_rng_and_route(

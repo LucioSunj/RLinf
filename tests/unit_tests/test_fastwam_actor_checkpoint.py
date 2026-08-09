@@ -64,6 +64,25 @@ class _Policy:
         self.route_tracker.load_state_dict(state["route_tracker"])
 
 
+class _P7Policy(_Policy):
+    visual_reader_enabled = True
+
+    def p7_project_checkpoint_contract(self) -> dict[str, Any]:
+        return {
+            "schema": "fastwam-p7-project-checkpoint-contract-v1",
+            "reader": {"reader_contract_sha256": "c" * 64},
+        }
+
+    def trainable_state_dict(self) -> dict[str, Any]:
+        payload = super().trainable_state_dict()
+        payload["schema"] = "fastwam-adaptive-policy-v2-p7"
+        payload["dual_visual_reader"] = {
+            "contract": self.p7_project_checkpoint_contract()["reader"],
+            "state": {"gamma": torch.tensor(0.0)},
+        }
+        return payload
+
+
 class _Stateful:
     def __init__(self, value: float) -> None:
         self.value = torch.tensor([value])
@@ -149,7 +168,7 @@ class _RootMutatingPolicy(_Policy):
         self.missing._is_root = True
 
 
-def _checkpoint_worker() -> Any:
+def _checkpoint_worker(*, p7: bool = False) -> Any:
     class CheckpointWorker:
         _checkpoint_cpu_clone = staticmethod(EmbodiedFSDPActor._checkpoint_cpu_clone)
         _fastwam_policy_module = EmbodiedFSDPActor._fastwam_policy_module
@@ -161,7 +180,7 @@ def _checkpoint_worker() -> Any:
             return {"kind": "unit"}
 
     worker = CheckpointWorker()
-    worker.model = _Policy()
+    worker.model = _P7Policy() if p7 else _Policy()
     worker.cfg = SimpleNamespace(
         runner=SimpleNamespace(resume_dir=None),
         actor=SimpleNamespace(
@@ -264,6 +283,38 @@ def test_fastwam_actor_checkpoint_rank_file_round_trip(
     audit_output = capsys.readouterr().out
     assert "FASTWAM_ACTOR_RESUME_AUDIT" in audit_output
     assert '"route_state_sha256"' in audit_output
+
+
+def test_p7_actor_checkpoint_uses_distinct_outer_schema_and_rejects_v1(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    rng_state = {"cpu": torch.tensor([7], dtype=torch.uint8)}
+    monkeypatch.setattr(worker_module, "get_rng_state", lambda: rng_state)
+    monkeypatch.setattr(worker_module, "set_rng_state", lambda _state: None)
+    monkeypatch.setattr(torch.distributed, "is_initialized", lambda: False)
+    checkpoint_dir = tmp_path / "p7-actor"
+    p7_worker = _checkpoint_worker(p7=True)
+
+    p7_worker.save_checkpoint(str(checkpoint_dir), step=5)
+    payload = torch.load(
+        checkpoint_dir / "rank_0.pt",
+        map_location="cpu",
+        weights_only=False,
+    )
+    assert payload["schema"] == "fastwam-adaptive-rl-checkpoint-v2-p7"
+    assert payload["p7"] == p7_worker.model.p7_project_checkpoint_contract()
+    assert payload["policy"]["schema"] == "fastwam-adaptive-policy-v2-p7"
+    assert p7_worker.load_checkpoint(str(checkpoint_dir)) == 5
+
+    baseline_worker = _checkpoint_worker()
+    with pytest.raises(ValueError, match="checkpoint keys changed|schema"):
+        baseline_worker.load_checkpoint(str(checkpoint_dir))
+
+    baseline_dir = tmp_path / "baseline-actor"
+    baseline_worker.save_checkpoint(str(baseline_dir), step=0)
+    with pytest.raises(ValueError, match="checkpoint keys changed|schema"):
+        p7_worker.load_checkpoint(str(baseline_dir))
 
 
 def test_fastwam_actor_checkpoint_round_trips_native_step_zero(

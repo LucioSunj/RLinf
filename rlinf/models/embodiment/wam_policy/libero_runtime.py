@@ -18,6 +18,8 @@ from __future__ import annotations
 
 import hashlib
 import math
+from contextlib import ExitStack
+from dataclasses import replace
 from pathlib import Path
 from typing import Any, Literal
 
@@ -26,6 +28,7 @@ from fastwam.adapters import PolicyRegime
 from fastwam.models.wan22.adaptive_action import (
     CachedActionCondition,
     CachedActionVelocity,
+    VisualReadCondition,
 )
 from fastwam.models.wan22.adaptive_sampler import (
     replay_action_flow_sde_transition,
@@ -36,6 +39,7 @@ from fastwam.models.wan22.kv_tap import (
     GateLayerKV,
     KeyValueBank,
 )
+from fastwam.models.wan22.visual_contracts import PreparedCameraBatch
 
 from rlinf.envs.action_contract import (
     DENORMALIZED_ACTION_STAGE,
@@ -57,6 +61,13 @@ from rlinf.envs.libero.image_preprocessing import (
 from .adaptive_policy import FastWAMChunkSample
 from .contracts import ChunkRouteRecord, WAMRoute
 from .kv_replay import GateKVReplayBackend
+from .visual_replay import (
+    DualVisualReplayBackend,
+    DualVisualReplayConfig,
+    NativeMemoryIdentity,
+    PackedDualVisualReplay,
+    pack_dual_visual_replay,
+)
 
 DEFAULT_FASTWAM_PROMPT_TEMPLATE = (
     "A video recorded from a robot's point of view executing the following "
@@ -374,6 +385,12 @@ class LiberoFastWAMRuntime:
         prompt_template: str = DEFAULT_FASTWAM_PROMPT_TEMPLATE,
         text_embedding_cache_dir: str | None = None,
         text_embedding_context_len: int = 128,
+        visual_encoder=None,
+        visual_reader=None,
+        visual_replay_config: DualVisualReplayConfig | None = None,
+        visual_memory_identity: NativeMemoryIdentity | None = None,
+        visual_geometry=None,
+        visual_input_contract_sha256: str | None = None,
     ) -> None:
         self.actor = actor
         self.lora_adapter = lora_adapter
@@ -412,6 +429,12 @@ class LiberoFastWAMRuntime:
             else Path(text_embedding_cache_dir).expanduser().resolve()
         )
         self.text_embedding_context_len = int(text_embedding_context_len)
+        self.visual_encoder = visual_encoder
+        self.visual_reader = visual_reader
+        self.visual_replay_config = visual_replay_config
+        self.visual_memory_identity = visual_memory_identity
+        self.visual_geometry = visual_geometry
+        self.visual_input_contract_sha256 = visual_input_contract_sha256
         if self.num_inference_steps < 1:
             raise ValueError("Inference steps must be positive.")
         if self.flow_sde_ignore_last_transition and self.num_inference_steps < 2:
@@ -446,6 +469,31 @@ class LiberoFastWAMRuntime:
             self.text_embedding_cache_dir.is_dir()
         ):
             raise FileNotFoundError(self.text_embedding_cache_dir)
+        visual_values = (
+            self.visual_encoder,
+            self.visual_reader,
+            self.visual_replay_config,
+            self.visual_memory_identity,
+            self.visual_geometry,
+            self.visual_input_contract_sha256,
+        )
+        if any(value is not None for value in visual_values) and any(
+            value is None for value in visual_values
+        ):
+            raise ValueError("P7 runtime inputs must be supplied together.")
+        if self.visual_reader is not None:
+            if self.camera_height != 224 or self.camera_width != 224:
+                raise ValueError("P7 DINO camera inputs must remain exactly 224x224.")
+            if (
+                self.visual_memory_identity.memory_contract_sha256
+                != self.visual_reader.memory_contract_sha256
+            ):
+                raise ValueError("P7 runtime reader and native-memory hashes differ.")
+            if (
+                self.visual_memory_identity.camera_ids
+                != self.visual_geometry.camera_ids
+            ):
+                raise ValueError("P7 runtime camera order differs across contracts.")
         _format_fastwam_prompts("validation", prompt_template=self.prompt_template)
         if self.processor is not None:
             from fastwam.datasets.lerobot.utils.normalizer import (
@@ -484,6 +532,85 @@ class LiberoFastWAMRuntime:
         if image.shape[-2] % 16 or image.shape[-1] % 16:
             raise ValueError("Combined FastWAM input image must be divisible by 16.")
         return image.to(dtype=self.dtype) * (2.0 / 255.0) - 1.0
+
+    def _visual_camera_batch(self, env_obs: dict[str, Any]) -> PreparedCameraBatch:
+        """Prepare typed per-view pixels without running the frozen DINO encoder."""
+
+        if self.visual_reader is None:
+            raise RuntimeError("P7 camera preparation requested while disabled.")
+        sources = {
+            "main": env_obs.get("main_images"),
+            "wrist": env_obs.get("wrist_images"),
+        }
+        camera_ids = self.visual_memory_identity.camera_ids
+        unknown = sorted(set(camera_ids) - set(sources))
+        if unknown or any(sources[camera_id] is None for camera_id in camera_ids):
+            raise KeyError(f"P7 camera sources are unavailable: {unknown}.")
+        pixels = torch.stack(
+            [
+                prepare_libero_camera_batch(
+                    sources[camera_id],
+                    height=224,
+                    width=224,
+                    resize_mode=self.camera_resize_mode,
+                )
+                for camera_id in camera_ids
+            ],
+            dim=1,
+        )
+        validity = env_obs.get("_fastwam_p7_camera_valid_mask")
+        if validity is None:
+            validity = torch.ones(pixels.shape[:2], dtype=torch.bool)
+        else:
+            validity = torch.as_tensor(validity, dtype=torch.bool).detach().cpu()
+        return PreparedCameraBatch(
+            pixels=pixels,
+            camera_ids=camera_ids,
+            camera_valid_mask=validity,
+            input_contract_sha256=self.visual_input_contract_sha256,
+        )
+
+    def _visual_target_mask(
+        self,
+        env_obs: dict[str, Any],
+        *,
+        batch_size: int,
+    ) -> torch.Tensor:
+        """Resolve static or explicit per-sample Wan target validity."""
+
+        target = env_obs.get("_fastwam_p7_target_valid_mask")
+        if target is None:
+            target = self.visual_geometry.target_valid_mask[None].expand(
+                batch_size, -1, -1
+            )
+        target = torch.as_tensor(target, dtype=torch.bool).detach().cpu()
+        expected = (
+            batch_size,
+            len(self.visual_geometry.camera_ids),
+            self.visual_geometry.wan_token_count,
+        )
+        if target.shape != expected:
+            raise ValueError(
+                f"P7 target-valid mask must have shape {expected}, got {target.shape}."
+            )
+        return target
+
+    def _prepare_visual_memory(
+        self,
+        *,
+        regime: PolicyRegime,
+        cameras: PreparedCameraBatch,
+    ):
+        """Run frozen DINO only for a consumed UNCOND route."""
+
+        if self.visual_reader is None:
+            return None
+        if regime is PolicyRegime.IDM:
+            return None
+        memory = self.visual_encoder.prepare_memory(PolicyRegime.UNCOND, cameras)
+        if memory is None:
+            raise RuntimeError("P7 UNCOND encoding produced no native memory.")
+        return memory
 
     def _normalized_proprio(self, states: torch.Tensor) -> torch.Tensor:
         states = states.to(device=self.device, dtype=torch.float32)
@@ -597,7 +724,30 @@ class LiberoFastWAMRuntime:
         regime: PolicyRegime,
         idm_initial_latents: torch.Tensor | None = None,
         idm_noise_seed: int | None = None,
+        visual_memory=None,
+        visual_proprio: torch.Tensor | None = None,
+        visual_target_valid_mask: torch.Tensor | None = None,
     ) -> tuple[CachedActionCondition, torch.Tensor | None]:
+        visual_values = (
+            visual_memory,
+            visual_proprio,
+            visual_target_valid_mask,
+        )
+        if regime is PolicyRegime.IDM and any(
+            value is not None for value in visual_values
+        ):
+            raise ValueError("IDM action conditioning must bypass the P7 sidecar.")
+        if (
+            regime is PolicyRegime.UNCOND
+            and self.visual_reader is not None
+            and any(value is None for value in visual_values)
+        ):
+            raise ValueError("P7 UNCOND conditioning requires memory/proprio/geometry.")
+        if self.visual_reader is None and any(
+            value is not None for value in visual_values
+        ):
+            raise ValueError("Visual inputs cannot be supplied while P7 is disabled.")
+
         first_frame = self.actor._encode_input_image_latents_tensor(
             image,
             tiled=self.tiled_vae,
@@ -703,6 +853,22 @@ class LiberoFastWAMRuntime:
             video_attention_mask=attention_mask[:video_seq_len, :video_seq_len],
             gate_current_frame_video_tokens=tokens_per_frame,
         )
+        visual_condition = None
+        if visual_memory is not None:
+            visual_condition = VisualReadCondition(
+                memory=visual_memory,
+                proprio=visual_proprio.to(
+                    device=visual_memory.tokens.device,
+                    dtype=visual_memory.tokens.dtype,
+                ),
+                video_layout_metadata={
+                    "wan_grid": self.visual_geometry.wan_grid,
+                    "camera_ids": self.visual_geometry.camera_ids,
+                    "target_valid_mask": visual_target_valid_mask.to(
+                        device=visual_memory.tokens.device
+                    ),
+                },
+            )
         return (
             CachedActionCondition(
                 context=context,
@@ -711,6 +877,7 @@ class LiberoFastWAMRuntime:
                 attention_mask=attention_mask,
                 video_seq_len=video_seq_len,
                 current_frame_video_tokens=tokens_per_frame,
+                visual=visual_condition,
             ),
             replay_initial_latents,
         )
@@ -743,6 +910,9 @@ class LiberoFastWAMRuntime:
             gate_layer_indices=self.gate_layer_indices,
             capture_gate_kv=capture_gate_kv,
             actor_version=actor_version,
+            visual_reader=(
+                self.visual_reader if condition.visual is not None else None
+            ),
         )
 
     def sample_action_batch(
@@ -760,6 +930,16 @@ class LiberoFastWAMRuntime:
             noise_level=self.flow_sde_noise_level,
         )
         images, context, context_mask = self._encode_condition(env_obs)
+        visual_cameras = None
+        visual_target_mask = None
+        visual_proprio = None
+        if self.visual_reader is not None:
+            visual_cameras = self._visual_camera_batch(env_obs)
+            visual_target_mask = self._visual_target_mask(
+                env_obs,
+                batch_size=routes.shape[0],
+            )
+            visual_proprio = self._normalized_proprio(env_obs["states"])
         timesteps, deltas = self._action_schedule()
         action_noise_override = env_obs.get("_fastwam_action_initial_noise")
         if action_noise_override is not None:
@@ -813,12 +993,28 @@ class LiberoFastWAMRuntime:
             )
         rollouts = []
         idm_initial_latents = []
+        native_memories = []
         for index, route_value in enumerate(routes.tolist()):
             regime = (
                 PolicyRegime.IDM
                 if int(route_value) == int(WAMRoute.IDM)
                 else PolicyRegime.UNCOND
             )
+            visual_memory = None
+            if self.visual_reader is not None and regime is PolicyRegime.UNCOND:
+                camera_row = PreparedCameraBatch(
+                    pixels=visual_cameras.pixels[index : index + 1],
+                    camera_ids=visual_cameras.camera_ids,
+                    camera_valid_mask=visual_cameras.camera_valid_mask[
+                        index : index + 1
+                    ],
+                    input_contract_sha256=visual_cameras.input_contract_sha256,
+                )
+                visual_memory = self._prepare_visual_memory(
+                    regime=regime,
+                    cameras=camera_row,
+                )
+            native_memories.append(visual_memory)
             condition, replay_video_noise = self._prepare_action_condition(
                 image=images[index : index + 1],
                 context=context[index : index + 1],
@@ -832,6 +1028,17 @@ class LiberoFastWAMRuntime:
                 idm_noise_seed=(
                     int(idm_noise_seeds[index])
                     if idm_noise_seeds is not None and regime is PolicyRegime.IDM
+                    else None
+                ),
+                visual_memory=visual_memory,
+                visual_proprio=(
+                    visual_proprio[index : index + 1]
+                    if visual_memory is not None
+                    else None
+                ),
+                visual_target_valid_mask=(
+                    visual_target_mask[index : index + 1]
+                    if visual_memory is not None
                     else None
                 ),
             )
@@ -922,6 +1129,29 @@ class LiberoFastWAMRuntime:
                 "fastwam_context": context.detach(),
                 "fastwam_context_mask": context_mask.detach(),
             }
+            if self.visual_reader is not None:
+                packed_visual = pack_dual_visual_replay(
+                    config=self.visual_replay_config,
+                    cameras=visual_cameras,
+                    present_mask=(routes == int(WAMRoute.UNCOND)),
+                    target_valid_mask=visual_target_mask,
+                    memory_contract_sha256=(
+                        self.visual_memory_identity.memory_contract_sha256
+                    ),
+                    transport_sha256=self.visual_geometry.transport_sha256,
+                    actor_version=actor_version,
+                    native_memories=(
+                        tuple(native_memories)
+                        if self.visual_replay_config.backend
+                        is DualVisualReplayBackend.STORED_NATIVE
+                        else None
+                    ),
+                    auxiliary_bytes_per_sample=(
+                        visual_proprio[0].numel() * visual_proprio.element_size()
+                    ),
+                )
+                replay_inputs.update(packed_visual.as_forward_inputs())
+                replay_inputs["fastwam_p7_visual_proprio"] = visual_proprio.detach()
         if collect_replay and self.gate_replay_backend is GateKVReplayBackend.RECOMPUTE:
             replay_inputs["fastwam_idm_initial_latents"] = torch.cat(
                 idm_initial_latents,
@@ -946,6 +1176,73 @@ class LiberoFastWAMRuntime:
             action_execution_trace=action_execution_trace,
         )
 
+    def _visual_replay_record(
+        self,
+        forward_inputs: dict[str, torch.Tensor],
+        *,
+        expected_actor_versions: torch.Tensor | None = None,
+        expected_present_mask: torch.Tensor | None = None,
+    ) -> PackedDualVisualReplay | None:
+        """Resolve and validate the optional P7 batch contract."""
+
+        has_visual = any(
+            name.startswith("p7_visual_") or name == "fastwam_p7_visual_proprio"
+            for name in forward_inputs
+        )
+        if self.visual_reader is None:
+            if has_visual:
+                raise ValueError("Disabled P7 cannot consume visual replay inputs.")
+            return None
+        if not has_visual or "fastwam_p7_visual_proprio" not in forward_inputs:
+            raise KeyError("Enabled P7 replay is missing its typed visual payload.")
+        packed = PackedDualVisualReplay.from_forward_inputs(forward_inputs)
+        packed.validate_contract(
+            backend=self.visual_replay_config.backend,
+            memory_contract_sha256=(self.visual_memory_identity.memory_contract_sha256),
+            transport_sha256=self.visual_geometry.transport_sha256,
+        )
+        if expected_actor_versions is not None and not torch.equal(
+            packed.actor_versions.to(expected_actor_versions.device),
+            expected_actor_versions.to(torch.long),
+        ):
+            raise ValueError("P7 replay behavior actor version mismatch.")
+        if expected_present_mask is not None and not torch.equal(
+            packed.present_mask.to(expected_present_mask.device),
+            expected_present_mask.to(torch.bool),
+        ):
+            raise ValueError("P7 replay presence differs from the consumed route.")
+        return packed
+
+    def _visual_memory_from_replay(
+        self,
+        packed: PackedDualVisualReplay,
+        *,
+        index: int,
+    ):
+        """Materialize only one consumed UNCOND row; IDM callers are forbidden."""
+
+        if not bool(packed.present_mask[index].item()):
+            raise ValueError("Attempted to materialize P7 memory for an IDM row.")
+        if packed.backend is DualVisualReplayBackend.STORED_NATIVE:
+            return packed.native_memory(
+                index,
+                identity=self.visual_memory_identity,
+                device=self.device,
+                dtype=self.dtype,
+            )
+        if packed.backend is not DualVisualReplayBackend.RECOMPUTE_NATIVE:
+            raise RuntimeError("Wan-V replay is not authorized by this runtime.")
+        camera_row = PreparedCameraBatch(
+            pixels=packed.camera_pixels[index : index + 1],
+            camera_ids=self.visual_memory_identity.camera_ids,
+            camera_valid_mask=packed.camera_valid_mask[index : index + 1],
+            input_contract_sha256=(self.visual_memory_identity.input_contract_sha256),
+        )
+        memory = self.visual_encoder.prepare_memory(PolicyRegime.UNCOND, camera_row)
+        if memory is None:
+            raise RuntimeError("P7 replay native recomputation returned no memory.")
+        return memory
+
     def replay_action_batch(
         self,
         *,
@@ -963,6 +1260,12 @@ class LiberoFastWAMRuntime:
         images = forward_inputs["fastwam_images"]
         context = forward_inputs["fastwam_context"]
         context_mask = forward_inputs["fastwam_context_mask"]
+        packed_visual = self._visual_replay_record(
+            forward_inputs,
+            expected_actor_versions=route_info.actor_versions,
+            expected_present_mask=(route_info.route_used == int(WAMRoute.UNCOND)),
+        )
+        visual_proprio = forward_inputs.get("fastwam_p7_visual_proprio")
         timesteps, deltas = self._action_schedule()
         logprobs = torch.zeros_like(chains[:, 0], dtype=torch.float32)
         entropies = torch.zeros_like(chains[:, 0], dtype=torch.float32)
@@ -974,11 +1277,27 @@ class LiberoFastWAMRuntime:
         for index in range(chains.shape[0]):
             if int(route_info.route_used[index]) != int(WAMRoute.UNCOND):
                 continue
+            visual_memory = (
+                None
+                if packed_visual is None
+                else self._visual_memory_from_replay(packed_visual, index=index)
+            )
             condition, _ = self._prepare_action_condition(
                 image=images[index : index + 1],
                 context=context[index : index + 1],
                 context_mask=context_mask[index : index + 1],
                 regime=PolicyRegime.UNCOND,
+                visual_memory=visual_memory,
+                visual_proprio=(
+                    visual_proprio[index : index + 1]
+                    if visual_memory is not None
+                    else None
+                ),
+                visual_target_valid_mask=(
+                    packed_visual.target_valid_mask[index : index + 1]
+                    if visual_memory is not None
+                    else None
+                ),
             )
             current_replay = replay_action_flow_sde_transition(
                 chains[index : index + 1],
@@ -1004,11 +1323,16 @@ class LiberoFastWAMRuntime:
             )
             if base_kl is not None:
                 with torch.no_grad():
+                    base_condition = (
+                        replace(condition, visual=None)
+                        if condition.visual is not None
+                        else condition
+                    )
                     base_replay = replay_action_flow_sde_transition(
                         chains[index : index + 1],
                         indices[index : index + 1],
                         velocity_fn=self._velocity(
-                            condition,
+                            base_condition,
                             # The conditioning remains UNCOND; the IDM regime
                             # only disables the regime-gated LoRA contribution.
                             regime=PolicyRegime.IDM,
@@ -1073,6 +1397,12 @@ class LiberoFastWAMRuntime:
         context = forward_inputs["fastwam_context"]
         context_mask = forward_inputs["fastwam_context_mask"]
         video_noise = forward_inputs["fastwam_idm_initial_latents"]
+        packed_visual = self._visual_replay_record(
+            forward_inputs,
+            expected_actor_versions=route_info.actor_versions,
+            expected_present_mask=(route_info.route_used == int(WAMRoute.UNCOND)),
+        )
+        visual_proprio = forward_inputs.get("fastwam_p7_visual_proprio")
         timesteps, _ = self._action_schedule()
         if chains.shape[1] != timesteps.numel() + 1:
             raise ValueError(
@@ -1087,8 +1417,27 @@ class LiberoFastWAMRuntime:
                 "One Gate K/V recompute batch must contain one actor version."
             )
         replay_actor_version = int(actor_versions.item())
+        replay_visual_memories = [None] * chains.shape[0]
+        if packed_visual is not None:
+            for index, route_value in enumerate(route_info.route_used.tolist()):
+                if int(route_value) == int(WAMRoute.UNCOND):
+                    replay_visual_memories[index] = self._visual_memory_from_replay(
+                        packed_visual,
+                        index=index,
+                    )
         snapshots: list[GateKVSnapshot] = []
-        with self.lora_adapter.use_replay_reference(actor_version=replay_actor_version):
+        with ExitStack() as replay_stack:
+            replay_stack.enter_context(
+                self.lora_adapter.use_replay_reference(
+                    actor_version=replay_actor_version
+                )
+            )
+            if self.visual_reader is not None:
+                replay_stack.enter_context(
+                    self.visual_reader.use_replay_reference(
+                        actor_version=replay_actor_version
+                    )
+                )
             first_step = timesteps.numel() - self.gate_denoise_last_n
             for step_index in range(first_step, timesteps.numel()):
                 per_sample: list[GateKVSnapshot] = []
@@ -1106,6 +1455,17 @@ class LiberoFastWAMRuntime:
                         idm_initial_latents=(
                             video_noise[index : index + 1]
                             if regime is PolicyRegime.IDM
+                            else None
+                        ),
+                        visual_memory=replay_visual_memories[index],
+                        visual_proprio=(
+                            visual_proprio[index : index + 1]
+                            if replay_visual_memories[index] is not None
+                            else None
+                        ),
+                        visual_target_valid_mask=(
+                            packed_visual.target_valid_mask[index : index + 1]
+                            if replay_visual_memories[index] is not None
                             else None
                         ),
                     )

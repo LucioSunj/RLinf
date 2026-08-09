@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import math
 import os
 import warnings
 from typing import ContextManager, Union
@@ -540,11 +541,13 @@ class FSDPModelManager:
         param_groups = []
         if fastwam_adaptive:
             from rlinf.models.embodiment.wam_policy.optimizer import (
+                fastwam_visual_reader_parameter_ids,
                 partition_fastwam_trainable_parameters,
             )
 
             fastwam_groups = partition_fastwam_trainable_parameters(
-                model.named_parameters()
+                model.named_parameters(),
+                visual_reader_parameter_ids=fastwam_visual_reader_parameter_ids(model),
             )
             param_groups.extend(
                 [
@@ -577,6 +580,35 @@ class FSDPModelManager:
                     },
                 ]
             )
+            if "dual_visual_reader" in fastwam_groups:
+                reader_lr = self._cfg.optim.get("reader_lr", None)
+                if (
+                    reader_lr is None
+                    or not math.isfinite(float(reader_lr))
+                    or float(reader_lr) <= 0
+                ):
+                    raise ValueError(
+                        "Enabled P7 requires a positive actor.optim.reader_lr."
+                    )
+                reader_weight_decay = self._cfg.optim.get("reader_weight_decay", None)
+                if (
+                    reader_weight_decay is None
+                    or not math.isfinite(float(reader_weight_decay))
+                    or float(reader_weight_decay) < 0
+                ):
+                    raise ValueError(
+                        "Enabled P7 requires an explicit nonnegative "
+                        "actor.optim.reader_weight_decay."
+                    )
+                param_groups.append(
+                    {
+                        "name": "dual_visual_reader",
+                        "params": fastwam_groups["dual_visual_reader"],
+                        "lr": float(reader_lr),
+                        "betas": betas,
+                        "weight_decay": float(reader_weight_decay),
+                    }
+                )
         elif len(params_actor) > 0:
             param_groups.append(
                 {

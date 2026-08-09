@@ -43,6 +43,15 @@ class _SelectiveModule(nn.Module):
         self.register_buffer("ephemeral", torch.tensor([8.0]), persistent=False)
 
 
+class _P7SelectiveModule(nn.Module):
+    def __init__(self) -> None:
+        super().__init__()
+        self.visual_reader = nn.Linear(2, 2, bias=False)
+        self.visual_encoder = nn.Linear(2, 2, bias=False)
+        self.visual_encoder.requires_grad_(False)
+        self.register_buffer("p7_contract_version", torch.tensor([1]))
+
+
 def test_capture_matches_trainable_and_persistent_sync_contract() -> None:
     module = _SelectiveModule()
 
@@ -53,6 +62,16 @@ def test_capture_matches_trainable_and_persistent_sync_contract() -> None:
     assert captured["trainable"].is_parameter
     assert captured["persistent"].tensor is module.persistent
     assert not captured["persistent"].is_parameter
+
+
+def test_p7_selective_sync_includes_reader_but_excludes_frozen_dino() -> None:
+    captured = capture_fastwam_sync_tensors(_P7SelectiveModule())
+
+    assert list(captured) == [
+        "visual_reader.weight",
+        "p7_contract_version",
+    ]
+    assert all("visual_encoder" not in name for name in captured)
 
 
 def test_single_rank_materialization_keeps_only_selected_live_storage() -> None:

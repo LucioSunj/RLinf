@@ -17,7 +17,7 @@ import importlib.util
 import sys
 from enum import Enum
 from pathlib import Path
-from types import ModuleType
+from types import ModuleType, SimpleNamespace
 
 import pytest
 import torch
@@ -218,6 +218,55 @@ class _LoRA:
         self.replay_reference_version = actor_version
 
 
+class _VisualEncoder(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.frozen = nn.Parameter(torch.ones(1))
+        self.asset = SimpleNamespace(
+            source_revision="revision",
+            weights_sha256="1" * 64,
+            preprocess_sha256="2" * 64,
+            output_contract_sha256="3" * 64,
+        )
+
+
+class _VisualReader(nn.Module):
+    reader_kind = "shared-dino-routing-dual-retrieval-v1"
+    reader_contract_sha256 = "4" * 64
+    parameter_family = "dual_visual_reader"
+    injection_layer_indices = (0,)
+    memory_contract_sha256 = "5" * 64
+
+    def __init__(self):
+        super().__init__()
+        self.weight = nn.Parameter(torch.tensor([0.25]))
+        self.replay_reference_version = None
+
+    def trainable_parameter_manifest(self):
+        return {self.parameter_family: ("weight",)}
+
+    def export_trainable_state(self):
+        return {
+            "schema": "test-reader-v1",
+            "reader_kind": self.reader_kind,
+            "reader_contract_sha256": self.reader_contract_sha256,
+            "parameter_names": ("weight",),
+            "state": {"weight": self.weight.detach().clone()},
+        }
+
+    def load_trainable_state(self, payload):
+        self.weight.data.copy_(payload["state"]["weight"])
+
+    def capture_replay_reference(self, *, actor_version):
+        self.replay_reference_version = actor_version
+
+    def checkpoint_contract(self):
+        return {
+            "schema": "test-p7-reader-provenance-v1",
+            "reader_contract_sha256": self.reader_contract_sha256,
+        }
+
+
 def _make_policy(
     backend="stored",
     *,
@@ -226,13 +275,31 @@ def _make_policy(
     eval_random_idm_probability=None,
     eval_routing_seed=0,
     eval_timing_cuda_synchronize=False,
+    with_visual=False,
 ):
+    visual_encoder = _VisualEncoder() if with_visual else None
+    visual_reader = _VisualReader() if with_visual else None
+    visual_replay = (
+        _runtime_module.DualVisualReplayConfig(
+            backend="recompute_native",
+            storage_dtype="bfloat16",
+            pin_memory=True,
+            max_bytes_per_sample=1_000_000,
+            max_bytes_aggregate=2_000_000,
+            fail_closed=True,
+        )
+        if with_visual
+        else None
+    )
     return FastWAMAdaptivePolicy(
         actor=nn.Linear(1, 1),
         runtime=_Runtime(),
         lora_adapter=_LoRA(),
         gate=_Gate(),
         critic=_Critic() if with_critic else None,
+        visual_encoder=visual_encoder,
+        visual_reader=visual_reader,
+        visual_replay_config=visual_replay,
         config=FastWAMAdaptivePolicyConfig(
             gate_epsilon=0.0,
             eval_idm_threshold=0.5,
@@ -566,6 +633,55 @@ def test_standalone_eval_runs_and_restores_gate_lora_without_critic():
     )
 
 
+def test_p7_eval_requires_v2_outer_schema_and_exact_project_contract() -> None:
+    source = _make_policy(with_visual=True)
+    source.set_global_step(4)
+    parent_sha256 = "a" * 64
+    payload = {
+        "schema": "fastwam-adaptive-rl-checkpoint-v2-p7",
+        "step": 4,
+        "parent_checkpoint_sha256": parent_sha256,
+        "contract": {"model": {"actor_checkpoint_sha256": parent_sha256}},
+        "policy": source.trainable_state_dict(),
+        "p7": source.p7_project_checkpoint_contract(),
+    }
+    restored = _make_policy(with_critic=False, with_visual=True)
+
+    assert (
+        restored.load_eval_checkpoint(
+            payload,
+            expected_parent_checkpoint_sha256=parent_sha256,
+        )
+        == 4
+    )
+    with pytest.raises(ValueError, match="Unsupported"):
+        _make_policy(with_critic=False).load_eval_checkpoint(
+            payload,
+            expected_parent_checkpoint_sha256=parent_sha256,
+        )
+    with pytest.raises(ValueError, match="project checkpoint contract mismatch"):
+        _make_policy(with_critic=False, with_visual=True).load_eval_checkpoint(
+            {
+                **payload,
+                "p7": {
+                    **payload["p7"],
+                    "reader": {"reader_contract_sha256": "0" * 64},
+                },
+            },
+            expected_parent_checkpoint_sha256=parent_sha256,
+        )
+
+    baseline_payload = {
+        **payload,
+        "schema": "fastwam-adaptive-rl-checkpoint-v1",
+    }
+    with pytest.raises(ValueError, match="Unsupported"):
+        _make_policy(with_critic=False, with_visual=True).load_eval_checkpoint(
+            baseline_payload,
+            expected_parent_checkpoint_sha256=parent_sha256,
+        )
+
+
 def test_policy_update_invalidates_pending_route_and_forces_idm_boundary():
     policy = _make_policy()
     obs = {
@@ -883,3 +999,44 @@ def test_optimizer_groups_are_disjoint():
     ]
     ids = [id(parameter) for group in groups for parameter in group["params"]]
     assert len(ids) == len(set(ids))
+
+
+def test_p7_checkpoint_optimizer_and_behavior_reference_are_integrated() -> None:
+    policy = _make_policy(backend="recompute", with_visual=True)
+    assert not policy.visual_encoder.frozen.requires_grad
+    assert policy.visual_reader.weight.requires_grad
+
+    groups = policy.optimizer_parameter_groups(
+        gate_lr=1e-4,
+        lora_lr=2e-4,
+        value_lr=3e-4,
+        reader_lr=4e-4,
+    )
+    assert [group["name"] for group in groups] == [
+        "gate",
+        "uncond_lora",
+        "value_head",
+        "dual_visual_reader",
+    ]
+    policy.capture_gate_recompute_reference()
+    assert policy.visual_reader.replay_reference_version == 0
+
+    payload = policy.trainable_state_dict()
+    assert payload["schema"] == "fastwam-adaptive-policy-v2-p7"
+    assert set(payload["dual_visual_reader"]) == {"contract", "state"}
+    assert "visual_encoder" not in payload
+    with torch.no_grad():
+        policy.visual_reader.weight.fill_(9.0)
+    restored = _make_policy(backend="recompute", with_visual=True)
+    restored.load_trainable_state_dict(payload)
+    torch.testing.assert_close(restored.visual_reader.weight, torch.tensor([0.25]))
+
+
+def test_p7_optimizer_requires_explicit_reader_lr() -> None:
+    policy = _make_policy(with_visual=True)
+    with pytest.raises(ValueError, match="reader_lr"):
+        policy.optimizer_parameter_groups(
+            gate_lr=1e-4,
+            lora_lr=2e-4,
+            value_lr=3e-4,
+        )
