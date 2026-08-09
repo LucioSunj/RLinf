@@ -188,6 +188,27 @@ class P8FrozenVisualSource:
                 raise TypeError("P8 Wan sources must be canonicalized to BF16.")
             if not layer.rope_freqs_current.is_complex():
                 raise TypeError("P8 Wan RoPE sources must use a complex dtype.")
+            canonical_rope = _canonicalize_rope_bf16(layer.rope_freqs_current)
+            if not torch.equal(layer.rope_freqs_current, canonical_rope):
+                raise ValueError(
+                    "P8 Wan RoPE sources must be canonicalized through BF16 "
+                    "real/imaginary components before behavior or replay use."
+                )
+
+
+def _canonicalize_rope_bf16(tensor: torch.Tensor) -> torch.Tensor:
+    """Quantize complex RoPE components to BF16 before either live path."""
+
+    component_dtype = {
+        torch.complex64: torch.float32,
+        torch.complex128: torch.float64,
+    }.get(tensor.dtype)
+    if component_dtype is None:
+        raise TypeError("P8 Wan RoPE source dtype must be complex64 or complex128.")
+    return torch.complex(
+        tensor.real.detach().to(torch.bfloat16).to(component_dtype),
+        tensor.imag.detach().to(torch.bfloat16).to(component_dtype),
+    )
 
 
 def canonicalize_p8_source_bf16(
@@ -226,7 +247,7 @@ def canonicalize_p8_source_bf16(
             base_value_current=(
                 layer.base_value_current.detach().to(dtype=torch.bfloat16)
             ),
-            rope_freqs_current=layer.rope_freqs_current.detach(),
+            rope_freqs_current=_canonicalize_rope_bf16(layer.rope_freqs_current),
             camera_index_current=layer.camera_index_current.detach(),
             current_frame_video_tokens=layer.current_frame_video_tokens,
             source_contract_sha256=layer.source_contract_sha256,
@@ -277,6 +298,10 @@ def _replay_contract_payload(spec: P8VisualReplaySpec) -> dict[str, Any]:
         "rope_shape": list(spec.rope_shape),
         "rope_complex_dtype": spec.rope_complex_dtype,
         "rope_storage_encoding": "separate_real_imag_bfloat16",
+        "rope_value_semantics": (
+            "source_canonicalized_through_bfloat16_components_before_"
+            "behavior_and_storage"
+        ),
         "native_grid": [14, 14],
         "native_patch_count": 196,
         "native_width": 384,

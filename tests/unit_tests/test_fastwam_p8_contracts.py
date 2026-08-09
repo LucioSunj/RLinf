@@ -40,6 +40,7 @@ from rlinf.models.embodiment.wam_policy.p8_visual_replay import (
     P8VisualReplayConfig,
     P8VisualReplaySpec,
     PackedP8VisualReplay,
+    canonicalize_p8_source_bf16,
     pack_p8_visual_sources,
     pin_p8_visual_forward_inputs,
     validate_p8_forward_input_integrity,
@@ -75,6 +76,14 @@ def _memory() -> NativePatchMemory:
 
 
 def _source(actor_version: int = 3) -> P8FrozenVisualSource:
+    rope_real = torch.tensor(
+        [0.1, 0.2, 0.3, 0.4, 1.1, 1.2, 1.3, 1.4],
+        dtype=torch.float32,
+    ).reshape(4, 1, 2)
+    rope_imag = torch.tensor(
+        [-0.15, -0.25, -0.35, -0.45, 0.55, 0.65, 0.75, 0.85],
+        dtype=torch.float32,
+    ).reshape(4, 1, 2)
     layer = WanCurrentLayerSource(
         layer_index=0,
         hidden_current=torch.randn(1, 4, 8, dtype=torch.bfloat16),
@@ -82,12 +91,12 @@ def _source(actor_version: int = 3) -> P8FrozenVisualSource:
         key_pre_norm_current=torch.randn(1, 4, 8, dtype=torch.bfloat16),
         base_key_current=torch.randn(1, 4, 8, dtype=torch.bfloat16),
         base_value_current=torch.randn(1, 4, 8, dtype=torch.bfloat16),
-        rope_freqs_current=torch.ones(4, 1, 2, dtype=torch.complex64),
+        rope_freqs_current=torch.complex(rope_real, rope_imag),
         camera_index_current=torch.tensor([[0, 0, 1, 1]]),
         current_frame_video_tokens=4,
         source_contract_sha256=_hash("source"),
     )
-    return P8FrozenVisualSource(
+    return canonicalize_p8_source_bf16(
         memory=_memory(),
         layers=(layer,),
         actor_version=actor_version,
@@ -150,12 +159,11 @@ def test_stored_visual_replay_roundtrips_real_native_provenance_and_idm_slot() -
     assert torch.equal(
         restored.layers[0].hidden_current, source.layers[0].hidden_current
     )
-    expected_rope = torch.complex(
-        source.layers[0].rope_freqs_current.real.to(torch.bfloat16).float(),
-        source.layers[0].rope_freqs_current.imag.to(torch.bfloat16).float(),
-    )
     assert restored.layers[0].rope_freqs_current.dtype is torch.complex64
-    assert torch.equal(restored.layers[0].rope_freqs_current, expected_rope)
+    assert torch.equal(
+        restored.layers[0].rope_freqs_current,
+        source.layers[0].rope_freqs_current,
+    )
     assert packed.rope_freqs_real_current.dtype is torch.bfloat16
     assert packed.rope_freqs_imag_current.dtype is torch.bfloat16
     assert not bool(packed.present[1])
@@ -169,6 +177,54 @@ def test_stored_visual_replay_roundtrips_real_native_provenance_and_idm_slot() -
     assert torch.equal(reconstructed.bytes_per_sample(), packed.bytes_per_sample())
     assert packed.contract_sha256.shape == (2, 32)
     assert packed.integrity_sha256.shape == (2, 32)
+
+
+def test_rope_source_is_quantized_before_behavior_and_exact_after_replay() -> None:
+    raw_real = torch.tensor(
+        [0.1001, 0.2002, 0.3003, 0.4004, 1.1001, 1.2002, 1.3003, 1.4004],
+        dtype=torch.float32,
+    ).reshape(4, 1, 2)
+    raw_imag = torch.tensor(
+        [-0.1501, -0.2502, -0.3503, -0.4504, 0.5501, 0.6502, 0.7503, 0.8504],
+        dtype=torch.float32,
+    ).reshape(4, 1, 2)
+    raw_rope = torch.complex(raw_real, raw_imag)
+    base = _source()
+    raw_layer = replace(base.layers[0], rope_freqs_current=raw_rope)
+
+    canonical = canonicalize_p8_source_bf16(
+        memory=base.memory,
+        layers=(raw_layer,),
+        actor_version=base.actor_version,
+    )
+    canonical_rope = canonical.layers[0].rope_freqs_current
+    assert canonical_rope.dtype is raw_rope.dtype
+    assert canonical_rope.shape == raw_rope.shape
+    assert canonical_rope.stride() == raw_rope.stride()
+    assert not torch.equal(canonical_rope, raw_rope)
+
+    restored = pack_p8_visual_sources((canonical,), spec=_spec()).materialize_sample(
+        0,
+        device="cpu",
+        expected_actor_version=canonical.actor_version,
+    )
+    assert restored.layers[0].rope_freqs_current.stride() == canonical_rope.stride()
+    assert torch.equal(restored.layers[0].rope_freqs_current, canonical_rope)
+
+
+def test_replay_rejects_noncanonical_complex_rope_source() -> None:
+    source = _source()
+    noncanonical = replace(
+        source.layers[0],
+        rope_freqs_current=source.layers[0].rope_freqs_current + (0.0001 + 0.0001j),
+    )
+
+    with pytest.raises(ValueError, match="canonicalized through BF16"):
+        P8FrozenVisualSource(
+            memory=source.memory,
+            layers=(noncanonical,),
+            actor_version=source.actor_version,
+        )
 
 
 @pytest.mark.parametrize(
