@@ -82,6 +82,13 @@ uncond_lora:
   freeze_base: true
   strict_target_discovery: true
 
+# P8-A0/KV is an independent runtime variant. Disabled means no DINO asset
+# validation/load, no Wan source capture, no refiner allocation, and the v1
+# adaptive checkpoint/optimizer interfaces remain byte-for-byte compatible.
+uncond_visual_sidecar:
+  type: dinov3_guided_wan_current_refinement
+  enabled: false
+
 gate:
   hidden_dim: 256
   num_query_tokens: 4

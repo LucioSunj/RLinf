@@ -18,7 +18,7 @@ import math
 import os
 import time
 from functools import partial
-from typing import Optional
+from typing import Any, Optional
 
 import numpy as np
 import torch
@@ -133,6 +133,29 @@ from rlinf.workers.actor.fastwam_selective_sync import (
     prepare_fastwam_sync_tensors,
 )
 from rlinf.workers.rollout.utils import RankMapper
+
+
+def _config_value(config: Any, name: str, default: Any = None) -> Any:
+    if isinstance(config, dict):
+        return config.get(name, default)
+    getter = getattr(config, "get", None)
+    if callable(getter):
+        return getter(name, default)
+    return getattr(config, name, default)
+
+
+def _fastwam_p8_enabled(model_cfg: Any) -> bool:
+    sidecar = _config_value(model_cfg, "uncond_visual_sidecar", None)
+    return bool(_config_value(sidecar, "enabled", False))
+
+
+def _fastwam_actor_checkpoint_schema(model_cfg: Any) -> str:
+    return (
+        "fastwam-adaptive-rl-checkpoint-v2-p8-a0-kv"
+        if _fastwam_p8_enabled(model_cfg)
+        else "fastwam-adaptive-rl-checkpoint-v1"
+    )
+
 
 _FASTWAM_BC_BOOTSTRAP_SCHEMA = "fastwam-uncond-bc-bootstrap-v1"
 _FASTWAM_BC_BOOTSTRAP_KEYS = {
@@ -1585,7 +1608,7 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
                 policy.set_global_step(int(step))
                 self.version = int(step)
                 payload = {
-                    "schema": "fastwam-adaptive-rl-checkpoint-v1",
+                    "schema": _fastwam_actor_checkpoint_schema(self.cfg.actor.model),
                     "step": int(step),
                     "optimizer_steps": int(self.optimizer_steps),
                     "parent_checkpoint_sha256": str(
@@ -1675,7 +1698,8 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
                         "FastWAM adaptive RL checkpoint keys changed: "
                         f"{sorted(payload)}."
                     )
-                if payload.get("schema") != "fastwam-adaptive-rl-checkpoint-v1":
+                expected_schema = _fastwam_actor_checkpoint_schema(self.cfg.actor.model)
+                if payload.get("schema") != expected_schema:
                     raise ValueError(
                         "Unsupported FastWAM adaptive RL checkpoint schema."
                     )
@@ -2342,7 +2366,10 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
                 group.get("name"): float(group["lr"])
                 for group in self.optimizer.param_groups
             }
+            p8_enabled = _fastwam_p8_enabled(self.cfg.actor.model)
             expected = {"gate", "uncond_lora", "value_head"}
+            if p8_enabled:
+                expected.add("wan_current_refiner")
             if set(lr_by_name) != expected:
                 raise RuntimeError(
                     "FastWAM adaptive optimizer groups changed unexpectedly: "
@@ -2355,6 +2382,8 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
                     "critic/lr": lr_by_name["value_head"],
                 }
             )
+            if p8_enabled:
+                data["uncond_flow/refiner_lr"] = lr_by_name["wan_current_refiner"]
             return data
         data["actor/lr"] = lr_list[0]
         if len(lr_list) > 1:
@@ -2416,6 +2445,26 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
             self.rollout_batch = process_nested_dict_for_train(
                 self.rollout_batch, shuffle_id
             )
+        if SupportedModel(
+            self.cfg.actor.model.model_type
+        ) is SupportedModel.FASTWAM_ADAPTIVE and _fastwam_p8_enabled(
+            self.cfg.actor.model
+        ):
+            from omegaconf import OmegaConf
+
+            from rlinf.models.embodiment.wam_policy.p8_visual_replay import (
+                P8VisualReplayConfig,
+                validate_p8_forward_input_budget,
+            )
+
+            replay_payload = OmegaConf.to_container(
+                self.cfg.actor.model.uncond_visual_sidecar.replay,
+                resolve=True,
+            )
+            validate_p8_forward_input_budget(
+                self.rollout_batch.get("forward_inputs", {}),
+                config=P8VisualReplayConfig.from_mapping(replay_payload),
+            )
         if (
             SupportedModel(self.cfg.actor.model.model_type)
             is SupportedModel.FASTWAM_ADAPTIVE
@@ -2427,6 +2476,18 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
             )
 
             self.rollout_batch["forward_inputs"] = pin_gate_kv_forward_inputs(
+                self.rollout_batch.get("forward_inputs", {})
+            )
+        if SupportedModel(
+            self.cfg.actor.model.model_type
+        ) is SupportedModel.FASTWAM_ADAPTIVE and _fastwam_p8_enabled(
+            self.cfg.actor.model
+        ):
+            from rlinf.models.embodiment.wam_policy.p8_visual_replay import (
+                pin_p8_visual_forward_inputs,
+            )
+
+            self.rollout_batch["forward_inputs"] = pin_p8_visual_forward_inputs(
                 self.rollout_batch.get("forward_inputs", {})
             )
 

@@ -29,7 +29,8 @@ from rlinf.workers.rollout.hf.huggingface_worker import MultiStepRolloutWorker
 
 
 class _Policy:
-    def __init__(self) -> None:
+    def __init__(self, *, p8_enabled: bool = False) -> None:
+        self.p8_enabled = p8_enabled
         self.actor_version = 0
         self.route_state = {
             "next_episode_id": 1,
@@ -50,26 +51,36 @@ class _Policy:
 
     def rollout_runtime_state_dict(self) -> dict[str, Any]:
         return {
-            "schema": "fastwam-adaptive-rollout-policy-runtime-v1",
+            "schema": (
+                "fastwam-adaptive-rollout-policy-runtime-v2-p8-a0-kv"
+                if self.p8_enabled
+                else "fastwam-adaptive-rollout-policy-runtime-v1"
+            ),
             "actor_version": self.actor_version,
             "route_tracker": self.route_state,
         }
 
     def load_rollout_runtime_state_dict(self, payload: dict[str, Any]) -> None:
-        if payload["schema"] != "fastwam-adaptive-rollout-policy-runtime-v1":
+        expected_schema = (
+            "fastwam-adaptive-rollout-policy-runtime-v2-p8-a0-kv"
+            if self.p8_enabled
+            else "fastwam-adaptive-rollout-policy-runtime-v1"
+        )
+        if payload["schema"] != expected_schema:
             raise ValueError("bad policy runtime schema")
         self.actor_version = int(payload["actor_version"])
         self.route_state = payload["route_tracker"]
 
 
-def _worker() -> MultiStepRolloutWorker:
+def _worker(*, p8_enabled: bool = False) -> MultiStepRolloutWorker:
     worker = MultiStepRolloutWorker.__new__(MultiStepRolloutWorker)
     worker.model_cfg = SimpleNamespace(
         model_type="fastwam_adaptive",
         actor_checkpoint_sha256="a" * 64,
         critic=SimpleNamespace(backbone_checkpoint_sha256="b" * 64),
+        uncond_visual_sidecar=SimpleNamespace(enabled=p8_enabled),
     )
-    worker.hf_model = _Policy()
+    worker.hf_model = _Policy(p8_enabled=p8_enabled)
     worker.version = 0
     worker._rank = 0
     worker._world_size = 1
@@ -123,6 +134,33 @@ def test_rollout_runtime_checkpoint_round_trip(
     audit_output = capsys.readouterr().out
     assert "FASTWAM_ROLLOUT_RESUME_AUDIT" in audit_output
     assert '"route_state_sha256"' in audit_output
+
+
+def test_p8_rollout_runtime_uses_v2_and_rejects_old_v1(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        worker_module,
+        "get_rng_state",
+        lambda: {"cpu": torch.tensor([8], dtype=torch.uint8)},
+    )
+    worker = _worker(p8_enabled=True)
+    checkpoint_dir = tmp_path / "rollout-p8"
+    worker.save_checkpoint(str(checkpoint_dir), step=1)
+
+    checkpoint_path = checkpoint_dir / "rank_0.pt"
+    payload = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
+    assert payload["schema"] == "fastwam-adaptive-rollout-runtime-v2-p8-a0-kv"
+    assert (
+        payload["policy_runtime"]["schema"]
+        == "fastwam-adaptive-rollout-policy-runtime-v2-p8-a0-kv"
+    )
+
+    payload["schema"] = "fastwam-adaptive-rollout-runtime-v1"
+    torch.save(payload, checkpoint_path)
+    with pytest.raises(ValueError, match="Unsupported FastWAM rollout-runtime"):
+        worker.load_checkpoint(str(checkpoint_dir))
 
 
 def test_step_zero_training_bootstrap_restores_rollout_rng_and_route(

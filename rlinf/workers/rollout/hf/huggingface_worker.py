@@ -51,6 +51,31 @@ from rlinf.utils.checkpoint_state import (
 from rlinf.utils.placement import HybridComponentPlacement
 from rlinf.utils.utils import get_rng_state, set_rng_state
 
+FASTWAM_ROLLOUT_RUNTIME_SCHEMA_V1 = "fastwam-adaptive-rollout-runtime-v1"
+FASTWAM_ROLLOUT_RUNTIME_SCHEMA_P8 = "fastwam-adaptive-rollout-runtime-v2-p8-a0-kv"
+
+
+def _config_value(config: Any, name: str, default: Any = None) -> Any:
+    if isinstance(config, dict):
+        return config.get(name, default)
+    getter = getattr(config, "get", None)
+    if callable(getter):
+        return getter(name, default)
+    return getattr(config, name, default)
+
+
+def _fastwam_p8_enabled(model_cfg: Any) -> bool:
+    sidecar = _config_value(model_cfg, "uncond_visual_sidecar", None)
+    return bool(_config_value(sidecar, "enabled", False))
+
+
+def _fastwam_rollout_runtime_schema(model_cfg: Any) -> str:
+    return (
+        FASTWAM_ROLLOUT_RUNTIME_SCHEMA_P8
+        if _fastwam_p8_enabled(model_cfg)
+        else FASTWAM_ROLLOUT_RUNTIME_SCHEMA_V1
+    )
+
 
 def _fastwam_checkpoint_cpu_clone(value: Any) -> Any:
     if isinstance(value, torch.Tensor):
@@ -378,7 +403,7 @@ class MultiStepRolloutWorker(Worker):
                 "FastWAM rollout worker and policy versions disagree at save."
             )
         payload = {
-            "schema": "fastwam-adaptive-rollout-runtime-v1",
+            "schema": _fastwam_rollout_runtime_schema(self.model_cfg),
             "rank": int(self._rank),
             "world_size": int(self._world_size),
             "step": step,
@@ -439,7 +464,7 @@ class MultiStepRolloutWorker(Worker):
             raise ValueError(
                 f"FastWAM rollout-runtime checkpoint keys changed: {sorted(payload)}."
             )
-        if payload.get("schema") != "fastwam-adaptive-rollout-runtime-v1":
+        if payload.get("schema") != _fastwam_rollout_runtime_schema(self.model_cfg):
             raise ValueError("Unsupported FastWAM rollout-runtime schema.")
         if int(payload.get("rank", -1)) != int(self._rank) or int(
             payload.get("world_size", -1)

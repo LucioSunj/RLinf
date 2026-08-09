@@ -47,6 +47,8 @@ from .kv_replay import (
     PackedGateKVTaps,
     pack_gate_kv,
 )
+from .optimizer import FastWAMRefinerParameterManifest
+from .p8_visual_replay import P8VisualReplayConfig, validate_p8_replay_bytes
 from .routing_state import PendingRouteTracker
 
 
@@ -116,6 +118,11 @@ class FastWAMPolicyRuntime(Protocol):
         route_info: ChunkRouteRecord,
     ) -> tuple[GateKVSnapshot, ...]: ...
 
+    def p8_replay_bytes_per_sample(
+        self,
+        forward_inputs: dict[str, torch.Tensor],
+    ) -> torch.Tensor: ...
+
 
 @dataclass(frozen=True)
 class FastWAMAdaptivePolicyConfig:
@@ -132,6 +139,7 @@ class FastWAMAdaptivePolicyConfig:
     eval_microbatch_size: int = 1
     eval_timing_cuda_synchronize: bool = False
     kv_replay: GateKVReplayConfig = field(default_factory=GateKVReplayConfig)
+    p8_visual_replay: P8VisualReplayConfig | None = None
 
     def __post_init__(self) -> None:
         if not math.isfinite(self.gate_epsilon) or not 0 <= self.gate_epsilon <= 1:
@@ -199,6 +207,8 @@ class FastWAMAdaptivePolicy(nn.Module, BasePolicy):
         gate: nn.Module,
         critic: nn.Module | None,
         config: FastWAMAdaptivePolicyConfig | None = None,
+        wan_current_refiner: nn.Module | None = None,
+        p8_checkpoint_contract: Mapping[str, Any] | None = None,
     ) -> None:
         super().__init__()
         self.actor = actor
@@ -207,6 +217,19 @@ class FastWAMAdaptivePolicy(nn.Module, BasePolicy):
         self.gate = gate
         self.critic = critic
         self.config = config or FastWAMAdaptivePolicyConfig()
+        self.wan_current_refiner = wan_current_refiner
+        self.p8_checkpoint_contract = (
+            None if p8_checkpoint_contract is None else dict(p8_checkpoint_contract)
+        )
+        if (self.wan_current_refiner is None) != (
+            self.config.p8_visual_replay is None
+        ) or (self.wan_current_refiner is None) != (
+            self.p8_checkpoint_contract is None
+        ):
+            raise ValueError(
+                "P8 refiner, visual replay config, and checkpoint contract must "
+                "be enabled or disabled together."
+            )
         self.route_tracker = PendingRouteTracker()
         self.actor_version = 0
         self._enforce_frozen_actor()
@@ -246,6 +269,8 @@ class FastWAMAdaptivePolicy(nn.Module, BasePolicy):
         super().train(mode)
         self.actor.eval()
         self.gate.train(mode)
+        if self.wan_current_refiner is not None:
+            self.wan_current_refiner.train(mode)
         if self.critic is not None:
             self.critic.train(mode)
         return self
@@ -313,6 +338,25 @@ class FastWAMAdaptivePolicy(nn.Module, BasePolicy):
             return
         self.lora_adapter.capture_replay_reference(
             actor_version=self.actor_version,
+        )
+        if self.wan_current_refiner is not None:
+            self.wan_current_refiner.capture_replay_reference(
+                actor_version=self.actor_version,
+            )
+
+    def refiner_parameter_manifest(
+        self,
+    ) -> FastWAMRefinerParameterManifest | None:
+        """Export identity-bound P8 trainables independently of FSDP names."""
+
+        if self.wan_current_refiner is None:
+            return None
+        entries = self.wan_current_refiner.trainable_parameter_manifest()
+        return FastWAMRefinerParameterManifest(
+            entries=tuple(
+                (f"wan_current_refiner.{entry.name}", entry.parameter)
+                for entry in entries
+            )
         )
 
     @staticmethod
@@ -667,6 +711,18 @@ class FastWAMAdaptivePolicy(nn.Module, BasePolicy):
             # them in forward_inputs would make rollout sharding split [L] by B.
             packed_inputs.pop("gate_kv_layer_indices", None)
             forward_inputs.update(packed_inputs)
+        if self.config.p8_visual_replay is not None:
+            p8_bytes = self.runtime.p8_replay_bytes_per_sample(forward_inputs)
+            gate_bytes = (
+                torch.zeros_like(p8_bytes)
+                if packed_kv is None
+                else _bytes_per_sample(packed_kv)
+            )
+            validate_p8_replay_bytes(
+                p8_bytes_per_sample=p8_bytes,
+                gate_bytes_per_sample=gate_bytes,
+                config=self.config.p8_visual_replay,
+            )
         if critic_prefix is not None:
             forward_inputs["critic_prefix"] = critic_prefix
         result = {
@@ -775,6 +831,7 @@ class FastWAMAdaptivePolicy(nn.Module, BasePolicy):
         gate_lr: float,
         lora_lr: float,
         value_lr: float,
+        refiner_lr: float | None = None,
     ) -> list[dict[str, Any]]:
         """Return disjoint Gate, LoRA, and fresh-value-head optimizer groups."""
 
@@ -808,6 +865,19 @@ class FastWAMAdaptivePolicy(nn.Module, BasePolicy):
                 "lr": value_lr,
             },
         ]
+        if self.wan_current_refiner is not None:
+            if refiner_lr is None or not math.isfinite(refiner_lr) or refiner_lr <= 0:
+                raise ValueError("Enabled P8 requires a positive `refiner_lr`.")
+            refiner_manifest = self.refiner_parameter_manifest()
+            if refiner_manifest is None:  # pragma: no cover - guarded above.
+                raise RuntimeError("Enabled P8 policy has no refiner manifest.")
+            groups.append(
+                {
+                    "name": "wan_current_refiner",
+                    "params": list(refiner_manifest.parameters),
+                    "lr": refiner_lr,
+                }
+            )
         empty_groups = [group["name"] for group in groups if not group["params"]]
         if empty_groups:
             raise RuntimeError(f"FastWAM optimizer groups are empty: {empty_groups}.")
@@ -822,14 +892,24 @@ class FastWAMAdaptivePolicy(nn.Module, BasePolicy):
         """Save only adaptive state plus delayed-route schedules."""
 
         critic = self._require_critic()
-        return {
-            "schema": "fastwam-adaptive-policy-v1",
+        payload = {
+            "schema": (
+                "fastwam-adaptive-policy-v1"
+                if self.wan_current_refiner is None
+                else "fastwam-adaptive-policy-v2-p8-a0-kv"
+            ),
             "actor_version": self.actor_version,
             "gate": self.gate.state_dict(),
             "lora": self.lora_adapter.lora_state_dict(),
             "value_head": critic.value_head.state_dict(),
             "route_tracker": self.route_tracker.state_dict(),
         }
+        if self.wan_current_refiner is not None:
+            payload["p8"] = {
+                "checkpoint_contract": self.p8_checkpoint_contract,
+                "wan_current_refiner": self.wan_current_refiner.checkpoint_state(),
+            }
+        return payload
 
     def load_trainable_state_dict(self, payload: dict[str, Any]) -> None:
         expected_keys = {
@@ -840,17 +920,33 @@ class FastWAMAdaptivePolicy(nn.Module, BasePolicy):
             "value_head",
             "route_tracker",
         }
+        expected_schema = "fastwam-adaptive-policy-v1"
+        if self.wan_current_refiner is not None:
+            expected_keys.add("p8")
+            expected_schema = "fastwam-adaptive-policy-v2-p8-a0-kv"
         if set(payload) != expected_keys:
             raise ValueError(
                 f"FastWAM adaptive-policy checkpoint keys changed: {sorted(payload)}."
             )
-        if payload.get("schema") != "fastwam-adaptive-policy-v1":
+        if payload.get("schema") != expected_schema:
             raise ValueError("Unsupported FastWAM adaptive-policy checkpoint.")
         self.gate.load_state_dict(payload["gate"], strict=True)
         self.lora_adapter.load_lora_state_dict(payload["lora"], strict=True)
         if self.critic is not None:
             self.critic.value_head.load_state_dict(payload["value_head"], strict=True)
         self.route_tracker.load_state_dict(payload["route_tracker"])
+        if self.wan_current_refiner is not None:
+            p8_payload = payload["p8"]
+            if not isinstance(p8_payload, Mapping) or set(p8_payload) != {
+                "checkpoint_contract",
+                "wan_current_refiner",
+            }:
+                raise ValueError("Invalid P8 adaptive-policy checkpoint payload.")
+            if p8_payload["checkpoint_contract"] != self.p8_checkpoint_contract:
+                raise ValueError("P8 adaptive-policy checkpoint contract mismatch.")
+            self.wan_current_refiner.load_checkpoint_state(
+                p8_payload["wan_current_refiner"]
+            )
         actor_version = int(payload["actor_version"])
         if actor_version < 0:
             raise ValueError("Checkpoint actor version must be non-negative.")
@@ -862,7 +958,11 @@ class FastWAMAdaptivePolicy(nn.Module, BasePolicy):
         """Serialize only delayed-route runtime state owned by rollout workers."""
 
         return {
-            "schema": "fastwam-adaptive-rollout-policy-runtime-v1",
+            "schema": (
+                "fastwam-adaptive-rollout-policy-runtime-v1"
+                if self.wan_current_refiner is None
+                else "fastwam-adaptive-rollout-policy-runtime-v2-p8-a0-kv"
+            ),
             "actor_version": self.actor_version,
             "route_tracker": self.route_tracker.state_dict(),
         }
@@ -875,7 +975,12 @@ class FastWAMAdaptivePolicy(nn.Module, BasePolicy):
             raise ValueError(
                 f"FastWAM rollout-runtime policy keys changed: {sorted(payload)}."
             )
-        if payload.get("schema") != ("fastwam-adaptive-rollout-policy-runtime-v1"):
+        expected_schema = (
+            "fastwam-adaptive-rollout-policy-runtime-v1"
+            if self.wan_current_refiner is None
+            else "fastwam-adaptive-rollout-policy-runtime-v2-p8-a0-kv"
+        )
+        if payload.get("schema") != expected_schema:
             raise ValueError("Unsupported FastWAM rollout-runtime policy schema.")
         actor_version = int(payload["actor_version"])
         if actor_version < 0:
@@ -895,7 +1000,12 @@ class FastWAMAdaptivePolicy(nn.Module, BasePolicy):
     ) -> int:
         """Restore adaptive policy state from one actor-rank project checkpoint."""
 
-        if payload.get("schema") != "fastwam-adaptive-rl-checkpoint-v1":
+        expected_schema = (
+            "fastwam-adaptive-rl-checkpoint-v1"
+            if self.wan_current_refiner is None
+            else "fastwam-adaptive-rl-checkpoint-v2-p8-a0-kv"
+        )
+        if payload.get("schema") != expected_schema:
             raise ValueError("Unsupported FastWAM adaptive evaluation checkpoint.")
         expected_parent = str(expected_parent_checkpoint_sha256).strip().lower()
         if len(expected_parent) != 64 or any(

@@ -50,6 +50,35 @@ warnings.filterwarnings(
 )
 
 
+def _resolve_fastwam_refiner_manifest(model: nn.Module):
+    """Unwrap FSDP and obtain the policy-owned identity manifest, if present."""
+
+    current = model
+    seen: set[int] = set()
+    while id(current) not in seen:
+        seen.add(id(current))
+        unwrapped = None
+        for attribute in ("module", "_fsdp_wrapped_module"):
+            candidate = getattr(current, attribute, None)
+            if isinstance(candidate, nn.Module) and candidate is not current:
+                unwrapped = candidate
+                break
+        if unwrapped is None:
+            break
+        current = unwrapped
+    exporter = getattr(current, "refiner_parameter_manifest", None)
+    if callable(exporter):
+        return exporter()
+    owners = [
+        module
+        for module in model.modules()
+        if callable(getattr(module, "refiner_parameter_manifest", None))
+    ]
+    if len(owners) > 1:
+        raise RuntimeError("Multiple FastWAM refiner manifest owners were found.")
+    return None if not owners else owners[0].refiner_parameter_manifest()
+
+
 class FSDPModelManager:
     """
     FSDP Model Manager for RL training
@@ -543,8 +572,20 @@ class FSDPModelManager:
                 partition_fastwam_trainable_parameters,
             )
 
+            p8_sidecar = getattr(
+                self._cfg.model,
+                "uncond_visual_sidecar",
+                None,
+            )
+            p8_enabled = bool(
+                p8_sidecar.get("enabled", False)
+                if hasattr(p8_sidecar, "get")
+                else getattr(p8_sidecar, "enabled", False)
+            )
             fastwam_groups = partition_fastwam_trainable_parameters(
-                model.named_parameters()
+                model.named_parameters(),
+                require_refiner=p8_enabled,
+                refiner_manifest=_resolve_fastwam_refiner_manifest(model),
             )
             param_groups.extend(
                 [
@@ -577,6 +618,18 @@ class FSDPModelManager:
                     },
                 ]
             )
+            if fastwam_groups.get("wan_current_refiner"):
+                param_groups.append(
+                    {
+                        "name": "wan_current_refiner",
+                        "params": fastwam_groups["wan_current_refiner"],
+                        "lr": self._cfg.optim.refiner_lr,
+                        "betas": betas,
+                        "weight_decay": self._cfg.optim.get(
+                            "refiner_weight_decay", weight_decay
+                        ),
+                    }
+                )
         elif len(params_actor) > 0:
             param_groups.append(
                 {

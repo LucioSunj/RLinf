@@ -251,6 +251,8 @@ def get_model(cfg, torch_dtype):
         FastWAMAdaptivePolicyConfig,
     )
     from .kv_replay import GateKVReplayConfig
+    from .p8_sidecar import build_p8_sidecar, validate_p8_sidecar_config
+    from .p8_visual_replay import P8VisualReplayConfig
     from .pi05_critic import Pi05ValueAfterVLMCritic
 
     if torch_dtype is None:
@@ -299,6 +301,9 @@ def get_model(cfg, torch_dtype):
         resolve=True,
     )
     replay_config = GateKVReplayConfig(**replay_payload)
+    p8_config_payload = validate_p8_sidecar_config(
+        cfg.get("uncond_visual_sidecar", {"enabled": False})
+    )
     _validate_flow_sde_config(cfg.flow_sde)
     load_critic = _validate_critic_build_config(cfg)
     inference_steps = int(cfg.runtime.get("num_inference_steps", 0))
@@ -329,6 +334,11 @@ def get_model(cfg, torch_dtype):
             cfg.get("eval_timing_cuda_synchronize", False)
         ),
         kv_replay=replay_config,
+        p8_visual_replay=(
+            None
+            if not p8_config_payload["enabled"]
+            else P8VisualReplayConfig.from_mapping(p8_config_payload["replay"])
+        ),
     )
 
     init_device = str(cfg.get("init_device", "cpu"))
@@ -362,6 +372,12 @@ def get_model(cfg, torch_dtype):
         lora_config,
     )
     gate = GateTransformer(gate_config).to(dtype=torch_dtype)
+    p8_sidecar = build_p8_sidecar(
+        p8_config_payload,
+        actor=actor,
+        device=init_device,
+        dtype=torch_dtype,
+    )
 
     critic = None
     if load_critic:
@@ -385,6 +401,13 @@ def get_model(cfg, torch_dtype):
         flow_sde_ignore_last_transition=bool(
             cfg.flow_sde.get("ignore_last_transition", False)
         ),
+        p8_encoder=None if p8_sidecar is None else p8_sidecar.encoder,
+        p8_refiner=None if p8_sidecar is None else p8_sidecar.refiner,
+        p8_replay_config=None if p8_sidecar is None else p8_sidecar.replay,
+        p8_camera_ids=None if p8_sidecar is None else p8_sidecar.camera_ids,
+        p8_camera_input_contract_sha256=(
+            None if p8_sidecar is None else p8_sidecar.camera_input_contract_sha256
+        ),
     )
     return FastWAMAdaptivePolicy(
         actor=actor,
@@ -393,6 +416,23 @@ def get_model(cfg, torch_dtype):
         gate=gate,
         critic=critic,
         config=policy_config,
+        wan_current_refiner=(None if p8_sidecar is None else p8_sidecar.refiner),
+        p8_checkpoint_contract=(
+            None
+            if p8_sidecar is None
+            else {
+                "resolved_sidecar": p8_config_payload,
+                "refiner": p8_sidecar.refiner.config.as_contract(),
+                "replay": p8_config_payload["replay"],
+                "camera_ids": list(p8_sidecar.camera_ids),
+                "camera_input_contract_sha256": (
+                    p8_sidecar.camera_input_contract_sha256
+                ),
+                "license_record_sha256": p8_sidecar.license_record_sha256,
+                "fixed_cost_profile_sha256": p8_sidecar.fixed_cost_profile_sha256,
+                "cache_visibility": "gate_base__uncond_action_shadow",
+            }
+        ),
     )
 
 

@@ -18,6 +18,8 @@ from __future__ import annotations
 
 import hashlib
 import math
+from contextlib import ExitStack
+from dataclasses import replace
 from pathlib import Path
 from typing import Any, Literal
 
@@ -35,6 +37,10 @@ from fastwam.models.wan22.kv_tap import (
     GateKVSnapshot,
     GateLayerKV,
     KeyValueBank,
+)
+from fastwam.models.wan22.visual_contracts import PreparedCameraBatch
+from fastwam.models.wan22.wan_current_refiner import (
+    WanCurrentSourceCaptureRequest,
 )
 
 from rlinf.envs.action_contract import (
@@ -57,6 +63,15 @@ from rlinf.envs.libero.image_preprocessing import (
 from .adaptive_policy import FastWAMChunkSample
 from .contracts import ChunkRouteRecord, WAMRoute
 from .kv_replay import GateKVReplayBackend
+from .p8_visual_replay import (
+    P8FrozenVisualSource,
+    P8VisualReplayConfig,
+    P8VisualReplaySpec,
+    PackedP8VisualReplay,
+    canonicalize_p8_source_bf16,
+    pack_p8_visual_sources,
+    pin_p8_visual_forward_inputs,
+)
 
 DEFAULT_FASTWAM_PROMPT_TEMPLATE = (
     "A video recorded from a robot's point of view executing the following "
@@ -374,6 +389,11 @@ class LiberoFastWAMRuntime:
         prompt_template: str = DEFAULT_FASTWAM_PROMPT_TEMPLATE,
         text_embedding_cache_dir: str | None = None,
         text_embedding_context_len: int = 128,
+        p8_encoder: Any | None = None,
+        p8_refiner: Any | None = None,
+        p8_replay_config: P8VisualReplayConfig | None = None,
+        p8_camera_ids: tuple[str, ...] | list[str] | None = None,
+        p8_camera_input_contract_sha256: str | None = None,
     ) -> None:
         self.actor = actor
         self.lora_adapter = lora_adapter
@@ -412,6 +432,29 @@ class LiberoFastWAMRuntime:
             else Path(text_embedding_cache_dir).expanduser().resolve()
         )
         self.text_embedding_context_len = int(text_embedding_context_len)
+        self.p8_encoder = p8_encoder
+        self.p8_refiner = p8_refiner
+        self.p8_replay_config = p8_replay_config
+        self.p8_camera_ids = (
+            None
+            if p8_camera_ids is None
+            else tuple(str(item) for item in p8_camera_ids)
+        )
+        self.p8_camera_input_contract_sha256 = p8_camera_input_contract_sha256
+        self.p8_replay_spec: P8VisualReplaySpec | None = None
+        p8_parts = (
+            self.p8_encoder,
+            self.p8_refiner,
+            self.p8_replay_config,
+            self.p8_camera_ids,
+            self.p8_camera_input_contract_sha256,
+        )
+        if any(part is not None for part in p8_parts) and any(
+            part is None for part in p8_parts
+        ):
+            raise ValueError(
+                "P8 runtime components must be enabled or disabled together."
+            )
         if self.num_inference_steps < 1:
             raise ValueError("Inference steps must be positive.")
         if self.flow_sde_ignore_last_transition and self.num_inference_steps < 2:
@@ -436,6 +479,18 @@ class LiberoFastWAMRuntime:
             raise ValueError(
                 f"Unsupported LIBERO camera resize mode: {self.camera_resize_mode!r}."
             )
+        if self.p8_enabled:
+            expected_cameras = (
+                ("main",) if self.camera_concat == "main_only" else ("main", "wrist")
+            )
+            if self.p8_camera_ids != expected_cameras:
+                raise ValueError(
+                    "P8 camera IDs must match the FastWAM panorama source order."
+                )
+            if (self.camera_height, self.camera_width) != (224, 224):
+                raise ValueError(
+                    "P8 native DINO inputs require per-view 224x224 crops."
+                )
         if (self.processor is None) != (self.processor_stats_path is None):
             raise ValueError(
                 "FastWAM processor and `processor_stats_path` must be configured together."
@@ -463,6 +518,126 @@ class LiberoFastWAMRuntime:
     @property
     def dtype(self) -> torch.dtype:
         return next(self.actor.parameters()).dtype
+
+    @property
+    def p8_enabled(self) -> bool:
+        """Whether the independently owned P8 sidecar is active."""
+
+        return self.p8_refiner is not None
+
+    def _p8_camera_batch(
+        self,
+        env_obs: dict[str, Any],
+        *,
+        index: int,
+    ) -> PreparedCameraBatch:
+        """Preserve official per-view crops; never reconstruct from panorama."""
+
+        if not self.p8_enabled:
+            raise RuntimeError("P8 camera preparation was called while disabled.")
+        cameras = [
+            prepare_libero_camera_batch(
+                env_obs["main_images"][index : index + 1],
+                height=self.camera_height,
+                width=self.camera_width,
+                resize_mode=self.camera_resize_mode,
+            )
+        ]
+        if self.camera_concat != "main_only":
+            cameras.append(
+                prepare_libero_camera_batch(
+                    env_obs["wrist_images"][index : index + 1],
+                    height=self.camera_height,
+                    width=self.camera_width,
+                    resize_mode=self.camera_resize_mode,
+                )
+            )
+        pixels = torch.stack(cameras, dim=1)
+        return PreparedCameraBatch(
+            pixels=pixels,
+            camera_ids=self.p8_camera_ids,
+            camera_valid_mask=torch.ones(
+                (1, len(cameras)),
+                dtype=torch.bool,
+            ),
+            input_contract_sha256=self.p8_camera_input_contract_sha256,
+        )
+
+    def _p8_camera_index(
+        self,
+        *,
+        grid_size: tuple[int, int, int],
+        batch_size: int,
+        device: torch.device,
+    ) -> torch.Tensor:
+        """Map flattened current Wan tokens to their original camera view."""
+
+        frames, height, width = (int(item) for item in grid_size)
+        if frames != 1:
+            raise ValueError("P8 source extraction requires a current-only Wan grid.")
+        if self.camera_concat == "main_only":
+            result = torch.zeros(height, width, dtype=torch.long, device=device)
+        elif self.camera_concat == "horizontal":
+            if width % 2:
+                raise ValueError("Horizontal P8 Wan grid cannot be split by camera.")
+            result = torch.zeros(height, width, dtype=torch.long, device=device)
+            result[:, width // 2 :] = 1
+        else:
+            if height % 2:
+                raise ValueError("Vertical P8 Wan grid cannot be split by camera.")
+            result = torch.zeros(height, width, dtype=torch.long, device=device)
+            result[height // 2 :, :] = 1
+        return result.reshape(1, -1).expand(batch_size, -1).contiguous()
+
+    def _ensure_p8_replay_spec(
+        self,
+        *,
+        video_pre: dict[str, Any],
+        video_cache: list[dict[str, Any]],
+        tokens_per_frame: int,
+    ) -> None:
+        if not self.p8_enabled:
+            return
+        config = self.p8_refiner.config
+        asset = self.p8_encoder.asset
+        candidate = P8VisualReplaySpec(
+            layer_indices=config.layer_indices,
+            camera_ids=self.p8_camera_ids,
+            current_frame_video_tokens=tokens_per_frame,
+            wan_hidden_dim=config.wan_hidden_dim,
+            kv_dim=int(video_cache[0]["k"].shape[-1]),
+            rope_shape=tuple(video_pre["freqs"][:tokens_per_frame].shape),
+            memory_contract_sha256=config.memory_contract_sha256,
+            source_contract_sha256=config.source_contract_sha256,
+            native_source_revision=asset.source_revision,
+            native_weights_sha256=asset.weights_sha256,
+            native_input_contract_sha256=self.p8_camera_input_contract_sha256,
+            native_preprocess_sha256=asset.preprocess_sha256,
+            native_output_contract_sha256=asset.output_contract_sha256,
+        )
+        if self.p8_replay_spec is None:
+            self.p8_replay_spec = candidate
+        elif self.p8_replay_spec != candidate:
+            raise ValueError("P8 frozen replay shape/provenance changed at runtime.")
+
+    def _prepare_p8_native_memory(
+        self,
+        *,
+        regime: PolicyRegime,
+        camera_batch: PreparedCameraBatch | None,
+    ):
+        """Route-aware DINO dispatch with an explicit IDM no-call contract."""
+
+        if regime is PolicyRegime.IDM:
+            if camera_batch is not None:
+                raise ValueError("IDM must not receive a P8 camera batch.")
+            return None
+        if not self.p8_enabled:
+            return None
+        if camera_batch is None:
+            raise ValueError("P8 UNCOND requires official per-view camera crops.")
+        self.p8_encoder.to(device=self.device)
+        return self.p8_encoder.prepare_memory(PolicyRegime.UNCOND, camera_batch)
 
     def _camera_tensor(self, image: torch.Tensor) -> torch.Tensor:
         image = prepare_libero_camera_batch(
@@ -597,7 +772,25 @@ class LiberoFastWAMRuntime:
         regime: PolicyRegime,
         idm_initial_latents: torch.Tensor | None = None,
         idm_noise_seed: int | None = None,
-    ) -> tuple[CachedActionCondition, torch.Tensor | None]:
+        p8_camera_batch: PreparedCameraBatch | None = None,
+        actor_version: int = 0,
+        extract_p8_source: bool = True,
+    ) -> tuple[
+        CachedActionCondition,
+        torch.Tensor | None,
+        P8FrozenVisualSource | None,
+    ]:
+        if regime is PolicyRegime.IDM and p8_camera_batch is not None:
+            raise ValueError("IDM must not receive P8 camera/DINO inputs.")
+        if (
+            self.p8_enabled
+            and regime is PolicyRegime.UNCOND
+            and extract_p8_source
+            and p8_camera_batch is None
+        ):
+            raise ValueError(
+                "Enabled P8 UNCOND source extraction requires per-view crops."
+            )
         first_frame = self.actor._encode_input_image_latents_tensor(
             image,
             tiled=self.tiled_vae,
@@ -692,6 +885,18 @@ class LiberoFastWAMRuntime:
             video_tokens_per_frame=tokens_per_frame,
             device=self.device,
         )
+        source_request = None
+        if self.p8_enabled and regime is PolicyRegime.UNCOND and extract_p8_source:
+            source_request = WanCurrentSourceCaptureRequest.create(
+                layer_indices=self.p8_refiner.config.layer_indices,
+                current_frame_video_tokens=tokens_per_frame,
+                camera_index_current=self._p8_camera_index(
+                    grid_size=tuple(video_pre["meta"]["grid_size"]),
+                    batch_size=int(video_pre["tokens"].shape[0]),
+                    device=video_pre["tokens"].device,
+                ),
+                source_contract_sha256=(self.p8_refiner.config.source_contract_sha256),
+            )
         video_cache = self.actor.mot.prefill_video_cache(
             video_tokens=video_pre["tokens"],
             video_freqs=video_pre["freqs"],
@@ -702,7 +907,26 @@ class LiberoFastWAMRuntime:
             },
             video_attention_mask=attention_mask[:video_seq_len, :video_seq_len],
             gate_current_frame_video_tokens=tokens_per_frame,
+            wan_current_source_capture=source_request,
         )
+        self._ensure_p8_replay_spec(
+            video_pre=video_pre,
+            video_cache=video_cache,
+            tokens_per_frame=tokens_per_frame,
+        )
+        p8_source = None
+        if source_request is not None:
+            memory = self._prepare_p8_native_memory(
+                regime=regime,
+                camera_batch=p8_camera_batch,
+            )
+            if memory is None:
+                raise RuntimeError("P8 UNCOND DINO encoder returned no memory.")
+            p8_source = canonicalize_p8_source_bf16(
+                memory=memory,
+                layers=source_request.snapshot(),
+                actor_version=actor_version,
+            )
         return (
             CachedActionCondition(
                 context=context,
@@ -713,7 +937,89 @@ class LiberoFastWAMRuntime:
                 current_frame_video_tokens=tokens_per_frame,
             ),
             replay_initial_latents,
+            p8_source,
         )
+
+    def _attach_p8_shadow(
+        self,
+        condition: CachedActionCondition,
+        source: P8FrozenVisualSource | None,
+        *,
+        actor_version: int,
+        allow_no_grad: bool,
+    ) -> CachedActionCondition:
+        """Build the action view outside frozen extraction's no-grad boundary."""
+
+        if source is None:
+            if self.p8_enabled:
+                raise ValueError(
+                    "Enabled P8 UNCOND execution is missing frozen source."
+                )
+            return condition
+        if source.actor_version != actor_version:
+            raise ValueError("P8 frozen source and live action actor versions differ.")
+        if not allow_no_grad and not torch.is_grad_enabled():
+            raise RuntimeError(
+                "Live P8 Flow replay shadow must be built with gradients."
+            )
+        action_view = self.p8_refiner.build_action_view(
+            base_video_kv_cache=condition.video_kv_cache,
+            sources=source.layers,
+            memory=source.memory,
+            video_blocks=self.actor.mot.mixtures["video"].blocks,
+            actor_version=actor_version,
+            allow_no_grad=allow_no_grad,
+        )
+        return replace(condition, action_video_kv_view=action_view)
+
+    @torch.no_grad()
+    def _attach_p8_behavior_shadow(
+        self,
+        condition: CachedActionCondition,
+        source: P8FrozenVisualSource,
+        *,
+        actor_version: int,
+    ) -> CachedActionCondition:
+        """Build rollout/eval/behavior shadows without retaining a refiner graph."""
+
+        return self._attach_p8_shadow(
+            condition,
+            source,
+            actor_version=actor_version,
+            allow_no_grad=True,
+        )
+
+    def _stored_p8_source(
+        self,
+        forward_inputs: dict[str, torch.Tensor],
+        *,
+        index: int,
+        actor_version: int,
+    ) -> P8FrozenVisualSource:
+        if self.p8_replay_spec is None:
+            raise RuntimeError("P8 replay spec was not initialized by rollout.")
+        packed = PackedP8VisualReplay.from_forward_inputs(
+            forward_inputs,
+            spec=self.p8_replay_spec,
+        )
+        return packed.materialize_sample(
+            index,
+            device=self.device,
+            expected_actor_version=actor_version,
+        )
+
+    def p8_replay_bytes_per_sample(
+        self,
+        forward_inputs: dict[str, torch.Tensor],
+    ) -> torch.Tensor:
+        """Return independently measured P8 payload bytes for budget auditing."""
+
+        if not self.p8_enabled or self.p8_replay_spec is None:
+            raise RuntimeError("P8 replay byte accounting was called while disabled.")
+        return PackedP8VisualReplay.from_forward_inputs(
+            forward_inputs,
+            spec=self.p8_replay_spec,
+        ).bytes_per_sample()
 
     def _action_schedule(self):
         # Keep schedule arithmetic in FP32. The sampler casts model timesteps
@@ -813,13 +1119,14 @@ class LiberoFastWAMRuntime:
             )
         rollouts = []
         idm_initial_latents = []
+        p8_sources: list[P8FrozenVisualSource | None] = []
         for index, route_value in enumerate(routes.tolist()):
             regime = (
                 PolicyRegime.IDM
                 if int(route_value) == int(WAMRoute.IDM)
                 else PolicyRegime.UNCOND
             )
-            condition, replay_video_noise = self._prepare_action_condition(
+            condition, replay_video_noise, p8_source = self._prepare_action_condition(
                 image=images[index : index + 1],
                 context=context[index : index + 1],
                 context_mask=context_mask[index : index + 1],
@@ -834,7 +1141,20 @@ class LiberoFastWAMRuntime:
                     if idm_noise_seeds is not None and regime is PolicyRegime.IDM
                     else None
                 ),
+                p8_camera_batch=(
+                    self._p8_camera_batch(env_obs, index=index)
+                    if self.p8_enabled and regime is PolicyRegime.UNCOND
+                    else None
+                ),
+                actor_version=actor_version,
             )
+            if self.p8_enabled and regime is PolicyRegime.UNCOND:
+                condition = self._attach_p8_behavior_shadow(
+                    condition,
+                    p8_source,
+                    actor_version=actor_version,
+                )
+            p8_sources.append(p8_source)
             if (
                 collect_replay
                 and self.gate_replay_backend is GateKVReplayBackend.RECOMPUTE
@@ -927,6 +1247,18 @@ class LiberoFastWAMRuntime:
                 idm_initial_latents,
                 dim=0,
             ).detach()
+        if collect_replay and self.p8_enabled:
+            if self.p8_replay_spec is None:
+                raise RuntimeError("P8 rollout did not initialize its replay spec.")
+            packed_p8 = pack_p8_visual_sources(
+                p8_sources,
+                spec=self.p8_replay_spec,
+            )
+            p8_inputs = {
+                name: tensor.detach().to(device="cpu")
+                for name, tensor in packed_p8.as_forward_inputs().items()
+            }
+            replay_inputs.update(pin_p8_visual_forward_inputs(p8_inputs))
         return FastWAMChunkSample(
             actions=processed_actions,
             old_flow_logprobs=select_executed_flow_statistics(
@@ -974,12 +1306,27 @@ class LiberoFastWAMRuntime:
         for index in range(chains.shape[0]):
             if int(route_info.route_used[index]) != int(WAMRoute.UNCOND):
                 continue
-            condition, _ = self._prepare_action_condition(
+            actor_version = int(route_info.actor_versions[index])
+            condition, _, _ = self._prepare_action_condition(
                 image=images[index : index + 1],
                 context=context[index : index + 1],
                 context_mask=context_mask[index : index + 1],
                 regime=PolicyRegime.UNCOND,
+                actor_version=actor_version,
+                extract_p8_source=not self.p8_enabled,
             )
+            if self.p8_enabled:
+                source = self._stored_p8_source(
+                    forward_inputs,
+                    index=index,
+                    actor_version=actor_version,
+                )
+                condition = self._attach_p8_shadow(
+                    condition,
+                    source,
+                    actor_version=actor_version,
+                    allow_no_grad=False,
+                )
             current_replay = replay_action_flow_sde_transition(
                 chains[index : index + 1],
                 indices[index : index + 1],
@@ -987,7 +1334,7 @@ class LiberoFastWAMRuntime:
                     condition,
                     regime=PolicyRegime.UNCOND,
                     capture_gate_kv=False,
-                    actor_version=int(route_info.actor_versions[index]),
+                    actor_version=actor_version,
                 ),
                 timesteps=timesteps,
                 scheduler_deltas=deltas,
@@ -1004,16 +1351,20 @@ class LiberoFastWAMRuntime:
             )
             if base_kl is not None:
                 with torch.no_grad():
+                    base_condition = replace(
+                        condition,
+                        action_video_kv_view=None,
+                    )
                     base_replay = replay_action_flow_sde_transition(
                         chains[index : index + 1],
                         indices[index : index + 1],
                         velocity_fn=self._velocity(
-                            condition,
+                            base_condition,
                             # The conditioning remains UNCOND; the IDM regime
                             # only disables the regime-gated LoRA contribution.
                             regime=PolicyRegime.IDM,
                             capture_gate_kv=False,
-                            actor_version=int(route_info.actor_versions[index]),
+                            actor_version=actor_version,
                         ),
                         timesteps=timesteps,
                         scheduler_deltas=deltas,
@@ -1088,7 +1439,18 @@ class LiberoFastWAMRuntime:
             )
         replay_actor_version = int(actor_versions.item())
         snapshots: list[GateKVSnapshot] = []
-        with self.lora_adapter.use_replay_reference(actor_version=replay_actor_version):
+        with ExitStack() as replay_stack:
+            replay_stack.enter_context(
+                self.lora_adapter.use_replay_reference(
+                    actor_version=replay_actor_version
+                )
+            )
+            if self.p8_enabled:
+                replay_stack.enter_context(
+                    self.p8_refiner.use_replay_reference(
+                        actor_version=replay_actor_version
+                    )
+                )
             first_step = timesteps.numel() - self.gate_denoise_last_n
             for step_index in range(first_step, timesteps.numel()):
                 per_sample: list[GateKVSnapshot] = []
@@ -1098,7 +1460,7 @@ class LiberoFastWAMRuntime:
                         if int(route_value) == int(WAMRoute.IDM)
                         else PolicyRegime.UNCOND
                     )
-                    condition, _ = self._prepare_action_condition(
+                    condition, _, _ = self._prepare_action_condition(
                         image=images[index : index + 1],
                         context=context[index : index + 1],
                         context_mask=context_mask[index : index + 1],
@@ -1108,7 +1470,19 @@ class LiberoFastWAMRuntime:
                             if regime is PolicyRegime.IDM
                             else None
                         ),
+                        actor_version=replay_actor_version,
+                        extract_p8_source=not self.p8_enabled,
                     )
+                    if self.p8_enabled and regime is PolicyRegime.UNCOND:
+                        condition = self._attach_p8_behavior_shadow(
+                            condition,
+                            self._stored_p8_source(
+                                forward_inputs,
+                                index=index,
+                                actor_version=replay_actor_version,
+                            ),
+                            actor_version=replay_actor_version,
+                        )
                     timestep = (
                         timesteps[step_index]
                         .to(

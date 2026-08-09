@@ -266,6 +266,32 @@ def test_fastwam_actor_checkpoint_rank_file_round_trip(
     assert '"route_state_sha256"' in audit_output
 
 
+def test_p8_actor_checkpoint_uses_v2_and_rejects_old_v1(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        worker_module,
+        "get_rng_state",
+        lambda: {"cpu": torch.tensor([8], dtype=torch.uint8)},
+    )
+    monkeypatch.setattr(worker_module, "set_rng_state", lambda _state: None)
+    monkeypatch.setattr(torch.distributed, "is_initialized", lambda: False)
+    worker = _checkpoint_worker()
+    worker.cfg.actor.model.uncond_visual_sidecar = SimpleNamespace(enabled=True)
+    checkpoint_dir = tmp_path / "actor-p8"
+    worker.save_checkpoint(str(checkpoint_dir), step=7)
+
+    checkpoint_path = checkpoint_dir / "rank_0.pt"
+    payload = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
+    assert payload["schema"] == "fastwam-adaptive-rl-checkpoint-v2-p8-a0-kv"
+
+    payload["schema"] = "fastwam-adaptive-rl-checkpoint-v1"
+    torch.save(payload, checkpoint_path)
+    with pytest.raises(ValueError, match="Unsupported FastWAM adaptive RL"):
+        worker.load_checkpoint(str(checkpoint_dir))
+
+
 def test_fastwam_actor_checkpoint_round_trips_native_step_zero(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

@@ -845,6 +845,16 @@ def _validate_fastwam_adaptive_cfg(cfg, *, only_eval: bool) -> None:
     from rlinf.models.embodiment.wam_policy.evaluation import (
         EvaluationRoutingConfig,
     )
+    from rlinf.models.embodiment.wam_policy.p8_sidecar import (
+        validate_p8_sidecar_config,
+    )
+
+    p8_payload = validate_p8_sidecar_config(
+        model_cfg.get("uncond_visual_sidecar", {"enabled": False})
+    )
+    p8_enabled = bool(p8_payload["enabled"])
+    if p8_enabled and str(model_cfg.get("precision", "")).lower() != "bf16":
+        raise ValueError("P8-A0/KV MVP requires BF16 actor/source precision.")
 
     random_probability = model_cfg.get("eval_random_idm_probability", None)
     EvaluationRoutingConfig(
@@ -902,6 +912,7 @@ def _validate_fastwam_adaptive_cfg(cfg, *, only_eval: bool) -> None:
         "eval_routing_seed",
         "eval_microbatch_size",
         "kv_replay",
+        "uncond_visual_sidecar",
         "flow_sde",
         "runtime",
         "critic",
@@ -998,6 +1009,10 @@ def _validate_fastwam_adaptive_cfg(cfg, *, only_eval: bool) -> None:
     kv_backend = str(actor_model.kv_replay.get("backend", "stored")).lower()
     weight_sync_interval = int(cfg.runner.get("weight_sync_interval", 1))
     validate_fastwam_kv_weight_sync(kv_backend, weight_sync_interval)
+    if p8_enabled and weight_sync_interval != 1:
+        raise ValueError(
+            "P8 refiner behavior/live replay requires `runner.weight_sync_interval: 1`."
+        )
     if str(OmegaConf.select(cfg, "weight_syncer.type", default="")).lower() != "patch":
         raise ValueError("FastWAM adaptive requires the patch weight syncer.")
     if not bool(
@@ -1073,6 +1088,30 @@ def _validate_fastwam_adaptive_cfg(cfg, *, only_eval: bool) -> None:
         value = OmegaConf.select(cfg, path)
         if value is None or float(value) <= 0:
             raise ValueError(f"FastWAM requires a positive `{path}`.")
+    if p8_enabled:
+        refiner_lr = OmegaConf.select(cfg, "actor.optim.refiner_lr")
+        if (
+            refiner_lr is None
+            or not math.isfinite(float(refiner_lr))
+            or float(refiner_lr) <= 0
+        ):
+            raise ValueError("Enabled P8 requires positive `actor.optim.refiner_lr`.")
+        refiner_weight_decay = float(
+            OmegaConf.select(cfg, "actor.optim.refiner_weight_decay", default=0.0)
+        )
+        if not math.isfinite(refiner_weight_decay) or refiner_weight_decay < 0:
+            raise ValueError("P8 refiner weight decay must be finite and non-negative.")
+        algorithm_p8 = cfg.algorithm.get("p8", {})
+        differential_cost = float(algorithm_p8.get("fixed_idm_differential_cost", 0.0))
+        if not math.isfinite(differential_cost) or differential_cost <= 0:
+            raise ValueError(
+                "Enabled P8 requires a preregistered positive IDM differential cost."
+            )
+        if (
+            str(algorithm_p8.get("runtime_cost_profile_sha256", "")).lower()
+            != p8_payload["fixed_cost_profile_sha256"]
+        ):
+            raise ValueError("P8 model and algorithm cost-profile hashes differ.")
 
 
 def validate_embodied_cfg(cfg):
