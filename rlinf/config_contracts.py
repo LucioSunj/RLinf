@@ -68,6 +68,26 @@ def _resolved_checkpoint_value(value: Any) -> Any:
     return value
 
 
+def is_fastwam_p6_enabled(model_cfg: Any) -> bool:
+    """Read the optional P6 flag from DictConfig, mapping, or test namespace."""
+
+    if OmegaConf.is_config(model_cfg):
+        return bool(
+            OmegaConf.select(
+                model_cfg,
+                "uncond_visual_sidecar.enabled",
+                default=False,
+            )
+        )
+    if isinstance(model_cfg, Mapping):
+        visual = model_cfg.get("uncond_visual_sidecar", {})
+    else:
+        visual = getattr(model_cfg, "uncond_visual_sidecar", None)
+    if isinstance(visual, Mapping):
+        return bool(visual.get("enabled", False))
+    return bool(getattr(visual, "enabled", False))
+
+
 def _selected_checkpoint_values(owner: Any, keys: tuple[str, ...]) -> dict[str, Any]:
     return {
         key: _resolved_checkpoint_value(OmegaConf.select(owner, key, default=None))
@@ -81,6 +101,8 @@ _FASTWAM_EVAL_RUNTIME_ONLY_PATHS = (
     "init_device",
     "fastwam.load_text_encoder",
     "runtime.text_embedding_cache_dir",
+    "uncond_visual_sidecar.dino.source_root",
+    "uncond_visual_sidecar.dino.weights_path",
     "gate_epsilon",
     "eval_routing_mode",
     "eval_idm_threshold",
@@ -197,7 +219,17 @@ def validate_fastwam_eval_checkpoint_contract(
 
     if not isinstance(payload, Mapping):
         raise TypeError("FastWAM evaluation checkpoint payload must be a mapping.")
-    if payload.get("schema") != "fastwam-adaptive-rl-checkpoint-v1":
+    live_model = _resolved_mapping(
+        live_model_cfg,
+        name="FastWAM live evaluation model config",
+    )
+    visual_enabled = is_fastwam_p6_enabled(live_model)
+    expected_schema = (
+        "fastwam-adaptive-rl-checkpoint-v2-p6"
+        if visual_enabled
+        else "fastwam-adaptive-rl-checkpoint-v1"
+    )
+    if payload.get("schema") != expected_schema:
         raise ValueError("Unsupported FastWAM adaptive evaluation checkpoint.")
     expected_parent = str(expected_parent_checkpoint_sha256).strip().lower()
     if len(expected_parent) != 64 or any(
@@ -218,10 +250,6 @@ def validate_fastwam_eval_checkpoint_contract(
             "FastWAM evaluation checkpoint contract has the wrong parent hash."
         )
     if load_critic:
-        live_model = _resolved_mapping(
-            live_model_cfg,
-            name="FastWAM live evaluation model config",
-        )
         live_critic = live_model.get("critic")
         expected_critic_parent = (
             str(

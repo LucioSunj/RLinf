@@ -56,7 +56,10 @@ from rlinf.algorithms.utils import (
     kl_penalty,
 )
 from rlinf.config import SupportedModel, torch_dtype_from_precision
-from rlinf.config_contracts import build_fastwam_checkpoint_contract
+from rlinf.config_contracts import (
+    build_fastwam_checkpoint_contract,
+    is_fastwam_p6_enabled,
+)
 from rlinf.data.embodied_io_struct import (
     ACTOR_TRAJECTORY_CHANNEL_TAG,
     Trajectory,
@@ -1585,7 +1588,11 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
                 policy.set_global_step(int(step))
                 self.version = int(step)
                 payload = {
-                    "schema": "fastwam-adaptive-rl-checkpoint-v1",
+                    "schema": (
+                        "fastwam-adaptive-rl-checkpoint-v2-p6"
+                        if is_fastwam_p6_enabled(self.cfg.actor.model)
+                        else "fastwam-adaptive-rl-checkpoint-v1"
+                    ),
                     "step": int(step),
                     "optimizer_steps": int(self.optimizer_steps),
                     "parent_checkpoint_sha256": str(
@@ -1675,7 +1682,13 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
                         "FastWAM adaptive RL checkpoint keys changed: "
                         f"{sorted(payload)}."
                     )
-                if payload.get("schema") != "fastwam-adaptive-rl-checkpoint-v1":
+                policy = self._fastwam_policy_module()
+                expected_schema = (
+                    "fastwam-adaptive-rl-checkpoint-v2-p6"
+                    if is_fastwam_p6_enabled(self.cfg.actor.model)
+                    else "fastwam-adaptive-rl-checkpoint-v1"
+                )
+                if payload.get("schema") != expected_schema:
                     raise ValueError(
                         "Unsupported FastWAM adaptive RL checkpoint schema."
                     )
@@ -1712,7 +1725,6 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
                         "FastWAM adaptive checkpoint/config contract mismatch."
                     )
 
-                policy = self._fastwam_policy_module()
                 saved_policy = payload["policy"]
                 if "route_tracker" not in saved_policy:
                     raise ValueError(
@@ -2343,6 +2355,8 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
                 for group in self.optimizer.param_groups
             }
             expected = {"gate", "uncond_lora", "value_head"}
+            if "visual_router" in lr_by_name:
+                expected.add("visual_router")
             if set(lr_by_name) != expected:
                 raise RuntimeError(
                     "FastWAM adaptive optimizer groups changed unexpectedly: "
@@ -2355,6 +2369,8 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
                     "critic/lr": lr_by_name["value_head"],
                 }
             )
+            if "visual_router" in lr_by_name:
+                data["uncond_visual/router_lr"] = lr_by_name["visual_router"]
             return data
         data["actor/lr"] = lr_list[0]
         if len(lr_list) > 1:
@@ -2427,6 +2443,18 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
             )
 
             self.rollout_batch["forward_inputs"] = pin_gate_kv_forward_inputs(
+                self.rollout_batch.get("forward_inputs", {})
+            )
+        if SupportedModel(
+            self.cfg.actor.model.model_type
+        ) is SupportedModel.FASTWAM_ADAPTIVE and is_fastwam_p6_enabled(
+            self.cfg.actor.model
+        ):
+            from rlinf.models.embodiment.wam_policy.visual_replay import (
+                pin_visual_replay_forward_inputs,
+            )
+
+            self.rollout_batch["forward_inputs"] = pin_visual_replay_forward_inputs(
                 self.rollout_batch.get("forward_inputs", {})
             )
 

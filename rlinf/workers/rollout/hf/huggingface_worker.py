@@ -33,6 +33,7 @@ from rlinf.algorithms.rlt import (
 from rlinf.config import SupportedModel
 from rlinf.config_contracts import (
     build_fastwam_checkpoint_contract,
+    is_fastwam_p6_enabled,
     validate_fastwam_eval_checkpoint_contract,
 )
 from rlinf.data.embodied_io_struct import (
@@ -283,6 +284,15 @@ class MultiStepRolloutWorker(Worker):
             world_size=int(self._world_size),
         )
 
+    def _fastwam_rollout_checkpoint_schema(self) -> str:
+        """Select the outer rollout schema from the resolved P6 enable flag."""
+
+        return (
+            "fastwam-adaptive-rollout-runtime-v2-p6"
+            if is_fastwam_p6_enabled(self.model_cfg)
+            else "fastwam-adaptive-rollout-runtime-v1"
+        )
+
     def _restore_fastwam_step0_training_runtime(
         self,
         payload: dict[str, Any],
@@ -378,7 +388,7 @@ class MultiStepRolloutWorker(Worker):
                 "FastWAM rollout worker and policy versions disagree at save."
             )
         payload = {
-            "schema": "fastwam-adaptive-rollout-runtime-v1",
+            "schema": self._fastwam_rollout_checkpoint_schema(),
             "rank": int(self._rank),
             "world_size": int(self._world_size),
             "step": step,
@@ -439,7 +449,7 @@ class MultiStepRolloutWorker(Worker):
             raise ValueError(
                 f"FastWAM rollout-runtime checkpoint keys changed: {sorted(payload)}."
             )
-        if payload.get("schema") != "fastwam-adaptive-rollout-runtime-v1":
+        if payload.get("schema") != self._fastwam_rollout_checkpoint_schema():
             raise ValueError("Unsupported FastWAM rollout-runtime schema.")
         if int(payload.get("rank", -1)) != int(self._rank) or int(
             payload.get("world_size", -1)

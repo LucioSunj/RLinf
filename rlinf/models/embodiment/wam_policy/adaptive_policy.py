@@ -198,6 +198,8 @@ class FastWAMAdaptivePolicy(nn.Module, BasePolicy):
         lora_adapter: Any,
         gate: nn.Module,
         critic: nn.Module | None,
+        visual_encoder: nn.Module | None = None,
+        visual_reader: nn.Module | None = None,
         config: FastWAMAdaptivePolicyConfig | None = None,
     ) -> None:
         super().__init__()
@@ -206,10 +208,34 @@ class FastWAMAdaptivePolicy(nn.Module, BasePolicy):
         self.lora_adapter = lora_adapter
         self.gate = gate
         self.critic = critic
+        if (visual_encoder is None) != (visual_reader is None):
+            raise ValueError(
+                "FastWAM visual encoder and reader must be supplied together."
+            )
+        self.visual_encoder = visual_encoder
+        self.visual_reader = visual_reader
         self.config = config or FastWAMAdaptivePolicyConfig()
         self.route_tracker = PendingRouteTracker()
         self.actor_version = 0
         self._enforce_frozen_actor()
+        if self.visual_encoder is not None:
+            self.visual_encoder.requires_grad_(False)
+            self.visual_encoder.eval()
+            manifest = self.visual_reader.trainable_parameter_manifest()
+            if set(manifest) != {"visual_router"}:
+                raise ValueError(
+                    "P6 visual reader must own exactly the `visual_router` family."
+                )
+            manifest_names = set(manifest["visual_router"])
+            trainable_names = {
+                name
+                for name, parameter in self.visual_reader.named_parameters()
+                if parameter.requires_grad
+            }
+            if not manifest_names or manifest_names != trainable_names:
+                raise ValueError(
+                    "P6 visual-router manifest does not match trainable tensors."
+                )
         self.actor.eval()
 
     def _require_critic(self) -> nn.Module:
@@ -218,6 +244,97 @@ class FastWAMAdaptivePolicy(nn.Module, BasePolicy):
                 "The pi0.5 critic is intentionally absent from standalone evaluation."
             )
         return self.critic
+
+    @property
+    def project_checkpoint_schema(self) -> str:
+        """Return the outer actor/evaluation schema for the active capacity."""
+
+        return (
+            "fastwam-adaptive-rl-checkpoint-v1"
+            if self.visual_reader is None
+            else "fastwam-adaptive-rl-checkpoint-v2-p6"
+        )
+
+    @property
+    def rollout_checkpoint_schema(self) -> str:
+        """Return the rollout-worker checkpoint schema for the active capacity."""
+
+        return (
+            "fastwam-adaptive-rollout-runtime-v1"
+            if self.visual_reader is None
+            else "fastwam-adaptive-rollout-runtime-v2-p6"
+        )
+
+    def visual_runtime_contract(self) -> dict[str, Any] | None:
+        """Return the tensor-free reader/geometry/replay contract for sync/resume."""
+
+        if self.visual_reader is None:
+            return None
+        sidecar = getattr(self.runtime, "visual_sidecar", None)
+        if sidecar is None:
+            raise RuntimeError("P6 policy and runtime sidecar ownership differ.")
+        replay = sidecar.replay
+        asset = sidecar.asset
+        return {
+            "schema": "fastwam-p6-runtime-contract-v1",
+            "reader_kind": self.visual_reader.reader_kind,
+            "reader_contract_sha256": self.visual_reader.reader_contract_sha256,
+            "parameter_family": self.visual_reader.parameter_family,
+            "memory_contract_sha256": self.visual_reader.memory_contract_sha256,
+            "source_revision": asset.source_revision,
+            "weights_sha256": asset.weights_sha256,
+            "preprocess_sha256": asset.preprocess_sha256,
+            "output_contract_sha256": asset.output_contract_sha256,
+            "camera_input_contract_sha256": sidecar.camera_input_contract_sha256,
+            "spatial_transport_contract_sha256": (
+                sidecar.spatial_metadata.spatial_transport_contract_sha256
+            ),
+            "transport_sha256": sidecar.transport.transport_sha256,
+            "gate_visibility": "base_video_direct_p6_indirect_via_action_kv",
+            "camera_order": list(sidecar.spatial_metadata.camera_order),
+            "dino_patch_grid": list(sidecar.spatial_metadata.dino_patch_grid),
+            "wan_grid": [
+                sidecar.spatial_metadata.wan_grid_f,
+                sidecar.spatial_metadata.wan_grid_h,
+                sidecar.spatial_metadata.wan_grid_w,
+            ],
+            "replay": {
+                "backend": replay.backend.value,
+                "storage_dtype": replay.storage_dtype,
+                "pin_memory": replay.pin_memory,
+                "max_bytes_per_sample": replay.max_bytes_per_sample,
+                "max_aggregate_bytes": replay.max_aggregate_bytes,
+            },
+        }
+
+    def visual_router_parameter_ids(self) -> frozenset[int]:
+        """Resolve P6 optimizer ownership from the reader's typed manifest."""
+
+        if self.visual_reader is None:
+            return frozenset()
+        manifest = self.visual_reader.trainable_parameter_manifest()
+        if set(manifest) != {"visual_router"}:
+            raise RuntimeError(
+                "P6 visual reader must expose exactly the visual_router family."
+            )
+        named = dict(self.visual_reader.named_parameters())
+        manifest_names = tuple(manifest["visual_router"])
+        missing = sorted(set(manifest_names) - set(named))
+        if missing:
+            raise RuntimeError(
+                f"P6 visual-router manifest references missing parameters: {missing}."
+            )
+        parameter_ids = frozenset(id(named[name]) for name in manifest_names)
+        trainable_ids = frozenset(
+            id(parameter)
+            for parameter in self.visual_reader.parameters()
+            if parameter.requires_grad
+        )
+        if not parameter_ids or parameter_ids != trainable_ids:
+            raise RuntimeError(
+                "P6 visual-router manifest differs from the live trainable reader."
+            )
+        return parameter_ids
 
     def _enforce_frozen_actor(self) -> None:
         """Keep only the injected UNCOND LoRA trainable inside FastWAM."""
@@ -246,6 +363,9 @@ class FastWAMAdaptivePolicy(nn.Module, BasePolicy):
         super().train(mode)
         self.actor.eval()
         self.gate.train(mode)
+        if self.visual_encoder is not None:
+            self.visual_encoder.eval()
+            self.visual_reader.train(mode)
         if self.critic is not None:
             self.critic.train(mode)
         return self
@@ -314,6 +434,10 @@ class FastWAMAdaptivePolicy(nn.Module, BasePolicy):
         self.lora_adapter.capture_replay_reference(
             actor_version=self.actor_version,
         )
+        if self.visual_reader is not None:
+            self.visual_reader.capture_replay_reference(
+                actor_version=self.actor_version,
+            )
 
     @staticmethod
     def _routing_metadata(
@@ -775,8 +899,9 @@ class FastWAMAdaptivePolicy(nn.Module, BasePolicy):
         gate_lr: float,
         lora_lr: float,
         value_lr: float,
+        visual_router_lr: float | None = None,
     ) -> list[dict[str, Any]]:
-        """Return disjoint Gate, LoRA, and fresh-value-head optimizer groups."""
+        """Return disjoint adaptive optimizer groups with optional P6 ownership."""
 
         critic = self._require_critic()
         groups = [
@@ -808,6 +933,20 @@ class FastWAMAdaptivePolicy(nn.Module, BasePolicy):
                 "lr": value_lr,
             },
         ]
+        if self.visual_reader is not None:
+            if visual_router_lr is None or float(visual_router_lr) <= 0:
+                raise ValueError("Enabled P6 requires a positive `visual_router_lr`.")
+            groups.append(
+                {
+                    "name": "visual_router",
+                    "params": [
+                        parameter
+                        for parameter in self.visual_reader.parameters()
+                        if parameter.requires_grad
+                    ],
+                    "lr": float(visual_router_lr),
+                }
+            )
         empty_groups = [group["name"] for group in groups if not group["params"]]
         if empty_groups:
             raise RuntimeError(f"FastWAM optimizer groups are empty: {empty_groups}.")
@@ -822,14 +961,21 @@ class FastWAMAdaptivePolicy(nn.Module, BasePolicy):
         """Save only adaptive state plus delayed-route schedules."""
 
         critic = self._require_critic()
-        return {
-            "schema": "fastwam-adaptive-policy-v1",
+        payload = {
+            "schema": (
+                "fastwam-adaptive-policy-v1"
+                if self.visual_reader is None
+                else "fastwam-adaptive-policy-v2-p6"
+            ),
             "actor_version": self.actor_version,
             "gate": self.gate.state_dict(),
             "lora": self.lora_adapter.lora_state_dict(),
             "value_head": critic.value_head.state_dict(),
             "route_tracker": self.route_tracker.state_dict(),
         }
+        if self.visual_reader is not None:
+            payload["visual_reader"] = self.visual_reader.export_trainable_state()
+        return payload
 
     def load_trainable_state_dict(self, payload: dict[str, Any]) -> None:
         expected_keys = {
@@ -840,16 +986,27 @@ class FastWAMAdaptivePolicy(nn.Module, BasePolicy):
             "value_head",
             "route_tracker",
         }
+        expected_schema = "fastwam-adaptive-policy-v1"
+        if self.visual_reader is not None:
+            expected_keys.add("visual_reader")
+            expected_schema = "fastwam-adaptive-policy-v2-p6"
         if set(payload) != expected_keys:
             raise ValueError(
                 f"FastWAM adaptive-policy checkpoint keys changed: {sorted(payload)}."
             )
-        if payload.get("schema") != "fastwam-adaptive-policy-v1":
+        if payload.get("schema") != expected_schema:
+            if self.visual_reader is not None:
+                raise ValueError(
+                    "Enabled P6 requires a visual-reader checkpoint; old schemas "
+                    "cannot silently initialize it."
+                )
             raise ValueError("Unsupported FastWAM adaptive-policy checkpoint.")
         self.gate.load_state_dict(payload["gate"], strict=True)
         self.lora_adapter.load_lora_state_dict(payload["lora"], strict=True)
         if self.critic is not None:
             self.critic.value_head.load_state_dict(payload["value_head"], strict=True)
+        if self.visual_reader is not None:
+            self.visual_reader.load_trainable_state(payload["visual_reader"])
         self.route_tracker.load_state_dict(payload["route_tracker"])
         actor_version = int(payload["actor_version"])
         if actor_version < 0:
@@ -861,22 +1018,38 @@ class FastWAMAdaptivePolicy(nn.Module, BasePolicy):
     def rollout_runtime_state_dict(self) -> dict[str, Any]:
         """Serialize only delayed-route runtime state owned by rollout workers."""
 
-        return {
-            "schema": "fastwam-adaptive-rollout-policy-runtime-v1",
+        payload = {
+            "schema": (
+                "fastwam-adaptive-rollout-policy-runtime-v1"
+                if self.visual_reader is None
+                else "fastwam-adaptive-rollout-policy-runtime-v2-p6"
+            ),
             "actor_version": self.actor_version,
             "route_tracker": self.route_tracker.state_dict(),
         }
+        if self.visual_reader is not None:
+            payload["visual_contract"] = self.visual_runtime_contract()
+        return payload
 
     def load_rollout_runtime_state_dict(self, payload: dict[str, Any]) -> None:
         """Restore rollout-owned delayed routes without duplicating trainables."""
 
         expected_keys = {"schema", "actor_version", "route_tracker"}
+        expected_schema = "fastwam-adaptive-rollout-policy-runtime-v1"
+        if self.visual_reader is not None:
+            expected_keys.add("visual_contract")
+            expected_schema = "fastwam-adaptive-rollout-policy-runtime-v2-p6"
         if set(payload) != expected_keys:
             raise ValueError(
                 f"FastWAM rollout-runtime policy keys changed: {sorted(payload)}."
             )
-        if payload.get("schema") != ("fastwam-adaptive-rollout-policy-runtime-v1"):
+        if payload.get("schema") != expected_schema:
             raise ValueError("Unsupported FastWAM rollout-runtime policy schema.")
+        if (
+            self.visual_reader is not None
+            and payload.get("visual_contract") != self.visual_runtime_contract()
+        ):
+            raise ValueError("P6 rollout reader/transport/replay contract mismatch.")
         actor_version = int(payload["actor_version"])
         if actor_version < 0:
             raise ValueError("Rollout-runtime actor version must be non-negative.")
@@ -895,7 +1068,7 @@ class FastWAMAdaptivePolicy(nn.Module, BasePolicy):
     ) -> int:
         """Restore adaptive policy state from one actor-rank project checkpoint."""
 
-        if payload.get("schema") != "fastwam-adaptive-rl-checkpoint-v1":
+        if payload.get("schema") != self.project_checkpoint_schema:
             raise ValueError("Unsupported FastWAM adaptive evaluation checkpoint.")
         expected_parent = str(expected_parent_checkpoint_sha256).strip().lower()
         if len(expected_parent) != 64 or any(

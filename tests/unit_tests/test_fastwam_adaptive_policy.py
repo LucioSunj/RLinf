@@ -15,9 +15,10 @@
 import hashlib
 import importlib.util
 import sys
+from contextlib import contextmanager
 from enum import Enum
 from pathlib import Path
-from types import ModuleType
+from types import ModuleType, SimpleNamespace
 
 import pytest
 import torch
@@ -27,11 +28,24 @@ OUTER = Path(__file__).resolve().parents[3]
 sys.path.insert(0, str(OUTER / "FastWAM/src"))
 
 from fastwam.adapters import PolicyRegime  # noqa: E402
+from fastwam.models.wan22.dinov3_memory import (  # noqa: E402
+    DINO_V3_OUTPUT_CONTRACT_SHA256,
+    DINO_V3_PREPROCESS_SHA256,
+    PINNED_DINOV3_SOURCE_REVISION,
+)
 from fastwam.models.wan22.kv_tap import (  # noqa: E402
     GateKVSnapshot,
     GateLayerKV,
     KeyValueBank,
     KVSource,
+)
+from fastwam.models.wan22.visual_contracts import (  # noqa: E402
+    WAN_FLATTEN_ORDER,
+    WAN_VIDEO_VALUE_LAYOUT,
+    NativePatchMemory,
+    PreparedCameraBatch,
+    WanValueSpatialMetadata,
+    build_area_overlap_dino_wan_transport,
 )
 
 
@@ -218,6 +232,79 @@ class _LoRA:
         self.replay_reference_version = actor_version
 
 
+class _VisualReader(nn.Module):
+    reader_kind = "test-p6-reader"
+    reader_contract_sha256 = "1" * 64
+    memory_contract_sha256 = "2" * 64
+    parameter_family = "visual_router"
+
+    def __init__(self):
+        super().__init__()
+        self.router = nn.Linear(1, 1, bias=False)
+        self.replay_reference_version = None
+        self.replay_reference_weight = None
+
+    def trainable_parameter_manifest(self):
+        return {"visual_router": ("router.weight",)}
+
+    def export_trainable_state(self):
+        return {
+            "schema": "test-reader-v1",
+            "state": {"router.weight": self.router.weight.detach().clone()},
+        }
+
+    def load_trainable_state(self, payload):
+        if set(payload) != {"schema", "state"} or payload["schema"] != (
+            "test-reader-v1"
+        ):
+            raise ValueError("test visual reader state mismatch")
+        self.router.weight.data.copy_(payload["state"]["router.weight"])
+
+    def capture_replay_reference(self, *, actor_version):
+        self.replay_reference_version = actor_version
+        self.replay_reference_weight = self.router.weight.detach().clone()
+
+    @contextmanager
+    def use_replay_reference(self, *, actor_version):
+        if actor_version != self.replay_reference_version:
+            raise ValueError("test visual replay version mismatch")
+        current = self.router.weight.detach().clone()
+        try:
+            self.router.weight.data.copy_(self.replay_reference_weight)
+            yield
+        finally:
+            self.router.weight.data.copy_(current)
+
+
+def _visual_sidecar(reader):
+    return SimpleNamespace(
+        reader=reader,
+        replay=SimpleNamespace(
+            backend=SimpleNamespace(value="stored_native"),
+            storage_dtype="bfloat16",
+            pin_memory=True,
+            max_bytes_per_sample=1024,
+            max_aggregate_bytes=4096,
+        ),
+        asset=SimpleNamespace(
+            source_revision="3" * 40,
+            weights_sha256="4" * 64,
+            preprocess_sha256="5" * 64,
+            output_contract_sha256="6" * 64,
+        ),
+        camera_input_contract_sha256="7" * 64,
+        spatial_metadata=SimpleNamespace(
+            spatial_transport_contract_sha256="8" * 64,
+            camera_order=("main", "wrist"),
+            dino_patch_grid=(14, 14),
+            wan_grid_f=1,
+            wan_grid_h=7,
+            wan_grid_w=14,
+        ),
+        transport=SimpleNamespace(transport_sha256="9" * 64),
+    )
+
+
 def _make_policy(
     backend="stored",
     *,
@@ -226,13 +313,20 @@ def _make_policy(
     eval_random_idm_probability=None,
     eval_routing_seed=0,
     eval_timing_cuda_synchronize=False,
+    with_visual=False,
 ):
+    runtime = _Runtime()
+    reader = _VisualReader() if with_visual else None
+    if reader is not None:
+        runtime.visual_sidecar = _visual_sidecar(reader)
     return FastWAMAdaptivePolicy(
         actor=nn.Linear(1, 1),
-        runtime=_Runtime(),
+        runtime=runtime,
         lora_adapter=_LoRA(),
         gate=_Gate(),
         critic=_Critic() if with_critic else None,
+        visual_encoder=nn.Linear(1, 1, bias=False) if with_visual else None,
+        visual_reader=reader,
         config=FastWAMAdaptivePolicyConfig(
             gate_epsilon=0.0,
             eval_idm_threshold=0.5,
@@ -483,6 +577,108 @@ def test_libero_critic_observation_canonicalizes_optional_camera_keys():
     assert explicit["extra_view_images"] is extra_view_images
 
 
+def test_p6_runtime_calls_dino_once_for_uncond_subset_and_never_for_idm() -> None:
+    metadata = WanValueSpatialMetadata(
+        wan_grid_f=1,
+        wan_grid_h=2,
+        wan_grid_w=4,
+        current_frame_video_tokens=8,
+        wan_flatten_order=WAN_FLATTEN_ORDER,
+        vae_model_type="WanVideoVAE38",
+        vae_weights_sha256="1" * 64,
+        vae_spatial_downsample_factor=16,
+        video_dit_weights_sha256="2" * 64,
+        video_dit_patch_size=(1, 2, 2),
+        video_attention_num_heads=2,
+        video_attention_head_dim=4,
+        video_value_layout=WAN_VIDEO_VALUE_LAYOUT,
+        video_value_rope_applied=False,
+        camera_concat_mode="horizontal",
+        camera_order=("main", "wrist"),
+        per_camera_post_crop_hw=((224, 224), (224, 224)),
+        per_camera_combined_rgb_box=((0, 0, 224, 224), (0, 224, 224, 448)),
+        per_camera_wan_grid_support=((0, 2, 0, 2), (0, 2, 2, 4)),
+        dino_patch_grid=(14, 14),
+        dino_preprocess_sha256=DINO_V3_PREPROCESS_SHA256,
+        invalid_mask_policy="renormalize_active_or_fail_closed",
+    )
+    camera_batch = PreparedCameraBatch(
+        pixels=torch.zeros(1, 2, 3, 224, 224, dtype=torch.uint8),
+        camera_ids=("main", "wrist"),
+        camera_valid_mask=torch.ones(1, 2, dtype=torch.bool),
+        input_contract_sha256="3" * 64,
+    )
+    memory = NativePatchMemory(
+        tokens=torch.randn(1, 2, 196, 384).detach(),
+        patch_valid_mask=torch.ones(1, 2, 196, dtype=torch.bool),
+        camera_valid_mask=torch.ones(1, 2, dtype=torch.bool),
+        camera_ids=("main", "wrist"),
+        grid=(14, 14),
+        source_revision=PINNED_DINOV3_SOURCE_REVISION,
+        weights_sha256="4" * 64,
+        input_contract_sha256="3" * 64,
+        preprocess_sha256=DINO_V3_PREPROCESS_SHA256,
+        output_contract_sha256=DINO_V3_OUTPUT_CONTRACT_SHA256,
+        memory_contract_sha256="5" * 64,
+    )
+
+    class Encoder:
+        calls = 0
+
+        def prepare_memory(self, regime, prepared):
+            assert regime is PolicyRegime.UNCOND
+            assert prepared is camera_batch
+            self.calls += 1
+            return memory
+
+    replay_module = sys.modules["fastwam_policy_composite_under_test.visual_replay"]
+    runtime = _runtime_module.LiberoFastWAMRuntime.__new__(
+        _runtime_module.LiberoFastWAMRuntime
+    )
+    runtime.visual_sidecar = object()
+    runtime.visual_encoder = Encoder()
+    runtime.visual_spatial_metadata = metadata
+    runtime.visual_transport = build_area_overlap_dino_wan_transport(metadata)
+    runtime.visual_replay = replay_module.VisualReplayConfig(
+        backend="stored_native",
+        storage_dtype="bfloat16",
+        pin_memory=True,
+        max_bytes_per_sample=1 << 22,
+        max_aggregate_bytes=1 << 24,
+    )
+    runtime.camera_height = 224
+    runtime.camera_width = 224
+    runtime._visual_camera_batch = lambda *_args, **_kwargs: camera_batch
+    env_obs = {"states": torch.zeros(2, 8)}
+
+    memories, replay = runtime._prepare_visual_rollout(
+        env_obs=env_obs,
+        routes=torch.tensor([1, 1]),
+        collect_replay=True,
+    )
+    assert memories == {}
+    assert runtime.visual_encoder.calls == 0
+    assert replay["visual_route_mask"].tolist() == [False, False]
+
+    memories, replay = runtime._prepare_visual_rollout(
+        env_obs=env_obs,
+        routes=torch.tensor([1, 0]),
+        collect_replay=True,
+    )
+    assert set(memories) == {1}
+    assert runtime.visual_encoder.calls == 1
+    assert replay["visual_route_mask"].tolist() == [False, True]
+    runtime._validate_visual_replay_route_alignment(
+        replay,
+        SimpleNamespace(route_used=torch.tensor([1, 0])),
+    )
+    with pytest.raises(ValueError, match="consumed UNCOND routes"):
+        runtime._validate_visual_replay_route_alignment(
+            {**replay, "visual_route_mask": torch.tensor([True, True])},
+            SimpleNamespace(route_used=torch.tensor([1, 0])),
+        )
+
+
 def test_standalone_eval_runs_and_restores_gate_lora_without_critic():
     source = _make_policy()
     source.set_global_step(3)
@@ -669,6 +865,128 @@ def test_trainable_checkpoint_excludes_frozen_actor_and_round_trips_version():
     restored.load_trainable_state_dict(payload)
     assert restored.actor_version == 3
     assert torch.equal(restored.gate.bias, policy.gate.bias)
+
+
+def test_p6_checkpoint_optimizer_and_rollout_contract_are_strict() -> None:
+    policy = _make_policy(with_visual=True)
+    policy.set_global_step(4)
+    with torch.no_grad():
+        policy.visual_reader.router.weight.fill_(7.0)
+    payload = policy.trainable_state_dict()
+
+    assert policy.project_checkpoint_schema == ("fastwam-adaptive-rl-checkpoint-v2-p6")
+    assert payload["schema"] == "fastwam-adaptive-policy-v2-p6"
+    assert "visual_reader" in payload
+    assert [
+        group["name"]
+        for group in policy.optimizer_parameter_groups(
+            gate_lr=1e-4,
+            lora_lr=1e-5,
+            value_lr=1e-4,
+            visual_router_lr=3e-5,
+        )
+    ] == ["gate", "uncond_lora", "value_head", "visual_router"]
+
+    restored = _make_policy(with_visual=True)
+    restored.load_trainable_state_dict(payload)
+    assert restored.actor_version == 4
+    assert torch.equal(
+        restored.visual_reader.router.weight,
+        policy.visual_reader.router.weight,
+    )
+
+    old = dict(payload)
+    old.pop("visual_reader")
+    old["schema"] = "fastwam-adaptive-policy-v1"
+    with pytest.raises(ValueError, match="checkpoint keys changed"):
+        _make_policy(with_visual=True).load_trainable_state_dict(old)
+
+    runtime_state = policy.rollout_runtime_state_dict()
+    assert runtime_state["schema"] == ("fastwam-adaptive-rollout-policy-runtime-v2-p6")
+    restored.load_rollout_runtime_state_dict(runtime_state)
+    tampered = {
+        **runtime_state,
+        "visual_contract": {
+            **runtime_state["visual_contract"],
+            "transport_sha256": "0" * 64,
+        },
+    }
+    with pytest.raises(ValueError, match="reader/transport/replay contract"):
+        restored.load_rollout_runtime_state_dict(tampered)
+
+
+def test_p6_behavior_reference_and_outer_v1_rejection() -> None:
+    policy = _make_policy(backend="recompute", with_visual=True, with_critic=False)
+    policy.capture_gate_recompute_reference()
+    assert policy.lora_adapter.replay_reference_version == 0
+    assert policy.visual_reader.replay_reference_version == 0
+
+    parent_sha256 = "a" * 64
+    with pytest.raises(ValueError, match="Unsupported FastWAM adaptive evaluation"):
+        policy.load_eval_checkpoint(
+            {
+                "schema": "fastwam-adaptive-rl-checkpoint-v1",
+                "step": 0,
+                "parent_checkpoint_sha256": parent_sha256,
+                "contract": {
+                    "model": {"actor_checkpoint_sha256": parent_sha256},
+                },
+                "policy": {},
+            },
+            expected_parent_checkpoint_sha256=parent_sha256,
+        )
+
+
+def test_p6_gate_recompute_uses_behavior_reader_but_flow_uses_live_grad() -> None:
+    policy = _make_policy(backend="recompute", with_visual=True)
+
+    class ReaderAwareRuntime(_Runtime):
+        def __init__(self, reader):
+            super().__init__()
+            self.reader = reader
+            self.behavior_weight_seen = None
+
+        def recompute_gate_snapshots(self, *, forward_inputs, route_info):
+            del forward_inputs
+            with self.reader.use_replay_reference(
+                actor_version=int(route_info.actor_versions[0])
+            ):
+                self.behavior_weight_seen = float(self.reader.router.weight.item())
+                return _snapshots(route_info.route_used)
+
+        def replay_action_batch(self, *, forward_inputs, route_info):
+            del route_info
+            batch = forward_inputs["critic_states"].shape[0]
+            flow = self.reader.router.weight.reshape(1, 1, 1).expand(batch, 2, 3)
+            return {
+                "flow_logprobs": flow,
+                "flow_entropy": torch.ones_like(flow),
+            }
+
+    policy.runtime = ReaderAwareRuntime(policy.visual_reader)
+    with torch.no_grad():
+        policy.visual_reader.router.weight.fill_(1.0)
+    obs = {
+        "states": torch.ones(2, 3),
+        "_fastwam_env_ids": torch.tensor([1, 2]),
+        "_fastwam_reset_mask": torch.tensor([True, True]),
+    }
+    _, rollout = policy.predict_action_batch(obs, mode="train")
+    policy.capture_gate_recompute_reference()
+    with torch.no_grad():
+        policy.visual_reader.router.weight.fill_(2.0)
+
+    replay = policy.default_forward(
+        rollout["forward_inputs"],
+        route_info=rollout["route_info"],
+        emitted_gate=rollout["emitted_gate"],
+        compute_values=False,
+    )
+    replay["flow_logprobs"].sum().backward()
+
+    assert policy.runtime.behavior_weight_seen == 1.0
+    assert policy.visual_reader.router.weight.item() == 2.0
+    assert policy.visual_reader.router.weight.grad.item() == 12.0
 
 
 def test_native_all_layer_policy_payload_round_trips_without_frozen_actor() -> None:

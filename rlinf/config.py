@@ -845,6 +845,14 @@ def _validate_fastwam_adaptive_cfg(cfg, *, only_eval: bool) -> None:
     from rlinf.models.embodiment.wam_policy.evaluation import (
         EvaluationRoutingConfig,
     )
+    from rlinf.models.embodiment.wam_policy.visual_sidecar import (
+        validate_uncond_visual_sidecar_config,
+    )
+
+    visual_payload = model_cfg.get("uncond_visual_sidecar", {"enabled": False})
+    if OmegaConf.is_config(visual_payload):
+        visual_payload = OmegaConf.to_container(visual_payload, resolve=True)
+    visual_enabled = validate_uncond_visual_sidecar_config(visual_payload)
 
     random_probability = model_cfg.get("eval_random_idm_probability", None)
     EvaluationRoutingConfig(
@@ -893,6 +901,7 @@ def _validate_fastwam_adaptive_cfg(cfg, *, only_eval: bool) -> None:
         "num_action_chunks",
         "fastwam",
         "uncond_lora",
+        "uncond_visual_sidecar",
         "gate",
         "gate_epsilon",
         "gate_temperature",
@@ -1073,6 +1082,31 @@ def _validate_fastwam_adaptive_cfg(cfg, *, only_eval: bool) -> None:
         value = OmegaConf.select(cfg, path)
         if value is None or float(value) <= 0:
             raise ValueError(f"FastWAM requires a positive `{path}`.")
+    if visual_enabled:
+        visual_optim = actor_model.uncond_visual_sidecar.optimizer
+        visual_lr = OmegaConf.select(cfg, "actor.optim.visual_router_lr")
+        if visual_lr is None or float(visual_lr) <= 0:
+            raise ValueError(
+                "Enabled P6 requires positive `actor.optim.visual_router_lr`."
+            )
+        if float(visual_lr) != float(visual_optim.lr):
+            raise ValueError(
+                "P6 model and actor optimizer visual-router learning rates differ."
+            )
+        configured_weight_decay = float(
+            cfg.actor.optim.get(
+                "visual_router_weight_decay",
+                cfg.actor.optim.get("weight_decay", 0.0),
+            )
+        )
+        if configured_weight_decay != float(visual_optim.weight_decay):
+            raise ValueError(
+                "P6 model and actor optimizer visual-router weight decay differ."
+            )
+        if str(cfg.actor.optim.lr_scheduler) != str(visual_optim.scheduler):
+            raise ValueError(
+                "P6 model and actor optimizer visual-router schedulers differ."
+            )
 
 
 def validate_embodied_cfg(cfg):

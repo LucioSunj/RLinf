@@ -144,6 +144,9 @@ actor:
     gate_lr: 1.0e-4
     lora_lr: 1.0e-5
     value_lr: 1.0e-4
+    # Required and positive only when uncond_visual_sidecar.enabled=true.
+    visual_router_lr: null
+    visual_router_weight_decay: null
     adam_beta1: 0.9
     adam_beta2: 0.95
     adam_eps: 1.0e-8
@@ -157,8 +160,8 @@ actor:
     strategy: fsdp
     sharding_strategy: no_shard
     save_full_model_weights: false
-    # The composite module deliberately mixes frozen backbones with three
-    # trainable parameter families.
+    # The composite module deliberately mixes frozen backbones with three v0
+    # families and an optional fourth P6 visual-router family.
     use_orig_params: true
     # Keep frozen FastWAM/pi0.5 parents outside FSDP flat handles. Otherwise
     # use_orig_params propagates requires_grad across a multi-billion-param

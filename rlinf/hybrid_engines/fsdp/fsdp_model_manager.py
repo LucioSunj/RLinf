@@ -543,8 +543,25 @@ class FSDPModelManager:
                 partition_fastwam_trainable_parameters,
             )
 
+            visual_router_parameter_ids = None
+            candidate = model
+            visited: set[int] = set()
+            while id(candidate) not in visited:
+                visited.add(id(candidate))
+                resolver = getattr(candidate, "visual_router_parameter_ids", None)
+                if resolver is not None:
+                    resolved_ids = set(resolver())
+                    visual_router_parameter_ids = resolved_ids or None
+                    break
+                next_candidate = getattr(candidate, "module", None)
+                if next_candidate is None:
+                    next_candidate = getattr(candidate, "_fsdp_wrapped_module", None)
+                if next_candidate is None:
+                    break
+                candidate = next_candidate
             fastwam_groups = partition_fastwam_trainable_parameters(
-                model.named_parameters()
+                model.named_parameters(),
+                visual_router_parameter_ids=visual_router_parameter_ids,
             )
             param_groups.extend(
                 [
@@ -577,6 +594,21 @@ class FSDPModelManager:
                     },
                 ]
             )
+            if "visual_router" in fastwam_groups:
+                visual_lr = self._cfg.optim.get("visual_router_lr")
+                if visual_lr is None or float(visual_lr) <= 0:
+                    raise ValueError("Enabled P6 requires positive `visual_router_lr`.")
+                param_groups.append(
+                    {
+                        "name": "visual_router",
+                        "params": fastwam_groups["visual_router"],
+                        "lr": float(visual_lr),
+                        "betas": betas,
+                        "weight_decay": self._cfg.optim.get(
+                            "visual_router_weight_decay", weight_decay
+                        ),
+                    }
+                )
         elif len(params_actor) > 0:
             param_groups.append(
                 {

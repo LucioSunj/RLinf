@@ -82,6 +82,101 @@ uncond_lora:
   freeze_base: true
   strict_target_discovery: true
 
+# P6 is an opt-in capacity variant. The disabled v0 preset returns before
+# constructing or loading DINO. Every null below must be explicitly pinned in
+# an enabled experiment; there are intentionally no scientific defaults.
+uncond_visual_sidecar:
+  enabled: false
+  type: dinov3_router_wan_value
+  enabled_regimes: [uncond]
+  dispatch_before_encoder: true
+  dino:
+    source_root: null
+    source_revision: null
+    model_name: null
+    weights_path: null
+    weights_sha256: null
+    preprocess_sha256: null
+    output_contract_sha256: null
+    compute_dtype: null
+    license_id: null
+    camera_input_contract_sha256: null
+    token_kind: x_norm_patchtokens
+    per_camera: true
+    frozen: true
+    stop_gradient: true
+  router:
+    query_source: base_modulated_self_attn_input
+    query_projection: null
+    query_rank: null
+    temperature: null
+    score_dtype: float32
+    per_camera_softmax: true
+    camera_mass: fixed
+    camera_mass_values: []
+    invalid_camera_policy: renormalize_active_or_fail_closed
+  transport:
+    mode: deterministic_area_overlap
+    contract_sha256: null
+    preserve_row_mass: true
+    fail_closed: true
+  optimizer:
+    family: visual_router
+    lr: null
+    weight_decay: null
+    scheduler: null
+    parameter_allowlist:
+      - "routers.*.query_projection.*"
+      - "branches.*.*.raw_beta"
+    fail_on_empty_or_overlap: true
+  wan_value:
+    source: video_cache_current_prefix
+    flatten_order: t_h_w_row_major
+    output_projection: frozen_action_self_attn_o_weight_only
+    output_bias: false
+    reuse_base_gate_msa: true
+    spatial_metadata:
+      wan_grid_f: null
+      wan_grid_h: null
+      wan_grid_w: null
+      current_frame_video_tokens: null
+      wan_flatten_order: t_h_w_row_major
+      vae_model_type: null
+      vae_weights_sha256: null
+      vae_spatial_downsample_factor: null
+      video_dit_weights_sha256: null
+      video_dit_patch_size: null
+      video_attention_num_heads: null
+      video_attention_head_dim: null
+      video_value_layout: batch_sequence_flat_heads
+      video_value_rope_applied: false
+      camera_concat_mode: null
+      camera_order: []
+      per_camera_post_crop_hw: []
+      per_camera_combined_rgb_box: []
+      per_camera_wan_grid_support: []
+      dino_patch_grid: null
+      dino_preprocess_sha256: null
+      invalid_mask_policy: renormalize_active_or_fail_closed
+      query_source: base_modulated_self_attn_input
+      query_timing: pre_block
+      residual_timing: post_block
+      spatial_transport_contract_sha256: null
+  injection:
+    query_timing: pre_block
+    residual_timing: post_block
+    layer_indices: []
+    beta_parameterization: bounded_tanh
+    beta_max: null
+    zero_init: beta
+    modify_base_attention: false
+  replay:
+    backend: null
+    storage_dtype: bfloat16
+    pin_memory: true
+    max_bytes_per_sample: null
+    max_aggregate_bytes: null
+
 gate:
   hidden_dim: 256
   num_query_tokens: 4

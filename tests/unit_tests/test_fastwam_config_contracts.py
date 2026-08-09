@@ -362,3 +362,35 @@ def test_eval_checkpoint_contract_validates_parent_hashes_before_construction() 
             expected_parent_checkpoint_sha256="a" * 64,
             load_critic=True,
         )
+
+
+def test_p6_eval_contract_rejects_outer_v1_and_accepts_v2_schema() -> None:
+    saved = _eval_model_cfg()
+    saved.uncond_visual_sidecar = {
+        "enabled": True,
+        "type": "dinov3_router_wan_value",
+        "transport": {"contract_sha256": "c" * 64},
+    }
+    live = OmegaConf.create(OmegaConf.to_container(saved, resolve=True))
+    payload = {
+        "schema": "fastwam-adaptive-rl-checkpoint-v1",
+        "parent_checkpoint_sha256": "a" * 64,
+        "contract": {"model": OmegaConf.to_container(saved, resolve=True)},
+    }
+
+    with pytest.raises(ValueError, match="Unsupported FastWAM adaptive evaluation"):
+        MODULE.validate_fastwam_eval_checkpoint_contract(
+            payload,
+            live,
+            expected_parent_checkpoint_sha256="a" * 64,
+            load_critic=False,
+        )
+
+    payload["schema"] = "fastwam-adaptive-rl-checkpoint-v2-p6"
+    contract = MODULE.validate_fastwam_eval_checkpoint_contract(
+        payload,
+        live,
+        expected_parent_checkpoint_sha256="a" * 64,
+        load_critic=False,
+    )
+    assert contract["model"]["uncond_visual_sidecar"]["enabled"] is True

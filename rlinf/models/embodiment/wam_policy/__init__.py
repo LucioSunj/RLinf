@@ -252,6 +252,11 @@ def get_model(cfg, torch_dtype):
     )
     from .kv_replay import GateKVReplayConfig
     from .pi05_critic import Pi05ValueAfterVLMCritic
+    from .visual_sidecar import (
+        build_uncond_visual_sidecar,
+        preflight_uncond_visual_sidecar,
+        validate_uncond_visual_sidecar_config,
+    )
 
     if torch_dtype is None:
         raise ValueError(
@@ -299,6 +304,13 @@ def get_model(cfg, torch_dtype):
         resolve=True,
     )
     replay_config = GateKVReplayConfig(**replay_payload)
+    visual_payload = cfg.get("uncond_visual_sidecar", {"enabled": False})
+    if OmegaConf.is_config(visual_payload):
+        visual_payload = OmegaConf.to_container(visual_payload, resolve=True)
+    else:
+        visual_payload = dict(visual_payload)
+    visual_enabled = validate_uncond_visual_sidecar_config(visual_payload)
+    visual_preflight = preflight_uncond_visual_sidecar(visual_payload)
     _validate_flow_sde_config(cfg.flow_sde)
     load_critic = _validate_critic_build_config(cfg)
     inference_steps = int(cfg.runtime.get("num_inference_steps", 0))
@@ -362,6 +374,15 @@ def get_model(cfg, torch_dtype):
         lora_config,
     )
     gate = GateTransformer(gate_config).to(dtype=torch_dtype)
+    visual_sidecar = build_uncond_visual_sidecar(
+        visual_payload,
+        actor=actor,
+        device=init_device,
+        dtype=torch_dtype,
+        preflight=visual_preflight,
+    )
+    if (visual_sidecar is not None) != visual_enabled:
+        raise RuntimeError("P6 sidecar construction did not honor its enable flag.")
 
     critic = None
     if load_critic:
@@ -385,6 +406,7 @@ def get_model(cfg, torch_dtype):
         flow_sde_ignore_last_transition=bool(
             cfg.flow_sde.get("ignore_last_transition", False)
         ),
+        visual_sidecar=visual_sidecar,
     )
     return FastWAMAdaptivePolicy(
         actor=actor,
@@ -392,6 +414,8 @@ def get_model(cfg, torch_dtype):
         lora_adapter=lora_adapter,
         gate=gate,
         critic=critic,
+        visual_encoder=(None if visual_sidecar is None else visual_sidecar.encoder),
+        visual_reader=(None if visual_sidecar is None else visual_sidecar.reader),
         config=policy_config,
     )
 

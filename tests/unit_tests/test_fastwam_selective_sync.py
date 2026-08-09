@@ -55,6 +55,17 @@ def test_capture_matches_trainable_and_persistent_sync_contract() -> None:
     assert not captured["persistent"].is_parameter
 
 
+def test_capture_includes_visual_router_but_excludes_frozen_dino() -> None:
+    module = nn.Module()
+    module.visual_reader = nn.Linear(3, 2, bias=False)
+    module.visual_encoder = nn.Linear(3, 2, bias=False).requires_grad_(False)
+
+    captured = capture_fastwam_sync_tensors(module)
+
+    assert list(captured) == ["visual_reader.weight"]
+    assert "visual_encoder.weight" not in captured
+
+
 def test_single_rank_materialization_keeps_only_selected_live_storage() -> None:
     module = _SelectiveModule()
     captured = capture_fastwam_sync_tensors(module)

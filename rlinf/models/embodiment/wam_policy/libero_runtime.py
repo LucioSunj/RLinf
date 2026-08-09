@@ -18,6 +18,8 @@ from __future__ import annotations
 
 import hashlib
 import math
+from contextlib import ExitStack
+from dataclasses import replace
 from pathlib import Path
 from typing import Any, Literal
 
@@ -26,6 +28,7 @@ from fastwam.adapters import PolicyRegime
 from fastwam.models.wan22.adaptive_action import (
     CachedActionCondition,
     CachedActionVelocity,
+    VisualReadCondition,
 )
 from fastwam.models.wan22.adaptive_sampler import (
     replay_action_flow_sde_transition,
@@ -35,6 +38,10 @@ from fastwam.models.wan22.kv_tap import (
     GateKVSnapshot,
     GateLayerKV,
     KeyValueBank,
+)
+from fastwam.models.wan22.visual_contracts import (
+    NativePatchMemory,
+    PreparedCameraBatch,
 )
 
 from rlinf.envs.action_contract import (
@@ -57,6 +64,14 @@ from rlinf.envs.libero.image_preprocessing import (
 from .adaptive_policy import FastWAMChunkSample
 from .contracts import ChunkRouteRecord, WAMRoute
 from .kv_replay import GateKVReplayBackend
+from .visual_replay import (
+    VisualReplayBackend,
+    empty_visual_replay,
+    pack_visual_replay,
+    unpack_recompute_camera_batch,
+    unpack_stored_native_memory,
+    validate_recomputed_effective_hash,
+)
 
 DEFAULT_FASTWAM_PROMPT_TEMPLATE = (
     "A video recorded from a robot's point of view executing the following "
@@ -374,6 +389,7 @@ class LiberoFastWAMRuntime:
         prompt_template: str = DEFAULT_FASTWAM_PROMPT_TEMPLATE,
         text_embedding_cache_dir: str | None = None,
         text_embedding_context_len: int = 128,
+        visual_sidecar: Any | None = None,
     ) -> None:
         self.actor = actor
         self.lora_adapter = lora_adapter
@@ -412,6 +428,22 @@ class LiberoFastWAMRuntime:
             else Path(text_embedding_cache_dir).expanduser().resolve()
         )
         self.text_embedding_context_len = int(text_embedding_context_len)
+        self.visual_sidecar = visual_sidecar
+        self.visual_encoder = None if visual_sidecar is None else visual_sidecar.encoder
+        self.visual_reader = None if visual_sidecar is None else visual_sidecar.reader
+        self.visual_spatial_metadata = (
+            None if visual_sidecar is None else visual_sidecar.spatial_metadata
+        )
+        self.visual_transport = (
+            None if visual_sidecar is None else visual_sidecar.transport
+        )
+        self.visual_asset = None if visual_sidecar is None else visual_sidecar.asset
+        self.visual_camera_input_contract_sha256 = (
+            None
+            if visual_sidecar is None
+            else visual_sidecar.camera_input_contract_sha256
+        )
+        self.visual_replay = None if visual_sidecar is None else visual_sidecar.replay
         if self.num_inference_steps < 1:
             raise ValueError("Inference steps must be positive.")
         if self.flow_sde_ignore_last_transition and self.num_inference_steps < 2:
@@ -447,6 +479,22 @@ class LiberoFastWAMRuntime:
         ):
             raise FileNotFoundError(self.text_embedding_cache_dir)
         _format_fastwam_prompts("validation", prompt_template=self.prompt_template)
+        if self.visual_sidecar is not None:
+            metadata = self.visual_spatial_metadata
+            if metadata.camera_concat_mode != self.camera_concat:
+                raise ValueError("P6 camera concat differs from the FastWAM runtime.")
+            if any(
+                tuple(shape) != (self.camera_height, self.camera_width)
+                for shape in metadata.per_camera_post_crop_hw
+            ):
+                raise ValueError("P6 camera crop size differs from the runtime.")
+            supported_camera_ids = {"main", "wrist"}
+            if not set(metadata.camera_order) <= supported_camera_ids:
+                raise ValueError(
+                    "P6 LIBERO supports only explicit main/wrist camera IDs."
+                )
+            if self.camera_concat == "main_only" and metadata.camera_order != ("main",):
+                raise ValueError("P6 main_only runtime requires camera order [main].")
         if self.processor is not None:
             from fastwam.datasets.lerobot.utils.normalizer import (
                 load_dataset_stats_from_json,
@@ -484,6 +532,127 @@ class LiberoFastWAMRuntime:
         if image.shape[-2] % 16 or image.shape[-1] % 16:
             raise ValueError("Combined FastWAM input image must be divisible by 16.")
         return image.to(dtype=self.dtype) * (2.0 / 255.0) - 1.0
+
+    def _visual_camera_batch(
+        self,
+        env_obs: dict[str, Any],
+        *,
+        sample_indices: torch.Tensor,
+    ) -> PreparedCameraBatch:
+        """Prepare selected per-view uint8 frames only for consumed UNCOND routes."""
+
+        if self.visual_sidecar is None:
+            raise RuntimeError("P6 camera preparation was called while disabled.")
+        indices = sample_indices.detach().cpu().long()
+        if indices.ndim != 1 or indices.numel() < 1:
+            raise ValueError("P6 UNCOND sample indices must be non-empty.")
+        camera_tensors = []
+        camera_keys = {"main": "main_images", "wrist": "wrist_images"}
+        for camera_id in self.visual_spatial_metadata.camera_order:
+            prepared = prepare_libero_camera_batch(
+                env_obs[camera_keys[camera_id]],
+                height=self.camera_height,
+                width=self.camera_width,
+                resize_mode=self.camera_resize_mode,
+            )
+            camera_tensors.append(prepared.index_select(0, indices))
+        pixels = torch.stack(camera_tensors, dim=1)
+        all_valid = env_obs.get("_fastwam_camera_valid_mask")
+        if all_valid is None:
+            camera_valid = torch.ones(
+                int(env_obs["states"].shape[0]),
+                len(camera_tensors),
+                dtype=torch.bool,
+            )
+        else:
+            camera_valid = torch.as_tensor(all_valid, dtype=torch.bool, device="cpu")
+            expected = (int(env_obs["states"].shape[0]), len(camera_tensors))
+            if tuple(camera_valid.shape) != expected:
+                raise ValueError(
+                    "P6 camera validity shape mismatch: "
+                    f"expected {expected}, got {tuple(camera_valid.shape)}."
+                )
+        return PreparedCameraBatch(
+            pixels=pixels,
+            camera_ids=self.visual_spatial_metadata.camera_order,
+            camera_valid_mask=camera_valid.index_select(0, indices),
+            input_contract_sha256=self.visual_camera_input_contract_sha256,
+        )
+
+    @staticmethod
+    def _slice_native_memory(
+        memory: NativePatchMemory,
+        index: int,
+    ) -> NativePatchMemory:
+        """Take one sample without weakening native-memory provenance."""
+
+        return NativePatchMemory(
+            tokens=memory.tokens[index : index + 1],
+            patch_valid_mask=memory.patch_valid_mask[index : index + 1],
+            camera_valid_mask=memory.camera_valid_mask[index : index + 1],
+            camera_ids=memory.camera_ids,
+            grid=memory.grid,
+            source_revision=memory.source_revision,
+            weights_sha256=memory.weights_sha256,
+            input_contract_sha256=memory.input_contract_sha256,
+            preprocess_sha256=memory.preprocess_sha256,
+            output_contract_sha256=memory.output_contract_sha256,
+            memory_contract_sha256=memory.memory_contract_sha256,
+        )
+
+    def _prepare_visual_rollout(
+        self,
+        *,
+        env_obs: dict[str, Any],
+        routes: torch.Tensor,
+        collect_replay: bool,
+    ) -> tuple[dict[int, NativePatchMemory], dict[str, torch.Tensor]]:
+        """Run frozen DINO once for the consumed UNCOND subset, never for IDM."""
+
+        if self.visual_sidecar is None:
+            return {}, {}
+        uncond_indices = torch.nonzero(
+            routes.detach().cpu() == int(WAMRoute.UNCOND),
+            as_tuple=False,
+        ).flatten()
+        if uncond_indices.numel() == 0:
+            replay = (
+                empty_visual_replay(
+                    config=self.visual_replay,
+                    batch_size=int(routes.shape[0]),
+                    camera_count=len(self.visual_spatial_metadata.camera_order),
+                    patch_grid=tuple(self.visual_spatial_metadata.dino_patch_grid),
+                    camera_hw=(self.camera_height, self.camera_width),
+                )
+                if collect_replay
+                else {}
+            )
+            return {}, replay
+        camera_batch = self._visual_camera_batch(
+            env_obs,
+            sample_indices=uncond_indices,
+        )
+        memory = self.visual_encoder.prepare_memory(
+            PolicyRegime.UNCOND,
+            camera_batch,
+        )
+        if memory is None:
+            raise RuntimeError("P6 frozen DINO returned no UNCOND native memory.")
+        per_sample = {
+            int(batch_index): self._slice_native_memory(memory, memory_index)
+            for memory_index, batch_index in enumerate(uncond_indices.tolist())
+        }
+        replay = {}
+        if collect_replay:
+            replay = pack_visual_replay(
+                config=self.visual_replay,
+                transport=self.visual_transport,
+                camera_batch=camera_batch,
+                memory=memory,
+                sample_indices=uncond_indices,
+                full_batch_size=int(routes.shape[0]),
+            )
+        return per_sample, replay
 
     def _normalized_proprio(self, states: torch.Tensor) -> torch.Tensor:
         states = states.to(device=self.device, dtype=torch.float32)
@@ -562,7 +731,7 @@ class LiberoFastWAMRuntime:
     def _encode_condition(
         self,
         env_obs: dict[str, Any],
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         images = self._model_images(env_obs)
         prompts = _format_fastwam_prompts(
             env_obs["task_descriptions"],
@@ -585,7 +754,7 @@ class LiberoFastWAMRuntime:
             context_mask=context_mask,
             proprio=proprio,
         )
-        return images, context, context_mask
+        return images, context, context_mask, proprio
 
     @torch.no_grad()
     def _prepare_action_condition(
@@ -595,9 +764,19 @@ class LiberoFastWAMRuntime:
         context: torch.Tensor,
         context_mask: torch.Tensor,
         regime: PolicyRegime,
+        visual_memory: NativePatchMemory | None = None,
+        visual_proprio: torch.Tensor | None = None,
         idm_initial_latents: torch.Tensor | None = None,
         idm_noise_seed: int | None = None,
     ) -> tuple[CachedActionCondition, torch.Tensor | None]:
+        if regime is PolicyRegime.IDM and (
+            visual_memory is not None or visual_proprio is not None
+        ):
+            raise ValueError("P6 visual inputs are forbidden on the IDM route.")
+        if (visual_memory is None) != (visual_proprio is None):
+            raise ValueError("P6 visual memory and proprioception must be paired.")
+        if visual_memory is not None and self.visual_sidecar is None:
+            raise ValueError("P6 visual inputs were supplied while disabled.")
         first_frame = self.actor._encode_input_image_latents_tensor(
             image,
             tiled=self.tiled_vae,
@@ -686,6 +865,40 @@ class LiberoFastWAMRuntime:
         )
         video_seq_len = int(video_pre["tokens"].shape[1])
         tokens_per_frame = int(video_pre["meta"]["tokens_per_frame"])
+        visual_condition = None
+        if visual_memory is not None:
+            metadata = self.visual_spatial_metadata
+            if tokens_per_frame != metadata.current_frame_video_tokens:
+                raise ValueError(
+                    "P6 runtime Wan prefix differs from the resolved grid: "
+                    f"{tokens_per_frame} != {metadata.current_frame_video_tokens}."
+                )
+            patch_size = tuple(int(item) for item in self.actor.video_expert.patch_size)
+            if patch_size != metadata.video_dit_patch_size:
+                raise ValueError("P6 runtime VideoDiT patch size changed.")
+            actual_grid = (
+                int(first_frame.shape[2]) // patch_size[0],
+                int(first_frame.shape[3]) // patch_size[1],
+                int(first_frame.shape[4]) // patch_size[2],
+            )
+            expected_grid = (
+                metadata.wan_grid_f,
+                metadata.wan_grid_h,
+                metadata.wan_grid_w,
+            )
+            if actual_grid != expected_grid:
+                raise ValueError(
+                    "P6 runtime Wan grid changed: "
+                    f"expected {expected_grid}, got {actual_grid}."
+                )
+            visual_condition = VisualReadCondition(
+                memory=visual_memory,
+                proprio=visual_proprio.to(
+                    device=visual_memory.tokens.device,
+                    dtype=self.dtype,
+                ),
+                video_layout_metadata=metadata,
+            )
         attention_mask = self.actor._build_mot_attention_mask(
             video_seq_len=video_seq_len,
             action_seq_len=self.action_protocol.generation_horizon,
@@ -711,6 +924,7 @@ class LiberoFastWAMRuntime:
                 attention_mask=attention_mask,
                 video_seq_len=video_seq_len,
                 current_frame_video_tokens=tokens_per_frame,
+                visual=visual_condition,
             ),
             replay_initial_latents,
         )
@@ -743,6 +957,9 @@ class LiberoFastWAMRuntime:
             gate_layer_indices=self.gate_layer_indices,
             capture_gate_kv=capture_gate_kv,
             actor_version=actor_version,
+            visual_reader=(
+                self.visual_reader if condition.visual is not None else None
+            ),
         )
 
     def sample_action_batch(
@@ -759,7 +976,12 @@ class LiberoFastWAMRuntime:
             routes=routes,
             noise_level=self.flow_sde_noise_level,
         )
-        images, context, context_mask = self._encode_condition(env_obs)
+        images, context, context_mask, proprio = self._encode_condition(env_obs)
+        visual_memories, visual_replay_inputs = self._prepare_visual_rollout(
+            env_obs=env_obs,
+            routes=routes,
+            collect_replay=collect_replay,
+        )
         timesteps, deltas = self._action_schedule()
         action_noise_override = env_obs.get("_fastwam_action_initial_noise")
         if action_noise_override is not None:
@@ -824,6 +1046,10 @@ class LiberoFastWAMRuntime:
                 context=context[index : index + 1],
                 context_mask=context_mask[index : index + 1],
                 regime=regime,
+                visual_memory=visual_memories.get(index),
+                visual_proprio=(
+                    proprio[index : index + 1] if index in visual_memories else None
+                ),
                 idm_initial_latents=(
                     video_noise_override[index : index + 1]
                     if video_noise_override is not None and regime is PolicyRegime.IDM
@@ -921,7 +1147,10 @@ class LiberoFastWAMRuntime:
                 "fastwam_images": images.detach(),
                 "fastwam_context": context.detach(),
                 "fastwam_context_mask": context_mask.detach(),
+                **visual_replay_inputs,
             }
+            if self.visual_sidecar is not None:
+                replay_inputs["fastwam_proprio"] = proprio.detach()
         if collect_replay and self.gate_replay_backend is GateKVReplayBackend.RECOMPUTE:
             replay_inputs["fastwam_idm_initial_latents"] = torch.cat(
                 idm_initial_latents,
@@ -946,6 +1175,86 @@ class LiberoFastWAMRuntime:
             action_execution_trace=action_execution_trace,
         )
 
+    def _visual_memory_from_replay(
+        self,
+        forward_inputs: dict[str, torch.Tensor],
+        *,
+        index: int,
+    ) -> NativePatchMemory | None:
+        """Restore one UNCOND native memory under the resolved replay backend."""
+
+        if self.visual_sidecar is None:
+            return None
+        route_mask = forward_inputs.get("visual_route_mask")
+        if route_mask is None:
+            raise KeyError("Enabled P6 replay is missing `visual_route_mask`.")
+        if route_mask.dtype is not torch.bool or route_mask.ndim != 1:
+            raise ValueError("P6 visual route mask must have shape [B] and bool dtype.")
+        if not bool(route_mask[index].item()):
+            raise ValueError(
+                "P6 replay is missing native material for an UNCOND route."
+            )
+        sliced = {
+            name: tensor[index : index + 1]
+            for name, tensor in forward_inputs.items()
+            if name.startswith("visual_")
+        }
+        asset = self.visual_asset
+        camera_ids = tuple(self.visual_spatial_metadata.camera_order)
+        if self.visual_replay.backend is VisualReplayBackend.STORED_NATIVE:
+            return unpack_stored_native_memory(
+                sliced,
+                camera_ids=camera_ids,
+                patch_grid=tuple(self.visual_spatial_metadata.dino_patch_grid),
+                source_revision=asset.source_revision,
+                weights_sha256=asset.weights_sha256,
+                input_contract_sha256=self.visual_camera_input_contract_sha256,
+                preprocess_sha256=asset.preprocess_sha256,
+                output_contract_sha256=asset.output_contract_sha256,
+                memory_contract_sha256=self.visual_reader.memory_contract_sha256,
+                transport=self.visual_transport,
+                device=self.device,
+            )
+        camera_batch = unpack_recompute_camera_batch(
+            sliced,
+            camera_ids=camera_ids,
+            input_contract_sha256=self.visual_camera_input_contract_sha256,
+        )
+        memory = self.visual_encoder.prepare_memory(
+            PolicyRegime.UNCOND,
+            camera_batch,
+        )
+        if memory is None:
+            raise RuntimeError("P6 DINO recomputation produced no native memory.")
+        validate_recomputed_effective_hash(
+            sliced,
+            memory=memory,
+            transport=self.visual_transport,
+        )
+        return memory
+
+    def _validate_visual_replay_route_alignment(
+        self,
+        forward_inputs: dict[str, torch.Tensor],
+        route_info: ChunkRouteRecord,
+    ) -> None:
+        """Require replay visual material for exactly the consumed UNCOND rows."""
+
+        if self.visual_sidecar is None:
+            return
+        route_mask = forward_inputs.get("visual_route_mask")
+        if route_mask is None:
+            raise KeyError("Enabled P6 replay is missing `visual_route_mask`.")
+        if route_mask.dtype is not torch.bool or route_mask.ndim != 1:
+            raise ValueError("P6 visual route mask must have shape [B] and bool dtype.")
+        expected = route_info.route_used.to(device=route_mask.device) == int(
+            WAMRoute.UNCOND
+        )
+        if route_mask.shape != expected.shape or not torch.equal(route_mask, expected):
+            raise ValueError(
+                "P6 visual replay rows do not match the consumed UNCOND routes."
+            )
+
     def replay_action_batch(
         self,
         *,
@@ -963,6 +1272,10 @@ class LiberoFastWAMRuntime:
         images = forward_inputs["fastwam_images"]
         context = forward_inputs["fastwam_context"]
         context_mask = forward_inputs["fastwam_context_mask"]
+        proprio = forward_inputs.get("fastwam_proprio")
+        if self.visual_sidecar is not None and proprio is None:
+            raise KeyError("Enabled P6 replay is missing `fastwam_proprio`.")
+        self._validate_visual_replay_route_alignment(forward_inputs, route_info)
         timesteps, deltas = self._action_schedule()
         logprobs = torch.zeros_like(chains[:, 0], dtype=torch.float32)
         entropies = torch.zeros_like(chains[:, 0], dtype=torch.float32)
@@ -974,11 +1287,19 @@ class LiberoFastWAMRuntime:
         for index in range(chains.shape[0]):
             if int(route_info.route_used[index]) != int(WAMRoute.UNCOND):
                 continue
+            visual_memory = self._visual_memory_from_replay(
+                forward_inputs,
+                index=index,
+            )
             condition, _ = self._prepare_action_condition(
                 image=images[index : index + 1],
                 context=context[index : index + 1],
                 context_mask=context_mask[index : index + 1],
                 regime=PolicyRegime.UNCOND,
+                visual_memory=visual_memory,
+                visual_proprio=(
+                    proprio[index : index + 1] if visual_memory is not None else None
+                ),
             )
             current_replay = replay_action_flow_sde_transition(
                 chains[index : index + 1],
@@ -1008,7 +1329,7 @@ class LiberoFastWAMRuntime:
                         chains[index : index + 1],
                         indices[index : index + 1],
                         velocity_fn=self._velocity(
-                            condition,
+                            replace(condition, visual=None),
                             # The conditioning remains UNCOND; the IDM regime
                             # only disables the regime-gated LoRA contribution.
                             regime=PolicyRegime.IDM,
@@ -1064,15 +1385,19 @@ class LiberoFastWAMRuntime:
             "fastwam_context_mask",
             "fastwam_idm_initial_latents",
         }
+        if self.visual_sidecar is not None:
+            required.update({"fastwam_proprio", "visual_route_mask"})
         missing = sorted(required - set(forward_inputs))
         if missing:
             raise KeyError(f"Gate K/V recomputation is missing inputs: {missing}.")
+        self._validate_visual_replay_route_alignment(forward_inputs, route_info)
 
         chains = forward_inputs["flow_chains"]
         images = forward_inputs["fastwam_images"]
         context = forward_inputs["fastwam_context"]
         context_mask = forward_inputs["fastwam_context_mask"]
         video_noise = forward_inputs["fastwam_idm_initial_latents"]
+        proprio = forward_inputs.get("fastwam_proprio")
         timesteps, _ = self._action_schedule()
         if chains.shape[1] != timesteps.numel() + 1:
             raise ValueError(
@@ -1088,7 +1413,24 @@ class LiberoFastWAMRuntime:
             )
         replay_actor_version = int(actor_versions.item())
         snapshots: list[GateKVSnapshot] = []
-        with self.lora_adapter.use_replay_reference(actor_version=replay_actor_version):
+        visual_memories = {
+            index: self._visual_memory_from_replay(forward_inputs, index=index)
+            for index, route_value in enumerate(route_info.route_used.tolist())
+            if int(route_value) == int(WAMRoute.UNCOND)
+            and self.visual_sidecar is not None
+        }
+        with ExitStack() as behavior_stack:
+            behavior_stack.enter_context(
+                self.lora_adapter.use_replay_reference(
+                    actor_version=replay_actor_version
+                )
+            )
+            if self.visual_reader is not None:
+                behavior_stack.enter_context(
+                    self.visual_reader.use_replay_reference(
+                        actor_version=replay_actor_version
+                    )
+                )
             first_step = timesteps.numel() - self.gate_denoise_last_n
             for step_index in range(first_step, timesteps.numel()):
                 per_sample: list[GateKVSnapshot] = []
@@ -1103,6 +1445,12 @@ class LiberoFastWAMRuntime:
                         context=context[index : index + 1],
                         context_mask=context_mask[index : index + 1],
                         regime=regime,
+                        visual_memory=visual_memories.get(index),
+                        visual_proprio=(
+                            proprio[index : index + 1]
+                            if index in visual_memories
+                            else None
+                        ),
                         idm_initial_latents=(
                             video_noise[index : index + 1]
                             if regime is PolicyRegime.IDM
