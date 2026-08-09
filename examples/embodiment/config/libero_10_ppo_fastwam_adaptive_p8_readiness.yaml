@@ -23,6 +23,7 @@ cluster:
 runner:
   task_type: embodied
   p8_readiness_endpoint: true
+  p8_stage2_systems_endpoint: false
   formal_training_authorized: false
   final_ledger_path: null
   weight_sync_interval: 1

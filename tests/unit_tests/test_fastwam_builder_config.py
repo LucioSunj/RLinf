@@ -21,7 +21,7 @@ from types import SimpleNamespace
 import pytest
 import torch.nn as nn
 from hydra import compose, initialize_config_dir
-from omegaconf import OmegaConf
+from omegaconf import OmegaConf, open_dict
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 CONFIG_ROOT = REPO_ROOT / "examples/embodiment/config"
@@ -287,6 +287,39 @@ def test_p8_readiness_uses_only_the_pinned_text_cache(monkeypatch) -> None:
     assert cfg.rollout.model.fastwam.load_text_encoder is False
     assert cfg.actor.model.runtime.text_embedding_cache_dir == "/tmp/text-cache"
     assert cfg.rollout.model.runtime.text_embedding_cache_dir == "/tmp/text-cache"
+
+
+def test_p8_stage2_systems_profile_passes_production_config_guard(monkeypatch) -> None:
+    from rlinf.config import _validate_fastwam_adaptive_cfg
+
+    monkeypatch.setenv("EMBODIED_PATH", str(REPO_ROOT / "examples/embodiment"))
+    monkeypatch.setenv("FASTWAM_CHECKPOINT", "/tmp/fastwam.pt")
+    monkeypatch.setenv("FASTWAM_CHECKPOINT_SHA256", "a" * 64)
+    monkeypatch.setenv("FASTWAM_DATASET_STATS", "/tmp/dataset_stats.json")
+    monkeypatch.setenv("PI05_CRITIC_CHECKPOINT", "/tmp/pi05")
+    monkeypatch.setenv("PI05_CRITIC_CHECKPOINT_SHA256", "b" * 64)
+    monkeypatch.setenv("FASTWAM_DINOV3_SOURCE_ROOT", "/tmp/dinov3")
+    monkeypatch.setenv("FASTWAM_DINOV3_WEIGHTS", "/tmp/dinov3.safetensors")
+    monkeypatch.setenv("FASTWAM_TEXT_EMBEDDING_CACHE", "/tmp/text-cache")
+
+    with initialize_config_dir(version_base=None, config_dir=str(CONFIG_ROOT)):
+        cfg = compose(config_name="libero_10_ppo_fastwam_adaptive_p8_readiness")
+    with open_dict(cfg):
+        cfg.runner.p8_readiness_endpoint = False
+        cfg.runner.p8_stage2_systems_endpoint = True
+        cfg.runner.max_steps = 1
+        cfg.runner.l11_route_seed = 20260801
+        cfg.actor.optim.total_training_steps = 1
+        cfg.actor.seed = 20260731
+        cfg.actor.global_batch_size = 4
+        cfg.env.train.seed = 20260801
+        cfg.env.train.total_num_envs = 2
+        cfg.env.train.specific_reset_id = 0
+
+    _validate_fastwam_adaptive_cfg(cfg, only_eval=False)
+    cfg.runner.p8_readiness_endpoint = True
+    with pytest.raises(ValueError, match="mutually exclusive"):
+        _validate_fastwam_adaptive_cfg(cfg, only_eval=False)
 
 
 def test_hydra_overrides_select_recompute_and_gate_subsets(monkeypatch) -> None:

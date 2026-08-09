@@ -66,6 +66,36 @@ def test_p8_readiness_gate_freeze_is_explicit_and_exact() -> None:
         )
 
 
+def test_p8_frozen_gate_endpoints_are_explicit_and_mutually_exclusive() -> None:
+    MODULE.validate_p8_readiness_gate_ownership(
+        p8_enabled=True,
+        gate_trainable=False,
+        readiness_endpoint=False,
+        stage2_systems_endpoint=True,
+        gate_lr=0.0,
+        gate_loss_weight=0.0,
+    )
+
+    with pytest.raises(ValueError, match="mutually exclusive"):
+        MODULE.validate_p8_readiness_gate_ownership(
+            p8_enabled=True,
+            gate_trainable=False,
+            readiness_endpoint=True,
+            stage2_systems_endpoint=True,
+            gate_lr=0.0,
+            gate_loss_weight=0.0,
+        )
+    with pytest.raises(ValueError, match="frozen-Gate"):
+        MODULE.validate_p8_readiness_gate_ownership(
+            p8_enabled=True,
+            gate_trainable=True,
+            readiness_endpoint=False,
+            stage2_systems_endpoint=True,
+            gate_lr=3e-5,
+            gate_loss_weight=1.0,
+        )
+
+
 def test_default_fastwam_model_does_not_change_v1_gate_contract() -> None:
     model_path = (
         Path(__file__).resolve().parents[2]
@@ -108,6 +138,44 @@ def test_p8_readiness_endpoint_rejects_identity_or_run_length_drift() -> None:
         invalid[key] = bad_value
         with pytest.raises(ValueError, match="two-step B0/B1"):
             MODULE.validate_p8_readiness_endpoint_contract(**invalid)
+
+
+def test_p8_stage2_systems_endpoint_is_distinct_and_fail_closed() -> None:
+    values = {
+        "max_steps": 1,
+        "max_epochs": 1,
+        "actor_total_training_steps": 1,
+        "actor_seed": 20260731,
+        "global_batch_size": 4,
+        "env_seed": 20260801,
+        "total_num_envs": 2,
+        "task_id_filter": [0],
+        "specific_reset_id": 0,
+        "use_fixed_reset_state_ids": True,
+        "training_route_override": "forced_uncond_after_initial",
+        "load_text_encoder": False,
+        "formal_training_authorized": False,
+        "final_ledger_path": None,
+        "replay_backend": "stored_native",
+        "compile_enabled": False,
+        "route_seed": 20260801,
+    }
+    MODULE.validate_p8_stage2_systems_endpoint_contract(**values)
+
+    for key, bad_value in (
+        ("max_steps", 2),
+        ("global_batch_size", 1),
+        ("env_seed", 424242),
+        ("specific_reset_id", 1),
+        ("total_num_envs", 4),
+        ("replay_backend", "recompute_native"),
+        ("compile_enabled", True),
+        ("formal_training_authorized", True),
+    ):
+        invalid = dict(values)
+        invalid[key] = bad_value
+        with pytest.raises(ValueError, match="one-update reset-0"):
+            MODULE.validate_p8_stage2_systems_endpoint_contract(**invalid)
 
 
 def test_pi05_critic_artifact_config_requires_path_and_hex_digest() -> None:
@@ -222,6 +290,31 @@ def test_checkpoint_contract_covers_continuation_semantics_not_run_length() -> N
 
     cfg.actor.seed = 43
     assert MODULE.build_fastwam_checkpoint_contract(cfg, world_size=2) != baseline
+
+
+def test_p8_checkpoint_contract_binds_frozen_endpoint_without_changing_v1() -> None:
+    cfg = _checkpoint_cfg()
+    v1 = MODULE.build_fastwam_checkpoint_contract(cfg, world_size=2)
+    assert "p8_stage2_systems_endpoint" not in v1["runner"]
+
+    cfg.actor.model.uncond_visual_sidecar = {
+        "enabled": True,
+        "compile": False,
+        "replay": {"backend": "stored_native"},
+    }
+    cfg.runner.p8_readiness_endpoint = False
+    cfg.runner.p8_stage2_systems_endpoint = True
+    cfg.runner.formal_training_authorized = False
+    p8 = MODULE.build_fastwam_checkpoint_contract(cfg, world_size=2)
+
+    assert p8["runner"] == {
+        **v1["runner"],
+        "p8_readiness_endpoint": False,
+        "p8_stage2_systems_endpoint": True,
+        "formal_training_authorized": False,
+    }
+    cfg.runner.p8_stage2_systems_endpoint = False
+    assert MODULE.build_fastwam_checkpoint_contract(cfg, world_size=2) != p8
 
 
 def test_checkpoint_contract_normalizes_validate_cfg_inserted_defaults() -> None:

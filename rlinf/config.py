@@ -30,6 +30,7 @@ from rlinf.config_contracts import (
     validate_libero_terminal_reward_config,
     validate_p8_readiness_endpoint_contract,
     validate_p8_readiness_gate_ownership,
+    validate_p8_stage2_systems_endpoint_contract,
     validate_pi05_critic_artifact_config,
 )
 from rlinf.envs import SupportedEnvType
@@ -1081,14 +1082,19 @@ def _validate_fastwam_adaptive_cfg(cfg, *, only_eval: bool) -> None:
             "shuffle does not preserve complete episodes or train-global batches."
         )
 
+    p8_readiness_endpoint = bool(cfg.runner.get("p8_readiness_endpoint", False))
+    p8_stage2_systems_endpoint = bool(
+        cfg.runner.get("p8_stage2_systems_endpoint", False)
+    )
     validate_p8_readiness_gate_ownership(
         p8_enabled=p8_enabled,
         gate_trainable=actor_model.get("gate_trainable", True),
-        readiness_endpoint=cfg.runner.get("p8_readiness_endpoint", False),
+        readiness_endpoint=p8_readiness_endpoint,
         gate_lr=cfg.actor.optim.get("gate_lr", 0.0),
         gate_loss_weight=cfg.algorithm.gate_ppo.get("loss_weight", 0.0),
+        stage2_systems_endpoint=p8_stage2_systems_endpoint,
     )
-    if bool(cfg.runner.get("p8_readiness_endpoint", False)):
+    if p8_readiness_endpoint:
         validate_p8_readiness_endpoint_contract(
             max_steps=cfg.runner.get("max_steps", -1),
             max_epochs=cfg.runner.get("max_epochs", -1),
@@ -1108,6 +1114,31 @@ def _validate_fastwam_adaptive_cfg(cfg, *, only_eval: bool) -> None:
                 "formal_training_authorized", False
             ),
             final_ledger_path=cfg.runner.get("final_ledger_path"),
+        )
+    if p8_stage2_systems_endpoint:
+        p8_replay = actor_model.uncond_visual_sidecar.get("replay", {})
+        validate_p8_stage2_systems_endpoint_contract(
+            max_steps=cfg.runner.get("max_steps", -1),
+            max_epochs=cfg.runner.get("max_epochs", -1),
+            actor_total_training_steps=cfg.actor.optim.get("total_training_steps", -1),
+            actor_seed=cfg.actor.get("seed", -1),
+            global_batch_size=cfg.actor.get("global_batch_size", -1),
+            env_seed=cfg.env.train.get("seed", -1),
+            total_num_envs=cfg.env.train.get("total_num_envs", -1),
+            task_id_filter=cfg.env.train.get("task_id_filter"),
+            specific_reset_id=cfg.env.train.get("specific_reset_id", -1),
+            use_fixed_reset_state_ids=cfg.env.train.get(
+                "use_fixed_reset_state_ids", False
+            ),
+            training_route_override=actor_model.get("training_route_override", "none"),
+            load_text_encoder=actor_model.fastwam.get("load_text_encoder", True),
+            formal_training_authorized=cfg.runner.get(
+                "formal_training_authorized", False
+            ),
+            final_ledger_path=cfg.runner.get("final_ledger_path"),
+            replay_backend=p8_replay.get("backend", ""),
+            compile_enabled=actor_model.uncond_visual_sidecar.get("compile", True),
+            route_seed=cfg.runner.get("l11_route_seed", -1),
         )
     for path in (
         "actor.optim.lora_lr",

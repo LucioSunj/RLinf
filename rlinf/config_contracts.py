@@ -58,31 +58,123 @@ def validate_p8_readiness_gate_ownership(
     readiness_endpoint: bool,
     gate_lr: float,
     gate_loss_weight: float,
+    stage2_systems_endpoint: bool = False,
 ) -> None:
-    """Validate the opt-in frozen-Gate P8 engineering endpoint."""
+    """Validate opt-in frozen-Gate P8 engineering endpoint ownership."""
 
     if not isinstance(gate_trainable, bool):
         raise TypeError("FastWAM `gate_trainable` must be a boolean.")
     if not isinstance(readiness_endpoint, bool):
         raise TypeError("`runner.p8_readiness_endpoint` must be a boolean.")
+    if not isinstance(stage2_systems_endpoint, bool):
+        raise TypeError("`runner.p8_stage2_systems_endpoint` must be a boolean.")
+    if readiness_endpoint and stage2_systems_endpoint:
+        raise ValueError(
+            "P8 readiness and Stage2 systems endpoints are mutually exclusive."
+        )
     gate_lr = float(gate_lr)
     gate_loss_weight = float(gate_loss_weight)
     if not math.isfinite(gate_lr) or not math.isfinite(gate_loss_weight):
         raise ValueError("FastWAM Gate LR and loss weight must be finite.")
     if gate_trainable:
-        if readiness_endpoint:
+        if readiness_endpoint or stage2_systems_endpoint:
             raise ValueError(
-                "P8 readiness endpoint requires an explicitly frozen Gate."
+                "P8 frozen-Gate endpoints require an explicitly frozen Gate."
             )
         if gate_lr <= 0 or gate_loss_weight <= 0:
             raise ValueError("Trainable FastWAM Gate requires positive LR and loss.")
         return
-    if not p8_enabled or not readiness_endpoint:
+    if not p8_enabled or not (readiness_endpoint or stage2_systems_endpoint):
         raise ValueError(
-            "Frozen Gate is restricted to the explicit enabled P8 readiness endpoint."
+            "Frozen Gate is restricted to an explicit enabled P8 endpoint."
         )
     if gate_lr != 0 or gate_loss_weight != 0:
         raise ValueError("Frozen P8 readiness Gate requires exact zero LR and loss.")
+
+
+def validate_p8_stage2_systems_endpoint_contract(
+    *,
+    max_steps: int,
+    max_epochs: int,
+    actor_total_training_steps: int,
+    actor_seed: int,
+    global_batch_size: int,
+    env_seed: int,
+    total_num_envs: int,
+    task_id_filter: object,
+    specific_reset_id: int,
+    use_fixed_reset_state_ids: bool,
+    training_route_override: str,
+    load_text_encoder: bool,
+    formal_training_authorized: bool,
+    final_ledger_path: object,
+    replay_backend: str,
+    compile_enabled: bool,
+    route_seed: int,
+) -> None:
+    """Restrict the test-only Stage2 FSDP systems fixture.
+
+    This endpoint is deliberately distinct from the P8-5 two-update canary. It
+    permits only the one-update reset-0 systems identity at one or two ranks;
+    it never authorizes formal training or access to a final ledger.
+    """
+
+    total_num_envs = int(total_num_envs)
+    exact_values = {
+        "runner.max_steps": (int(max_steps), 1),
+        "runner.max_epochs": (int(max_epochs), 1),
+        "actor.optim.total_training_steps": (
+            int(actor_total_training_steps),
+            1,
+        ),
+        "actor.seed": (int(actor_seed), 20260731),
+        "actor.global_batch_size": (
+            int(global_batch_size),
+            2 * total_num_envs,
+        ),
+        "env.train.seed": (int(env_seed), 20260801),
+        "env.train.specific_reset_id": (int(specific_reset_id), 0),
+        "runner.l11_route_seed": (int(route_seed), 20260801),
+    }
+    mismatches = [
+        f"{name}={actual!r} (expected {expected!r})"
+        for name, (actual, expected) in exact_values.items()
+        if actual != expected
+    ]
+    if total_num_envs not in {1, 2}:
+        mismatches.append(
+            f"env.train.total_num_envs={total_num_envs!r} (expected 1 or 2)"
+        )
+    if OmegaConf.is_config(task_id_filter):
+        task_id_filter = OmegaConf.to_container(task_id_filter, resolve=True)
+    normalized_task_ids = (
+        list(task_id_filter) if isinstance(task_id_filter, (list, tuple)) else None
+    )
+    if normalized_task_ids != [0]:
+        mismatches.append(f"env.train.task_id_filter={task_id_filter!r} (expected [0])")
+    if use_fixed_reset_state_ids is not True:
+        mismatches.append("env.train.use_fixed_reset_state_ids must be true")
+    if training_route_override != "forced_uncond_after_initial":
+        mismatches.append(
+            "training_route_override must be `forced_uncond_after_initial`"
+        )
+    if load_text_encoder is not False:
+        mismatches.append(
+            "fastwam.load_text_encoder must be false so Stage2 uses the pinned cache"
+        )
+    if formal_training_authorized is not False:
+        mismatches.append("runner.formal_training_authorized must be false")
+    if final_ledger_path is not None:
+        mismatches.append("runner.final_ledger_path must be null")
+    if replay_backend != "stored_native":
+        mismatches.append("P8 Stage2 replay.backend must be `stored_native`")
+    if compile_enabled is not False:
+        mismatches.append("P8 Stage2 compile must be false")
+    if mismatches:
+        raise ValueError(
+            "P8 Stage2 systems endpoint is restricted to the one-update reset-0 "
+            "FSDP fixture: " + "; ".join(mismatches)
+        )
 
 
 def validate_p8_readiness_endpoint_contract(
@@ -446,6 +538,40 @@ def build_fastwam_checkpoint_contract(cfg: Any, *, world_size: int) -> dict[str,
         overlap = False
     env_offload = bool(OmegaConf.select(cfg, "env.train.enable_offload", default=False))
     runner["overlap_env_bootstrap"] = bool(overlap) and not env_offload
+    p8_sidecar = OmegaConf.select(
+        cfg,
+        "actor.model.uncond_visual_sidecar",
+        default=None,
+    )
+    p8_enabled = bool(
+        p8_sidecar.get("enabled", False) if hasattr(p8_sidecar, "get") else False
+    )
+    if p8_enabled:
+        runner.update(
+            {
+                "p8_readiness_endpoint": bool(
+                    OmegaConf.select(
+                        cfg,
+                        "runner.p8_readiness_endpoint",
+                        default=False,
+                    )
+                ),
+                "p8_stage2_systems_endpoint": bool(
+                    OmegaConf.select(
+                        cfg,
+                        "runner.p8_stage2_systems_endpoint",
+                        default=False,
+                    )
+                ),
+                "formal_training_authorized": bool(
+                    OmegaConf.select(
+                        cfg,
+                        "runner.formal_training_authorized",
+                        default=False,
+                    )
+                ),
+            }
+        )
     return {
         "schema": "fastwam-adaptive-checkpoint-contract-v2",
         "model": _resolved_checkpoint_value(cfg.actor.model),
