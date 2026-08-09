@@ -226,6 +226,8 @@ def _make_policy(
     eval_random_idm_probability=None,
     eval_routing_seed=0,
     eval_timing_cuda_synchronize=False,
+    gate_trainable=True,
+    training_route_override="none",
 ):
     return FastWAMAdaptivePolicy(
         actor=nn.Linear(1, 1),
@@ -240,6 +242,8 @@ def _make_policy(
             eval_random_idm_probability=eval_random_idm_probability,
             eval_routing_seed=eval_routing_seed,
             eval_timing_cuda_synchronize=eval_timing_cuda_synchronize,
+            gate_trainable=gate_trainable,
+            training_route_override=training_route_override,
             kv_replay=_policy.GateKVReplayConfig(
                 backend=backend,
                 pin_memory=False,
@@ -655,6 +659,7 @@ def test_trainable_checkpoint_excludes_frozen_actor_and_round_trips_version():
     policy.set_global_step(3)
     payload = policy.trainable_state_dict()
 
+    assert payload["schema"] == "fastwam-adaptive-policy-v1"
     assert set(payload) == {
         "schema",
         "actor_version",
@@ -883,3 +888,46 @@ def test_optimizer_groups_are_disjoint():
     ]
     ids = [id(parameter) for group in groups for parameter in group["params"]]
     assert len(ids) == len(set(ids))
+
+
+def test_p8_readiness_frozen_gate_has_no_optimizer_but_remains_checkpointed():
+    policy = _make_policy(gate_trainable=False)
+
+    policy.train()
+    groups = policy.optimizer_parameter_groups(
+        gate_lr=0.0,
+        lora_lr=2e-4,
+        value_lr=3e-4,
+    )
+
+    assert [group["name"] for group in groups] == ["uncond_lora", "value_head"]
+    assert not policy.gate.training
+    assert all(not parameter.requires_grad for parameter in policy.gate.parameters())
+    assert policy.trainable_state_dict()["gate"]
+    assert policy.additional_rollout_sync_parameter_names()
+    with pytest.raises(ValueError, match="exactly zero"):
+        policy.optimizer_parameter_groups(
+            gate_lr=1e-4,
+            lora_lr=2e-4,
+            value_lr=3e-4,
+        )
+
+
+def test_p8_readiness_forces_uncond_after_initial_idm_chunk():
+    policy = _make_policy(
+        gate_trainable=False,
+        training_route_override="forced_uncond_after_initial",
+    )
+    obs = {
+        "states": torch.ones(1, 3),
+        "_fastwam_env_ids": torch.tensor([0]),
+        "_fastwam_reset_mask": torch.tensor([True]),
+    }
+
+    _, first = policy.predict_action_batch(obs, compute_values=False)
+    obs["_fastwam_reset_mask"] = torch.tensor([False])
+    _, second = policy.predict_action_batch(obs, compute_values=False)
+
+    assert first["route_info"].route_used.tolist() == [1]
+    assert first["emitted_gate"].next_route.tolist() == [0]
+    assert second["route_info"].route_used.tolist() == [0]

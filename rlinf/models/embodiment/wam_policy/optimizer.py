@@ -43,6 +43,7 @@ class FastWAMRefinerParameterManifest:
 def partition_fastwam_trainable_parameters(
     named_parameters: Iterable[tuple[str, nn.Parameter]],
     *,
+    require_gate: bool = True,
     require_refiner: bool = False,
     refiner_manifest: FastWAMRefinerParameterManifest | None = None,
 ) -> dict[str, list[nn.Parameter]]:
@@ -96,7 +97,13 @@ def partition_fastwam_trainable_parameters(
             "P8 refiner manifest parameters are missing from the optimizer model: "
             f"{len(missing_manifest_ids)}."
         )
-    required = {"gate", "uncond_lora", "value_head"}
+    if not require_gate and groups["gate"]:
+        raise RuntimeError(
+            "Frozen Gate endpoint exposed trainable Gate parameters to the optimizer."
+        )
+    required = {"uncond_lora", "value_head"}
+    if require_gate:
+        required.add("gate")
     if require_refiner:
         required.add("wan_current_refiner")
     missing = [name for name in sorted(required) if not groups[name]]
@@ -106,4 +113,6 @@ def partition_fastwam_trainable_parameters(
         )
     if not require_refiner:
         groups.pop("wan_current_refiner")
+    if not require_gate:
+        groups.pop("gate")
     return groups

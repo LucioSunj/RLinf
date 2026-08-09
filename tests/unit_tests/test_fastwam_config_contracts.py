@@ -32,6 +32,82 @@ def test_recompute_kv_requires_every_update_weight_sync() -> None:
         MODULE.validate_fastwam_kv_weight_sync("recompute", 2)
 
 
+def test_p8_readiness_gate_freeze_is_explicit_and_exact() -> None:
+    MODULE.validate_p8_readiness_gate_ownership(
+        p8_enabled=True,
+        gate_trainable=False,
+        readiness_endpoint=True,
+        gate_lr=0.0,
+        gate_loss_weight=0.0,
+    )
+    MODULE.validate_p8_readiness_gate_ownership(
+        p8_enabled=False,
+        gate_trainable=True,
+        readiness_endpoint=False,
+        gate_lr=3e-5,
+        gate_loss_weight=1.0,
+    )
+
+    with pytest.raises(ValueError, match="restricted"):
+        MODULE.validate_p8_readiness_gate_ownership(
+            p8_enabled=True,
+            gate_trainable=False,
+            readiness_endpoint=False,
+            gate_lr=0.0,
+            gate_loss_weight=0.0,
+        )
+    with pytest.raises(ValueError, match="exact zero"):
+        MODULE.validate_p8_readiness_gate_ownership(
+            p8_enabled=True,
+            gate_trainable=False,
+            readiness_endpoint=True,
+            gate_lr=1e-8,
+            gate_loss_weight=0.0,
+        )
+
+
+def test_default_fastwam_model_does_not_change_v1_gate_contract() -> None:
+    model_path = (
+        Path(__file__).resolve().parents[2]
+        / "examples/embodiment/config/model/fastwam_adaptive.yaml"
+    )
+    model = OmegaConf.load(model_path)
+
+    assert "gate_trainable" not in model
+
+
+def test_p8_readiness_endpoint_rejects_identity_or_run_length_drift() -> None:
+    values = {
+        "max_steps": 2,
+        "max_epochs": 1,
+        "actor_total_training_steps": 2,
+        "actor_seed": 424242,
+        "global_batch_size": 1,
+        "env_seed": 424242,
+        "total_num_envs": 1,
+        "task_id_filter": [0],
+        "specific_reset_id": 1,
+        "use_fixed_reset_state_ids": True,
+        "training_route_override": "forced_uncond_after_initial",
+        "formal_training_authorized": False,
+        "final_ledger_path": None,
+    }
+    MODULE.validate_p8_readiness_endpoint_contract(**values)
+
+    for key, bad_value in (
+        ("max_steps", 3),
+        ("specific_reset_id", 0),
+        ("task_id_filter", [1]),
+        ("training_route_override", "none"),
+        ("formal_training_authorized", True),
+        ("final_ledger_path", "/forbidden/final_ledger.json"),
+    ):
+        invalid = dict(values)
+        invalid[key] = bad_value
+        with pytest.raises(ValueError, match="two-step B0/B1"):
+            MODULE.validate_p8_readiness_endpoint_contract(**invalid)
+
+
 def test_pi05_critic_artifact_config_requires_path_and_hex_digest() -> None:
     MODULE.validate_pi05_critic_artifact_config("/tmp/pi05", "a" * 64)
 

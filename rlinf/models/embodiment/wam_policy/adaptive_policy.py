@@ -138,6 +138,8 @@ class FastWAMAdaptivePolicyConfig:
     eval_routing_seed: int = 0
     eval_microbatch_size: int = 1
     eval_timing_cuda_synchronize: bool = False
+    gate_trainable: bool = True
+    training_route_override: str = "none"
     kv_replay: GateKVReplayConfig = field(default_factory=GateKVReplayConfig)
     p8_visual_replay: P8VisualReplayConfig | None = None
 
@@ -150,6 +152,18 @@ class FastWAMAdaptivePolicyConfig:
             raise ValueError("`eval_microbatch_size` must be positive.")
         if not isinstance(self.eval_timing_cuda_synchronize, bool):
             raise TypeError("`eval_timing_cuda_synchronize` must be a boolean.")
+        if not isinstance(self.gate_trainable, bool):
+            raise TypeError("`gate_trainable` must be a boolean.")
+        if self.training_route_override not in {
+            "none",
+            "forced_uncond_after_initial",
+        }:
+            raise ValueError(
+                "`training_route_override` must be `none` or "
+                "`forced_uncond_after_initial`."
+            )
+        if self.training_route_override != "none" and self.gate_trainable:
+            raise ValueError("Training route override requires a frozen Gate.")
         evaluation = self.evaluation_routing
         object.__setattr__(self, "eval_routing_mode", evaluation.mode)
         object.__setattr__(self, "eval_idm_threshold", evaluation.idm_threshold)
@@ -233,6 +247,7 @@ class FastWAMAdaptivePolicy(nn.Module, BasePolicy):
         self.route_tracker = PendingRouteTracker()
         self.actor_version = 0
         self._enforce_frozen_actor()
+        self._enforce_gate_ownership()
         self.actor.eval()
 
     def _require_critic(self) -> nn.Module:
@@ -263,12 +278,30 @@ class FastWAMAdaptivePolicy(nn.Module, BasePolicy):
                 f"FastWAM actor has trainable non-LoRA parameters: {unexpected}."
             )
 
+    def _enforce_gate_ownership(self) -> None:
+        """Apply the explicit Gate optimizer-ownership contract."""
+
+        gate_parameters = tuple(self.gate.parameters())
+        if not gate_parameters:
+            raise ValueError("FastWAM adaptive policy requires Gate parameters.")
+        for parameter in gate_parameters:
+            parameter.requires_grad_(self.config.gate_trainable)
+        if not self.config.gate_trainable:
+            self.gate.eval()
+
+    def additional_rollout_sync_parameter_names(self) -> tuple[str, ...]:
+        """Return frozen adaptive parameters that rollout still must receive."""
+
+        if self.config.gate_trainable:
+            return ()
+        return tuple(f"gate.{name}" for name, _ in self.gate.named_parameters())
+
     def train(self, mode: bool = True) -> FastWAMAdaptivePolicy:
         """Train adaptive modules while keeping the frozen actor in eval mode."""
 
         super().train(mode)
         self.actor.eval()
-        self.gate.train(mode)
+        self.gate.train(mode if self.config.gate_trainable else False)
         if self.wan_current_refiner is not None:
             self.wan_current_refiner.train(mode)
         if self.critic is not None:
@@ -389,7 +422,11 @@ class FastWAMAdaptivePolicy(nn.Module, BasePolicy):
             temperature=self.config.gate_temperature,
             epsilon=self.config.gate_epsilon,
         )
-        route = behavior.sample()
+        route = (
+            torch.zeros_like(logits, dtype=torch.long)
+            if self.config.training_route_override == "forced_uncond_after_initial"
+            else behavior.sample()
+        )
         logprob = behavior.log_prob(route)
         return (
             route,
@@ -836,35 +873,45 @@ class FastWAMAdaptivePolicy(nn.Module, BasePolicy):
         """Return disjoint Gate, LoRA, and fresh-value-head optimizer groups."""
 
         critic = self._require_critic()
-        groups = [
-            {
-                "name": "gate",
-                "params": [
-                    parameter
-                    for parameter in self.gate.parameters()
-                    if parameter.requires_grad
-                ],
-                "lr": gate_lr,
-            },
-            {
-                "name": "uncond_lora",
-                "params": [
-                    parameter
-                    for parameter in self.lora_adapter.lora_parameters()
-                    if parameter.requires_grad
-                ],
-                "lr": lora_lr,
-            },
-            {
-                "name": "value_head",
-                "params": [
-                    parameter
-                    for parameter in critic.value_head.parameters()
-                    if parameter.requires_grad
-                ],
-                "lr": value_lr,
-            },
-        ]
+        groups = []
+        if self.config.gate_trainable:
+            if not math.isfinite(gate_lr) or gate_lr <= 0:
+                raise ValueError("Trainable Gate requires a positive `gate_lr`.")
+            groups.append(
+                {
+                    "name": "gate",
+                    "params": [
+                        parameter
+                        for parameter in self.gate.parameters()
+                        if parameter.requires_grad
+                    ],
+                    "lr": gate_lr,
+                }
+            )
+        elif gate_lr != 0:
+            raise ValueError("Frozen Gate requires `gate_lr` to be exactly zero.")
+        groups.extend(
+            [
+                {
+                    "name": "uncond_lora",
+                    "params": [
+                        parameter
+                        for parameter in self.lora_adapter.lora_parameters()
+                        if parameter.requires_grad
+                    ],
+                    "lr": lora_lr,
+                },
+                {
+                    "name": "value_head",
+                    "params": [
+                        parameter
+                        for parameter in critic.value_head.parameters()
+                        if parameter.requires_grad
+                    ],
+                    "lr": value_lr,
+                },
+            ]
+        )
         if self.wan_current_refiner is not None:
             if refiner_lr is None or not math.isfinite(refiner_lr) or refiner_lr <= 0:
                 raise ValueError("Enabled P8 requires a positive `refiner_lr`.")

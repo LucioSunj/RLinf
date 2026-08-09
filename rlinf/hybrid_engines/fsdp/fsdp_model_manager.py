@@ -582,13 +582,15 @@ class FSDPModelManager:
                 if hasattr(p8_sidecar, "get")
                 else getattr(p8_sidecar, "enabled", False)
             )
+            gate_trainable = bool(self._cfg.model.get("gate_trainable", True))
             fastwam_groups = partition_fastwam_trainable_parameters(
                 model.named_parameters(),
+                require_gate=gate_trainable,
                 require_refiner=p8_enabled,
                 refiner_manifest=_resolve_fastwam_refiner_manifest(model),
             )
-            param_groups.extend(
-                [
+            if gate_trainable:
+                param_groups.append(
                     {
                         "name": "gate",
                         "params": fastwam_groups["gate"],
@@ -597,7 +599,10 @@ class FSDPModelManager:
                         "weight_decay": self._cfg.optim.get(
                             "gate_weight_decay", weight_decay
                         ),
-                    },
+                    }
+                )
+            param_groups.extend(
+                [
                     {
                         "name": "uncond_lora",
                         "params": fastwam_groups["uncond_lora"],

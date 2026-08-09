@@ -15,6 +15,7 @@
 """Small fail-fast contracts shared by RLinf configuration entry points."""
 
 import copy
+import math
 from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
@@ -47,6 +48,97 @@ def validate_fastwam_kv_weight_sync(backend: str, weight_sync_interval: int) -> 
         raise ValueError(
             "FastWAM K/V recomputation requires `runner.weight_sync_interval: 1` "
             "so the rollout actor version can be reconstructed exactly."
+        )
+
+
+def validate_p8_readiness_gate_ownership(
+    *,
+    p8_enabled: bool,
+    gate_trainable: bool,
+    readiness_endpoint: bool,
+    gate_lr: float,
+    gate_loss_weight: float,
+) -> None:
+    """Validate the opt-in frozen-Gate P8 engineering endpoint."""
+
+    if not isinstance(gate_trainable, bool):
+        raise TypeError("FastWAM `gate_trainable` must be a boolean.")
+    if not isinstance(readiness_endpoint, bool):
+        raise TypeError("`runner.p8_readiness_endpoint` must be a boolean.")
+    gate_lr = float(gate_lr)
+    gate_loss_weight = float(gate_loss_weight)
+    if not math.isfinite(gate_lr) or not math.isfinite(gate_loss_weight):
+        raise ValueError("FastWAM Gate LR and loss weight must be finite.")
+    if gate_trainable:
+        if readiness_endpoint:
+            raise ValueError(
+                "P8 readiness endpoint requires an explicitly frozen Gate."
+            )
+        if gate_lr <= 0 or gate_loss_weight <= 0:
+            raise ValueError("Trainable FastWAM Gate requires positive LR and loss.")
+        return
+    if not p8_enabled or not readiness_endpoint:
+        raise ValueError(
+            "Frozen Gate is restricted to the explicit enabled P8 readiness endpoint."
+        )
+    if gate_lr != 0 or gate_loss_weight != 0:
+        raise ValueError("Frozen P8 readiness Gate requires exact zero LR and loss.")
+
+
+def validate_p8_readiness_endpoint_contract(
+    *,
+    max_steps: int,
+    max_epochs: int,
+    actor_total_training_steps: int,
+    actor_seed: int,
+    global_batch_size: int,
+    env_seed: int,
+    total_num_envs: int,
+    task_id_filter: object,
+    specific_reset_id: int,
+    use_fixed_reset_state_ids: bool,
+    training_route_override: str,
+    formal_training_authorized: bool,
+    final_ledger_path: object,
+) -> None:
+    """Restrict the P8 readiness preset to the frozen B0/B1 identity."""
+
+    exact_values = {
+        "runner.max_steps": (int(max_steps), 2),
+        "runner.max_epochs": (int(max_epochs), 1),
+        "actor.optim.total_training_steps": (int(actor_total_training_steps), 2),
+        "actor.seed": (int(actor_seed), 424242),
+        "actor.global_batch_size": (int(global_batch_size), 1),
+        "env.train.seed": (int(env_seed), 424242),
+        "env.train.total_num_envs": (int(total_num_envs), 1),
+        "env.train.specific_reset_id": (int(specific_reset_id), 1),
+    }
+    mismatches = [
+        f"{name}={actual!r} (expected {expected!r})"
+        for name, (actual, expected) in exact_values.items()
+        if actual != expected
+    ]
+    if OmegaConf.is_config(task_id_filter):
+        task_id_filter = OmegaConf.to_container(task_id_filter, resolve=True)
+    normalized_task_ids = (
+        list(task_id_filter) if isinstance(task_id_filter, (list, tuple)) else None
+    )
+    if normalized_task_ids != [0]:
+        mismatches.append(f"env.train.task_id_filter={task_id_filter!r} (expected [0])")
+    if use_fixed_reset_state_ids is not True:
+        mismatches.append("env.train.use_fixed_reset_state_ids must be true")
+    if training_route_override != "forced_uncond_after_initial":
+        mismatches.append(
+            "training_route_override must be `forced_uncond_after_initial`"
+        )
+    if formal_training_authorized is not False:
+        mismatches.append("runner.formal_training_authorized must be false")
+    if final_ledger_path is not None:
+        mismatches.append("runner.final_ledger_path must be null")
+    if mismatches:
+        raise ValueError(
+            "P8 readiness endpoint is restricted to the two-step B0/B1 harness: "
+            + "; ".join(mismatches)
         )
 
 

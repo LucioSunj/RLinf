@@ -73,6 +73,19 @@ def test_partition_fastwam_trainable_parameters_requires_all_groups() -> None:
         )
 
 
+def test_partition_frozen_gate_endpoint_omits_gate_group() -> None:
+    named = _base_named_parameters()
+    named[0][1].requires_grad_(False)
+
+    groups = partition_fastwam_trainable_parameters(named, require_gate=False)
+
+    assert set(groups) == {"uncond_lora", "value_head"}
+
+    named[0][1].requires_grad_(True)
+    with pytest.raises(RuntimeError, match="Frozen Gate endpoint"):
+        partition_fastwam_trainable_parameters(named, require_gate=False)
+
+
 def test_p8_refiner_partition_uses_manifest_identity_with_flat_name() -> None:
     refiner = _parameter()
     manifest = FastWAMRefinerParameterManifest(
