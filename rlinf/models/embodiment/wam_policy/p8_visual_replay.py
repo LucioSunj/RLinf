@@ -10,6 +10,8 @@
 
 from __future__ import annotations
 
+import hashlib
+import json
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from enum import Enum
@@ -229,7 +231,7 @@ def canonicalize_p8_source_bf16(
     )
 
 
-_TENSOR_NAMES = (
+_CONTENT_TENSOR_NAMES = (
     "present",
     "actor_versions",
     "native_tokens",
@@ -243,6 +245,189 @@ _TENSOR_NAMES = (
     "rope_freqs_current",
     "camera_index_current",
 )
+_HASH_BYTES = hashlib.sha256().digest_size
+_TENSOR_NAMES = (
+    *_CONTENT_TENSOR_NAMES,
+    "contract_sha256",
+    "integrity_sha256",
+)
+_INTEGRITY_SCHEMA = "fastwam-p8-stored-native-replay-integrity-v1"
+
+
+def _replay_contract_payload(spec: P8VisualReplaySpec) -> dict[str, Any]:
+    """Return the canonical metadata/provenance bound to every replay row."""
+
+    return {
+        "schema": _INTEGRITY_SCHEMA,
+        "layer_indices": list(spec.layer_indices),
+        "camera_ids": list(spec.camera_ids),
+        "current_frame_video_tokens": spec.current_frame_video_tokens,
+        "wan_hidden_dim": spec.wan_hidden_dim,
+        "kv_dim": spec.kv_dim,
+        "rope_shape": list(spec.rope_shape),
+        "native_grid": [14, 14],
+        "native_patch_count": 196,
+        "native_width": 384,
+        "memory_contract_sha256": spec.memory_contract_sha256,
+        "source_contract_sha256": spec.source_contract_sha256,
+        "native_source_revision": spec.native_source_revision,
+        "native_weights_sha256": spec.native_weights_sha256,
+        "native_input_contract_sha256": spec.native_input_contract_sha256,
+        "native_preprocess_sha256": spec.native_preprocess_sha256,
+        "native_output_contract_sha256": spec.native_output_contract_sha256,
+        "content_tensor_order": list(_CONTENT_TENSOR_NAMES),
+    }
+
+
+def _replay_contract_digest(spec: P8VisualReplaySpec) -> bytes:
+    payload = json.dumps(
+        _replay_contract_payload(spec),
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return hashlib.sha256(payload).digest()
+
+
+def _update_digest_with_tensor(
+    digest: Any,
+    *,
+    name: str,
+    tensor: torch.Tensor,
+) -> None:
+    """Hash one tensor without depending on its source device or strides."""
+
+    header = json.dumps(
+        {
+            "name": name,
+            "dtype": str(tensor.dtype),
+            "shape": list(tensor.shape),
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    digest.update(len(header).to_bytes(8, byteorder="big", signed=False))
+    digest.update(header)
+    raw = tensor.detach().contiguous().reshape(-1).view(torch.uint8)
+    if raw.device.type != "cpu":
+        raw = raw.cpu()
+    for chunk in raw.split(1024 * 1024):
+        digest.update(chunk.numpy().tobytes())
+
+
+def _validate_integrity_payload(
+    payload: Mapping[str, torch.Tensor],
+) -> tuple[int, torch.device]:
+    missing = [name for name in _TENSOR_NAMES if name not in payload]
+    if missing:
+        raise KeyError(f"P8 visual replay is missing integrity tensors: {missing}.")
+    if any(not torch.is_tensor(payload[name]) for name in _TENSOR_NAMES):
+        raise TypeError("Every P8 visual replay integrity field must be a tensor.")
+    present = payload["present"]
+    if present.ndim != 1 or present.shape[0] < 1:
+        raise ValueError("P8 replay integrity requires a non-empty batch dimension.")
+    batch = int(present.shape[0])
+    for name in _TENSOR_NAMES:
+        tensor = payload[name]
+        if tensor.ndim < 1 or tensor.shape[0] != batch:
+            raise ValueError(
+                f"P8 replay integrity tensor `{name}` must be batch first with B={batch}."
+            )
+    for name in ("contract_sha256", "integrity_sha256"):
+        tensor = payload[name]
+        if tensor.shape != (batch, _HASH_BYTES) or tensor.dtype is not torch.uint8:
+            raise ValueError(
+                f"P8 replay `{name}` must have shape [B,{_HASH_BYTES}] and uint8 dtype."
+            )
+    devices = {payload[name].device for name in _TENSOR_NAMES}
+    if len(devices) != 1:
+        raise ValueError("P8 replay payload tensors must share one device.")
+    return batch, devices.pop()
+
+
+def _content_integrity_tensor(
+    payload: Mapping[str, torch.Tensor],
+) -> torch.Tensor:
+    """Recompute one content digest per row from stored contract and raw tensors."""
+
+    batch, _device = _validate_integrity_payload(payload)
+    contract_hashes = payload["contract_sha256"].detach().cpu()
+    result = []
+    for index in range(batch):
+        digest = hashlib.sha256()
+        digest.update(_INTEGRITY_SCHEMA.encode("utf-8"))
+        digest.update(b"\0")
+        digest.update(bytes(contract_hashes[index].tolist()))
+        for name in _CONTENT_TENSOR_NAMES:
+            _update_digest_with_tensor(
+                digest,
+                name=name,
+                tensor=payload[name][index],
+            )
+        result.append(torch.tensor(list(digest.digest()), dtype=torch.uint8))
+    return torch.stack(result)
+
+
+def _verify_content_integrity(payload: Mapping[str, torch.Tensor]) -> None:
+    """Fail closed when transported P8 content differs from its stored digest."""
+
+    expected = _content_integrity_tensor(payload)
+    actual = payload["integrity_sha256"].detach().cpu()
+    if not torch.equal(actual, expected):
+        raise ValueError("P8 replay content integrity SHA256 mismatch.")
+
+
+def _verify_contract_integrity(
+    spec: P8VisualReplaySpec,
+    payload: Mapping[str, torch.Tensor],
+) -> None:
+    """Bind the transported content digest to the live typed replay spec."""
+
+    batch, _device = _validate_integrity_payload(payload)
+    expected = torch.tensor(
+        list(_replay_contract_digest(spec)),
+        dtype=torch.uint8,
+    ).expand(batch, -1)
+    actual = payload["contract_sha256"].detach().cpu()
+    if not torch.equal(actual, expected):
+        raise ValueError("P8 replay metadata/provenance contract SHA256 mismatch.")
+    _verify_content_integrity(payload)
+
+
+def _build_integrity_hashes(
+    *,
+    spec: P8VisualReplaySpec,
+    payload: Mapping[str, torch.Tensor],
+) -> dict[str, torch.Tensor]:
+    """Create compact contract/content hashes on the payload's source device."""
+
+    present = payload.get("present")
+    if not torch.is_tensor(present) or present.ndim != 1 or present.shape[0] < 1:
+        raise ValueError("P8 replay hashing requires a non-empty presence tensor.")
+    batch = int(present.shape[0])
+    device = present.device
+    contract = (
+        torch.tensor(
+            list(_replay_contract_digest(spec)),
+            dtype=torch.uint8,
+        )
+        .expand(batch, -1)
+        .clone()
+    )
+    hash_payload = {
+        **payload,
+        "contract_sha256": contract.to(device=device),
+        "integrity_sha256": torch.zeros(
+            batch,
+            _HASH_BYTES,
+            dtype=torch.uint8,
+            device=device,
+        ),
+    }
+    integrity = _content_integrity_tensor(hash_payload)
+    return {
+        "contract_sha256": hash_payload["contract_sha256"],
+        "integrity_sha256": integrity.to(device=device),
+    }
 
 
 @dataclass(frozen=True)
@@ -262,9 +447,13 @@ class PackedP8VisualReplay:
     base_value_current: torch.Tensor
     rope_freqs_current: torch.Tensor
     camera_index_current: torch.Tensor
+    contract_sha256: torch.Tensor
+    integrity_sha256: torch.Tensor
 
     def __post_init__(self) -> None:
         batch = self.present.shape[0]
+        if batch < 1:
+            raise ValueError("P8 replay batches must be non-empty.")
         layers = len(self.spec.layer_indices)
         current = self.spec.current_frame_video_tokens
         views = len(self.spec.camera_ids)
@@ -314,8 +503,23 @@ class PackedP8VisualReplay:
             raise TypeError("P8 replay camera masks must use bool dtype.")
         if self.camera_index_current.dtype is not torch.long:
             raise TypeError("P8 replay camera indices must use int64 dtype.")
+        for name in ("contract_sha256", "integrity_sha256"):
+            tensor = getattr(self, name)
+            if tensor.shape != (batch, _HASH_BYTES) or tensor.dtype is not torch.uint8:
+                raise ValueError(
+                    f"P8 replay `{name}` must have shape [B,{_HASH_BYTES}] "
+                    "and uint8 dtype."
+                )
         if bool((self.present & (self.actor_versions < 0)).any().item()):
             raise ValueError("Present P8 sources require non-negative actor versions.")
+        expected_patch_cameras = self.camera_valid_mask & self.present[:, None]
+        if not torch.equal(
+            self.patch_valid_mask.any(dim=-1),
+            expected_patch_cameras,
+        ):
+            raise ValueError(
+                "P8 replay patch validity disagrees with route/camera validity."
+            )
         absent = ~self.present
         if bool(absent.any().item()):
             for name in (
@@ -327,12 +531,17 @@ class PackedP8VisualReplay:
                 "key_pre_norm_current",
                 "base_key_current",
                 "base_value_current",
+                "rope_freqs_current",
                 "camera_index_current",
             ):
                 if bool((getattr(self, name)[absent] != 0).any().item()):
                     raise ValueError(
                         "Absent IDM P8 replay slots must contain exact zeros."
                     )
+        _verify_contract_integrity(
+            self.spec,
+            {name: getattr(self, name) for name in _TENSOR_NAMES},
+        )
 
     @property
     def batch_size(self) -> int:
@@ -341,6 +550,11 @@ class PackedP8VisualReplay:
     def as_forward_inputs(self) -> dict[str, torch.Tensor]:
         return {f"p8_visual_{name}": getattr(self, name) for name in _TENSOR_NAMES}
 
+    def validate_integrity(self) -> None:
+        """Revalidate mutable tensor contents before live replay materialization."""
+
+        self.__post_init__()
+
     @classmethod
     def from_forward_inputs(
         cls,
@@ -348,6 +562,14 @@ class PackedP8VisualReplay:
         *,
         spec: P8VisualReplaySpec,
     ) -> PackedP8VisualReplay:
+        prefixed = {
+            name.removeprefix("p8_visual_")
+            for name in forward_inputs
+            if name.startswith("p8_visual_")
+        }
+        unknown = sorted(prefixed - set(_TENSOR_NAMES))
+        if unknown:
+            raise KeyError(f"P8 visual replay has unknown tensors: {unknown}.")
         missing = [
             name for name in _TENSOR_NAMES if f"p8_visual_{name}" not in forward_inputs
         ]
@@ -373,6 +595,10 @@ class PackedP8VisualReplay:
         device: torch.device | str,
         expected_actor_version: int,
     ) -> P8FrozenVisualSource:
+        # Tensor contents remain mutable even on a frozen dataclass. Validate
+        # before the first `.to(target)` so corrupt replay never reaches a GPU
+        # or any frozen runtime asset.
+        self.validate_integrity()
         if not 0 <= index < self.batch_size:
             raise IndexError(index)
         if not bool(self.present[index].item()):
@@ -564,6 +790,7 @@ def pack_p8_visual_sources(
                 "base_value_current",
             ):
                 payload[name][batch_index, layer_offset] = getattr(layer, name)[0]
+    payload.update(_build_integrity_hashes(spec=spec, payload=payload))
     return PackedP8VisualReplay(spec=spec, **payload)
 
 
@@ -623,6 +850,33 @@ def replay_bytes_by_prefix(
     return result
 
 
+def validate_p8_forward_input_integrity(
+    forward_inputs: Mapping[str, torch.Tensor],
+) -> None:
+    """Validate transported content before actor-side device transfer.
+
+    This transport-level check uses the stored contract digest, so it survives
+    trajectory stack/cat/shuffle without needing to construct frozen assets.
+    Live replay additionally binds that digest to its typed
+    :class:`P8VisualReplaySpec` before materializing a sample.
+    """
+
+    values = {
+        name.removeprefix("p8_visual_"): tensor
+        for name, tensor in forward_inputs.items()
+        if name.startswith("p8_visual_")
+    }
+    if not values:
+        return
+    unknown = sorted(set(values) - set(_TENSOR_NAMES))
+    if unknown:
+        raise KeyError(f"P8 visual replay has unknown tensors: {unknown}.")
+    missing = sorted(set(_TENSOR_NAMES) - set(values))
+    if missing:
+        raise KeyError(f"P8 visual replay is missing tensors: {missing}.")
+    _verify_content_integrity(values)
+
+
 def validate_p8_forward_input_budget(
     forward_inputs: Mapping[str, torch.Tensor],
     *,
@@ -630,6 +884,7 @@ def validate_p8_forward_input_budget(
 ) -> None:
     """Enforce aggregate limits on the complete actor-side rollout payload."""
 
+    validate_p8_forward_input_integrity(forward_inputs)
     p8_bytes = replay_bytes_by_prefix(forward_inputs, prefix="p8_visual_")
     try:
         gate_bytes = replay_bytes_by_prefix(forward_inputs, prefix="gate_kv_")
@@ -660,6 +915,7 @@ def pin_p8_visual_forward_inputs(
 ) -> dict[str, torch.Tensor]:
     """Re-pin P8 payload after stack/cat/shuffle copies."""
 
+    validate_p8_forward_input_integrity(forward_inputs)
     result = (
         forward_inputs if isinstance(forward_inputs, dict) else dict(forward_inputs)
     )

@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import hashlib
+from dataclasses import replace
 from types import SimpleNamespace
 
 import pytest
@@ -40,6 +41,8 @@ from rlinf.models.embodiment.wam_policy.p8_visual_replay import (
     P8VisualReplaySpec,
     PackedP8VisualReplay,
     pack_p8_visual_sources,
+    pin_p8_visual_forward_inputs,
+    validate_p8_forward_input_integrity,
     validate_p8_replay_bytes,
 )
 from rlinf.workers.actor.fastwam_selective_sync import capture_fastwam_sync_tensors
@@ -155,6 +158,162 @@ def test_stored_visual_replay_roundtrips_real_native_provenance_and_idm_slot() -
         spec=spec,
     )
     assert torch.equal(reconstructed.bytes_per_sample(), packed.bytes_per_sample())
+    assert packed.contract_sha256.shape == (2, 32)
+    assert packed.integrity_sha256.shape == (2, 32)
+
+
+@pytest.mark.parametrize(
+    "tensor_name",
+    (
+        "present",
+        "actor_versions",
+        "native_tokens",
+        "patch_valid_mask",
+        "camera_valid_mask",
+        "hidden_current",
+        "attention_input_current",
+        "key_pre_norm_current",
+        "base_key_current",
+        "base_value_current",
+        "rope_freqs_current",
+        "camera_index_current",
+        "contract_sha256",
+        "integrity_sha256",
+    ),
+)
+def test_stored_visual_replay_rejects_any_present_sample_tamper(
+    tensor_name: str,
+) -> None:
+    packed = pack_p8_visual_sources((_source(), None), spec=_spec())
+    forward_inputs = {
+        name: tensor.clone() for name, tensor in packed.as_forward_inputs().items()
+    }
+    tensor = forward_inputs[f"p8_visual_{tensor_name}"]
+    index = (0,) * tensor.ndim
+    if tensor.dtype is torch.bool:
+        tensor[index] = ~tensor[index]
+    elif tensor.is_floating_point() or tensor.is_complex():
+        tensor[index] += 1
+    else:
+        tensor[index] += 1
+
+    with pytest.raises(ValueError, match="content integrity"):
+        validate_p8_forward_input_integrity(forward_inputs)
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    (
+        ("native_source_revision", "different-source-revision"),
+        ("native_weights_sha256", _hash("different-weights")),
+        ("native_input_contract_sha256", _hash("different-input")),
+        ("native_preprocess_sha256", _hash("different-preprocess")),
+        ("native_output_contract_sha256", _hash("different-output")),
+        ("memory_contract_sha256", _hash("different-memory")),
+        ("source_contract_sha256", _hash("different-source")),
+        ("camera_ids", ("main", "different-camera")),
+    ),
+)
+def test_stored_visual_replay_binds_live_metadata_and_provenance(
+    field: str,
+    value: object,
+) -> None:
+    spec = _spec()
+    packed = pack_p8_visual_sources((_source(),), spec=spec)
+
+    with pytest.raises(ValueError, match="metadata/provenance contract"):
+        PackedP8VisualReplay.from_forward_inputs(
+            packed.as_forward_inputs(),
+            spec=replace(spec, **{field: value}),
+        )
+
+
+@pytest.mark.parametrize("hash_name", ("contract_sha256", "integrity_sha256"))
+def test_stored_visual_replay_rejects_missing_or_malformed_hash(
+    hash_name: str,
+) -> None:
+    packed = pack_p8_visual_sources((_source(),), spec=_spec())
+    key = f"p8_visual_{hash_name}"
+
+    missing = dict(packed.as_forward_inputs())
+    missing.pop(key)
+    with pytest.raises(KeyError, match="missing"):
+        PackedP8VisualReplay.from_forward_inputs(missing, spec=_spec())
+
+    wrong_dtype = dict(packed.as_forward_inputs())
+    wrong_dtype[key] = wrong_dtype[key].to(torch.long)
+    with pytest.raises(ValueError, match="uint8 dtype"):
+        PackedP8VisualReplay.from_forward_inputs(wrong_dtype, spec=_spec())
+
+    wrong_shape = dict(packed.as_forward_inputs())
+    wrong_shape[key] = wrong_shape[key][:, :-1]
+    with pytest.raises(ValueError, match=r"shape \[B,32\]"):
+        PackedP8VisualReplay.from_forward_inputs(wrong_shape, spec=_spec())
+
+
+def test_stored_visual_replay_integrity_survives_stack_cat_shuffle_and_pin() -> None:
+    spec = _spec()
+    first = pack_p8_visual_sources((_source(actor_version=3), None), spec=spec)
+    second = pack_p8_visual_sources(
+        (_source(actor_version=4), _source(actor_version=4)),
+        spec=spec,
+    )
+    first_inputs = first.as_forward_inputs()
+    second_inputs = second.as_forward_inputs()
+    concatenated = {
+        name: torch.cat((first_inputs[name], second_inputs[name]), dim=0)
+        for name in first_inputs
+    }
+    stacked_then_flattened = {
+        name: torch.stack((first_inputs[name], second_inputs[name]), dim=0).flatten(
+            0, 1
+        )
+        for name in first_inputs
+    }
+    assert all(
+        torch.equal(concatenated[name], stacked_then_flattened[name])
+        for name in concatenated
+    )
+    permutation = torch.tensor([3, 0, 2, 1])
+    shuffled = {
+        name: tensor.index_select(0, permutation)
+        for name, tensor in concatenated.items()
+    }
+
+    validate_p8_forward_input_integrity(shuffled)
+    pinned = pin_p8_visual_forward_inputs(shuffled)
+    reconstructed = PackedP8VisualReplay.from_forward_inputs(pinned, spec=spec)
+    assert reconstructed.actor_versions.tolist() == [4, 3, 4, -1]
+    assert reconstructed.present.tolist() == [True, True, True, False]
+    reconstructed.materialize_sample(
+        0,
+        device="cpu",
+        expected_actor_version=4,
+    )
+    reconstructed.materialize_sample(
+        1,
+        device="cpu",
+        expected_actor_version=3,
+    )
+
+
+def test_live_materialization_revalidates_before_target_device_transfer() -> None:
+    packed = pack_p8_visual_sources((_source(),), spec=_spec())
+    packed.native_tokens[0, 0, 0, 0] += 1
+
+    with pytest.raises(ValueError, match="content integrity"):
+        packed.materialize_sample(
+            0,
+            device="cuda",
+            expected_actor_version=3,
+        )
+
+
+def test_disabled_p8_pin_and_integrity_helpers_are_exact_noops() -> None:
+    forward_inputs = {"unrelated": torch.tensor([1])}
+
+    validate_p8_forward_input_integrity(forward_inputs)
+    assert pin_p8_visual_forward_inputs(forward_inputs) is forward_inputs
 
 
 def test_visual_replay_caps_and_unimplemented_recompute_fail_closed() -> None:
