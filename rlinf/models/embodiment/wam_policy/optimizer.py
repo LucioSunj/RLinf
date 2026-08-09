@@ -66,10 +66,18 @@ def partition_fastwam_trainable_parameters(
     }
     unexpected: list[str] = []
     seen_refiner_ids: set[int] = set()
+    seen_parameter_names_by_id: dict[int, str] = {}
     for name, parameter in named_parameters:
         if not parameter.requires_grad:
             continue
         parameter_id = id(parameter)
+        previous_name = seen_parameter_names_by_id.get(parameter_id)
+        if previous_name is not None:
+            raise RuntimeError(
+                "FastWAM adaptive optimizer received duplicate parameter ownership: "
+                f"{previous_name!r} and {name!r} identify the same parameter."
+            )
+        seen_parameter_names_by_id[parameter_id] = name
         refiner_named = (
             name.startswith("wan_current_refiner.") or ".wan_current_refiner." in name
         )

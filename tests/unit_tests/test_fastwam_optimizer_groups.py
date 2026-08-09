@@ -129,6 +129,22 @@ def test_p8_refiner_partition_rejects_missing_manifest_identity() -> None:
         )
 
 
+def test_p8_refiner_partition_rejects_duplicate_parameter_ownership() -> None:
+    refiner = _parameter()
+    manifest = FastWAMRefinerParameterManifest(entries=(("real", refiner),))
+
+    with pytest.raises(RuntimeError, match="duplicate parameter ownership"):
+        partition_fastwam_trainable_parameters(
+            [
+                *_base_named_parameters(),
+                ("flat.real", refiner),
+                ("another.flat.alias", refiner),
+            ],
+            require_refiner=True,
+            refiner_manifest=manifest,
+        )
+
+
 def test_p8_refiner_partition_rejects_manifest_when_disabled() -> None:
     refiner = _parameter()
     manifest = FastWAMRefinerParameterManifest(entries=(("real", refiner),))
