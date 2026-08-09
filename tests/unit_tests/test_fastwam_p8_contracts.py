@@ -103,6 +103,7 @@ def _spec() -> P8VisualReplaySpec:
         wan_hidden_dim=8,
         kv_dim=8,
         rope_shape=(4, 1, 2),
+        rope_complex_dtype="complex64",
         memory_contract_sha256=memory.memory_contract_sha256,
         source_contract_sha256=_hash("source"),
         native_source_revision=memory.source_revision,
@@ -149,6 +150,14 @@ def test_stored_visual_replay_roundtrips_real_native_provenance_and_idm_slot() -
     assert torch.equal(
         restored.layers[0].hidden_current, source.layers[0].hidden_current
     )
+    expected_rope = torch.complex(
+        source.layers[0].rope_freqs_current.real.to(torch.bfloat16).float(),
+        source.layers[0].rope_freqs_current.imag.to(torch.bfloat16).float(),
+    )
+    assert restored.layers[0].rope_freqs_current.dtype is torch.complex64
+    assert torch.equal(restored.layers[0].rope_freqs_current, expected_rope)
+    assert packed.rope_freqs_real_current.dtype is torch.bfloat16
+    assert packed.rope_freqs_imag_current.dtype is torch.bfloat16
     assert not bool(packed.present[1])
     with pytest.raises(ValueError, match="IDM replay slots"):
         packed.materialize_sample(1, device="cpu", expected_actor_version=3)
@@ -175,7 +184,8 @@ def test_stored_visual_replay_roundtrips_real_native_provenance_and_idm_slot() -
         "key_pre_norm_current",
         "base_key_current",
         "base_value_current",
-        "rope_freqs_current",
+        "rope_freqs_real_current",
+        "rope_freqs_imag_current",
         "camera_index_current",
         "contract_sha256",
         "integrity_sha256",
@@ -212,6 +222,7 @@ def test_stored_visual_replay_rejects_any_present_sample_tamper(
         ("memory_contract_sha256", _hash("different-memory")),
         ("source_contract_sha256", _hash("different-source")),
         ("camera_ids", ("main", "different-camera")),
+        ("rope_complex_dtype", "complex128"),
     ),
 )
 def test_stored_visual_replay_binds_live_metadata_and_provenance(
@@ -249,6 +260,26 @@ def test_stored_visual_replay_rejects_missing_or_malformed_hash(
     wrong_shape[key] = wrong_shape[key][:, :-1]
     with pytest.raises(ValueError, match=r"shape \[B,32\]"):
         PackedP8VisualReplay.from_forward_inputs(wrong_shape, spec=_spec())
+
+
+def test_stored_visual_replay_rejects_legacy_or_non_bf16_rope_payload() -> None:
+    packed = pack_p8_visual_sources((_source(),), spec=_spec())
+    legacy = dict(packed.as_forward_inputs())
+    legacy["p8_visual_rope_freqs_current"] = torch.ones(
+        1,
+        4,
+        1,
+        2,
+        dtype=torch.complex64,
+    )
+    with pytest.raises(KeyError, match="unknown tensors"):
+        PackedP8VisualReplay.from_forward_inputs(legacy, spec=_spec())
+
+    for name in ("rope_freqs_real_current", "rope_freqs_imag_current"):
+        wrong_dtype = dict(packed.as_forward_inputs())
+        wrong_dtype[f"p8_visual_{name}"] = wrong_dtype[f"p8_visual_{name}"].float()
+        with pytest.raises(TypeError, match="must use bfloat16"):
+            PackedP8VisualReplay.from_forward_inputs(wrong_dtype, spec=_spec())
 
 
 def test_stored_visual_replay_integrity_survives_stack_cat_shuffle_and_pin() -> None:

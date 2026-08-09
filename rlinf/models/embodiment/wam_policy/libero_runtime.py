@@ -607,6 +607,9 @@ class LiberoFastWAMRuntime:
             wan_hidden_dim=config.wan_hidden_dim,
             kv_dim=int(video_cache[0]["k"].shape[-1]),
             rope_shape=tuple(video_pre["freqs"][:tokens_per_frame].shape),
+            rope_complex_dtype=str(
+                video_pre["freqs"][:tokens_per_frame].dtype
+            ).removeprefix("torch."),
             memory_contract_sha256=config.memory_contract_sha256,
             source_contract_sha256=config.source_contract_sha256,
             native_source_revision=asset.source_revision,

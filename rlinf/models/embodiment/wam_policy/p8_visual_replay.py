@@ -99,6 +99,7 @@ class P8VisualReplaySpec:
     wan_hidden_dim: int
     kv_dim: int
     rope_shape: tuple[int, ...]
+    rope_complex_dtype: str
     memory_contract_sha256: str
     source_contract_sha256: str
     native_source_revision: str
@@ -119,8 +120,14 @@ class P8VisualReplaySpec:
                 raise ValueError(f"P8 replay `{name}` must be positive.")
         if not self.rope_shape or self.rope_shape[0] != self.current_frame_video_tokens:
             raise ValueError("P8 replay RoPE shape must cover the current prefix.")
+        rope_complex_dtype = str(self.rope_complex_dtype).removeprefix("torch.")
+        if rope_complex_dtype not in {"complex64", "complex128"}:
+            raise ValueError(
+                "P8 replay RoPE source dtype must be complex64 or complex128."
+            )
         object.__setattr__(self, "layer_indices", layers)
         object.__setattr__(self, "camera_ids", cameras)
+        object.__setattr__(self, "rope_complex_dtype", rope_complex_dtype)
         object.__setattr__(
             self,
             "memory_contract_sha256",
@@ -179,6 +186,8 @@ class P8FrozenVisualSource:
             )
             if any(tensor.dtype is not torch.bfloat16 for tensor in tensors):
                 raise TypeError("P8 Wan sources must be canonicalized to BF16.")
+            if not layer.rope_freqs_current.is_complex():
+                raise TypeError("P8 Wan RoPE sources must use a complex dtype.")
 
 
 def canonicalize_p8_source_bf16(
@@ -242,7 +251,8 @@ _CONTENT_TENSOR_NAMES = (
     "key_pre_norm_current",
     "base_key_current",
     "base_value_current",
-    "rope_freqs_current",
+    "rope_freqs_real_current",
+    "rope_freqs_imag_current",
     "camera_index_current",
 )
 _HASH_BYTES = hashlib.sha256().digest_size
@@ -251,7 +261,7 @@ _TENSOR_NAMES = (
     "contract_sha256",
     "integrity_sha256",
 )
-_INTEGRITY_SCHEMA = "fastwam-p8-stored-native-replay-integrity-v1"
+_INTEGRITY_SCHEMA = "fastwam-p8-stored-native-replay-integrity-v2-bf16-rope"
 
 
 def _replay_contract_payload(spec: P8VisualReplaySpec) -> dict[str, Any]:
@@ -265,6 +275,8 @@ def _replay_contract_payload(spec: P8VisualReplaySpec) -> dict[str, Any]:
         "wan_hidden_dim": spec.wan_hidden_dim,
         "kv_dim": spec.kv_dim,
         "rope_shape": list(spec.rope_shape),
+        "rope_complex_dtype": spec.rope_complex_dtype,
+        "rope_storage_encoding": "separate_real_imag_bfloat16",
         "native_grid": [14, 14],
         "native_patch_count": 196,
         "native_width": 384,
@@ -445,7 +457,8 @@ class PackedP8VisualReplay:
     key_pre_norm_current: torch.Tensor
     base_key_current: torch.Tensor
     base_value_current: torch.Tensor
-    rope_freqs_current: torch.Tensor
+    rope_freqs_real_current: torch.Tensor
+    rope_freqs_imag_current: torch.Tensor
     camera_index_current: torch.Tensor
     contract_sha256: torch.Tensor
     integrity_sha256: torch.Tensor
@@ -478,7 +491,8 @@ class PackedP8VisualReplay:
             "key_pre_norm_current": (batch, layers, current, self.spec.kv_dim),
             "base_key_current": (batch, layers, current, self.spec.kv_dim),
             "base_value_current": (batch, layers, current, self.spec.kv_dim),
-            "rope_freqs_current": (batch, *self.spec.rope_shape),
+            "rope_freqs_real_current": (batch, *self.spec.rope_shape),
+            "rope_freqs_imag_current": (batch, *self.spec.rope_shape),
             "camera_index_current": (batch, current),
         }
         for name, shape in expected.items():
@@ -494,6 +508,8 @@ class PackedP8VisualReplay:
             "key_pre_norm_current",
             "base_key_current",
             "base_value_current",
+            "rope_freqs_real_current",
+            "rope_freqs_imag_current",
         ):
             if getattr(self, name).dtype is not torch.bfloat16:
                 raise TypeError(f"P8 replay `{name}` must use bfloat16.")
@@ -531,7 +547,8 @@ class PackedP8VisualReplay:
                 "key_pre_norm_current",
                 "base_key_current",
                 "base_value_current",
-                "rope_freqs_current",
+                "rope_freqs_real_current",
+                "rope_freqs_imag_current",
                 "camera_index_current",
             ):
                 if bool((getattr(self, name)[absent] != 0).any().item()):
@@ -607,6 +624,29 @@ class PackedP8VisualReplay:
         if actor_version != expected_actor_version:
             raise ValueError("P8 replay source actor version mismatch.")
         target = torch.device(device)
+        component_dtype = {
+            "complex64": torch.float32,
+            "complex128": torch.float64,
+        }[self.spec.rope_complex_dtype]
+        rope_freqs_current = torch.complex(
+            self.rope_freqs_real_current[index].to(
+                device=target,
+                dtype=component_dtype,
+            ),
+            self.rope_freqs_imag_current[index].to(
+                device=target,
+                dtype=component_dtype,
+            ),
+        )
+        expected_rope_dtype = {
+            "complex64": torch.complex64,
+            "complex128": torch.complex128,
+        }[self.spec.rope_complex_dtype]
+        if (
+            rope_freqs_current.dtype is not expected_rope_dtype
+            or tuple(rope_freqs_current.shape) != self.spec.rope_shape
+        ):
+            raise RuntimeError("P8 replay failed to reconstruct the typed Wan RoPE.")
         memory = NativePatchMemory(
             tokens=self.native_tokens[index : index + 1].to(target),
             patch_valid_mask=self.patch_valid_mask[index : index + 1].to(target),
@@ -638,7 +678,7 @@ class PackedP8VisualReplay:
                 base_value_current=(
                     self.base_value_current[index : index + 1, offset].to(target)
                 ),
-                rope_freqs_current=self.rope_freqs_current[index].to(target),
+                rope_freqs_current=rope_freqs_current,
                 camera_index_current=(
                     self.camera_index_current[index : index + 1].to(target)
                 ),
@@ -666,10 +706,8 @@ def pack_p8_visual_sources(
     real = next((source for source in sources if source is not None), None)
     if real is not None:
         example_device = real.memory.tokens.device
-        rope_dtype = real.layers[0].rope_freqs_current.dtype
     else:
         example_device = torch.device("cpu")
-        rope_dtype = torch.complex64
     batch = len(sources)
     layers = len(spec.layer_indices)
     current = spec.current_frame_video_tokens
@@ -728,8 +766,11 @@ def pack_p8_visual_sources(
             dtype=torch.bfloat16,
             device=example_device,
         ),
-        "rope_freqs_current": torch.zeros(
-            (batch, *spec.rope_shape), dtype=rope_dtype, device=example_device
+        "rope_freqs_real_current": torch.zeros(
+            (batch, *spec.rope_shape), dtype=torch.bfloat16, device=example_device
+        ),
+        "rope_freqs_imag_current": torch.zeros(
+            (batch, *spec.rope_shape), dtype=torch.bfloat16, device=example_device
         ),
         "camera_index_current": torch.zeros(
             batch, current, dtype=torch.long, device=example_device
@@ -770,7 +811,19 @@ def pack_p8_visual_sources(
         payload["camera_index_current"][batch_index] = source.layers[
             0
         ].camera_index_current[0]
-        payload["rope_freqs_current"][batch_index] = source.layers[0].rope_freqs_current
+        source_rope = source.layers[0].rope_freqs_current
+        if (
+            not source_rope.is_complex()
+            or tuple(source_rope.shape) != spec.rope_shape
+            or str(source_rope.dtype).removeprefix("torch.") != spec.rope_complex_dtype
+        ):
+            raise TypeError("P8 source RoPE dtype/shape differs from replay spec.")
+        payload["rope_freqs_real_current"][batch_index] = source_rope.real.to(
+            dtype=torch.bfloat16
+        )
+        payload["rope_freqs_imag_current"][batch_index] = source_rope.imag.to(
+            dtype=torch.bfloat16
+        )
         for layer_offset, layer in enumerate(source.layers):
             if layer.source_contract_sha256 != spec.source_contract_sha256:
                 raise ValueError("P8 source Wan hash differs from replay spec.")
