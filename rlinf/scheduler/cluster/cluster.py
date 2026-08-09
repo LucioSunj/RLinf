@@ -47,6 +47,14 @@ if TYPE_CHECKING:
     from ..worker import Worker
 
 
+def _list_current_cluster_actors(*, filters: list[tuple[str, str, Any]]) -> list[Any]:
+    """List actors through the GCS address of this initialized Ray cluster."""
+    address = ray.get_runtime_context().gcs_address
+    if not address:
+        raise RuntimeError("The current Ray runtime has no GCS address.")
+    return list_actors(address=address, filters=filters)
+
+
 class ClusterEnvVar(str, Enum):
     """Scheduler environment variables. All env vars are prefixed with {Cluster.SYS_NAME}_ in usage."""
 
@@ -427,7 +435,7 @@ class Cluster:
                 self._distributed_log_collector.stop()
 
             with without_http_proxies():
-                alive_actors = list_actors(
+                alive_actors = _list_current_cluster_actors(
                     filters=[
                         ("STATE", "=", "ALIVE"),
                         ("RAY_NAMESPACE", "=", Cluster.NAMESPACE),

@@ -79,8 +79,7 @@ def _validate_critic_parent_artifact(cfg) -> str:
     actual = _sha256_artifact(checkpoint_path)
     if actual != expected:
         raise ValueError(
-            "pi0.5 critic parent SHA-256 mismatch: "
-            f"expected {expected}, got {actual}."
+            f"pi0.5 critic parent SHA-256 mismatch: expected {expected}, got {actual}."
         )
     return actual
 
@@ -88,7 +87,9 @@ def _validate_critic_parent_artifact(cfg) -> str:
 def _validate_fastwam_parent_payload(actor, payload: Mapping) -> None:
     mot_state = payload.get("mot")
     if not isinstance(mot_state, Mapping):
-        raise ValueError("Adaptive FastWAM parent checkpoint must contain `mot` weights.")
+        raise ValueError(
+            "Adaptive FastWAM parent checkpoint must contain `mot` weights."
+        )
     expected_mot = set(actor.mot.state_dict())
     actual_mot = set(mot_state)
     missing_mot = sorted(expected_mot - actual_mot)
@@ -160,7 +161,9 @@ def _validate_exact_pi05_critic_config(cfg) -> None:
     """Fail before loading if the critic could restore an existing value head."""
 
     input_dim = int(cfg.get("input_dim", 2048))
-    hidden_sizes = tuple(int(item) for item in cfg.get("hidden_sizes", (1024, 512, 256)))
+    hidden_sizes = tuple(
+        int(item) for item in cfg.get("hidden_sizes", (1024, 512, 256))
+    )
     if input_dim != 2048 or hidden_sizes != (1024, 512, 256):
         raise ValueError(
             "The v0 exact pi0.5 critic requires ValueHead "
@@ -207,12 +210,14 @@ def _validate_flow_sde_config(cfg) -> None:
     if bool(cfg.get("joint_logprob", False)):
         raise ValueError("FastWAM adaptive v0 requires `joint_logprob: false`.")
     if str(cfg.get("denoise_index_sampling", "uniform")) != "uniform":
-        raise ValueError("FastWAM adaptive v0 requires uniform denoising-index sampling.")
-    if bool(cfg.get("ignore_last_transition", False)):
-        raise ValueError("Ignoring the final Flow-SDE transition is not implemented in v0.")
+        raise ValueError(
+            "FastWAM adaptive v0 requires uniform denoising-index sampling."
+        )
     noise_level = float(cfg.get("noise_level", 0.0))
     if not math.isfinite(noise_level) or noise_level <= 0:
-        raise ValueError("Training Flow-SDE requires a strictly positive `noise_level`.")
+        raise ValueError(
+            "Training Flow-SDE requires a strictly positive `noise_level`."
+        )
 
 
 def _validate_critic_build_config(cfg) -> bool:
@@ -249,7 +254,9 @@ def get_model(cfg, torch_dtype):
     from .pi05_critic import Pi05ValueAfterVLMCritic
 
     if torch_dtype is None:
-        raise ValueError("FastWAM adaptive policy requires an explicit model precision.")
+        raise ValueError(
+            "FastWAM adaptive policy requires an explicit model precision."
+        )
 
     # Validate the complete lightweight contract before allocating either large
     # pretrained backbone.
@@ -309,9 +316,7 @@ def get_model(cfg, torch_dtype):
     policy_config = FastWAMAdaptivePolicyConfig(
         gate_epsilon=float(cfg.get("gate_epsilon", 0.1)),
         gate_temperature=float(cfg.get("gate_temperature", 1.0)),
-        eval_routing_mode=str(
-            cfg.get("eval_routing_mode", "learned_threshold")
-        ),
+        eval_routing_mode=str(cfg.get("eval_routing_mode", "learned_threshold")),
         eval_idm_threshold=float(cfg.get("eval_idm_threshold", 0.5)),
         eval_random_idm_probability=(
             None
@@ -377,6 +382,9 @@ def get_model(cfg, torch_dtype):
         gate_denoise_last_n=gate_config.denoise_last_n,
         gate_replay_backend=replay_config.backend,
         flow_sde_noise_level=float(cfg.flow_sde.noise_level),
+        flow_sde_ignore_last_transition=bool(
+            cfg.flow_sde.get("ignore_last_transition", False)
+        ),
     )
     return FastWAMAdaptivePolicy(
         actor=actor,

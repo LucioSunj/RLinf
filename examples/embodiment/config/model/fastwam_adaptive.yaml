@@ -119,7 +119,11 @@ flow_sde:
   joint_logprob: false
   denoise_index_sampling: uniform
   noise_level: 0.5
-  ignore_last_transition: false
+  # A final deterministic ODE step keeps the single stochastic transition
+  # away from the action-submission boundary. Real P6b evidence showed that
+  # selecting step 9/9 could push an otherwise valid UNCOND action past the
+  # exact live LIBERO bounds.
+  ignore_last_transition: true
 
 runtime:
   _target_: rlinf.models.embodiment.wam_policy.libero_runtime.LiberoFastWAMRuntime

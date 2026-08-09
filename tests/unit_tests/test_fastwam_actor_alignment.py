@@ -233,6 +233,170 @@ def test_fixed_route_cost_is_subtracted_once_after_reward_aggregation():
     )
 
 
+def test_chunk_cost_audit_reconciles_forced_eligible_and_padded_routes():
+    route, _, _ = _alignment_records()
+    rewards = torch.arange(36, dtype=torch.float32).reshape(3, 4, 3) / 10
+    valid_mask = torch.ones(3, 4, 1, dtype=torch.bool)
+    valid_mask[2, 3] = False
+    result = advantages.apply_fastwam_chunk_cost(
+        environment_rewards=rewards,
+        route_used=route.route_used,
+        idm_cost=0.25,
+        valid_mask=valid_mask,
+    )
+
+    audit = advantages.summarize_fastwam_chunk_cost(
+        environment_rewards=rewards,
+        route=route,
+        cost_result=result,
+        idm_cost=0.25,
+        valid_mask=valid_mask,
+    )
+    artifact = audit.to_artifact()
+
+    assert artifact["schema"] == "fastwam-chunk-cost-audit-v1"
+    assert artifact["valid_chunk_count"] == 11
+    assert artifact["valid_idm_chunk_count"] == 4
+    assert artifact["forced_idm_chunk_count"] == 4
+    assert artifact["eligible_idm_chunk_count"] == 0
+    assert artifact["valid_uncond_chunk_count"] == 7
+    assert artifact["expected_cost_sum"] == 1.0
+    assert artifact["actual_branch_costs"]["sum"] == 1.0
+    assert artifact["shaped_reward_identity_max_abs_error"] == 0.0
+    assert artifact["raw_primitive_rewards"]["count"] == 33
+    json.dumps(artifact, sort_keys=True)
+
+
+def _counterfactual_records():
+    routes = torch.tensor(
+        [
+            [WAMRoute.IDM, WAMRoute.IDM],
+            [WAMRoute.IDM, WAMRoute.UNCOND],
+            [WAMRoute.UNCOND, WAMRoute.IDM],
+        ],
+        dtype=torch.long,
+    )
+    forced = torch.tensor([[True, True], [False, False], [False, False]])
+    chunks = torch.tensor([[0, 0], [1, 1], [2, 2]])
+    episodes = torch.tensor([[10, 20], [10, 20], [10, 20]])
+    route = ChunkRouteRecord(
+        route_used=routes,
+        route_was_forced=forced,
+        chunk_ids=chunks,
+        episode_ids=episodes,
+        route_source_chunk_ids=torch.tensor([[-1, -1], [0, 0], [1, 1]]),
+        actor_versions=torch.full_like(routes, 3),
+    )
+    next_route = torch.tensor(
+        [
+            [WAMRoute.IDM, WAMRoute.UNCOND],
+            [WAMRoute.UNCOND, WAMRoute.IDM],
+            [WAMRoute.IDM, WAMRoute.UNCOND],
+        ],
+        dtype=torch.long,
+    )
+    behavior = torch.full(route.shape, 0.5)
+    emitted = GateDecisionRecord(
+        next_route=next_route,
+        base_probability=behavior,
+        behavior_probability=behavior,
+        old_logprob=torch.full(route.shape, -torch.log(torch.tensor(2.0))),
+        epsilon=torch.full(route.shape, 0.1),
+        temperature=torch.ones(route.shape),
+        valid=torch.ones(route.shape, dtype=torch.bool),
+        source_chunk_ids=chunks.clone(),
+        episode_ids=episodes.clone(),
+        actor_versions=torch.full_like(routes, 3),
+        kv_metadata=GateKVMetadata(
+            layer_indices=(0,),
+            denoise_timesteps=torch.ones(*route.shape, 1),
+            total_bytes=torch.full(route.shape, 16, dtype=torch.long),
+        ),
+    )
+    dones = torch.zeros(4, 2, 1, dtype=torch.bool)
+    return route, emitted, dones
+
+
+def test_counterfactual_cost_audit_is_read_only_and_lowers_idm_advantage():
+    route, emitted, dones = _counterfactual_records()
+    rewards = torch.zeros(3, 2, 2)
+    rewards[-1, :, -1] = 1.0
+    values = torch.zeros(4, 2, 1)
+    mask = torch.ones(3, 2, 1, dtype=torch.bool)
+    configured_cost = 0.025
+    configured_rewards = advantages.apply_fastwam_chunk_cost(
+        environment_rewards=rewards,
+        route_used=route.route_used,
+        idm_cost=configured_cost,
+        valid_mask=mask,
+    ).rewards
+    configured_advantages, _ = advantages.compute_gae_advantages_and_returns(
+        rewards=configured_rewards[..., 0],
+        values=values[..., 0],
+        dones=dones[..., 0],
+        gamma=0.99,
+        gae_lambda=0.95,
+        normalize_advantages=True,
+        loss_mask=mask[..., 0],
+    )
+    configured_alignment = advantages.align_fastwam_policy_advantages(
+        advantages=configured_advantages.unsqueeze(-1),
+        route=route,
+        emitted=emitted,
+        dones=dones,
+        rollout_epoch=1,
+        carry_pending_across_epochs=False,
+        loss_mask=mask,
+    )
+    input_clones = {
+        "rewards": rewards.clone(),
+        "values": values.clone(),
+        "routes": route.route_used.clone(),
+    }
+    rng_before = torch.random.get_rng_state().clone()
+
+    audit = advantages.summarize_fastwam_counterfactual_costs(
+        environment_rewards=rewards,
+        route=route,
+        emitted=emitted,
+        dones=dones,
+        values=values,
+        valid_mask=mask,
+        idm_costs=(0.0, 0.025, 0.05, 0.1),
+        configured_idm_cost=configured_cost,
+        configured_gate_advantages=configured_alignment.gate_advantages,
+        gamma=0.99,
+        gae_lambda=0.95,
+        rollout_epoch=1,
+        carry_pending_across_epochs=False,
+    )
+    artifact = audit.to_artifact()
+
+    assert artifact["schema"] == "fastwam-counterfactual-cost-audit-v1"
+    assert artifact["configured_alignment_max_abs_error"] == 0.0
+    assert artifact["eligible_gate_decision_count"] == 4
+    assert artifact["eligible_idm_decision_count"] == 2
+    assert [entry["idm_cost"] for entry in artifact["entries"]] == [
+        0.0,
+        0.025,
+        0.05,
+        0.1,
+    ]
+    assert (
+        artifact["entries"][0]["idm_destination_delta_from_zero"]["unnormalized"]["sum"]
+        == 0.0
+    )
+    assert all(
+        entry["idm_destination_delta_from_zero"]["unnormalized"]["sum"] < 0.0
+        for entry in artifact["entries"][1:]
+    )
+    assert torch.equal(rewards, input_clones["rewards"])
+    assert torch.equal(values, input_clones["values"])
+    assert torch.equal(route.route_used, input_clones["routes"])
+    assert torch.equal(torch.random.get_rng_state(), rng_before)
+    json.dumps(artifact, sort_keys=True)
+
+
 def test_environment_reward_audit_counts_only_valid_success_signals():
     rewards = torch.zeros(3, 2, 4)
     rewards[1, 0, 2] = 1.0

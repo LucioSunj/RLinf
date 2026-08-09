@@ -16,11 +16,13 @@ import os
 import shlex
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 import ray
 from omegaconf import DictConfig, OmegaConf
 
+import rlinf.scheduler.cluster.cluster as cluster_module
 from rlinf.scheduler import (
     AcceleratorType,
     Cluster,
@@ -52,6 +54,30 @@ def path_merge_test_env_var() -> str:
         # before the test worker starts, so use another whitelisted path var.
         return "LIBRARY_PATH"
     return "LD_LIBRARY_PATH"
+
+
+def test_actor_listing_is_scoped_to_current_ray_cluster(monkeypatch):
+    captured = {}
+    expected = [SimpleNamespace(name="actor")]
+
+    monkeypatch.setattr(
+        cluster_module.ray,
+        "get_runtime_context",
+        lambda: SimpleNamespace(gcs_address="192.0.2.1:12345"),
+    )
+
+    def fake_list_actors(*, address, filters):
+        captured.update(address=address, filters=filters)
+        return expected
+
+    monkeypatch.setattr(cluster_module, "list_actors", fake_list_actors)
+    filters = [("STATE", "=", "ALIVE")]
+
+    assert cluster_module._list_current_cluster_actors(filters=filters) == expected
+    assert captured == {
+        "address": "192.0.2.1:12345",
+        "filters": filters,
+    }
 
 
 def test_cluster_config_parses_node_group_hardware():

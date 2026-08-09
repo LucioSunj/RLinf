@@ -15,6 +15,7 @@
 import dataclasses
 import importlib.util
 import logging
+import math
 import os
 from dataclasses import asdict
 from typing import TYPE_CHECKING, Callable, ClassVar, Optional, Union
@@ -967,6 +968,32 @@ def _validate_fastwam_adaptive_cfg(cfg, *, only_eval: bool) -> None:
             raise ValueError(
                 "FastWAM scientific and short-canary training guards are mutually "
                 "exclusive."
+            )
+    cost_audit = training_guard.get("cost_audit", {})
+    if bool(cost_audit.get("enabled", False)):
+        if not bool(training_guard.get("enabled", False)):
+            raise ValueError("FastWAM cost audit requires the scientific guard.")
+        if str(cfg.algorithm.adv_type).lower() != "gae":
+            raise ValueError("FastWAM counterfactual cost audit requires GAE.")
+        candidates = [
+            float(item) for item in cost_audit.get("counterfactual_idm_costs", [])
+        ]
+        if (
+            not candidates
+            or candidates != sorted(set(candidates))
+            or candidates[0] != 0.0
+            or any(not math.isfinite(item) or item < 0.0 for item in candidates)
+        ):
+            raise ValueError(
+                "FastWAM counterfactual IDM costs must be unique, sorted, "
+                "finite, and begin at zero."
+            )
+        configured_cost = float(
+            cfg.algorithm.get("fixed_branch_cost", {}).get("idm_cost", 0.0)
+        )
+        if configured_cost not in candidates:
+            raise ValueError(
+                "FastWAM configured IDM cost must appear in the counterfactual grid."
             )
     kv_backend = str(actor_model.kv_replay.get("backend", "stored")).lower()
     weight_sync_interval = int(cfg.runner.get("weight_sync_interval", 1))

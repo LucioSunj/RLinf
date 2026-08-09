@@ -48,6 +48,7 @@ from rlinf.envs.action_utils import prepare_actions
 from rlinf.envs.libero.action_contract import LiberoActionContract
 from rlinf.envs.utils import get_env_attr
 from rlinf.envs.wrappers import RecordVideo
+from rlinf.models.embodiment.wam_policy.contracts import ChunkRouteRecord, WAMRoute
 from rlinf.scheduler import (
     Channel,
     Cluster,
@@ -55,6 +56,7 @@ from rlinf.scheduler import (
     Worker,
     merge_batches,
 )
+from rlinf.utils.checkpoint_state import checkpoint_state_sha256
 from rlinf.utils.data_iter_utils import split_list
 from rlinf.utils.distributed import masked_stats, normalize_from_stats
 from rlinf.utils.metric_utils import compute_split_num
@@ -74,6 +76,190 @@ from rlinf.workers.env.history_manager import HistoryManager
 
 FASTWAM_TRAINING_ACTION_AUDIT_SENTINEL = "FASTWAM_TRAINING_ACTION_AUDIT"
 FASTWAM_TRAINING_ACTION_AUDIT_SCHEMA = "fastwam-training-action-audit-v1"
+FASTWAM_TRAINING_ACTION_FAILURE_SENTINEL = "FASTWAM_TRAINING_ACTION_FAILURE"
+FASTWAM_TRAINING_ACTION_FAILURE_SCHEMA = "fastwam-training-action-failure-v1"
+
+
+def _batch_metadata_value(value: Any, index: int) -> int | None:
+    """Return one compact integer metadata value from a batch container."""
+
+    if value is None:
+        return None
+    tensor = torch.as_tensor(value).reshape(-1)
+    if not 0 <= index < int(tensor.numel()):
+        return None
+    return int(tensor[index].item())
+
+
+def _route_metadata_for_batch_index(
+    route: ChunkRouteRecord | None,
+    index: int,
+) -> dict[str, Any] | None:
+    """Return one route identity without retaining a route timeline."""
+
+    if route is None:
+        return None
+    flattened = {
+        name: getattr(route, name).reshape(-1)
+        for name in (
+            "route_used",
+            "route_was_forced",
+            "chunk_ids",
+            "episode_ids",
+            "route_source_chunk_ids",
+            "actor_versions",
+        )
+    }
+    if any(index >= int(value.numel()) for value in flattened.values()):
+        return None
+    route_value = int(flattened["route_used"][index].item())
+    return {
+        "route": WAMRoute(route_value).name,
+        "route_was_forced": bool(flattened["route_was_forced"][index].item()),
+        "chunk_id": int(flattened["chunk_ids"][index].item()),
+        "episode_id": int(flattened["episode_ids"][index].item()),
+        "route_source_chunk_id": int(flattened["route_source_chunk_ids"][index].item()),
+        "actor_version": int(flattened["actor_versions"][index].item()),
+    }
+
+
+def build_fastwam_episode_identity_sha256(
+    *,
+    route: ChunkRouteRecord,
+    task_ids: Any,
+    trial_ids: Any,
+    reset_state_ids: Any,
+) -> str:
+    """Hash one pre-submission environment identity without retaining raw state."""
+
+    batch_size = int(route.route_used.numel())
+    identity = []
+    for index in range(batch_size):
+        record = {
+            "environment_index": index,
+            "task_id": _batch_metadata_value(task_ids, index),
+            "trial_id": _batch_metadata_value(trial_ids, index),
+            "reset_state_id": _batch_metadata_value(reset_state_ids, index),
+            "episode_id": int(route.episode_ids.reshape(-1)[index].item()),
+        }
+        if any(
+            record[name] is None for name in ("task_id", "trial_id", "reset_state_id")
+        ):
+            raise ValueError(
+                "FastWAM training environment identity metadata is incomplete."
+            )
+        identity.append(record)
+    return checkpoint_state_sha256(identity)
+
+
+def build_fastwam_action_failure_audit(
+    *,
+    trace: ActionExecutionTrace,
+    contract: LiberoActionContract,
+    route: ChunkRouteRecord | None,
+    task_ids: Any,
+    trial_ids: Any,
+    reset_state_ids: Any,
+    denoise_indices: Any,
+    worker_rank: int,
+    pipeline_stage_id: int,
+) -> dict[str, Any]:
+    """Build compact first-violation provenance for a rejected Action chunk."""
+
+    violations = []
+    for batch_index in range(trace.batch_size):
+        for dimension_index in range(trace.stages[0].action_dim):
+            first_stage = None
+            stage_record = None
+            for statistics in trace.stages:
+                invalid = (
+                    int(statistics.finite_count[batch_index, dimension_index])
+                    != int(statistics.total_value_count[batch_index, dimension_index])
+                    or int(statistics.below_low_count[batch_index, dimension_index]) > 0
+                    or int(statistics.above_high_count[batch_index, dimension_index])
+                    > 0
+                )
+                if invalid:
+                    first_stage = statistics.stage
+                    stage_record = statistics.record_for_batch_index(batch_index)[
+                        "dimensions"
+                    ][dimension_index]
+                    break
+            if first_stage is None:
+                continue
+            route_metadata = _route_metadata_for_batch_index(route, batch_index)
+            denoise_index = _batch_metadata_value(denoise_indices, batch_index)
+            if (
+                route_metadata is not None
+                and route_metadata["route"] == WAMRoute.UNCOND.name
+                and denoise_index is None
+            ):
+                raise ValueError(
+                    "Rejected UNCOND Action is missing its Flow-SDE denoise index."
+                )
+            violations.append(
+                {
+                    "environment_index": batch_index,
+                    "dimension_index": dimension_index,
+                    "dimension_name": contract.dimension_names[dimension_index],
+                    "first_out_of_live_bounds_stage": first_stage,
+                    "statistics": stage_record,
+                    "low": float(contract.low[dimension_index]),
+                    "high": float(contract.high[dimension_index]),
+                    "task_id": _batch_metadata_value(task_ids, batch_index),
+                    "trial_id": _batch_metadata_value(trial_ids, batch_index),
+                    "reset_state_id": _batch_metadata_value(
+                        reset_state_ids, batch_index
+                    ),
+                    "route_metadata": route_metadata,
+                    "flow_sde_denoise_index": denoise_index,
+                }
+            )
+    if not violations:
+        raise ValueError(
+            "Rejected submitted Action has no matching pre-submission violation."
+        )
+    return {
+        "schema": FASTWAM_TRAINING_ACTION_FAILURE_SCHEMA,
+        "worker_rank": int(worker_rank),
+        "pipeline_stage_id": int(pipeline_stage_id),
+        "stage_order": list(trace.stage_names),
+        "action_contract_sha256": contract.canonical_sha256,
+        "violations": violations,
+        "no_silent_clamp": True,
+    }
+
+
+def summarize_fastwam_flow_sde_denoise_indices(
+    values: list[torch.Tensor],
+    *,
+    num_inference_steps: int,
+    ignore_last_transition: bool,
+) -> dict[str, Any]:
+    """Summarize selected stochastic transitions without retaining a timeline."""
+
+    if num_inference_steps < 1:
+        raise ValueError("FastWAM inference-step count must be positive.")
+    if not values:
+        raise ValueError("FastWAM training collected no Flow-SDE denoise indices.")
+    indices = torch.cat(
+        [torch.as_tensor(value, dtype=torch.long).reshape(-1) for value in values]
+    )
+    selected = indices[indices >= 0]
+    final_index = num_inference_steps - 1
+    final_count = int((selected == final_index).sum().item())
+    if ignore_last_transition and final_count:
+        raise ValueError(
+            "FastWAM ignore-last contract observed a selected final transition."
+        )
+    return {
+        "ignore_last_transition": bool(ignore_last_transition),
+        "num_inference_steps": int(num_inference_steps),
+        "selected_count": int(selected.numel()),
+        "minimum": int(selected.min().item()) if selected.numel() else None,
+        "maximum": int(selected.max().item()) if selected.numel() else None,
+        "final_transition_count": final_count,
+    }
 
 
 def _merge_evaluation_rollout_results(items: list[Any]) -> Any:
@@ -546,6 +732,8 @@ class EnvWorker(Worker):
         chunk_actions: torch.Tensor,
         stage_id: int,
         action_execution_trace: ActionExecutionTrace | None = None,
+        route_info: ChunkRouteRecord | None = None,
+        flow_sde_denoise_indices: torch.Tensor | None = None,
     ) -> tuple[EnvOutput, dict[str, Any], dict[str, Any]]:
         """
         This function is used to interact with the environment.
@@ -594,9 +782,38 @@ class EnvWorker(Worker):
                 gripper_dimension_index=action_contract.gripper_dimension_index,
                 action_contract_sha256=action_contract.canonical_sha256,
             )
-            chunk_result, submitted_statistics = self.env_list[
-                stage_id
-            ].chunk_step_with_action_trace(exec_actions, action_contract)
+            pre_submission_trace = ActionExecutionTrace.combine(
+                action_execution_trace,
+                ActionExecutionTrace(stages=(prepared_statistics,)),
+            )
+            try:
+                chunk_result, submitted_statistics = self.env_list[
+                    stage_id
+                ].chunk_step_with_action_trace(exec_actions, action_contract)
+            except ValueError as error:
+                if "Refusing to submit Action values outside" not in str(error):
+                    raise
+                environment = self.env_list[stage_id]
+                failure_audit = build_fastwam_action_failure_audit(
+                    trace=pre_submission_trace,
+                    contract=action_contract,
+                    route=route_info,
+                    task_ids=get_env_attr(environment, "task_ids"),
+                    trial_ids=get_env_attr(environment, "trial_ids"),
+                    reset_state_ids=get_env_attr(environment, "reset_state_ids"),
+                    denoise_indices=flow_sde_denoise_indices,
+                    worker_rank=int(getattr(self, "_rank", 0)),
+                    pipeline_stage_id=stage_id,
+                )
+                print(
+                    f"{FASTWAM_TRAINING_ACTION_FAILURE_SENTINEL} "
+                    + json.dumps(failure_audit, sort_keys=True),
+                    flush=True,
+                )
+                raise ValueError(
+                    f"{error} FastWAM failure provenance: "
+                    + json.dumps(failure_audit, sort_keys=True)
+                ) from error
             environment_trace = ActionExecutionTrace(
                 stages=(prepared_statistics, submitted_statistics)
             )
@@ -1339,6 +1556,12 @@ class EnvWorker(Worker):
         training_action_traces: list[list[ActionExecutionTrace]] = [
             [] for _ in range(self.stage_num)
         ]
+        training_action_episode_identity_hashes: list[list[str]] = [
+            [] for _ in range(self.stage_num)
+        ]
+        training_flow_sde_denoise_indices: list[list[torch.Tensor]] = [
+            [] for _ in range(self.stage_num)
+        ]
 
         for epoch in range(self.rollout_epoch):
             if epoch == 0 and self._prefetched_train_bootstrap is not None:
@@ -1430,10 +1653,41 @@ class EnvWorker(Worker):
                             cache_current=True,
                         )
 
+                    if bool(
+                        self.cfg.runner.get("fastwam_training_guard", {}).get(
+                            "enabled", False
+                        )
+                    ):
+                        environment = self.env_list[stage_id]
+                        training_action_episode_identity_hashes[stage_id].append(
+                            build_fastwam_episode_identity_sha256(
+                                route=rollout_result.route_info,
+                                task_ids=get_env_attr(environment, "task_ids"),
+                                trial_ids=get_env_attr(environment, "trial_ids"),
+                                reset_state_ids=get_env_attr(
+                                    environment, "reset_state_ids"
+                                ),
+                            )
+                        )
+                        denoise_indices = rollout_result.forward_inputs.get(
+                            "denoise_indices"
+                        )
+                        if denoise_indices is None:
+                            raise ValueError(
+                                "FastWAM guarded training requires Flow-SDE "
+                                "denoise indices."
+                            )
+                        training_flow_sde_denoise_indices[stage_id].append(
+                            denoise_indices.detach().cpu()
+                        )
                     env_output, env_info, chunk_step_payload = self.env_interact_step(
                         rollout_result.actions,
                         stage_id,
                         action_execution_trace=rollout_result.action_execution_trace,
+                        route_info=rollout_result.route_info,
+                        flow_sde_denoise_indices=rollout_result.forward_inputs.get(
+                            "denoise_indices"
+                        ),
                     )
                     action_trace = chunk_step_payload.pop(
                         "action_execution_trace", None
@@ -1587,12 +1841,35 @@ class EnvWorker(Worker):
                     raise TypeError(
                         "FastWAM training Action audit lost its live contract."
                     )
+                identity_hashes = training_action_episode_identity_hashes[stage_id]
+                if len(identity_hashes) != len(traces):
+                    raise RuntimeError(
+                        "FastWAM training Action identity/trace counts disagree."
+                    )
                 payload = {
                     "schema": FASTWAM_TRAINING_ACTION_AUDIT_SCHEMA,
                     "worker_rank": int(self._rank),
                     "pipeline_stage_id": int(stage_id),
                     "stage_order": list(merged_trace.stage_names),
                     "action_contract": contract.to_artifact(),
+                    "episode_identity_observation_count": len(identity_hashes),
+                    "first_episode_identity_sha256": identity_hashes[0],
+                    "episode_identity_sequence_sha256": checkpoint_state_sha256(
+                        identity_hashes
+                    ),
+                    "flow_sde_denoise_indices": (
+                        summarize_fastwam_flow_sde_denoise_indices(
+                            training_flow_sde_denoise_indices[stage_id],
+                            num_inference_steps=int(
+                                self.model_cfg.runtime.num_inference_steps
+                            ),
+                            ignore_last_transition=bool(
+                                self.model_cfg.flow_sde.get(
+                                    "ignore_last_transition", False
+                                )
+                            ),
+                        )
+                    ),
                     "records": [
                         merged_trace.record_for_batch_index(index)
                         for index in range(merged_trace.batch_size)

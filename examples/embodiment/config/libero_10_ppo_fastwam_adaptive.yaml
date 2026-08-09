@@ -51,6 +51,9 @@ runner:
     gate_kl_single_max: 0.1
     gate_clip_median_max: 0.6
     gate_clip_single_max: 0.8
+    cost_audit:
+      enabled: false
+      counterfactual_idm_costs: []
 
   bootstrap_project_checkpoint_dir: null
   bootstrap_uncond_lora_sidecar: null

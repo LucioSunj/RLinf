@@ -198,10 +198,14 @@ def test_builder_enforces_non_joint_positive_flow_sde() -> None:
             "joint_logprob": False,
             "denoise_index_sampling": "uniform",
             "noise_level": 0.5,
-            "ignore_last_transition": False,
+            "ignore_last_transition": True,
         }
     )
     _builder._validate_flow_sde_config(config)
+
+    config.ignore_last_transition = False
+    _builder._validate_flow_sde_config(config)
+    config.ignore_last_transition = True
 
     config.joint_logprob = True
     with pytest.raises(ValueError, match="joint_logprob"):
@@ -250,6 +254,7 @@ def test_libero_adaptive_config_composes_with_confirmed_defaults(monkeypatch) ->
     ]
     assert cfg.actor.model.flow_sde.noise_level == 0.5
     assert cfg.actor.model.flow_sde.joint_logprob is False
+    assert cfg.actor.model.flow_sde.ignore_last_transition is True
     assert cfg.algorithm.fixed_branch_cost.idm_cost == 0.01
     assert cfg.env.eval.reward_coef == cfg.algorithm.reward_coef
     assert cfg.algorithm.fixed_branch_cost.uncond_cost == 0.0

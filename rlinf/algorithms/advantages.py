@@ -12,6 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import math
+from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import Optional
 
@@ -24,12 +26,21 @@ from rlinf.models.embodiment.wam_policy.contracts import (
     GateDecisionRecord,
     WAMRoute,
 )
+from rlinf.utils.checkpoint_state import checkpoint_state_sha256
 from rlinf.utils.utils import masked_mean
 
 FASTWAM_REWARD_AUDIT_SCHEMA = "fastwam-environment-reward-audit-v1"
 FASTWAM_REWARD_AUDIT_SENTINEL = "FASTWAM_SHORT_RL_REWARD_AUDIT"
 FASTWAM_ROLLOUT_STATE_AUDIT_SCHEMA = "fastwam-rollout-state-audit-v1"
 FASTWAM_ROLLOUT_STATE_AUDIT_SENTINEL = "FASTWAM_SHORT_RL_ROLLOUT_STATE_AUDIT"
+FASTWAM_CHUNK_COST_AUDIT_SCHEMA = "fastwam-chunk-cost-audit-v1"
+FASTWAM_CHUNK_COST_AUDIT_SENTINEL = "FASTWAM_TRAINING_COST_AUDIT"
+FASTWAM_COUNTERFACTUAL_COST_AUDIT_SCHEMA = "fastwam-counterfactual-cost-audit-v1"
+FASTWAM_COUNTERFACTUAL_COST_AUDIT_SENTINEL = (
+    "FASTWAM_TRAINING_COUNTERFACTUAL_COST_AUDIT"
+)
+FASTWAM_GATE_UPDATE_AUDIT_SCHEMA = "fastwam-gate-update-audit-v1"
+FASTWAM_GATE_UPDATE_AUDIT_SENTINEL = "FASTWAM_TRAINING_GATE_UPDATE_AUDIT"
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
@@ -38,6 +49,179 @@ class FastWAMChunkCost:
 
     rewards: torch.Tensor
     costs: torch.Tensor
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
+class FastWAMScalarAudit:
+    """Finite scalar aggregates that never retain the source tensor."""
+
+    count: int
+    finite_count: int
+    nonfinite_count: int
+    minimum: float | None
+    maximum: float | None
+    total: float
+
+    def to_artifact(self) -> dict[str, object]:
+        """Return a JSON-safe aggregate."""
+
+        return {
+            "count": self.count,
+            "finite_count": self.finite_count,
+            "nonfinite_count": self.nonfinite_count,
+            "minimum": self.minimum,
+            "maximum": self.maximum,
+            "sum": self.total,
+        }
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
+class FastWAMChunkCostAudit:
+    """Exact production branch-cost accounting for one rollout batch."""
+
+    reward_shape: tuple[int, ...]
+    reward_dtype: str
+    idm_cost: float
+    uncond_cost: float
+    valid_chunk_count: int
+    valid_idm_chunk_count: int
+    forced_idm_chunk_count: int
+    eligible_idm_chunk_count: int
+    valid_uncond_chunk_count: int
+    expected_cost_sum: float
+    raw_primitive_rewards: FastWAMScalarAudit
+    aggregated_raw_rewards: FastWAMScalarAudit
+    actual_branch_costs: FastWAMScalarAudit
+    shaped_rewards: FastWAMScalarAudit
+    shaped_reward_identity_max_abs_error: float
+
+    def to_artifact(self) -> dict[str, object]:
+        """Return compact reward/cost evidence without per-step values."""
+
+        return {
+            "schema": FASTWAM_CHUNK_COST_AUDIT_SCHEMA,
+            "reward_shape": list(self.reward_shape),
+            "reward_dtype": self.reward_dtype,
+            "idm_cost": self.idm_cost,
+            "uncond_cost": self.uncond_cost,
+            "valid_chunk_count": self.valid_chunk_count,
+            "valid_idm_chunk_count": self.valid_idm_chunk_count,
+            "forced_idm_chunk_count": self.forced_idm_chunk_count,
+            "eligible_idm_chunk_count": self.eligible_idm_chunk_count,
+            "valid_uncond_chunk_count": self.valid_uncond_chunk_count,
+            "expected_cost_sum": self.expected_cost_sum,
+            "raw_primitive_rewards": self.raw_primitive_rewards.to_artifact(),
+            "aggregated_raw_rewards": self.aggregated_raw_rewards.to_artifact(),
+            "actual_branch_costs": self.actual_branch_costs.to_artifact(),
+            "shaped_rewards": self.shaped_rewards.to_artifact(),
+            "shaped_reward_identity_max_abs_error": (
+                self.shaped_reward_identity_max_abs_error
+            ),
+        }
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
+class FastWAMCounterfactualCostEntry:
+    """Read-only same-batch advantage response to one hypothetical IDM cost."""
+
+    idm_cost: float
+    expected_cost_sum: float
+    unnormalized_gate_advantage: FastWAMScalarAudit
+    normalized_gate_advantage: FastWAMScalarAudit
+    unnormalized_idm_gate_advantage: FastWAMScalarAudit
+    normalized_idm_gate_advantage: FastWAMScalarAudit
+    unnormalized_uncond_gate_advantage: FastWAMScalarAudit
+    normalized_uncond_gate_advantage: FastWAMScalarAudit
+    unnormalized_idm_delta_from_zero: FastWAMScalarAudit
+    normalized_idm_delta_from_zero: FastWAMScalarAudit
+
+    def to_artifact(self) -> dict[str, object]:
+        """Return compact same-batch counterfactual evidence."""
+
+        return {
+            "idm_cost": self.idm_cost,
+            "expected_cost_sum": self.expected_cost_sum,
+            "gate_advantage": {
+                "unnormalized": self.unnormalized_gate_advantage.to_artifact(),
+                "normalized": self.normalized_gate_advantage.to_artifact(),
+            },
+            "idm_destination_gate_advantage": {
+                "unnormalized": (self.unnormalized_idm_gate_advantage.to_artifact()),
+                "normalized": self.normalized_idm_gate_advantage.to_artifact(),
+            },
+            "uncond_destination_gate_advantage": {
+                "unnormalized": (self.unnormalized_uncond_gate_advantage.to_artifact()),
+                "normalized": self.normalized_uncond_gate_advantage.to_artifact(),
+            },
+            "idm_destination_delta_from_zero": {
+                "unnormalized": (self.unnormalized_idm_delta_from_zero.to_artifact()),
+                "normalized": self.normalized_idm_delta_from_zero.to_artifact(),
+            },
+        }
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
+class FastWAMCounterfactualCostAudit:
+    """Same-rollout causal branch-cost audit with no optimization side effects."""
+
+    configured_idm_cost: float
+    configured_alignment_max_abs_error: float
+    eligible_gate_decision_count: int
+    eligible_idm_decision_count: int
+    eligible_uncond_decision_count: int
+    entries: tuple[FastWAMCounterfactualCostEntry, ...]
+
+    def to_artifact(self) -> dict[str, object]:
+        """Return compact counterfactual evidence."""
+
+        return {
+            "schema": FASTWAM_COUNTERFACTUAL_COST_AUDIT_SCHEMA,
+            "configured_idm_cost": self.configured_idm_cost,
+            "configured_alignment_max_abs_error": (
+                self.configured_alignment_max_abs_error
+            ),
+            "eligible_gate_decision_count": self.eligible_gate_decision_count,
+            "eligible_idm_decision_count": self.eligible_idm_decision_count,
+            "eligible_uncond_decision_count": self.eligible_uncond_decision_count,
+            "entries": [entry.to_artifact() for entry in self.entries],
+        }
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
+class FastWAMGateUpdateAudit:
+    """One runner step's aggregate Gate parameter update."""
+
+    optimizer_steps_before: int
+    optimizer_steps_after: int
+    tensor_count: int
+    parameter_count: int
+    before_sha256: str
+    after_sha256: str
+    before_l2_norm: float
+    update_l2_norm: float
+    update_max_abs: float
+    relative_update_l2_norm: float
+    finite_update_count: int
+    nonfinite_update_count: int
+
+    def to_artifact(self) -> dict[str, object]:
+        """Return compact parameter-update evidence without model tensors."""
+
+        return {
+            "schema": FASTWAM_GATE_UPDATE_AUDIT_SCHEMA,
+            "optimizer_steps_before": self.optimizer_steps_before,
+            "optimizer_steps_after": self.optimizer_steps_after,
+            "tensor_count": self.tensor_count,
+            "parameter_count": self.parameter_count,
+            "before_sha256": self.before_sha256,
+            "after_sha256": self.after_sha256,
+            "before_l2_norm": self.before_l2_norm,
+            "update_l2_norm": self.update_l2_norm,
+            "update_max_abs": self.update_max_abs,
+            "relative_update_l2_norm": self.relative_update_l2_norm,
+            "finite_update_count": self.finite_update_count,
+            "nonfinite_update_count": self.nonfinite_update_count,
+        }
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
@@ -111,6 +295,7 @@ class FastWAMRolloutStateAudit:
     eligible_gate_decision_count: int
     eligible_idm_decision_count: int
     unused_emitted_decision_count: int
+    route_decision_sha256: str
     base_probability_min: float
     base_probability_max: float
     base_probability_mean: float
@@ -153,6 +338,7 @@ class FastWAMRolloutStateAudit:
                 self.eligible_idm_decision_count / self.eligible_gate_decision_count
             ),
             "unused_emitted_decision_count": self.unused_emitted_decision_count,
+            "route_decision_sha256": self.route_decision_sha256,
             "base_probability": {
                 "count": probability_count,
                 "minimum": self.base_probability_min,
@@ -269,6 +455,118 @@ def _primitive_reward_mask(
             f"got {value.shape[-1]} and {reward_shape[-1]}."
         )
     return value.expand(reward_shape)
+
+
+def _summarize_selected_scalars(
+    values: torch.Tensor,
+    *,
+    mask: torch.Tensor | None = None,
+) -> FastWAMScalarAudit:
+    """Reduce selected values to finite JSON-safe aggregates."""
+
+    selected = values.reshape(-1) if mask is None else values[mask]
+    selected = selected.detach()
+    finite = torch.isfinite(selected)
+    finite_values = selected[finite].to(torch.float64)
+    count = int(selected.numel())
+    finite_count = int(finite.sum().item())
+    return FastWAMScalarAudit(
+        count=count,
+        finite_count=finite_count,
+        nonfinite_count=count - finite_count,
+        minimum=(float(finite_values.min().item()) if finite_count else None),
+        maximum=(float(finite_values.max().item()) if finite_count else None),
+        total=(float(finite_values.sum().item()) if finite_count else 0.0),
+    )
+
+
+def summarize_fastwam_chunk_cost(
+    *,
+    environment_rewards: torch.Tensor,
+    route: ChunkRouteRecord,
+    cost_result: FastWAMChunkCost,
+    idm_cost: float,
+    uncond_cost: float = 0.0,
+    valid_mask: torch.Tensor | None = None,
+) -> FastWAMChunkCostAudit:
+    """Audit the exact production reward aggregation and route cost."""
+
+    if environment_rewards.ndim != 3 or route.shape != environment_rewards.shape[:2]:
+        raise ValueError(
+            "FastWAM cost audit requires rewards [time,batch,actions] and "
+            "matching route metadata."
+        )
+    expected_shape = (*route.shape, 1)
+    if cost_result.rewards.shape != expected_shape:
+        raise ValueError("Shaped FastWAM rewards do not have chunk-level shape.")
+    if cost_result.costs.shape != expected_shape:
+        raise ValueError("FastWAM branch costs do not have chunk-level shape.")
+    if not environment_rewards.is_floating_point():
+        raise TypeError("FastWAM cost audit rewards must use a floating dtype.")
+    if (
+        not cost_result.rewards.is_floating_point()
+        or not cost_result.costs.is_floating_point()
+    ):
+        raise TypeError("FastWAM shaped rewards and costs must use floating dtypes.")
+    idm_cost = float(idm_cost)
+    uncond_cost = float(uncond_cost)
+    if not torch.isfinite(torch.tensor([idm_cost, uncond_cost])).all() or (
+        idm_cost < 0 or uncond_cost < 0
+    ):
+        raise ValueError("FastWAM audited route costs must be finite and non-negative.")
+
+    chunk_mask = _chunk_mask(
+        valid_mask,
+        shape=route.shape,
+        name="valid_mask",
+        device=environment_rewards.device,
+    )
+    primitive_mask = _primitive_reward_mask(
+        valid_mask,
+        reward_shape=environment_rewards.shape,
+        device=environment_rewards.device,
+    )
+    idm_mask = chunk_mask & (route.route_used == int(WAMRoute.IDM))
+    uncond_mask = chunk_mask & (route.route_used == int(WAMRoute.UNCOND))
+    forced_idm_mask = idm_mask & route.route_was_forced
+    eligible_idm_mask = idm_mask & ~route.route_was_forced
+    aggregated = environment_rewards.sum(dim=-1, keepdim=True)
+    identity_error = (cost_result.rewards - (aggregated - cost_result.costs)).abs()
+    identity_max = float(identity_error.max().item()) if identity_error.numel() else 0.0
+    expected_cost_sum = (
+        float(idm_mask.sum().item()) * idm_cost
+        + float(uncond_mask.sum().item()) * uncond_cost
+    )
+
+    return FastWAMChunkCostAudit(
+        reward_shape=tuple(int(item) for item in environment_rewards.shape),
+        reward_dtype=str(environment_rewards.dtype),
+        idm_cost=idm_cost,
+        uncond_cost=uncond_cost,
+        valid_chunk_count=int(chunk_mask.sum().item()),
+        valid_idm_chunk_count=int(idm_mask.sum().item()),
+        forced_idm_chunk_count=int(forced_idm_mask.sum().item()),
+        eligible_idm_chunk_count=int(eligible_idm_mask.sum().item()),
+        valid_uncond_chunk_count=int(uncond_mask.sum().item()),
+        expected_cost_sum=expected_cost_sum,
+        raw_primitive_rewards=_summarize_selected_scalars(
+            environment_rewards,
+            mask=primitive_mask,
+        ),
+        aggregated_raw_rewards=_summarize_selected_scalars(
+            aggregated[..., 0],
+            mask=chunk_mask,
+        ),
+        actual_branch_costs=_summarize_selected_scalars(
+            cost_result.costs[..., 0],
+            mask=chunk_mask,
+        ),
+        shaped_rewards=_summarize_selected_scalars(
+            cost_result.rewards[..., 0],
+            mask=chunk_mask,
+        ),
+        shaped_reward_identity_max_abs_error=identity_max,
+    )
 
 
 def summarize_fastwam_environment_rewards(
@@ -467,6 +765,19 @@ def summarize_fastwam_rollout_state(
         eligible_gate_decision_count=eligible_count,
         eligible_idm_decision_count=eligible_idm_count,
         unused_emitted_decision_count=emitted_count - eligible_count,
+        route_decision_sha256=checkpoint_state_sha256(
+            {
+                "route_used": route.route_used,
+                "route_was_forced": route.route_was_forced,
+                "chunk_ids": route.chunk_ids,
+                "episode_ids": route.episode_ids,
+                "route_source_chunk_ids": route.route_source_chunk_ids,
+                "actor_versions": route.actor_versions,
+                "emitted_next_route": emitted.next_route,
+                "emitted_valid": emitted.valid,
+                "emitted_source_chunk_ids": emitted.source_chunk_ids,
+            }
+        ),
         base_probability_min=base_min,
         base_probability_max=base_max,
         base_probability_mean=base_mean,
@@ -837,6 +1148,209 @@ def compute_gae_advantages_and_returns(
         returns = safe_normalize(returns, loss_mask=loss_mask)
 
     return advantages, returns
+
+
+def summarize_fastwam_counterfactual_costs(
+    *,
+    environment_rewards: torch.Tensor,
+    route: ChunkRouteRecord,
+    emitted: GateDecisionRecord,
+    dones: torch.Tensor,
+    values: torch.Tensor,
+    valid_mask: torch.Tensor | None,
+    idm_costs: Sequence[float],
+    configured_idm_cost: float,
+    configured_gate_advantages: torch.Tensor,
+    gamma: float,
+    gae_lambda: float,
+    rollout_epoch: int,
+    carry_pending_across_epochs: bool,
+) -> FastWAMCounterfactualCostAudit:
+    """Evaluate several IDM costs on one immutable rollout batch.
+
+    This diagnostic deliberately recomputes GAE and delayed Gate alignment
+    without autograd or optimizer work. The production rollout tensors are
+    never mutated, so every candidate observes identical rewards, values,
+    routes, dones, masks, and behavior-policy decisions.
+    """
+
+    normalized_costs = tuple(float(item) for item in idm_costs)
+    if (
+        not normalized_costs
+        or normalized_costs != tuple(sorted(set(normalized_costs)))
+        or normalized_costs[0] != 0.0
+        or any(not math.isfinite(item) or item < 0 for item in normalized_costs)
+    ):
+        raise ValueError(
+            "Counterfactual IDM costs must be unique, sorted, finite, and begin at zero."
+        )
+    configured_idm_cost = float(configured_idm_cost)
+    if configured_idm_cost not in normalized_costs:
+        raise ValueError("Configured IDM cost is absent from the counterfactual grid.")
+    if route.shape != environment_rewards.shape[:2] or emitted.shape != route.shape:
+        raise ValueError("Counterfactual rewards, routes, and Gate records disagree.")
+    expected_values_shape = (route.shape[0] + 1, route.shape[1], 1)
+    if values.shape != expected_values_shape:
+        raise ValueError(
+            "Counterfactual critic values must include one bootstrap timestep; "
+            f"expected {expected_values_shape}, got {tuple(values.shape)}."
+        )
+    if dones.shape[:2] != expected_values_shape[:2] or dones.dtype != torch.bool:
+        raise ValueError(
+            "Counterfactual dones must be boolean and include one bootstrap timestep."
+        )
+    if configured_gate_advantages.shape != route.shape:
+        raise ValueError("Configured Gate advantages must match the route shape.")
+
+    chunk_mask = _chunk_mask(
+        valid_mask,
+        shape=route.shape,
+        name="valid_mask",
+        device=route.route_used.device,
+    )
+    gae_dones = dones.reshape(*dones.shape[:2], -1).any(dim=-1)
+    gae_values = values[..., 0]
+    results: list[
+        tuple[
+            float,
+            FastWAMPolicyAlignment,
+            FastWAMPolicyAlignment,
+            float,
+        ]
+    ] = []
+    with torch.no_grad():
+        for idm_cost in normalized_costs:
+            cost_result = apply_fastwam_chunk_cost(
+                environment_rewards=environment_rewards,
+                route_used=route.route_used,
+                idm_cost=idm_cost,
+                uncond_cost=0.0,
+                valid_mask=valid_mask,
+            )
+            unnormalized, _ = compute_gae_advantages_and_returns(
+                rewards=cost_result.rewards[..., 0],
+                gamma=gamma,
+                gae_lambda=gae_lambda,
+                values=gae_values,
+                normalize_advantages=False,
+                loss_mask=chunk_mask,
+                dones=gae_dones,
+            )
+            normalized, _ = compute_gae_advantages_and_returns(
+                rewards=cost_result.rewards[..., 0],
+                gamma=gamma,
+                gae_lambda=gae_lambda,
+                values=gae_values,
+                normalize_advantages=True,
+                loss_mask=chunk_mask,
+                dones=gae_dones,
+            )
+            unnormalized_alignment = align_fastwam_policy_advantages(
+                advantages=unnormalized.unsqueeze(-1),
+                route=route,
+                emitted=emitted,
+                dones=dones,
+                rollout_epoch=rollout_epoch,
+                carry_pending_across_epochs=carry_pending_across_epochs,
+                loss_mask=valid_mask,
+            )
+            normalized_alignment = align_fastwam_policy_advantages(
+                advantages=normalized.unsqueeze(-1),
+                route=route,
+                emitted=emitted,
+                dones=dones,
+                rollout_epoch=rollout_epoch,
+                carry_pending_across_epochs=carry_pending_across_epochs,
+                loss_mask=valid_mask,
+            )
+            expected_cost_sum = float(
+                cost_result.costs[..., 0][chunk_mask].to(torch.float64).sum().item()
+            )
+            results.append(
+                (
+                    idm_cost,
+                    unnormalized_alignment,
+                    normalized_alignment,
+                    expected_cost_sum,
+                )
+            )
+
+    baseline_unnormalized = results[0][1].gate_advantages
+    baseline_normalized = results[0][2].gate_advantages
+    eligible_mask = results[0][1].gate_valid_mask
+    if any(
+        not torch.equal(item[1].gate_valid_mask, eligible_mask)
+        or not torch.equal(item[2].gate_valid_mask, eligible_mask)
+        for item in results[1:]
+    ):
+        raise ValueError("Counterfactual costs changed Gate eligibility.")
+    idm_mask = eligible_mask & (emitted.next_route == int(WAMRoute.IDM))
+    uncond_mask = eligible_mask & (emitted.next_route == int(WAMRoute.UNCOND))
+    if not bool(idm_mask.any().item()) or not bool(uncond_mask.any().item()):
+        raise ValueError(
+            "Counterfactual cost audit requires eligible IDM and UNCOND decisions."
+        )
+
+    entries = []
+    configured_alignment_error = None
+    for idm_cost, unnormalized, normalized, expected_cost_sum in results:
+        unnormalized_delta = unnormalized.gate_advantages - baseline_unnormalized
+        normalized_delta = normalized.gate_advantages - baseline_normalized
+        if idm_cost == configured_idm_cost:
+            difference = (
+                normalized.gate_advantages - configured_gate_advantages
+            ).abs()[eligible_mask]
+            configured_alignment_error = (
+                float(difference.max().item()) if difference.numel() else 0.0
+            )
+        entries.append(
+            FastWAMCounterfactualCostEntry(
+                idm_cost=idm_cost,
+                expected_cost_sum=expected_cost_sum,
+                unnormalized_gate_advantage=_summarize_selected_scalars(
+                    unnormalized.gate_advantages,
+                    mask=eligible_mask,
+                ),
+                normalized_gate_advantage=_summarize_selected_scalars(
+                    normalized.gate_advantages,
+                    mask=eligible_mask,
+                ),
+                unnormalized_idm_gate_advantage=_summarize_selected_scalars(
+                    unnormalized.gate_advantages,
+                    mask=idm_mask,
+                ),
+                normalized_idm_gate_advantage=_summarize_selected_scalars(
+                    normalized.gate_advantages,
+                    mask=idm_mask,
+                ),
+                unnormalized_uncond_gate_advantage=_summarize_selected_scalars(
+                    unnormalized.gate_advantages,
+                    mask=uncond_mask,
+                ),
+                normalized_uncond_gate_advantage=_summarize_selected_scalars(
+                    normalized.gate_advantages,
+                    mask=uncond_mask,
+                ),
+                unnormalized_idm_delta_from_zero=_summarize_selected_scalars(
+                    unnormalized_delta,
+                    mask=idm_mask,
+                ),
+                normalized_idm_delta_from_zero=_summarize_selected_scalars(
+                    normalized_delta,
+                    mask=idm_mask,
+                ),
+            )
+        )
+    if configured_alignment_error is None:
+        raise AssertionError("Configured counterfactual candidate was not evaluated.")
+    return FastWAMCounterfactualCostAudit(
+        configured_idm_cost=configured_idm_cost,
+        configured_alignment_max_abs_error=configured_alignment_error,
+        eligible_gate_decision_count=int(eligible_mask.sum().item()),
+        eligible_idm_decision_count=int(idm_mask.sum().item()),
+        eligible_uncond_decision_count=int(uncond_mask.sum().item()),
+        entries=tuple(entries),
+    )
 
 
 @register_advantage("grpo")

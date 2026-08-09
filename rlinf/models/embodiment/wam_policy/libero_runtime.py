@@ -361,6 +361,7 @@ class LiberoFastWAMRuntime:
         seeded_noise_device: str = "cpu",
         sigma_shift: float | None = None,
         flow_sde_noise_level: float = 0.5,
+        flow_sde_ignore_last_transition: bool = False,
         gate_layer_indices: tuple[int, ...] | list[int] | None = None,
         gate_denoise_last_n: int = 1,
         gate_replay_backend: GateKVReplayBackend | str = GateKVReplayBackend.STORED,
@@ -390,6 +391,7 @@ class LiberoFastWAMRuntime:
         )
         self.sigma_shift = sigma_shift
         self.flow_sde_noise_level = float(flow_sde_noise_level)
+        self.flow_sde_ignore_last_transition = bool(flow_sde_ignore_last_transition)
         self.gate_layer_indices = (
             None
             if gate_layer_indices is None
@@ -412,6 +414,11 @@ class LiberoFastWAMRuntime:
         self.text_embedding_context_len = int(text_embedding_context_len)
         if self.num_inference_steps < 1:
             raise ValueError("Inference steps must be positive.")
+        if self.flow_sde_ignore_last_transition and self.num_inference_steps < 2:
+            raise ValueError(
+                "Ignoring the final Flow-SDE transition requires at least two "
+                "inference steps."
+            )
         if self.seeded_noise_device not in {"cpu", "model"}:
             raise ValueError("seeded_noise_device must be either 'cpu' or 'model'.")
         if self.num_video_frames % 4 != 1:
@@ -886,6 +893,7 @@ class LiberoFastWAMRuntime:
                 ),
                 noise_level=self.flow_sde_noise_level,
                 gate_last_n=self.gate_denoise_last_n,
+                ignore_last_transition=self.flow_sde_ignore_last_transition,
                 stochastic=mode == "train" and regime is PolicyRegime.UNCOND,
                 collect_replay=collect_replay,
             )

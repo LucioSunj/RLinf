@@ -229,6 +229,8 @@ class MultiStepRolloutWorker(Worker):
                         self.model_cfg.critic.get("backbone_checkpoint_sha256", "")
                     ),
                 )
+                if not self.only_eval:
+                    self._restore_fastwam_step0_training_runtime(fastwam_eval_payload)
             else:
                 model_dict = torch.load(self.cfg.runner.ckpt_path)
                 self.hf_model.load_state_dict(model_dict)
@@ -279,6 +281,74 @@ class MultiStepRolloutWorker(Worker):
         return build_fastwam_checkpoint_contract(
             self.cfg,
             world_size=int(self._world_size),
+        )
+
+    def _restore_fastwam_step0_training_runtime(
+        self,
+        payload: dict[str, Any],
+    ) -> None:
+        """Restore rollout RNG/routes from a native training bootstrap.
+
+        A fresh training rollout loads trainable tensors through the standalone
+        evaluation loader before the actor performs its first weight sync.  The
+        project checkpoint also owns the RNG state that generated that exact
+        initialization.  Restoring it here keeps the first rollout paired
+        across cost cells; nonzero resumes continue to use the dedicated
+        rollout-runtime checkpoint path.
+        """
+
+        step = payload.get("step")
+        if isinstance(step, bool) or int(step) != 0:
+            raise ValueError(
+                "FastWAM training ckpt_path requires a native step-zero "
+                f"checkpoint, got step={step}."
+            )
+        if int(self.version) != 0:
+            raise ValueError(
+                "FastWAM step-zero rollout bootstrap restored a nonzero "
+                f"policy version: {self.version}."
+            )
+        policy_payload = payload.get("policy")
+        if (
+            not isinstance(policy_payload, dict)
+            or "route_tracker" not in policy_payload
+        ):
+            raise ValueError("FastWAM step-zero checkpoint omits rollout route state.")
+        checkpoint_rng = payload.get("rng")
+        if not isinstance(checkpoint_rng, dict):
+            raise ValueError("FastWAM step-zero checkpoint omits RNG state.")
+
+        expected_route_sha256 = checkpoint_state_sha256(policy_payload["route_tracker"])
+        runtime = self.hf_model.rollout_runtime_state_dict()
+        restored_route_sha256 = checkpoint_state_sha256(runtime["route_tracker"])
+        if restored_route_sha256 != expected_route_sha256:
+            raise ValueError(
+                "FastWAM rollout route state changed during step-zero bootstrap."
+            )
+
+        expected_rng_sha256 = checkpoint_state_sha256(checkpoint_rng)
+        set_rng_state(checkpoint_rng)
+        restored_rng_sha256 = checkpoint_state_sha256(get_rng_state())
+        if restored_rng_sha256 != expected_rng_sha256:
+            raise ValueError(
+                "FastWAM rollout RNG state changed during step-zero bootstrap."
+            )
+        print(
+            f"{FASTWAM_ROLLOUT_RESUME_AUDIT_SENTINEL} "
+            + json.dumps(
+                {
+                    "schema": FASTWAM_RESUME_AUDIT_SCHEMA,
+                    "owner": "rollout",
+                    "rank": int(self._rank),
+                    "step": 0,
+                    "actor_version": 0,
+                    "route_state_sha256": restored_route_sha256,
+                    "rng_sha256": restored_rng_sha256,
+                    "status": "PASS",
+                },
+                sort_keys=True,
+            ),
+            flush=True,
         )
 
     def save_checkpoint(self, save_path: str, step: int = 0) -> None:

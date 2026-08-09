@@ -125,6 +125,57 @@ def test_rollout_runtime_checkpoint_round_trip(
     assert '"route_state_sha256"' in audit_output
 
 
+def test_step_zero_training_bootstrap_restores_rollout_rng_and_route(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    worker = _worker()
+    rng_state = {"cpu": torch.tensor([3, 1, 4], dtype=torch.uint8)}
+    restored: list[dict[str, Any]] = []
+    monkeypatch.setattr(
+        worker_module,
+        "set_rng_state",
+        lambda state: restored.append(state),
+    )
+    monkeypatch.setattr(worker_module, "get_rng_state", lambda: restored[-1])
+    payload = {
+        "step": 0,
+        "rng": rng_state,
+        "policy": {"route_tracker": worker.hf_model.route_state},
+    }
+
+    worker._restore_fastwam_step0_training_runtime(payload)
+
+    assert restored == [rng_state]
+    audit_output = capsys.readouterr().out
+    assert "FASTWAM_ROLLOUT_RESUME_AUDIT" in audit_output
+    assert '"owner": "rollout"' in audit_output
+    assert '"step": 0' in audit_output
+
+
+def test_step_zero_training_bootstrap_fails_closed_without_rng() -> None:
+    worker = _worker()
+    payload = {
+        "step": 0,
+        "policy": {"route_tracker": worker.hf_model.route_state},
+    }
+
+    with pytest.raises(ValueError, match="omits RNG state"):
+        worker._restore_fastwam_step0_training_runtime(payload)
+
+
+def test_step_zero_training_bootstrap_rejects_route_mismatch() -> None:
+    worker = _worker()
+    payload = {
+        "step": 0,
+        "rng": {"cpu": torch.tensor([3], dtype=torch.uint8)},
+        "policy": {"route_tracker": {"next_episode_id": 99, "states": {}}},
+    }
+
+    with pytest.raises(ValueError, match="route state changed"):
+        worker._restore_fastwam_step0_training_runtime(payload)
+
+
 def test_rollout_runtime_checkpoint_rejects_extra_payload(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -201,6 +252,10 @@ def test_eval_checkpoint_contract_fails_before_model_construction(
             },
             "gate_epsilon": 0.0,
             "gate_temperature": 1.0,
+            "flow_sde": {
+                "noise_level": 0.5,
+                "ignore_last_transition": True,
+            },
             "runtime": {"text_embedding_cache_dir": "/cache"},
             "critic": {"load_for_eval": False},
         }
@@ -234,6 +289,24 @@ def test_eval_checkpoint_contract_fails_before_model_construction(
     )
 
     with pytest.raises(ValueError, match=r"gate\.hidden_dim"):
+        worker.init_worker()
+
+    assert model_construction_calls == []
+
+    checkpoint_model["gate"]["hidden_dim"] = 256
+    checkpoint_model["flow_sde"]["ignore_last_transition"] = False
+    torch.save(
+        {
+            "schema": "fastwam-adaptive-rl-checkpoint-v1",
+            "parent_checkpoint_sha256": parent_sha256,
+            "contract": {"model": checkpoint_model},
+        },
+        checkpoint_path,
+    )
+    with pytest.raises(
+        ValueError,
+        match=r"flow_sde\.ignore_last_transition",
+    ):
         worker.init_worker()
 
     assert model_construction_calls == []

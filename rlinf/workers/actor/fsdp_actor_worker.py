@@ -14,6 +14,7 @@
 
 import hashlib
 import json
+import math
 import os
 import time
 from functools import partial
@@ -28,10 +29,16 @@ from torch.multiprocessing.reductions import reduce_tensor
 
 import rlinf.algorithms  # noqa: F401
 from rlinf.algorithms.advantages import (
+    FASTWAM_CHUNK_COST_AUDIT_SENTINEL,
+    FASTWAM_COUNTERFACTUAL_COST_AUDIT_SENTINEL,
+    FASTWAM_GATE_UPDATE_AUDIT_SENTINEL,
     FASTWAM_REWARD_AUDIT_SENTINEL,
     FASTWAM_ROLLOUT_STATE_AUDIT_SENTINEL,
+    FastWAMGateUpdateAudit,
     align_fastwam_policy_advantages,
     apply_fastwam_chunk_cost,
+    summarize_fastwam_chunk_cost,
+    summarize_fastwam_counterfactual_costs,
     summarize_fastwam_environment_rewards,
     summarize_fastwam_rollout_state,
 )
@@ -1384,6 +1391,83 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
             "Could not unwrap the FastWAM adaptive policy from its FSDP wrapper."
         )
 
+    def _capture_fastwam_gate_parameters(self) -> dict[str, torch.Tensor]:
+        """Clone trainable Gate parameters to CPU for an audit-only delta."""
+
+        gate = self._fastwam_policy_module().gate
+        state = {
+            name: parameter.detach().cpu().contiguous().clone()
+            for name, parameter in gate.named_parameters()
+            if parameter.requires_grad
+        }
+        if not state:
+            raise RuntimeError("FastWAM Gate update audit found no trainable tensors.")
+        return state
+
+    @staticmethod
+    def _summarize_fastwam_gate_update(
+        *,
+        before: dict[str, torch.Tensor],
+        after: dict[str, torch.Tensor],
+        optimizer_steps_before: int,
+        optimizer_steps_after: int,
+    ) -> FastWAMGateUpdateAudit:
+        """Build finite aggregate update evidence from two CPU snapshots."""
+
+        if set(before) != set(after):
+            raise RuntimeError("FastWAM Gate parameter names changed during training.")
+        before_square_sum = 0.0
+        update_square_sum = 0.0
+        update_max_abs = 0.0
+        finite_count = 0
+        nonfinite_count = 0
+        parameter_count = 0
+        for name in sorted(before):
+            before_tensor = before[name]
+            after_tensor = after[name]
+            if (
+                before_tensor.shape != after_tensor.shape
+                or before_tensor.dtype != after_tensor.dtype
+            ):
+                raise RuntimeError(f"FastWAM Gate tensor {name!r} changed metadata.")
+            before_float = before_tensor.float()
+            update = after_tensor.float() - before_float
+            finite = torch.isfinite(update)
+            finite_count += int(finite.sum().item())
+            nonfinite_count += int((~finite).sum().item())
+            parameter_count += int(update.numel())
+            if bool(finite.any().item()):
+                finite_update = update[finite]
+                update_square_sum += float(
+                    finite_update.square().to(torch.float64).sum().item()
+                )
+                update_max_abs = max(
+                    update_max_abs,
+                    float(finite_update.abs().max().item()),
+                )
+            before_finite = before_float[torch.isfinite(before_float)]
+            before_square_sum += float(
+                before_finite.square().to(torch.float64).sum().item()
+            )
+        before_l2 = math.sqrt(before_square_sum)
+        update_l2 = math.sqrt(update_square_sum)
+        return FastWAMGateUpdateAudit(
+            optimizer_steps_before=int(optimizer_steps_before),
+            optimizer_steps_after=int(optimizer_steps_after),
+            tensor_count=len(before),
+            parameter_count=parameter_count,
+            before_sha256=checkpoint_state_sha256(before),
+            after_sha256=checkpoint_state_sha256(after),
+            before_l2_norm=before_l2,
+            update_l2_norm=update_l2,
+            update_max_abs=update_max_abs,
+            relative_update_l2_norm=(
+                update_l2 / before_l2 if before_l2 > 0.0 else float("inf")
+            ),
+            finite_update_count=finite_count,
+            nonfinite_update_count=nonfinite_count,
+        )
+
     @staticmethod
     def _checkpoint_cpu_clone(value):
         if isinstance(value, torch.Tensor):
@@ -1879,6 +1963,8 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
             self.compute_opd_teacher_logprobs()
 
         reward_audit = None
+        cost_audit = None
+        counterfactual_cost_audit = None
         rollout_state_audit = None
         model_type = SupportedModel(self.cfg.actor.model.model_type)
         if model_type is SupportedModel.FASTWAM_ADAPTIVE:
@@ -1899,9 +1985,14 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
             training_guard = self.cfg.runner.get("fastwam_training_guard", {})
             scientific_guard = bool(training_guard.get("enabled", False))
             audit_enabled = short_canary_guard or scientific_guard
+            cost_audit_cfg = training_guard.get("cost_audit", {})
+            cost_audit_enabled = scientific_guard and bool(
+                cost_audit_cfg.get("enabled", False)
+            )
+            raw_environment_rewards = self.rollout_batch["rewards"]
             if audit_enabled:
                 reward_audit = summarize_fastwam_environment_rewards(
-                    environment_rewards=self.rollout_batch["rewards"],
+                    environment_rewards=raw_environment_rewards,
                     route_used=self.rollout_batch["route_info"].route_used,
                     valid_mask=self.rollout_batch.get("loss_mask", None),
                 )
@@ -1917,7 +2008,7 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
                 if "fastwam_branch_costs" in self.rollout_batch:
                     raise RuntimeError("FastWAM branch cost was already applied.")
                 cost_result = apply_fastwam_chunk_cost(
-                    environment_rewards=self.rollout_batch["rewards"],
+                    environment_rewards=raw_environment_rewards,
                     route_used=self.rollout_batch["route_info"].route_used,
                     idm_cost=float(cost_cfg.get("idm_cost", 0.0)),
                     uncond_cost=float(cost_cfg.get("uncond_cost", 0.0)),
@@ -1925,6 +2016,24 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
                 )
                 self.rollout_batch["rewards"] = cost_result.rewards
                 self.rollout_batch["fastwam_branch_costs"] = cost_result.costs
+                if cost_audit_enabled:
+                    cost_audit = summarize_fastwam_chunk_cost(
+                        environment_rewards=raw_environment_rewards,
+                        route=self.rollout_batch["route_info"],
+                        cost_result=cost_result,
+                        idm_cost=float(cost_cfg.get("idm_cost", 0.0)),
+                        uncond_cost=float(cost_cfg.get("uncond_cost", 0.0)),
+                        valid_mask=self.rollout_batch.get("loss_mask", None),
+                    )
+                    print(
+                        f"{FASTWAM_CHUNK_COST_AUDIT_SENTINEL} "
+                        + json.dumps(cost_audit.to_artifact(), sort_keys=True),
+                        flush=True,
+                    )
+            elif cost_audit_enabled:
+                raise ValueError(
+                    "FastWAM cost audit requires fixed_branch_cost.enabled=true."
+                )
 
         kwargs = {
             "task_type": self.cfg.runner.task_type,
@@ -1941,6 +2050,9 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
             "reward_type": self.cfg.algorithm.reward_type,
             "loss_mask": self.rollout_batch.get("loss_mask", None),
             "loss_mask_sum": self.rollout_batch.get("loss_mask_sum", None),
+            "normalize_advantages": bool(
+                self.cfg.algorithm.get("normalize_advantages", True)
+            ),
         }
 
         advantages_and_returns = calculate_adv_and_returns(**kwargs)
@@ -1964,6 +2076,32 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
                     "gate_valid_mask": alignment.gate_valid_mask,
                 }
             )
+            if cost_audit_enabled:
+                counterfactual_cost_audit = summarize_fastwam_counterfactual_costs(
+                    environment_rewards=raw_environment_rewards,
+                    route=self.rollout_batch["route_info"],
+                    emitted=self.rollout_batch["emitted_gate"],
+                    dones=self.rollout_batch["dones"],
+                    values=self.rollout_batch["prev_values"],
+                    valid_mask=self.rollout_batch.get("loss_mask", None),
+                    idm_costs=tuple(
+                        float(item)
+                        for item in cost_audit_cfg.get("counterfactual_idm_costs", [])
+                    ),
+                    configured_idm_cost=float(cost_cfg.get("idm_cost", 0.0)),
+                    configured_gate_advantages=alignment.gate_advantages,
+                    gamma=float(self.cfg.algorithm.get("gamma", 1.0)),
+                    gae_lambda=float(self.cfg.algorithm.get("gae_lambda", 1.0)),
+                    rollout_epoch=int(self.cfg.env.train.rollout_epoch),
+                    carry_pending_across_epochs=bool(self.cfg.env.train.auto_reset),
+                )
+                print(
+                    f"{FASTWAM_COUNTERFACTUAL_COST_AUDIT_SENTINEL} "
+                    + json.dumps(
+                        counterfactual_cost_audit.to_artifact(), sort_keys=True
+                    ),
+                    flush=True,
+                )
             if audit_enabled:
                 kv_cfg = self.cfg.actor.model.kv_replay
                 rollout_state_audit = summarize_fastwam_rollout_state(
@@ -2013,6 +2151,20 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
                         rollout_state_audit.valid_uncond_chunk_count
                     ),
                 }
+            )
+        if cost_audit is not None:
+            rollout_metrics.update(
+                {
+                    "fastwam/branch_cost_sum": cost_audit.actual_branch_costs.total,
+                    "fastwam/shaped_reward_sum": cost_audit.shaped_rewards.total,
+                    "fastwam/cost_identity_max_abs_error": (
+                        cost_audit.shaped_reward_identity_max_abs_error
+                    ),
+                }
+            )
+        if counterfactual_cost_audit is not None:
+            rollout_metrics["fastwam/counterfactual_alignment_max_abs_error"] = (
+                counterfactual_cost_audit.configured_alignment_max_abs_error
             )
         return rollout_metrics
 
@@ -2219,6 +2371,18 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
         if self.is_optimizer_offloaded:
             self.load_optimizer(self.device)
 
+        gate_update_before = None
+        gate_optimizer_steps_before = None
+        if SupportedModel(
+            self.cfg.actor.model.model_type
+        ) is SupportedModel.FASTWAM_ADAPTIVE and bool(
+            self.cfg.runner.get("fastwam_training_guard", {})
+            .get("cost_audit", {})
+            .get("enabled", False)
+        ):
+            gate_update_before = self._capture_fastwam_gate_parameters()
+            gate_optimizer_steps_before = int(self.optimizer_steps)
+
         if self.cfg.algorithm.loss_type == "opd":
             target_steps = int(self.rollout_batch["advantages"].shape[0])
             for key in [
@@ -2352,6 +2516,32 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
         # put LR scheduler step here
         self.lr_scheduler.step()
         self.optimizer.zero_grad()
+        if gate_update_before is not None:
+            gate_update_after = self._capture_fastwam_gate_parameters()
+            gate_update_audit = self._summarize_fastwam_gate_update(
+                before=gate_update_before,
+                after=gate_update_after,
+                optimizer_steps_before=int(gate_optimizer_steps_before),
+                optimizer_steps_after=int(self.optimizer_steps),
+            )
+            print(
+                f"{FASTWAM_GATE_UPDATE_AUDIT_SENTINEL} "
+                + json.dumps(gate_update_audit.to_artifact(), sort_keys=True),
+                flush=True,
+            )
+            append_to_dict(
+                metrics,
+                {
+                    "gate/update_l2_norm": gate_update_audit.update_l2_norm,
+                    "gate/update_max_abs": gate_update_audit.update_max_abs,
+                    "gate/relative_update_l2_norm": (
+                        gate_update_audit.relative_update_l2_norm
+                    ),
+                    "gate/update_nonfinite_count": float(
+                        gate_update_audit.nonfinite_update_count
+                    ),
+                },
+            )
         clear_memory()
         explained_variance_stats = pop_critic_explained_variance_stats(metrics)
         weighted_sums = {}

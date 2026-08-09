@@ -46,11 +46,16 @@ from rlinf.envs.libero.image_preprocessing import (
     OFFICIAL_LIBERO_CAMERA_RESIZE_MODE,
     prepare_libero_camera_batch,
 )
+from rlinf.models.embodiment.wam_policy.contracts import ChunkRouteRecord, WAMRoute
 from rlinf.models.embodiment.wam_policy.libero_runtime import (
     _convert_fastwam_gripper_to_libero,
     _seeded_randn,
 )
-from rlinf.workers.env.env_worker import EnvWorker
+from rlinf.workers.env.env_worker import (
+    EnvWorker,
+    build_fastwam_episode_identity_sha256,
+    summarize_fastwam_flow_sde_denoise_indices,
+)
 
 
 class _Controller:
@@ -494,6 +499,161 @@ def test_guarded_env_step_requires_typed_model_action_trace(
     actions = torch.zeros(1, 10, 7)
     with pytest.raises(ValueError, match="typed model Action trace"):
         inspect.unwrap(EnvWorker.env_interact_step)(worker, actions, 0)
+
+
+def test_guarded_env_step_reports_route_and_first_action_violation_stage(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    contract = _contract()
+
+    class RejectingTraceEnv(_TrainingActionTraceEnv):
+        def chunk_step_with_action_trace(self, actions, contract):
+            raise ValueError(
+                "Refusing to submit Action values outside the exact live LIBERO "
+                "contract. No clamp was applied."
+            )
+
+    environment = RejectingTraceEnv(contract)
+    environment.task_ids = np.asarray([3])
+    environment.trial_ids = np.asarray([24])
+    environment.reset_state_ids = np.asarray([174])
+    worker = object.__new__(EnvWorker)
+    worker._rank = 2
+    worker.cfg = OmegaConf.create(
+        {
+            "runner": {"fastwam_training_guard": {"enabled": True}},
+            "env": {
+                "train": {
+                    "env_type": "libero",
+                    "auto_reset": False,
+                    "ignore_terminations": False,
+                }
+            },
+        }
+    )
+    worker.model_cfg = OmegaConf.create(
+        {"model_type": "fastwam_adaptive", "num_action_chunks": 10, "action_dim": 7}
+    )
+    worker.env_list = [environment]
+    worker.use_external_reward_model = False
+    actions = torch.zeros(1, 10, 7)
+    actions[..., 2] = -1.0625
+    normalized = torch.zeros_like(actions)
+    model_trace = ActionExecutionTrace(
+        (
+            ActionStageStatistics.from_values(
+                stage=NORMALIZED_ACTION_STAGE,
+                values=normalized,
+                low=contract.low,
+                high=contract.high,
+                gripper_dimension_index=6,
+                action_contract_sha256=contract.canonical_sha256,
+            ),
+            *ActionExecutionTrace(
+                tuple(
+                    ActionStageStatistics.from_values(
+                        stage=stage,
+                        values=actions,
+                        low=contract.low,
+                        high=contract.high,
+                        gripper_dimension_index=6,
+                        action_contract_sha256=contract.canonical_sha256,
+                    )
+                    for stage in (
+                        DENORMALIZED_ACTION_STAGE,
+                        GRIPPER_CONVERTED_ACTION_STAGE,
+                    )
+                )
+            ).stages,
+        )
+    )
+    route = ChunkRouteRecord(
+        route_used=torch.tensor([WAMRoute.UNCOND]),
+        route_was_forced=torch.tensor([False]),
+        chunk_ids=torch.tensor([7]),
+        episode_ids=torch.tensor([11]),
+        route_source_chunk_ids=torch.tensor([6]),
+        actor_versions=torch.tensor([4]),
+    )
+    monkeypatch.setattr(
+        "rlinf.workers.env.env_worker.prepare_actions",
+        lambda *, raw_chunk_actions, **_: raw_chunk_actions,
+    )
+    monkeypatch.setattr(
+        "rlinf.workers.env.env_worker.get_env_attr",
+        lambda owner, name: getattr(owner, name),
+    )
+
+    with pytest.raises(ValueError, match="FastWAM failure provenance") as error:
+        inspect.unwrap(EnvWorker.env_interact_step)(
+            worker,
+            actions,
+            0,
+            action_execution_trace=model_trace,
+            route_info=route,
+            flow_sde_denoise_indices=torch.tensor([9]),
+        )
+
+    message = str(error.value)
+    assert '"first_out_of_live_bounds_stage": "normalizer_backward"' in message
+    assert '"route": "UNCOND"' in message
+    assert '"chunk_id": 7' in message
+    assert '"route_source_chunk_id": 6' in message
+    assert '"flow_sde_denoise_index": 9' in message
+    assert '"task_id": 3' in message
+    assert '"reset_state_id": 174' in message
+    assert "FASTWAM_TRAINING_ACTION_FAILURE" in capsys.readouterr().out
+
+
+def test_ignore_last_flow_sde_denoise_audit_fails_closed() -> None:
+    summary = summarize_fastwam_flow_sde_denoise_indices(
+        [torch.tensor([-1, 0, 8]), torch.tensor([3, -1])],
+        num_inference_steps=10,
+        ignore_last_transition=True,
+    )
+    assert summary == {
+        "ignore_last_transition": True,
+        "num_inference_steps": 10,
+        "selected_count": 3,
+        "minimum": 0,
+        "maximum": 8,
+        "final_transition_count": 0,
+    }
+
+    with pytest.raises(ValueError, match="selected final transition"):
+        summarize_fastwam_flow_sde_denoise_indices(
+            [torch.tensor([9])],
+            num_inference_steps=10,
+            ignore_last_transition=True,
+        )
+
+
+def test_training_episode_identity_hash_is_compact_and_deterministic() -> None:
+    route = ChunkRouteRecord(
+        route_used=torch.tensor([WAMRoute.IDM, WAMRoute.UNCOND]),
+        route_was_forced=torch.tensor([True, False]),
+        chunk_ids=torch.tensor([0, 5]),
+        episode_ids=torch.tensor([9, 11]),
+        route_source_chunk_ids=torch.tensor([-1, 4]),
+        actor_versions=torch.tensor([0, 0]),
+    )
+    kwargs = {
+        "route": route,
+        "task_ids": np.asarray([0, 3]),
+        "trial_ids": np.asarray([24, 49]),
+        "reset_state_ids": np.asarray([24, 199]),
+    }
+
+    first = build_fastwam_episode_identity_sha256(**kwargs)
+    second = build_fastwam_episode_identity_sha256(**kwargs)
+    changed = build_fastwam_episode_identity_sha256(
+        **{**kwargs, "reset_state_ids": np.asarray([24, 198])}
+    )
+
+    assert len(first) == 64
+    assert first == second
+    assert first != changed
 
 
 def test_guarded_training_rollout_input_injects_live_action_contract() -> None:

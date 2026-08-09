@@ -51,6 +51,11 @@ runner:
     gate_kl_single_max: 0.1
     gate_clip_median_max: 0.6
     gate_clip_single_max: 0.8
+    # P6b enables this through a contract-bound launcher override. Shadow
+    # costs are read-only and never alter the optimized reward or policy.
+    cost_audit:
+      enabled: false
+      counterfactual_idm_costs: []
 
   bootstrap_project_checkpoint_dir: null
 algorithm:
