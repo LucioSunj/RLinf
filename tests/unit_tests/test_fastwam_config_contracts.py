@@ -89,6 +89,7 @@ def test_p8_readiness_endpoint_rejects_identity_or_run_length_drift() -> None:
         "specific_reset_id": 1,
         "use_fixed_reset_state_ids": True,
         "training_route_override": "forced_uncond_after_initial",
+        "load_text_encoder": False,
         "formal_training_authorized": False,
         "final_ledger_path": None,
     }
@@ -99,6 +100,7 @@ def test_p8_readiness_endpoint_rejects_identity_or_run_length_drift() -> None:
         ("specific_reset_id", 0),
         ("task_id_filter", [1]),
         ("training_route_override", "none"),
+        ("load_text_encoder", True),
         ("formal_training_authorized", True),
         ("final_ledger_path", "/forbidden/final_ledger.json"),
     ):

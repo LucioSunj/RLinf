@@ -269,6 +269,26 @@ def test_libero_adaptive_config_composes_with_confirmed_defaults(monkeypatch) ->
     _builder._validate_exact_pi05_critic_config(cfg.actor.model.critic)
 
 
+def test_p8_readiness_uses_only_the_pinned_text_cache(monkeypatch) -> None:
+    monkeypatch.setenv("EMBODIED_PATH", str(REPO_ROOT / "examples/embodiment"))
+    monkeypatch.setenv("FASTWAM_CHECKPOINT", "/tmp/fastwam.pt")
+    monkeypatch.setenv("FASTWAM_CHECKPOINT_SHA256", "a" * 64)
+    monkeypatch.setenv("FASTWAM_DATASET_STATS", "/tmp/dataset_stats.json")
+    monkeypatch.setenv("PI05_CRITIC_CHECKPOINT", "/tmp/pi05")
+    monkeypatch.setenv("PI05_CRITIC_CHECKPOINT_SHA256", "b" * 64)
+    monkeypatch.setenv("FASTWAM_DINOV3_SOURCE_ROOT", "/tmp/dinov3")
+    monkeypatch.setenv("FASTWAM_DINOV3_WEIGHTS", "/tmp/dinov3.safetensors")
+    monkeypatch.setenv("FASTWAM_TEXT_EMBEDDING_CACHE", "/tmp/text-cache")
+
+    with initialize_config_dir(version_base=None, config_dir=str(CONFIG_ROOT)):
+        cfg = compose(config_name="libero_10_ppo_fastwam_adaptive_p8_readiness")
+
+    assert cfg.actor.model.fastwam.load_text_encoder is False
+    assert cfg.rollout.model.fastwam.load_text_encoder is False
+    assert cfg.actor.model.runtime.text_embedding_cache_dir == "/tmp/text-cache"
+    assert cfg.rollout.model.runtime.text_embedding_cache_dir == "/tmp/text-cache"
+
+
 def test_hydra_overrides_select_recompute_and_gate_subsets(monkeypatch) -> None:
     monkeypatch.setenv("EMBODIED_PATH", str(REPO_ROOT / "examples/embodiment"))
     monkeypatch.setenv("FASTWAM_CHECKPOINT", "/tmp/fastwam.pt")

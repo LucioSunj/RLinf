@@ -7,6 +7,11 @@ defaults:
 runtime:
   text_embedding_cache_dir: ${oc.env:FASTWAM_TEXT_EMBEDDING_CACHE}
 
+# The bounded readiness endpoint consumes only the pinned production cache. It
+# must not construct or download an unpinned text encoder/tokenizer.
+fastwam:
+  load_text_encoder: false
+
 # This test-only endpoint still checkpoints and synchronizes Gate state, but
 # excludes Gate parameters and Gate loss from the readiness canary optimizer.
 gate_trainable: false

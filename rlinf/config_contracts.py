@@ -98,6 +98,7 @@ def validate_p8_readiness_endpoint_contract(
     specific_reset_id: int,
     use_fixed_reset_state_ids: bool,
     training_route_override: str,
+    load_text_encoder: bool,
     formal_training_authorized: bool,
     final_ledger_path: object,
 ) -> None:
@@ -130,6 +131,11 @@ def validate_p8_readiness_endpoint_contract(
     if training_route_override != "forced_uncond_after_initial":
         mismatches.append(
             "training_route_override must be `forced_uncond_after_initial`"
+        )
+    if load_text_encoder is not False:
+        mismatches.append(
+            "fastwam.load_text_encoder must be false so the endpoint uses only "
+            "the pinned text cache"
         )
     if formal_training_authorized is not False:
         mismatches.append("runner.formal_training_authorized must be false")

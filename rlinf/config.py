@@ -1103,6 +1103,7 @@ def _validate_fastwam_adaptive_cfg(cfg, *, only_eval: bool) -> None:
                 "use_fixed_reset_state_ids", False
             ),
             training_route_override=actor_model.get("training_route_override", "none"),
+            load_text_encoder=actor_model.fastwam.get("load_text_encoder", True),
             formal_training_authorized=cfg.runner.get(
                 "formal_training_authorized", False
             ),
