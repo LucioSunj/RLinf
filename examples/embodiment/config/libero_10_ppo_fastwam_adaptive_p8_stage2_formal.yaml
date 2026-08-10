@@ -26,6 +26,9 @@ runner:
   p8_readiness_endpoint: false
   p8_stage2_systems_endpoint: false
   p8_formal_stage2_endpoint: true
+  # Independent of the adaptive-Gate training guard: the fixed-route formal
+  # endpoint must still carry the typed model-to-LIBERO Action trace.
+  p8_formal_action_audit: true
   p8_formal_stage2_mode: training
   formal_training_authorized: true
   formal_training_authorization_record: ${oc.env:P8_FORMAL_AUTHORIZATION_RECORD}

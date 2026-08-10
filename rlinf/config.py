@@ -1164,6 +1164,9 @@ def _validate_fastwam_adaptive_cfg(cfg, *, only_eval: bool) -> None:
                 "use_fixed_reset_state_ids", False
             ),
             training_route_override=actor_model.get("training_route_override", "none"),
+            preserve_fixed_route_across_actor_updates=actor_model.get(
+                "preserve_fixed_route_across_actor_updates", False
+            ),
             load_text_encoder=actor_model.fastwam.get("load_text_encoder", True),
             formal_training_authorized=cfg.runner.get(
                 "formal_training_authorized", False
@@ -1212,6 +1215,7 @@ def _validate_fastwam_adaptive_cfg(cfg, *, only_eval: bool) -> None:
             training_guard_enabled=cfg.runner.get("fastwam_training_guard", {}).get(
                 "enabled", False
             ),
+            formal_action_audit=cfg.runner.get("p8_formal_action_audit", False),
         )
     for path in (
         "actor.optim.lora_lr",

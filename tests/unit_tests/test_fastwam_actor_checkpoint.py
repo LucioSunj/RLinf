@@ -26,6 +26,7 @@ import pytest
 import torch
 from omegaconf import OmegaConf
 
+from rlinf.hybrid_engines.fsdp.fsdp_model_manager import FSDPModelManager
 from rlinf.workers.actor import fsdp_actor_worker as worker_module
 from rlinf.workers.actor.fsdp_actor_worker import EmbodiedFSDPActor
 
@@ -69,6 +70,72 @@ def test_p8_formal_runner_step_requires_exactly_ten_optimizer_updates() -> None:
             optimizer_steps_before=20,
             optimizer_steps_after=29,
             expected_updates=10,
+        )
+
+
+def test_fsdp_optimizer_step_can_fail_before_nonfinite_update() -> None:
+    calls = []
+
+    class _Scaler:
+        def unscale_(self, optimizer) -> None:
+            calls.append(("unscale", optimizer))
+
+        def step(self, optimizer) -> None:
+            calls.append(("step", optimizer))
+
+        def update(self) -> None:
+            calls.append(("update", None))
+
+    optimizer = SimpleNamespace(param_groups=[])
+    manager = SimpleNamespace(
+        optimizer_steps=0,
+        grad_scaler=_Scaler(),
+        optimizer=optimizer,
+        _strategy=SimpleNamespace(
+            clip_grad_norm_=lambda *, model: torch.tensor(float("nan"))
+        ),
+        model=object(),
+    )
+
+    with pytest.raises(FloatingPointError, match="before optimizer step"):
+        FSDPModelManager.optimizer_step(manager, fail_on_nonfinite=True)
+
+    assert calls == [("unscale", optimizer)]
+    assert manager.optimizer_steps == 0
+
+
+def test_p8_formal_route_audit_requires_idm_first_and_uncond_later() -> None:
+    route = worker_module.ChunkRouteRecord(
+        route_used=torch.tensor([[1, 1], [0, 0], [0, 0]]),
+        route_was_forced=torch.tensor([[True, True], [False, False], [False, False]]),
+        chunk_ids=torch.tensor([[0, 0], [1, 1], [2, 2]]),
+        episode_ids=torch.tensor([[4, 9], [4, 9], [4, 9]]),
+        route_source_chunk_ids=torch.tensor([[-1, -1], [0, 0], [1, 1]]),
+        actor_versions=torch.zeros(3, 2, dtype=torch.long),
+    )
+
+    audit = worker_module._audit_p8_formal_fixed_route(
+        route=route,
+        loss_mask=torch.ones(3, 2, 10, dtype=torch.bool),
+    )
+
+    assert audit["status"] == "PASS"
+    assert audit["valid_chunk_count"] == 6
+    assert audit["first_chunk_count"] == 2
+    assert audit["later_chunk_count"] == 4
+    tampered = worker_module.ChunkRouteRecord(
+        route_used=route.route_used.clone(),
+        route_was_forced=route.route_was_forced,
+        chunk_ids=route.chunk_ids,
+        episode_ids=route.episode_ids,
+        route_source_chunk_ids=route.route_source_chunk_ids,
+        actor_versions=route.actor_versions,
+    )
+    tampered.route_used[1, 0] = int(worker_module.WAMRoute.IDM)
+    with pytest.raises(RuntimeError, match="every later chunk"):
+        worker_module._audit_p8_formal_fixed_route(
+            route=tampered,
+            loss_mask=torch.ones(3, 2, 10, dtype=torch.bool),
         )
 
 
@@ -756,3 +823,29 @@ def test_p8_formal_first_update_requires_finite_nonzero_three_family_delta() -> 
             before,
             nonfinite,
         )
+
+    unchanged_summary = EmbodiedFSDPActor._summarize_p8_formal_optimizer_update(
+        before,
+        before,
+        require_nonzero=False,
+    )
+    assert all(item["finite"] is True for item in unchanged_summary.values())
+    assert all(item["update_l2_norm"] == 0.0 for item in unchanged_summary.values())
+
+
+def test_p8_formal_frozen_manifest_detects_in_place_parameter_change() -> None:
+    model = torch.nn.Module()
+    model.trainable = torch.nn.Parameter(torch.ones(2))
+    model.frozen = torch.nn.Parameter(torch.zeros(3), requires_grad=False)
+    worker = object.__new__(EmbodiedFSDPActor)
+    worker.model = model
+    worker.optimizer = SimpleNamespace(
+        param_groups=[{"name": "trainable", "params": [model.trainable]}]
+    )
+
+    before = worker._capture_p8_formal_frozen_state_manifest()
+    with torch.no_grad():
+        model.frozen.add_(1.0)
+    after = worker._capture_p8_formal_frozen_state_manifest()
+
+    assert before["state_manifest_sha256"] != after["state_manifest_sha256"]

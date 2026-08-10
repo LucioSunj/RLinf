@@ -80,6 +80,24 @@ FASTWAM_TRAINING_ACTION_FAILURE_SENTINEL = "FASTWAM_TRAINING_ACTION_FAILURE"
 FASTWAM_TRAINING_ACTION_FAILURE_SCHEMA = "fastwam-training-action-failure-v1"
 
 
+def _fastwam_training_action_audit_enabled(
+    cfg: Any,
+    *,
+    eval_mode: bool = False,
+) -> bool:
+    """Resolve the generic or P8-formal typed Action audit fail-closed."""
+
+    runner = cfg.get("runner", {})
+    formal_endpoint = bool(runner.get("p8_formal_stage2_endpoint", False))
+    formal_audit = bool(runner.get("p8_formal_action_audit", False))
+    if formal_endpoint != formal_audit:
+        raise ValueError(
+            "P8 formal Stage2 and its typed Action audit must be enabled together."
+        )
+    generic_audit = bool(runner.get("fastwam_training_guard", {}).get("enabled", False))
+    return bool(not eval_mode and (generic_audit or formal_audit))
+
+
 def _batch_metadata_value(value: Any, index: int) -> int | None:
     """Return one compact integer metadata value from a batch container."""
 
@@ -756,9 +774,7 @@ class EnvWorker(Worker):
             chunk_actions = exec_actions
         env_info = {}
 
-        training_action_audit = bool(
-            self.cfg.runner.get("fastwam_training_guard", {}).get("enabled", False)
-        )
+        training_action_audit = _fastwam_training_action_audit_enabled(self.cfg)
         combined_action_trace = None
         if training_action_audit:
             if str(self.model_cfg.model_type) != "fastwam_adaptive":
@@ -1364,11 +1380,9 @@ class EnvWorker(Worker):
                 if isinstance(first_value, torch.Tensor)
                 else len(first_value)
             )
-            training_action_audit = bool(
-                not eval_mode
-                and self.cfg.get("runner", {})
-                .get("fastwam_training_guard", {})
-                .get("enabled", False)
+            training_action_audit = _fastwam_training_action_audit_enabled(
+                self.cfg,
+                eval_mode=eval_mode,
             )
             if training_action_audit:
                 if str(self.model_cfg.model_type) != "fastwam_adaptive":
@@ -1553,6 +1567,7 @@ class EnvWorker(Worker):
         )
         env_metrics = defaultdict(list)
         rlt_pending_obs: list[dict[str, Any] | None] = [None] * self.stage_num
+        training_action_audit = _fastwam_training_action_audit_enabled(self.cfg)
         training_action_traces: list[list[ActionExecutionTrace]] = [
             [] for _ in range(self.stage_num)
         ]
@@ -1653,11 +1668,7 @@ class EnvWorker(Worker):
                             cache_current=True,
                         )
 
-                    if bool(
-                        self.cfg.runner.get("fastwam_training_guard", {}).get(
-                            "enabled", False
-                        )
-                    ):
+                    if training_action_audit:
                         environment = self.env_list[stage_id]
                         training_action_episode_identity_hashes[stage_id].append(
                             build_fastwam_episode_identity_sha256(
@@ -1826,9 +1837,6 @@ class EnvWorker(Worker):
                         stage_id=stage_id,
                     )
 
-        training_action_audit = bool(
-            self.cfg.runner.get("fastwam_training_guard", {}).get("enabled", False)
-        )
         if training_action_audit:
             for stage_id, traces in enumerate(training_action_traces):
                 if not traces:

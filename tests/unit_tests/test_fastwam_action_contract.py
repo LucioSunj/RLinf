@@ -53,9 +53,40 @@ from rlinf.models.embodiment.wam_policy.libero_runtime import (
 )
 from rlinf.workers.env.env_worker import (
     EnvWorker,
+    _fastwam_training_action_audit_enabled,
     build_fastwam_episode_identity_sha256,
     summarize_fastwam_flow_sde_denoise_indices,
 )
+
+
+def test_p8_formal_action_audit_is_independent_and_fail_closed() -> None:
+    cfg = OmegaConf.create(
+        {
+            "runner": {
+                "p8_formal_stage2_endpoint": True,
+                "p8_formal_action_audit": True,
+                "fastwam_training_guard": {"enabled": False},
+            }
+        }
+    )
+
+    assert _fastwam_training_action_audit_enabled(cfg) is True
+    assert _fastwam_training_action_audit_enabled(cfg, eval_mode=True) is False
+
+    cfg.runner.p8_formal_action_audit = False
+    with pytest.raises(ValueError, match="must be enabled together"):
+        _fastwam_training_action_audit_enabled(cfg)
+
+    cfg.runner.p8_formal_stage2_endpoint = False
+    cfg.runner.p8_formal_action_audit = True
+    with pytest.raises(ValueError, match="must be enabled together"):
+        _fastwam_training_action_audit_enabled(cfg)
+
+
+def test_action_audit_defaults_off_without_changing_the_legacy_path() -> None:
+    cfg = OmegaConf.create({"runner": {}})
+
+    assert _fastwam_training_action_audit_enabled(cfg) is False
 
 
 class _Controller:
@@ -400,6 +431,15 @@ class _TrainingActionTraceEnv:
         truncations = torch.zeros_like(terminations)
         return (observations, rewards, terminations, truncations, [{}]), submitted
 
+    def chunk_step(self, actions):
+        self.submitted = torch.as_tensor(actions).clone()
+        batch, horizon = actions.shape[:2]
+        observations = [{"state": torch.zeros(batch, 1)}]
+        rewards = torch.zeros(batch, horizon)
+        terminations = torch.zeros(batch, horizon, dtype=torch.bool)
+        truncations = torch.zeros_like(terminations)
+        return observations, rewards, terminations, truncations, [{}]
+
 
 def _three_stage_model_trace(actions, contract) -> ActionExecutionTrace:
     return ActionExecutionTrace(
@@ -419,6 +459,45 @@ def _three_stage_model_trace(actions, contract) -> ActionExecutionTrace:
             )
         )
     )
+
+
+def test_default_off_env_step_keeps_the_legacy_chunk_step_surface(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    contract = _contract()
+    environment = _TrainingActionTraceEnv(contract)
+    worker = object.__new__(EnvWorker)
+    worker.cfg = OmegaConf.create(
+        {
+            "runner": {},
+            "env": {
+                "train": {
+                    "env_type": "libero",
+                    "auto_reset": False,
+                    "ignore_terminations": False,
+                }
+            },
+        }
+    )
+    worker.model_cfg = OmegaConf.create(
+        {
+            "model_type": "fastwam_adaptive",
+            "num_action_chunks": 10,
+            "action_dim": 7,
+        }
+    )
+    worker.env_list = [environment]
+    worker.use_external_reward_model = False
+    monkeypatch.setattr(
+        "rlinf.workers.env.env_worker.prepare_actions",
+        lambda *, raw_chunk_actions, **_: raw_chunk_actions,
+    )
+    actions = torch.zeros(1, 10, 7)
+
+    _, _, payload = inspect.unwrap(EnvWorker.env_interact_step)(worker, actions, 0)
+
+    assert torch.equal(environment.submitted, actions)
+    assert payload["action_execution_trace"] is None
 
 
 def test_guarded_env_step_combines_exact_five_stage_trace_without_clamp(
@@ -477,14 +556,26 @@ def test_guarded_env_step_combines_exact_five_stage_trace_without_clamp(
     )
 
 
+@pytest.mark.parametrize(
+    "runner_config",
+    [
+        {"fastwam_training_guard": {"enabled": True}},
+        {
+            "p8_formal_stage2_endpoint": True,
+            "p8_formal_action_audit": True,
+            "fastwam_training_guard": {"enabled": False},
+        },
+    ],
+)
 def test_guarded_env_step_requires_typed_model_action_trace(
     monkeypatch: pytest.MonkeyPatch,
+    runner_config: dict,
 ) -> None:
     contract = _contract()
     worker = object.__new__(EnvWorker)
     worker.cfg = OmegaConf.create(
         {
-            "runner": {"fastwam_training_guard": {"enabled": True}},
+            "runner": runner_config,
             "env": {"train": {"env_type": "libero"}},
         }
     )

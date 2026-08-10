@@ -261,6 +261,7 @@ def _p8_formal_contract_values(output_root: Path) -> dict[str, object]:
         "specific_reset_id": None,
         "use_fixed_reset_state_ids": True,
         "training_route_override": "forced_uncond_after_initial",
+        "preserve_fixed_route_across_actor_updates": True,
         "load_text_encoder": False,
         "formal_training_authorized": True,
         "authorization_record_path": (
@@ -291,6 +292,7 @@ def _p8_formal_contract_values(output_root: Path) -> dict[str, object]:
         "checkpoint_keep_last": 2,
         "checkpoint_atomic": True,
         "training_guard_enabled": False,
+        "formal_action_audit": True,
     }
 
 
@@ -312,6 +314,7 @@ def test_p8_formal_stage2_endpoint_locks_the_authorized_profile(
         ("global_batch_size", 4),
         ("task_id_filter", [0]),
         ("specific_reset_id", 0),
+        ("preserve_fixed_route_across_actor_updates", False),
         ("formal_training_authorized", False),
         ("authorization_record_path", "relative/authorization.json"),
         ("authorization_record_sha256", "bad"),
@@ -322,6 +325,7 @@ def test_p8_formal_stage2_endpoint_locks_the_authorized_profile(
         ("component_placement", {"actor,env,rollout": "all"}),
         ("checkpoint_keep_last", 3),
         ("checkpoint_atomic", False),
+        ("formal_action_audit", False),
         ("final_ledger_path", "/forbidden/final_ledger.json"),
     ):
         invalid = dict(values)
@@ -520,10 +524,12 @@ def test_p8_checkpoint_contract_binds_frozen_endpoint_without_changing_v1() -> N
     cfg.runner.formal_training_authorization_record = "/tmp/authorization.json"
     cfg.runner.formal_training_authorization_sha256 = "c" * 64
     cfg.runner.formal_optimizer_updates_per_runner_step = 10
+    cfg.runner.p8_formal_action_audit = True
     formal = MODULE.build_fastwam_checkpoint_contract(cfg, world_size=2)
     assert formal["runner"]["p8_formal_stage2_endpoint"] is True
     assert formal["runner"]["formal_training_authorization_sha256"] == "c" * 64
     assert formal["runner"]["formal_optimizer_updates_per_runner_step"] == 10
+    assert formal["runner"]["p8_formal_action_audit"] is True
 
 
 def test_checkpoint_contract_normalizes_validate_cfg_inserted_defaults() -> None:

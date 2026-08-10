@@ -228,6 +228,7 @@ def _make_policy(
     eval_timing_cuda_synchronize=False,
     gate_trainable=True,
     training_route_override="none",
+    preserve_fixed_route_across_actor_updates=False,
 ):
     return FastWAMAdaptivePolicy(
         actor=nn.Linear(1, 1),
@@ -244,6 +245,9 @@ def _make_policy(
             eval_timing_cuda_synchronize=eval_timing_cuda_synchronize,
             gate_trainable=gate_trainable,
             training_route_override=training_route_override,
+            preserve_fixed_route_across_actor_updates=(
+                preserve_fixed_route_across_actor_updates
+            ),
             kv_replay=_policy.GateKVReplayConfig(
                 backend=backend,
                 pin_memory=False,
@@ -917,6 +921,7 @@ def test_p8_readiness_forces_uncond_after_initial_idm_chunk():
     policy = _make_policy(
         gate_trainable=False,
         training_route_override="forced_uncond_after_initial",
+        preserve_fixed_route_across_actor_updates=True,
     )
     obs = {
         "states": torch.ones(1, 3),
@@ -927,7 +932,31 @@ def test_p8_readiness_forces_uncond_after_initial_idm_chunk():
     _, first = policy.predict_action_batch(obs, compute_values=False)
     obs["_fastwam_reset_mask"] = torch.tensor([False])
     _, second = policy.predict_action_batch(obs, compute_values=False)
+    policy.set_global_step(1)
+    _, after_update = policy.predict_action_batch(obs, compute_values=False)
 
     assert first["route_info"].route_used.tolist() == [1]
     assert first["emitted_gate"].next_route.tolist() == [0]
     assert second["route_info"].route_used.tolist() == [0]
+    assert after_update["route_info"].route_used.tolist() == [0]
+
+
+def test_fixed_route_keeps_legacy_actor_update_idm_guard_by_default():
+    policy = _make_policy(
+        gate_trainable=False,
+        training_route_override="forced_uncond_after_initial",
+    )
+    obs = {
+        "states": torch.ones(1, 3),
+        "_fastwam_env_ids": torch.tensor([0]),
+        "_fastwam_reset_mask": torch.tensor([True]),
+    }
+
+    policy.predict_action_batch(obs, compute_values=False)
+    obs["_fastwam_reset_mask"] = torch.tensor([False])
+    policy.predict_action_batch(obs, compute_values=False)
+    policy.set_global_step(1)
+    _, after_update = policy.predict_action_batch(obs, compute_values=False)
+
+    assert after_update["route_info"].route_used.tolist() == [1]
+    assert after_update["route_info"].route_was_forced.tolist() == [True]

@@ -413,6 +413,7 @@ def test_p8_formal_stage2_profile_is_distinct_and_fully_bound(
     assert cfg.runner.p8_formal_stage2_mode == "training"
     assert cfg.runner.p8_readiness_endpoint is False
     assert cfg.runner.p8_stage2_systems_endpoint is False
+    assert cfg.runner.p8_formal_action_audit is True
     assert cfg.runner.formal_training_authorized is True
     assert cfg.runner.final_ledger_path is None
     assert cfg.runner.logger.log_path == str(output_root)
@@ -430,6 +431,7 @@ def test_p8_formal_stage2_profile_is_distinct_and_fully_bound(
     assert cfg.actor.micro_batch_size == 1
     assert cfg.actor.optim.total_training_steps == 1000
     assert cfg.actor.model.gate_trainable is False
+    assert cfg.actor.model.preserve_fixed_route_across_actor_updates is True
     assert cfg.actor.model.fastwam.load_text_encoder is False
     assert cfg.actor.model.uncond_visual_sidecar.refiner.layer_indices == [12]
 

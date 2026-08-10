@@ -140,6 +140,7 @@ class FastWAMAdaptivePolicyConfig:
     eval_timing_cuda_synchronize: bool = False
     gate_trainable: bool = True
     training_route_override: str = "none"
+    preserve_fixed_route_across_actor_updates: bool = False
     kv_replay: GateKVReplayConfig = field(default_factory=GateKVReplayConfig)
     p8_visual_replay: P8VisualReplayConfig | None = None
 
@@ -164,6 +165,17 @@ class FastWAMAdaptivePolicyConfig:
             )
         if self.training_route_override != "none" and self.gate_trainable:
             raise ValueError("Training route override requires a frozen Gate.")
+        if not isinstance(self.preserve_fixed_route_across_actor_updates, bool):
+            raise TypeError(
+                "`preserve_fixed_route_across_actor_updates` must be a boolean."
+            )
+        if self.preserve_fixed_route_across_actor_updates and (
+            self.training_route_override != "forced_uncond_after_initial"
+        ):
+            raise ValueError(
+                "Preserving a fixed route across actor updates requires "
+                "`forced_uncond_after_initial`."
+            )
         evaluation = self.evaluation_routing
         object.__setattr__(self, "eval_routing_mode", evaluation.mode)
         object.__setattr__(self, "eval_idm_threshold", evaluation.idm_threshold)
@@ -360,7 +372,10 @@ class FastWAMAdaptivePolicy(nn.Module, BasePolicy):
         if version < 0:
             raise ValueError("Actor version must be non-negative.")
         version = int(version)
-        if version != self.actor_version:
+        if (
+            version != self.actor_version
+            and not self.config.preserve_fixed_route_across_actor_updates
+        ):
             self.route_tracker.force_idm_after_actor_update()
         self.actor_version = version
 

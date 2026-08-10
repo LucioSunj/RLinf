@@ -238,6 +238,7 @@ def validate_p8_formal_stage2_endpoint_contract(
     specific_reset_id: object,
     use_fixed_reset_state_ids: bool,
     training_route_override: str,
+    preserve_fixed_route_across_actor_updates: bool,
     load_text_encoder: bool,
     formal_training_authorized: bool,
     authorization_record_path: object,
@@ -266,6 +267,7 @@ def validate_p8_formal_stage2_endpoint_contract(
     checkpoint_keep_last: int,
     checkpoint_atomic: bool,
     training_guard_enabled: bool,
+    formal_action_audit: bool,
 ) -> None:
     """Validate the separately authorized 1000-update P8 Stage2 run."""
 
@@ -322,6 +324,8 @@ def validate_p8_formal_stage2_endpoint_contract(
         mismatches.append(
             "training_route_override must be `forced_uncond_after_initial`"
         )
+    if preserve_fixed_route_across_actor_updates is not True:
+        mismatches.append("preserve_fixed_route_across_actor_updates must be true")
     if load_text_encoder is not False:
         mismatches.append(
             "fastwam.load_text_encoder must be false so formal Stage2 uses only "
@@ -365,6 +369,8 @@ def validate_p8_formal_stage2_endpoint_contract(
             "runner.fastwam_training_guard.enabled must be false for the "
             "fixed-route endpoint"
         )
+    if formal_action_audit is not True:
+        mismatches.append("runner.p8_formal_action_audit must be true")
 
     if OmegaConf.is_config(component_placement):
         component_placement = OmegaConf.to_container(
@@ -943,6 +949,13 @@ def build_fastwam_checkpoint_contract(cfg: Any, *, world_size: int) -> dict[str,
                     cfg,
                     "runner.formal_optimizer_updates_per_runner_step",
                     default=-1,
+                )
+            )
+            runner["p8_formal_action_audit"] = bool(
+                OmegaConf.select(
+                    cfg,
+                    "runner.p8_formal_action_audit",
+                    default=False,
                 )
             )
     return {

@@ -12,6 +12,7 @@ fastwam:
 
 gate_trainable: false
 training_route_override: forced_uncond_after_initial
+preserve_fixed_route_across_actor_updates: true
 
 uncond_visual_sidecar:
   type: dinov3_guided_wan_current_refinement

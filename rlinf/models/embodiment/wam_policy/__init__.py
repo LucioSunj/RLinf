@@ -335,6 +335,9 @@ def get_model(cfg, torch_dtype):
         ),
         gate_trainable=cfg.get("gate_trainable", True),
         training_route_override=str(cfg.get("training_route_override", "none")),
+        preserve_fixed_route_across_actor_updates=bool(
+            cfg.get("preserve_fixed_route_across_actor_updates", False)
+        ),
         kv_replay=replay_config,
         p8_visual_replay=(
             None

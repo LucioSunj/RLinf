@@ -443,24 +443,38 @@ class FSDPModelManager:
         self._strategy.onload_optimizer(self.optimizer, device_id)
         self.is_optimizer_offloaded = False
 
-    def optimizer_step(self) -> tuple[float, list[float]]:
+    def optimizer_step(
+        self,
+        *,
+        fail_on_nonfinite: bool = False,
+    ) -> tuple[float, list[float]]:
         """
         Perform optimizer step using its optimizer, lr_scheduler and grad_scaler.
+
+        Args:
+            fail_on_nonfinite: Raise before the optimizer step counter or any
+                parameter can advance when the clipped gradient norm is non-finite.
 
         Returns:
             A tuple of (grad_norm, lr_list), lr_list contains learning rates for all param groups.
         """
-        self.optimizer_steps += 1
+        next_optimizer_step = int(self.optimizer_steps) + 1
         self.grad_scaler.unscale_(self.optimizer)
         grad_norm = self._strategy.clip_grad_norm_(
             model=self.model,
         )
 
         if not torch.isfinite(torch.as_tensor(grad_norm)):
+            if fail_on_nonfinite:
+                raise FloatingPointError(
+                    f"Non-finite grad norm {grad_norm} detected before optimizer step."
+                )
+            self.optimizer_steps = next_optimizer_step
             self._logger.warning(
                 f"[FSDP] Non-finite grad norm {grad_norm} detected. Skipping optimizer step."
             )
         else:
+            self.optimizer_steps = next_optimizer_step
             self.grad_scaler.step(optimizer=self.optimizer)
 
         self.grad_scaler.update()

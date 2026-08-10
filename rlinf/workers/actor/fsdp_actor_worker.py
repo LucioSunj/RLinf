@@ -74,7 +74,7 @@ from rlinf.hybrid_engines.fsdp.utils import (
 from rlinf.hybrid_engines.weight_syncer import WeightSyncer
 from rlinf.models import get_model
 from rlinf.models.embodiment.base_policy import ForwardType
-from rlinf.models.embodiment.wam_policy.contracts import WAMRoute
+from rlinf.models.embodiment.wam_policy.contracts import ChunkRouteRecord, WAMRoute
 from rlinf.scheduler import Channel, Cluster, CommMapper, Worker
 from rlinf.utils.checkpoint_state import (
     FASTWAM_ACTOR_RESUME_AUDIT_SENTINEL,
@@ -166,7 +166,84 @@ _FASTWAM_BC_BOOTSTRAP_KEYS = {
     "parent_checkpoint_sha256",
 }
 FASTWAM_P8_FORMAL_FIRST_UPDATE_SENTINEL = "FASTWAM_P8_FORMAL_FIRST_UPDATE_AUDIT"
-FASTWAM_P8_FORMAL_STEP_SENTINEL = "FASTWAM_P8_FORMAL_RUNNER_STEP_AUDIT"
+FASTWAM_P8_FORMAL_UPDATE_SENTINEL = "FASTWAM_P8_FORMAL_UPDATE_AUDIT"
+FASTWAM_P8_FORMAL_STEP_SENTINEL = "FASTWAM_P8_FORMAL_STEP_AUDIT"
+
+
+def _audit_p8_formal_fixed_route(
+    *,
+    route: ChunkRouteRecord,
+    loss_mask: torch.Tensor,
+) -> dict[str, Any]:
+    """Validate and summarize the fixed IDM-first/UNCOND-later route."""
+
+    if not isinstance(route, ChunkRouteRecord):
+        raise TypeError("P8 formal route audit requires a ChunkRouteRecord.")
+    valid = torch.as_tensor(loss_mask).detach().bool().cpu()
+    while valid.ndim > len(route.shape):
+        valid = valid.any(dim=-1)
+    if valid.shape != route.shape:
+        if int(valid.numel()) != int(route.route_used.numel()):
+            raise ValueError(
+                "P8 formal route/loss-mask shapes disagree: "
+                f"route={tuple(route.shape)}, mask={tuple(valid.shape)}."
+            )
+        valid = valid.reshape(route.shape)
+    if not bool(valid.any().item()):
+        raise RuntimeError("P8 formal runner step has no eligible Action chunks.")
+
+    route_cpu = route.cpu()
+    selected = {
+        name: getattr(route_cpu, name)[valid].contiguous()
+        for name in (
+            "route_used",
+            "route_was_forced",
+            "chunk_ids",
+            "episode_ids",
+            "route_source_chunk_ids",
+            "actor_versions",
+        )
+    }
+    first = selected["chunk_ids"] == 0
+    later = selected["chunk_ids"] > 0
+    first_valid = (
+        (selected["route_used"][first] == int(WAMRoute.IDM))
+        & selected["route_was_forced"][first]
+        & (selected["route_source_chunk_ids"][first] == -1)
+    )
+    if not bool(first_valid.all().item()):
+        raise RuntimeError(
+            "P8 formal fixed route requires every first chunk to be forced IDM."
+        )
+    later_valid = (
+        (selected["route_used"][later] == int(WAMRoute.UNCOND))
+        & (~selected["route_was_forced"][later])
+        & (
+            selected["route_source_chunk_ids"][later]
+            == selected["chunk_ids"][later] - 1
+        )
+    )
+    if not bool(later_valid.all().item()):
+        raise RuntimeError(
+            "P8 formal fixed route requires every later chunk to be prior-chunk "
+            "sourced UNCOND."
+        )
+    return {
+        "schema": "fastwam-p8-formal-route-audit-v1",
+        "status": "PASS",
+        "valid_chunk_count": int(valid.sum().item()),
+        "first_chunk_count": int(first.sum().item()),
+        "later_chunk_count": int(later.sum().item()),
+        "idm_chunk_count": int(
+            (selected["route_used"] == int(WAMRoute.IDM)).sum().item()
+        ),
+        "uncond_chunk_count": int(
+            (selected["route_used"] == int(WAMRoute.UNCOND)).sum().item()
+        ),
+        "actor_version_min": int(selected["actor_versions"].min().item()),
+        "actor_version_max": int(selected["actor_versions"].max().item()),
+        "route_sequence_sha256": checkpoint_state_sha256(selected),
+    }
 
 
 def _validate_p8_formal_optimizer_geometry(
@@ -1312,6 +1389,8 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
 
         self.enable_sft_co_train = cfg.actor.get("enable_sft_co_train", False)
         self.version = 0
+        self._p8_formal_gate_state_baseline = None
+        self._p8_formal_frozen_state_baseline = None
         if self.enable_sft_co_train:
             self._build_sft_data_loader()
 
@@ -1482,10 +1561,93 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
             for group in self.optimizer.param_groups
         }
 
+    def _capture_p8_formal_gate_state(self) -> dict[str, torch.Tensor]:
+        """Clone every frozen Gate state tensor for an exact content audit."""
+
+        gate_state = {
+            name: tensor.detach().cpu().contiguous().clone()
+            for name, tensor in self._fastwam_policy_module().gate.state_dict().items()
+        }
+        if not gate_state:
+            raise RuntimeError("P8 formal Gate state audit found no tensors.")
+        return gate_state
+
+    def _capture_p8_formal_frozen_state_manifest(self) -> dict[str, Any]:
+        """Hash a version-locked identity manifest for every frozen parameter."""
+
+        optimizer_ids = {
+            id(parameter)
+            for group in self.optimizer.param_groups
+            for parameter in group["params"]
+        }
+        entries = []
+        parameter_count = 0
+        for name, parameter in self.model.named_parameters():
+            if id(parameter) in optimizer_ids:
+                continue
+            entries.append(
+                {
+                    "name": name,
+                    "parameter_id": id(parameter),
+                    "shape": list(parameter.shape),
+                    "dtype": str(parameter.dtype),
+                    "numel": int(parameter.numel()),
+                    "requires_grad": bool(parameter.requires_grad),
+                    "tensor_version": int(parameter._version),
+                }
+            )
+            parameter_count += int(parameter.numel())
+        if not entries:
+            raise RuntimeError("P8 formal frozen state audit found no parameters.")
+        return {
+            "state_manifest_sha256": checkpoint_state_sha256(entries),
+            "tensor_count": len(entries),
+            "parameter_count": parameter_count,
+        }
+
+    def _audit_p8_formal_immutable_state(self) -> dict[str, Any]:
+        """Require exact frozen Gate state and unchanged frozen identities."""
+
+        gate_current = self._capture_p8_formal_gate_state()
+        gate_baseline = self._p8_formal_gate_state_baseline
+        if gate_baseline is None:
+            raise RuntimeError("P8 formal Gate baseline was not initialized.")
+        gate_baseline_sha = checkpoint_state_sha256(gate_baseline)
+        gate_current_sha = checkpoint_state_sha256(gate_current)
+        if gate_current_sha != gate_baseline_sha:
+            raise RuntimeError("P8 formal frozen Gate state changed.")
+
+        frozen_current = self._capture_p8_formal_frozen_state_manifest()
+        frozen_baseline = self._p8_formal_frozen_state_baseline
+        if frozen_baseline is None:
+            raise RuntimeError("P8 formal frozen state baseline was not initialized.")
+        if frozen_current != frozen_baseline:
+            raise RuntimeError(
+                "P8 formal frozen parameter identity/version manifest changed."
+            )
+        ownership = self._audit_p8_formal_nonoptimizer_parameters()
+        return {
+            "gate": {
+                "baseline_state_sha256": gate_baseline_sha,
+                "current_state_sha256": gate_current_sha,
+                "unchanged": True,
+                "tensor_count": len(gate_current),
+            },
+            "frozen": {
+                "baseline_state_sha256": frozen_baseline["state_manifest_sha256"],
+                "current_state_sha256": frozen_current["state_manifest_sha256"],
+                "unchanged": True,
+                "hash_kind": "parameter-identity-version-manifest",
+                **ownership,
+            },
+        }
+
     @staticmethod
     def _summarize_p8_formal_optimizer_update(
         before: dict[str, tuple[torch.Tensor, ...]],
         after: dict[str, tuple[torch.Tensor, ...]],
+        *,
+        require_nonzero: bool = True,
     ) -> dict[str, dict[str, float | int]]:
         if set(before) != set(after):
             raise RuntimeError("P8 formal optimizer families changed during update.")
@@ -1508,6 +1670,13 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
                     raise RuntimeError(
                         f"P8 formal optimizer family {family!r} changed metadata."
                     )
+                if not bool(torch.isfinite(before_tensor).all().item()) or not bool(
+                    torch.isfinite(after_tensor).all().item()
+                ):
+                    raise FloatingPointError(
+                        f"P8 formal optimizer family {family!r} has a non-finite "
+                        "parameter."
+                    )
                 update = after_tensor.float() - before_tensor.float()
                 if not bool(torch.isfinite(update).all().item()):
                     raise FloatingPointError(
@@ -1523,13 +1692,14 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
                         float(update.abs().max().item()),
                     )
             update_l2_norm = math.sqrt(update_square_sum)
-            if update_l2_norm <= 0.0 or update_max_abs <= 0.0:
+            if require_nonzero and (update_l2_norm <= 0.0 or update_max_abs <= 0.0):
                 raise RuntimeError(
                     f"P8 formal optimizer family {family!r} did not update."
                 )
             result[family] = {
                 "tensor_count": len(before_tensors),
                 "parameter_count": parameter_count,
+                "finite": True,
                 "update_l2_norm": update_l2_norm,
                 "update_max_abs": update_max_abs,
             }
@@ -2557,13 +2727,59 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
             self.cfg.runner.get("p8_formal_stage2_endpoint", False)
         )
         formal_step_optimizer_before = int(self.optimizer_steps)
-        formal_optimizer_before = None
-        formal_gate_before = None
-        if p8_formal_endpoint and int(self.optimizer_steps) == 0:
-            formal_optimizer_before = self._capture_p8_formal_optimizer_parameters()
-            formal_gate_before = self._capture_fastwam_gate_parameters(
-                require_trainable=False
+        formal_runner_step = int(self.version) + 1
+        formal_route_audit = None
+        formal_step_optimizer_before_state = None
+        formal_boundary_optimizer_before = None
+        formal_boundary_audits: list[dict[str, Any]] = []
+        if p8_formal_endpoint:
+            if self.cfg.runner.get("p8_formal_action_audit", False) is not True:
+                raise RuntimeError(
+                    "P8 formal actor requires the independent typed Action audit."
+                )
+            if not 1 <= formal_runner_step <= 100:
+                raise RuntimeError(
+                    "P8 formal runner step is outside the authorized 1..100 range: "
+                    f"{formal_runner_step}."
+                )
+            expected_optimizer_before = (formal_runner_step - 1) * 10
+            if formal_step_optimizer_before != expected_optimizer_before:
+                raise RuntimeError(
+                    "P8 formal optimizer counter is not aligned to runner step: "
+                    f"runner_step={formal_runner_step}, "
+                    f"optimizer_steps={formal_step_optimizer_before}, "
+                    f"expected={expected_optimizer_before}."
+                )
+            formal_route_audit = _audit_p8_formal_fixed_route(
+                route=self.rollout_batch["route_info"],
+                loss_mask=self.rollout_batch["loss_mask"],
             )
+            minimum_allowed_actor_version = max(0, int(self.version) - 1)
+            if formal_route_audit[
+                "actor_version_min"
+            ] < minimum_allowed_actor_version or formal_route_audit[
+                "actor_version_max"
+            ] > int(self.version):
+                raise RuntimeError(
+                    "P8 formal route actor version is not current or the single "
+                    "carried fixed decision from the prior runner step."
+                )
+            if self._p8_formal_gate_state_baseline is None:
+                if formal_runner_step != 1:
+                    raise RuntimeError(
+                        "P8 formal immutable-state baseline is missing after step one."
+                    )
+                self._p8_formal_gate_state_baseline = (
+                    self._capture_p8_formal_gate_state()
+                )
+                self._p8_formal_frozen_state_baseline = (
+                    self._capture_p8_formal_frozen_state_manifest()
+                )
+            self._audit_p8_formal_immutable_state()
+            formal_step_optimizer_before_state = (
+                self._capture_p8_formal_optimizer_parameters()
+            )
+            formal_boundary_optimizer_before = formal_step_optimizer_before_state
 
         if self.cfg.algorithm.loss_type == "opd":
             target_steps = int(self.rollout_batch["advantages"].shape[0])
@@ -2724,60 +2940,68 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
 
                 self.torch_platform.empty_cache()
 
-                grad_norm, lr_list = self.optimizer_step()
+                grad_norm, lr_list = self.optimizer_step(
+                    fail_on_nonfinite=p8_formal_endpoint
+                )
                 data = self._optimizer_metrics(grad_norm, lr_list)
                 append_to_dict(metrics, data)
-                if formal_optimizer_before is not None:
+                if p8_formal_endpoint:
                     grad_norm_value = float(torch.as_tensor(grad_norm).item())
                     if not math.isfinite(grad_norm_value):
                         raise FloatingPointError(
-                            "P8 formal first optimizer update has a non-finite "
-                            "gradient norm."
+                            "P8 formal optimizer update has a non-finite gradient "
+                            f"norm at step {self.optimizer_steps}."
                         )
-                    formal_optimizer_after = (
+                    formal_boundary_optimizer_after = (
                         self._capture_p8_formal_optimizer_parameters()
                     )
                     family_updates = self._summarize_p8_formal_optimizer_update(
-                        formal_optimizer_before,
-                        formal_optimizer_after,
+                        formal_boundary_optimizer_before,
+                        formal_boundary_optimizer_after,
+                        require_nonzero=int(self.optimizer_steps) == 1,
                     )
-                    formal_gate_after = self._capture_fastwam_gate_parameters(
-                        require_trainable=False
-                    )
-                    gate_audit = self._summarize_fastwam_gate_update(
-                        before=formal_gate_before,
-                        after=formal_gate_after,
-                        optimizer_steps_before=0,
-                        optimizer_steps_after=int(self.optimizer_steps),
-                    )
-                    if (
-                        gate_audit.update_l2_norm != 0.0
-                        or gate_audit.update_max_abs != 0.0
-                        or gate_audit.nonfinite_update_count != 0
-                    ):
-                        raise RuntimeError(
-                            "P8 formal frozen Gate changed during the first update."
-                        )
-                    frozen_ownership = self._audit_p8_formal_nonoptimizer_parameters()
+                    immutable_state = self._audit_p8_formal_immutable_state()
+                    update_audit = {
+                        "schema": "fastwam-p8-formal-update-audit-v1",
+                        "status": "PASS",
+                        "rank": int(self._rank),
+                        "runner_step": formal_runner_step,
+                        "optimizer_step": int(self.optimizer_steps),
+                        "grad_norm": grad_norm_value,
+                        "families": family_updates,
+                        **immutable_state,
+                    }
                     print(
-                        f"{FASTWAM_P8_FORMAL_FIRST_UPDATE_SENTINEL} "
-                        + json.dumps(
-                            {
-                                "schema": ("fastwam-p8-formal-first-update-audit-v1"),
-                                "status": "PASS",
-                                "rank": int(self._rank),
-                                "optimizer_steps": int(self.optimizer_steps),
-                                "grad_norm": grad_norm_value,
-                                "families": family_updates,
-                                "gate": gate_audit.to_artifact(),
-                                "frozen_ownership": frozen_ownership,
-                            },
-                            sort_keys=True,
-                        ),
+                        f"{FASTWAM_P8_FORMAL_UPDATE_SENTINEL} "
+                        + json.dumps(update_audit, sort_keys=True),
                         flush=True,
                     )
-                    formal_optimizer_before = None
-                    formal_gate_before = None
+                    formal_boundary_audits.append(update_audit)
+                    if int(self.optimizer_steps) == 1:
+                        legacy_gate_audit = self._summarize_fastwam_gate_update(
+                            before=self._p8_formal_gate_state_baseline,
+                            after=self._capture_p8_formal_gate_state(),
+                            optimizer_steps_before=0,
+                            optimizer_steps_after=1,
+                        )
+                        print(
+                            f"{FASTWAM_P8_FORMAL_FIRST_UPDATE_SENTINEL} "
+                            + json.dumps(
+                                {
+                                    "schema": "fastwam-p8-formal-first-update-audit-v1",
+                                    "status": "PASS",
+                                    "rank": int(self._rank),
+                                    "optimizer_steps": 1,
+                                    "grad_norm": grad_norm_value,
+                                    "families": family_updates,
+                                    "gate": legacy_gate_audit.to_artifact(),
+                                    "frozen_ownership": immutable_state["frozen"],
+                                },
+                                sort_keys=True,
+                            ),
+                            flush=True,
+                        )
+                    formal_boundary_optimizer_before = formal_boundary_optimizer_after
         formal_geometry = _validate_p8_formal_optimizer_geometry(
             enabled=p8_formal_endpoint,
             optimizer_steps_before=formal_step_optimizer_before,
@@ -2787,13 +3011,39 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
             ),
         )
         if formal_geometry is not None:
+            if int(self.optimizer_steps) != formal_runner_step * 10:
+                raise RuntimeError(
+                    "P8 formal cumulative optimizer count changed: "
+                    f"runner_step={formal_runner_step}, "
+                    f"optimizer_steps={self.optimizer_steps}."
+                )
+            if len(formal_boundary_audits) != 10:
+                raise RuntimeError(
+                    "P8 formal runner step did not emit ten optimizer-boundary "
+                    f"audits: {len(formal_boundary_audits)}."
+                )
+            formal_step_optimizer_after_state = (
+                self._capture_p8_formal_optimizer_parameters()
+            )
+            formal_step_families = self._summarize_p8_formal_optimizer_update(
+                formal_step_optimizer_before_state,
+                formal_step_optimizer_after_state,
+                require_nonzero=False,
+            )
+            formal_immutable_state = self._audit_p8_formal_immutable_state()
             print(
                 f"{FASTWAM_P8_FORMAL_STEP_SENTINEL} "
                 + json.dumps(
                     {
-                        "schema": "fastwam-p8-formal-runner-step-audit-v1",
+                        "schema": "fastwam-p8-formal-step-audit-v1",
                         "status": "PASS",
                         "rank": int(self._rank),
+                        "runner_step": formal_runner_step,
+                        "optimizer_steps": int(self.optimizer_steps),
+                        "optimizer_boundary_audits": len(formal_boundary_audits),
+                        "route": formal_route_audit,
+                        "families": formal_step_families,
+                        **formal_immutable_state,
                         **formal_geometry,
                     },
                     sort_keys=True,
