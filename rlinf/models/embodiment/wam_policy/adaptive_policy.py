@@ -291,6 +291,16 @@ class FastWAMAdaptivePolicy(nn.Module, BasePolicy):
             raise RuntimeError("P6 policy and runtime sidecar ownership differ.")
         replay = sidecar.replay
         asset = sidecar.asset
+        shape_contract_fn = getattr(
+            self.visual_reader,
+            "resolved_runtime_shape_contract",
+            None,
+        )
+        if not callable(shape_contract_fn):
+            raise RuntimeError("P6 visual reader omitted its resolved shape contract.")
+        shape_contract = shape_contract_fn()
+        if not isinstance(shape_contract, Mapping):
+            raise RuntimeError("P6 visual reader returned no resolved shape contract.")
         return {
             "schema": "fastwam-p6-runtime-contract-v1",
             "reader_kind": self.visual_reader.reader_kind,
@@ -314,6 +324,7 @@ class FastWAMAdaptivePolicy(nn.Module, BasePolicy):
                 sidecar.spatial_metadata.wan_grid_h,
                 sidecar.spatial_metadata.wan_grid_w,
             ],
+            "resolved_runtime_shapes": dict(shape_contract),
             "replay": {
                 "backend": replay.backend.value,
                 "storage_dtype": replay.storage_dtype,
@@ -328,6 +339,21 @@ class FastWAMAdaptivePolicy(nn.Module, BasePolicy):
                 ),
             },
         }
+
+    def visual_runtime_shape_audit(self) -> dict[str, Any] | None:
+        """Return tensor-free actual P6 shapes observed by completed forwards."""
+
+        if self.visual_reader is None:
+            return None
+        audit_fn = getattr(self.visual_reader, "runtime_shape_audit", None)
+        if not callable(audit_fn):
+            raise RuntimeError("P6 visual reader omitted its runtime shape audit.")
+        audit = audit_fn()
+        if audit is None:
+            return None
+        if not isinstance(audit, Mapping):
+            raise RuntimeError("P6 runtime shape audit must be a mapping.")
+        return dict(audit)
 
     def visual_router_parameter_ids(self) -> frozenset[int]:
         """Resolve P6 optimizer ownership from the reader's typed manifest."""

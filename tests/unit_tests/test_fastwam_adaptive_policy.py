@@ -258,6 +258,27 @@ class _VisualReader(nn.Module):
         self.router = nn.Linear(1, 1, bias=False)
         self.replay_reference_version = None
         self.replay_reference_weight = None
+        self.observed_runtime_shapes = None
+
+    def resolved_runtime_shape_contract(self):
+        return {
+            "schema": "fastwam-p6-resolved-runtime-shapes-v1",
+            "tensor_free": True,
+            "layers": [
+                {
+                    "layer_index": 0,
+                    "dino_tokens_shape": ["batch", 2, 196, 384],
+                    "wan_current_value_shape": ["batch", 98, 8],
+                    "transport_matrix_shape": [2, 196, 98],
+                    "action_query_shape": ["batch", "action_tokens", 6],
+                    "routing_weights_shape": ["batch", 2, "action_tokens", 196],
+                    "visual_residual_shape": ["batch", "action_tokens", 6],
+                }
+            ],
+        }
+
+    def runtime_shape_audit(self):
+        return self.observed_runtime_shapes
 
     def trainable_parameter_manifest(self):
         return {"visual_router": ("router.weight",)}
@@ -947,6 +968,18 @@ def test_p6_checkpoint_optimizer_and_rollout_contract_are_strict() -> None:
 
     runtime_state = policy.rollout_runtime_state_dict()
     assert runtime_state["schema"] == ("fastwam-adaptive-rollout-policy-runtime-v2-p6")
+    assert runtime_state["visual_contract"]["resolved_runtime_shapes"] == (
+        policy.visual_reader.resolved_runtime_shape_contract()
+    )
+    assert policy.visual_runtime_shape_audit() is None
+    policy.visual_reader.observed_runtime_shapes = {
+        "schema": "fastwam-p6-observed-runtime-shapes-v1",
+        "tensor_free": True,
+        "layers": [{"layer_index": 0, "dino_tokens_shape": [1, 2, 196, 384]}],
+    }
+    assert policy.visual_runtime_shape_audit() == (
+        policy.visual_reader.observed_runtime_shapes
+    )
     restored.load_rollout_runtime_state_dict(runtime_state)
     tampered = {
         **runtime_state,
