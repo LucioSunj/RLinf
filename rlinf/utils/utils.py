@@ -123,6 +123,23 @@ def collect_param_names_need_sync(module: torch.nn.Module) -> list[str]:
         for name, param in module.named_parameters(remove_duplicate=False)
         if param.requires_grad
     ]
+    additional_names_provider = getattr(
+        module, "additional_rollout_sync_parameter_names", None
+    )
+    additional_parameter_names = (
+        [] if additional_names_provider is None else list(additional_names_provider())
+    )
+    known_parameter_names = {
+        name for name, _ in module.named_parameters(remove_duplicate=False)
+    }
+    invalid_additional_names = sorted(
+        set(additional_parameter_names) - known_parameter_names
+    )
+    if invalid_additional_names:
+        raise RuntimeError(
+            "Additional rollout-sync parameters are not present in the module: "
+            f"{invalid_additional_names}."
+        )
 
     persistent_buffer_names: list[str] = []
     for module_name, submodule in module.named_modules(remove_duplicate=False):
@@ -139,7 +156,11 @@ def collect_param_names_need_sync(module: torch.nn.Module) -> list[str]:
             )
             persistent_buffer_names.append(full_name)
 
-    return trainable_param_names + persistent_buffer_names
+    return list(
+        dict.fromkeys(
+            trainable_param_names + additional_parameter_names + persistent_buffer_names
+        )
+    )
 
 
 def tensors_record_stream(

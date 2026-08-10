@@ -63,6 +63,40 @@ def test_partition_fastwam_trainable_parameters_adds_explicit_visual_family() ->
     assert len({id(item) for values in groups.values() for item in values}) == 5
 
 
+def test_partition_fastwam_frozen_gate_keeps_three_p6_families() -> None:
+    lora = _parameter()
+    value = _parameter()
+    visual = _parameter()
+
+    groups = partition_fastwam_trainable_parameters(
+        [
+            ("actor.action_expert.q.lora_A", lora),
+            ("critic.value_head.weight", value),
+            ("visual_reader.router.weight", visual),
+        ],
+        require_gate=False,
+        visual_router_parameter_ids={id(visual)},
+    )
+
+    assert groups == {
+        "uncond_lora": [lora],
+        "value_head": [value],
+        "visual_router": [visual],
+    }
+
+
+def test_partition_fastwam_frozen_gate_rejects_trainable_gate() -> None:
+    with pytest.raises(RuntimeError, match="Frozen Gate endpoint"):
+        partition_fastwam_trainable_parameters(
+            [
+                ("gate.output.weight", _parameter()),
+                ("actor.action_expert.q.lora_A", _parameter()),
+                ("critic.value_head.weight", _parameter()),
+            ],
+            require_gate=False,
+        )
+
+
 def test_partition_fastwam_visual_ownership_comes_from_manifest_ids() -> None:
     gate = _parameter()
     lora = _parameter()

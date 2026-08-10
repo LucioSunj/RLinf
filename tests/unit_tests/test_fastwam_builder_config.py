@@ -21,7 +21,7 @@ from types import SimpleNamespace
 import pytest
 import torch.nn as nn
 from hydra import compose, initialize_config_dir
-from omegaconf import OmegaConf
+from omegaconf import OmegaConf, open_dict
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 CONFIG_ROOT = REPO_ROOT / "examples/embodiment/config"
@@ -321,3 +321,56 @@ def test_standalone_eval_config_resolves_without_pi05_environment(monkeypatch) -
     resolved = OmegaConf.to_container(cfg, resolve=True)
     assert resolved["rollout"]["model"]["critic"]["backbone_checkpoint_sha256"] == ""
     assert resolved["rollout"]["model"]["critic"]["backbone"]["model_path"] == ""
+
+
+def _set_p6_readiness_environment(monkeypatch) -> None:
+    monkeypatch.setenv("EMBODIED_PATH", str(REPO_ROOT / "examples/embodiment"))
+    monkeypatch.setenv(
+        "FASTWAM_CHECKPOINT",
+        "/tmp/fastwam-step-021700.pt",
+    )
+    monkeypatch.setenv(
+        "FASTWAM_CHECKPOINT_SHA256",
+        "e979511a2d7a1310009496c6b2f06957171bba28b96aac0d513992c6ed21ca5a",
+    )
+    monkeypatch.setenv("FASTWAM_DATASET_STATS", "/tmp/dataset_stats.json")
+    monkeypatch.setenv("PI05_CRITIC_CHECKPOINT", "/tmp/pi05")
+    monkeypatch.setenv("PI05_CRITIC_CHECKPOINT_SHA256", "b" * 64)
+    monkeypatch.setenv("FASTWAM_DINOV3_SOURCE_ROOT", "/tmp/dinov3")
+    monkeypatch.setenv("FASTWAM_DINOV3_WEIGHTS", "/tmp/dinov3.safetensors")
+    monkeypatch.setenv("FASTWAM_TEXT_EMBEDDING_CACHE", "/tmp/text-cache")
+    monkeypatch.setenv("P6_VISUAL_REPLAY_MAX_BYTES_PER_SAMPLE", "400000")
+    monkeypatch.setenv("P6_VISUAL_REPLAY_MAX_AGGREGATE_BYTES", "3200000")
+    monkeypatch.setenv("P6_COMBINED_REPLAY_MAX_BYTES_PER_SAMPLE", "800000")
+    monkeypatch.setenv("P6_COMBINED_REPLAY_MAX_AGGREGATE_BYTES", "6400000")
+
+
+def test_p6_readiness_and_stage2_profiles_pass_production_guard(monkeypatch) -> None:
+    from rlinf.config import _validate_fastwam_adaptive_cfg
+
+    _set_p6_readiness_environment(monkeypatch)
+    with initialize_config_dir(version_base=None, config_dir=str(CONFIG_ROOT)):
+        readiness = compose(config_name="libero_10_ppo_fastwam_adaptive_p6_readiness")
+        systems = compose(
+            config_name="libero_10_ppo_fastwam_adaptive_p6_stage2_systems"
+        )
+
+    _validate_fastwam_adaptive_cfg(readiness, only_eval=False)
+    _validate_fastwam_adaptive_cfg(systems, only_eval=False)
+    assert readiness.runner.p6_readiness_endpoint is True
+    assert readiness.actor.model.gate_trainable is False
+    assert readiness.actor.model.fastwam.load_text_encoder is False
+    assert readiness.actor.model.uncond_visual_sidecar.injection.layer_indices == [
+        9,
+        15,
+        21,
+    ]
+    assert readiness.actor.optim.visual_router_lr == 1e-5
+    assert systems.runner.p6_stage2_systems_endpoint is True
+    assert systems.env.train.specific_reset_id == 0
+
+    with open_dict(readiness):
+        readiness.actor.model.uncond_visual_sidecar.router.query_rank = 16
+        readiness.rollout.model.uncond_visual_sidecar.router.query_rank = 16
+    with pytest.raises(ValueError, match="mechanics preset changed"):
+        _validate_fastwam_adaptive_cfg(readiness, only_eval=False)

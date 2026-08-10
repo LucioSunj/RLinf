@@ -72,6 +72,7 @@ def _load_policy_package():
         "kv_replay",
         "routing_state",
         "evaluation",
+        "visual_replay",
         "adaptive_policy",
         "libero_runtime",
     ):
@@ -88,6 +89,7 @@ def _load_policy_package():
 
 _policy = _load_policy_package()
 _runtime_module = sys.modules["fastwam_policy_composite_under_test.libero_runtime"]
+_visual_replay_module = sys.modules["fastwam_policy_composite_under_test.visual_replay"]
 FastWAMAdaptivePolicy = _policy.FastWAMAdaptivePolicy
 FastWAMAdaptivePolicyConfig = _policy.FastWAMAdaptivePolicyConfig
 FastWAMChunkSample = _policy.FastWAMChunkSample
@@ -146,18 +148,31 @@ class _Runtime:
         actor_version,
         collect_replay=True,
     ):
-        del mode, actor_version
+        del mode
         batch = routes.shape[0]
         self.sample_batch_sizes.append(batch)
         self.collect_replay_flags.append(collect_replay)
         self.grad_enabled_flags.append(torch.is_grad_enabled())
+        forward_inputs = {"critic_states": env_obs["states"].clone()}
+        if hasattr(self, "visual_sidecar"):
+            forward_inputs.update(
+                _visual_replay_module.empty_visual_replay(
+                    config=self.visual_replay,
+                    batch_size=batch,
+                    camera_count=2,
+                    patch_grid=(14, 14),
+                    camera_hw=(224, 224),
+                    actor_version=actor_version,
+                    static_contract_sha256="a" * 64,
+                )
+            )
         return FastWAMChunkSample(
             actions=torch.zeros(batch, 2, 3),
             old_flow_logprobs=torch.zeros(batch, 2, 3),
             flow_chains=torch.zeros(batch, 3, 2, 3),
             denoise_indices=torch.zeros(batch, dtype=torch.long),
             gate_snapshots=_snapshots(routes),
-            forward_inputs={"critic_states": env_obs["states"].clone()},
+            forward_inputs=forward_inputs,
         )
 
     def replay_action_batch(self, *, forward_inputs, route_info):
@@ -279,12 +294,14 @@ class _VisualReader(nn.Module):
 def _visual_sidecar(reader):
     return SimpleNamespace(
         reader=reader,
-        replay=SimpleNamespace(
-            backend=SimpleNamespace(value="stored_native"),
+        replay=_visual_replay_module.VisualReplayConfig(
+            backend="stored_native",
             storage_dtype="bfloat16",
             pin_memory=True,
-            max_bytes_per_sample=1024,
-            max_aggregate_bytes=4096,
+            max_bytes_per_sample=1 << 22,
+            max_aggregate_bytes=1 << 24,
+            max_combined_gate_plus_visual_bytes_per_sample=1 << 23,
+            max_combined_gate_plus_visual_aggregate_bytes=1 << 25,
         ),
         asset=SimpleNamespace(
             source_revision="3" * 40,
@@ -314,11 +331,14 @@ def _make_policy(
     eval_routing_seed=0,
     eval_timing_cuda_synchronize=False,
     with_visual=False,
+    gate_trainable=True,
+    training_route_override="none",
 ):
     runtime = _Runtime()
     reader = _VisualReader() if with_visual else None
     if reader is not None:
         runtime.visual_sidecar = _visual_sidecar(reader)
+        runtime.visual_replay = runtime.visual_sidecar.replay
     return FastWAMAdaptivePolicy(
         actor=nn.Linear(1, 1),
         runtime=runtime,
@@ -334,6 +354,8 @@ def _make_policy(
             eval_random_idm_probability=eval_random_idm_probability,
             eval_routing_seed=eval_routing_seed,
             eval_timing_cuda_synchronize=eval_timing_cuda_synchronize,
+            gate_trainable=gate_trainable,
+            training_route_override=training_route_override,
             kv_replay=_policy.GateKVReplayConfig(
                 backend=backend,
                 pin_memory=False,
@@ -646,6 +668,7 @@ def test_p6_runtime_calls_dino_once_for_uncond_subset_and_never_for_idm() -> Non
         max_bytes_per_sample=1 << 22,
         max_aggregate_bytes=1 << 24,
     )
+    runtime.visual_replay_static_contract_sha256 = "6" * 64
     runtime.camera_height = 224
     runtime.camera_width = 224
     runtime._visual_camera_batch = lambda *_args, **_kwargs: camera_batch
@@ -670,12 +693,33 @@ def test_p6_runtime_calls_dino_once_for_uncond_subset_and_never_for_idm() -> Non
     assert replay["visual_route_mask"].tolist() == [False, True]
     runtime._validate_visual_replay_route_alignment(
         replay,
-        SimpleNamespace(route_used=torch.tensor([1, 0])),
+        SimpleNamespace(
+            route_used=torch.tensor([1, 0]),
+            actor_versions=torch.zeros(2, dtype=torch.long),
+        ),
+    )
+    tampered_route = {
+        **replay,
+        "visual_route_mask": torch.tensor([True, True]),
+    }
+    with pytest.raises(ValueError, match="content SHA256"):
+        runtime._validate_visual_replay_route_alignment(
+            tampered_route,
+            SimpleNamespace(
+                route_used=torch.tensor([1, 0]),
+                actor_versions=torch.zeros(2, dtype=torch.long),
+            ),
+        )
+    tampered_route["visual_content_sha256"] = replay_module._content_sha256(
+        tampered_route
     )
     with pytest.raises(ValueError, match="consumed UNCOND routes"):
         runtime._validate_visual_replay_route_alignment(
-            {**replay, "visual_route_mask": torch.tensor([True, True])},
-            SimpleNamespace(route_used=torch.tensor([1, 0])),
+            tampered_route,
+            SimpleNamespace(
+                route_used=torch.tensor([1, 0]),
+                actor_versions=torch.zeros(2, dtype=torch.long),
+            ),
         )
 
 
@@ -915,6 +959,35 @@ def test_p6_checkpoint_optimizer_and_rollout_contract_are_strict() -> None:
         restored.load_rollout_runtime_state_dict(tampered)
 
 
+def test_p6_frozen_gate_stays_synced_but_has_three_optimizer_families() -> None:
+    policy = _make_policy(
+        with_visual=True,
+        gate_trainable=False,
+        training_route_override="forced_uncond_after_initial",
+    )
+
+    assert not policy.gate.training
+    assert all(not parameter.requires_grad for parameter in policy.gate.parameters())
+    assert policy.additional_rollout_sync_parameter_names() == ("gate.bias",)
+    assert [
+        group["name"]
+        for group in policy.optimizer_parameter_groups(
+            gate_lr=0.0,
+            lora_lr=1e-5,
+            value_lr=1e-4,
+            visual_router_lr=1e-5,
+        )
+    ] == ["uncond_lora", "value_head", "visual_router"]
+
+    logits = torch.tensor([-4.0, 4.0])
+    route, *_ = policy._training_gate_decision(logits=logits)
+    assert torch.equal(route, torch.zeros(2, dtype=torch.long))
+
+    policy.train()
+    assert not policy.gate.training
+    assert policy.visual_reader.training
+
+
 def test_p6_behavior_reference_and_outer_v1_rejection() -> None:
     policy = _make_policy(backend="recompute", with_visual=True, with_critic=False)
     policy.capture_gate_recompute_reference()
@@ -945,6 +1018,8 @@ def test_p6_gate_recompute_uses_behavior_reader_but_flow_uses_live_grad() -> Non
             super().__init__()
             self.reader = reader
             self.behavior_weight_seen = None
+            self.visual_sidecar = _visual_sidecar(reader)
+            self.visual_replay = self.visual_sidecar.replay
 
         def recompute_gate_snapshots(self, *, forward_inputs, route_info):
             del forward_inputs

@@ -15,11 +15,312 @@
 """Small fail-fast contracts shared by RLinf configuration entry points."""
 
 import copy
+import math
 from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
 
 from omegaconf import OmegaConf
+
+P6_PARENT_SHA256 = "e979511a2d7a1310009496c6b2f06957171bba28b96aac0d513992c6ed21ca5a"
+P6_VAE_SHA256 = "0e913a2ca571c75fcb63385a8edadcca73454af5842596cb1ad11e4142590996"
+P6_DINO_SOURCE_REVISION = "6876159a11b4df116f30f667f8c9888617df0751"
+P6_DINO_WEIGHTS_SHA256 = (
+    "4610ad75edef83e75afdebf162d148dc628045ea6cbb83d67d4708c709c4f91d"
+)
+P6_DINO_PREPROCESS_SHA256 = (
+    "0a70d846042c4bb29893ead5d9433e97d1ec5089875704e472dd821632e24dc0"
+)
+P6_DINO_OUTPUT_SHA256 = (
+    "631bb13876a3e9c79476eb1ac089bced12aae93302f117cfeb106dd8acfe9f18"
+)
+P6_CAMERA_INPUT_SHA256 = (
+    "336d06c39a488c89b1404154b6ed8a9ee25969507611d8b06b884f8c2945e8e7"
+)
+P6_SPATIAL_CONTRACT_SHA256 = (
+    "c58c1548b4b0ac6ddcc58266d4e4caf4ec9e5652aadfe29c17f4eff31195ac4e"
+)
+P6_TRANSPORT_SHA256 = "89ce4864e45350380fa1e9aab12522035fe1686bba6870b4e911d4a1c90b54ab"
+
+
+def validate_p6_readiness_mechanics_contract(
+    *,
+    visual_sidecar: object,
+    precision: str,
+    actor_checkpoint_sha256: str,
+    text_embedding_cache_dir: object,
+) -> None:
+    """Validate the frozen P6 mechanics preset without touching assets."""
+
+    if OmegaConf.is_config(visual_sidecar):
+        visual_sidecar = OmegaConf.to_container(visual_sidecar, resolve=True)
+    if not isinstance(visual_sidecar, Mapping):
+        raise TypeError("P6 readiness sidecar must resolve to a mapping.")
+    payload = dict(visual_sidecar)
+    dino = payload.get("dino", {})
+    router = payload.get("router", {})
+    transport = payload.get("transport", {})
+    optimizer = payload.get("optimizer", {})
+    wan = payload.get("wan_value", {})
+    spatial = wan.get("spatial_metadata", {}) if isinstance(wan, Mapping) else {}
+    injection = payload.get("injection", {})
+    replay = payload.get("replay", {})
+    if not all(
+        isinstance(item, Mapping)
+        for item in (dino, router, transport, optimizer, spatial, injection, replay)
+    ):
+        raise TypeError("P6 readiness sidecar contains a non-mapping section.")
+    expected = {
+        "precision": (str(precision).lower(), "bf16"),
+        "actor_checkpoint_sha256": (
+            str(actor_checkpoint_sha256).lower(),
+            P6_PARENT_SHA256,
+        ),
+        "dino.source_revision": (
+            str(dino.get("source_revision", "")),
+            P6_DINO_SOURCE_REVISION,
+        ),
+        "dino.model_name": (str(dino.get("model_name", "")), "dinov3_vits16"),
+        "dino.weights_sha256": (
+            str(dino.get("weights_sha256", "")).lower(),
+            P6_DINO_WEIGHTS_SHA256,
+        ),
+        "dino.preprocess_sha256": (
+            str(dino.get("preprocess_sha256", "")).lower(),
+            P6_DINO_PREPROCESS_SHA256,
+        ),
+        "dino.output_contract_sha256": (
+            str(dino.get("output_contract_sha256", "")).lower(),
+            P6_DINO_OUTPUT_SHA256,
+        ),
+        "dino.camera_input_contract_sha256": (
+            str(dino.get("camera_input_contract_sha256", "")).lower(),
+            P6_CAMERA_INPUT_SHA256,
+        ),
+        "dino.compute_dtype": (str(dino.get("compute_dtype", "")), "bfloat16"),
+        "dino.license_id": (str(dino.get("license_id", "")), "DINOv3 License"),
+        "router.query_projection": (
+            str(router.get("query_projection", "")),
+            "low_rank",
+        ),
+        "router.query_rank": (int(router.get("query_rank", -1)), 32),
+        "router.temperature": (float(router.get("temperature", float("nan"))), 0.07),
+        "router.camera_mass_values": (
+            list(router.get("camera_mass_values", [])),
+            [0.5, 0.5],
+        ),
+        "transport.contract_sha256": (
+            str(transport.get("contract_sha256", "")).lower(),
+            P6_TRANSPORT_SHA256,
+        ),
+        "optimizer.lr": (float(optimizer.get("lr", float("nan"))), 1.0e-5),
+        "optimizer.weight_decay": (
+            float(optimizer.get("weight_decay", float("nan"))),
+            0.0,
+        ),
+        "optimizer.scheduler": (str(optimizer.get("scheduler", "")), "cosine"),
+        "spatial.vae_weights_sha256": (
+            str(spatial.get("vae_weights_sha256", "")).lower(),
+            P6_VAE_SHA256,
+        ),
+        "spatial.video_dit_weights_sha256": (
+            str(spatial.get("video_dit_weights_sha256", "")).lower(),
+            P6_PARENT_SHA256,
+        ),
+        "spatial.spatial_transport_contract_sha256": (
+            str(spatial.get("spatial_transport_contract_sha256", "")).lower(),
+            P6_SPATIAL_CONTRACT_SHA256,
+        ),
+        "injection.layer_indices": (
+            list(injection.get("layer_indices", [])),
+            [9, 15, 21],
+        ),
+        "injection.beta_max": (
+            float(injection.get("beta_max", float("nan"))),
+            1.0,
+        ),
+        "replay.backend": (str(replay.get("backend", "")), "stored_native"),
+    }
+    mismatches = [
+        f"{name}={actual!r} (expected {wanted!r})"
+        for name, (actual, wanted) in expected.items()
+        if actual != wanted
+    ]
+    cache_path = Path(str(text_embedding_cache_dir or "").strip())
+    if not cache_path.is_absolute():
+        mismatches.append("runtime.text_embedding_cache_dir must be absolute")
+    if mismatches:
+        raise ValueError(
+            "P6 readiness mechanics preset changed: " + "; ".join(mismatches)
+        )
+
+
+def validate_p6_readiness_gate_ownership(
+    *,
+    p6_enabled: bool,
+    gate_trainable: bool,
+    readiness_endpoint: bool,
+    stage2_systems_endpoint: bool,
+    gate_lr: float,
+    gate_loss_weight: float,
+) -> None:
+    """Validate the two opt-in frozen-Gate P6 engineering endpoints."""
+
+    if not isinstance(gate_trainable, bool):
+        raise TypeError("FastWAM `gate_trainable` must be a boolean.")
+    if not isinstance(readiness_endpoint, bool):
+        raise TypeError("`runner.p6_readiness_endpoint` must be a boolean.")
+    if not isinstance(stage2_systems_endpoint, bool):
+        raise TypeError("`runner.p6_stage2_systems_endpoint` must be a boolean.")
+    if readiness_endpoint and stage2_systems_endpoint:
+        raise ValueError("P6 readiness endpoints are mutually exclusive.")
+    gate_lr = float(gate_lr)
+    gate_loss_weight = float(gate_loss_weight)
+    if not math.isfinite(gate_lr) or not math.isfinite(gate_loss_weight):
+        raise ValueError("FastWAM Gate LR and loss weight must be finite.")
+    endpoint_enabled = readiness_endpoint or stage2_systems_endpoint
+    if gate_trainable:
+        if endpoint_enabled:
+            raise ValueError("P6 frozen-Gate endpoints require a frozen Gate.")
+        if gate_lr <= 0 or gate_loss_weight <= 0:
+            raise ValueError("Trainable FastWAM Gate requires positive LR and loss.")
+        return
+    if not p6_enabled or not endpoint_enabled:
+        raise ValueError(
+            "Frozen Gate is restricted to an explicit enabled P6 readiness endpoint."
+        )
+    if gate_lr != 0 or gate_loss_weight != 0:
+        raise ValueError("Frozen P6 readiness Gate requires exact zero LR and loss.")
+
+
+def _normalized_task_ids(task_id_filter: object) -> list[int] | None:
+    if OmegaConf.is_config(task_id_filter):
+        task_id_filter = OmegaConf.to_container(task_id_filter, resolve=True)
+    if not isinstance(task_id_filter, (list, tuple)):
+        return None
+    return [int(item) for item in task_id_filter]
+
+
+def validate_p6_readiness_endpoint_contract(
+    *,
+    max_steps: int,
+    max_epochs: int,
+    actor_total_training_steps: int,
+    actor_seed: int,
+    global_batch_size: int,
+    env_seed: int,
+    total_num_envs: int,
+    task_id_filter: object,
+    specific_reset_id: int,
+    use_fixed_reset_state_ids: bool,
+    training_route_override: str,
+    load_text_encoder: bool,
+    formal_training_authorized: bool,
+    final_ledger_path: object,
+    replay_backend: str,
+) -> None:
+    """Restrict P6 B0/B1 readiness to its frozen development identity."""
+
+    exact_values = {
+        "runner.max_steps": (int(max_steps), 2),
+        "runner.max_epochs": (int(max_epochs), 1),
+        "actor.optim.total_training_steps": (int(actor_total_training_steps), 2),
+        "actor.seed": (int(actor_seed), 424242),
+        "actor.global_batch_size": (int(global_batch_size), 1),
+        "env.train.seed": (int(env_seed), 424242),
+        "env.train.total_num_envs": (int(total_num_envs), 1),
+        "env.train.specific_reset_id": (int(specific_reset_id), 1),
+    }
+    mismatches = [
+        f"{name}={actual!r} (expected {expected!r})"
+        for name, (actual, expected) in exact_values.items()
+        if actual != expected
+    ]
+    if _normalized_task_ids(task_id_filter) != [0]:
+        mismatches.append(f"env.train.task_id_filter={task_id_filter!r} (expected [0])")
+    if use_fixed_reset_state_ids is not True:
+        mismatches.append("env.train.use_fixed_reset_state_ids must be true")
+    if training_route_override != "forced_uncond_after_initial":
+        mismatches.append(
+            "training_route_override must be `forced_uncond_after_initial`"
+        )
+    if load_text_encoder is not False:
+        mismatches.append("fastwam.load_text_encoder must be false")
+    if formal_training_authorized is not False:
+        mismatches.append("runner.formal_training_authorized must be false")
+    if final_ledger_path is not None:
+        mismatches.append("runner.final_ledger_path must be null")
+    if replay_backend != "stored_native":
+        mismatches.append("P6 readiness replay.backend must be `stored_native`")
+    if mismatches:
+        raise ValueError(
+            "P6 readiness endpoint is restricted to the two-update B0/B1 "
+            "fixture: " + "; ".join(mismatches)
+        )
+
+
+def validate_p6_stage2_systems_endpoint_contract(
+    *,
+    max_steps: int,
+    max_epochs: int,
+    actor_total_training_steps: int,
+    actor_seed: int,
+    global_batch_size: int,
+    env_seed: int,
+    total_num_envs: int,
+    task_id_filter: object,
+    specific_reset_id: int,
+    use_fixed_reset_state_ids: bool,
+    training_route_override: str,
+    load_text_encoder: bool,
+    formal_training_authorized: bool,
+    final_ledger_path: object,
+    replay_backend: str,
+    route_seed: int,
+) -> None:
+    """Restrict the P6 WS1/WS2 fixture to one non-scientific update."""
+
+    total_num_envs = int(total_num_envs)
+    exact_values = {
+        "runner.max_steps": (int(max_steps), 1),
+        "runner.max_epochs": (int(max_epochs), 1),
+        "actor.optim.total_training_steps": (int(actor_total_training_steps), 1),
+        "actor.seed": (int(actor_seed), 20260731),
+        "actor.global_batch_size": (int(global_batch_size), 2 * total_num_envs),
+        "env.train.seed": (int(env_seed), 20260801),
+        "env.train.specific_reset_id": (int(specific_reset_id), 0),
+        "runner.l11_route_seed": (int(route_seed), 20260801),
+    }
+    mismatches = [
+        f"{name}={actual!r} (expected {expected!r})"
+        for name, (actual, expected) in exact_values.items()
+        if actual != expected
+    ]
+    if total_num_envs not in {1, 2}:
+        mismatches.append(
+            f"env.train.total_num_envs={total_num_envs!r} (expected 1 or 2)"
+        )
+    if _normalized_task_ids(task_id_filter) != [0]:
+        mismatches.append(f"env.train.task_id_filter={task_id_filter!r} (expected [0])")
+    if use_fixed_reset_state_ids is not True:
+        mismatches.append("env.train.use_fixed_reset_state_ids must be true")
+    if training_route_override != "forced_uncond_after_initial":
+        mismatches.append(
+            "training_route_override must be `forced_uncond_after_initial`"
+        )
+    if load_text_encoder is not False:
+        mismatches.append("fastwam.load_text_encoder must be false")
+    if formal_training_authorized is not False:
+        mismatches.append("runner.formal_training_authorized must be false")
+    if final_ledger_path is not None:
+        mismatches.append("runner.final_ledger_path must be null")
+    if replay_backend != "stored_native":
+        mismatches.append("P6 Stage2 replay.backend must be `stored_native`")
+    if mismatches:
+        raise ValueError(
+            "P6 Stage2 systems endpoint is restricted to the one-update reset-0 "
+            "fixture: " + "; ".join(mismatches)
+        )
 
 
 def validate_pi05_critic_artifact_config(
@@ -367,6 +668,40 @@ def build_fastwam_checkpoint_contract(cfg: Any, *, world_size: int) -> dict[str,
         overlap = False
     env_offload = bool(OmegaConf.select(cfg, "env.train.enable_offload", default=False))
     runner["overlap_env_bootstrap"] = bool(overlap) and not env_offload
+    p6_sidecar = OmegaConf.select(
+        cfg,
+        "actor.model.uncond_visual_sidecar",
+        default=None,
+    )
+    p6_enabled = bool(
+        p6_sidecar.get("enabled", False) if hasattr(p6_sidecar, "get") else False
+    )
+    if p6_enabled:
+        runner.update(
+            {
+                "p6_readiness_endpoint": bool(
+                    OmegaConf.select(
+                        cfg,
+                        "runner.p6_readiness_endpoint",
+                        default=False,
+                    )
+                ),
+                "p6_stage2_systems_endpoint": bool(
+                    OmegaConf.select(
+                        cfg,
+                        "runner.p6_stage2_systems_endpoint",
+                        default=False,
+                    )
+                ),
+                "formal_training_authorized": bool(
+                    OmegaConf.select(
+                        cfg,
+                        "runner.formal_training_authorized",
+                        default=False,
+                    )
+                ),
+            }
+        )
     return {
         "schema": "fastwam-adaptive-checkpoint-contract-v2",
         "model": _resolved_checkpoint_value(cfg.actor.model),

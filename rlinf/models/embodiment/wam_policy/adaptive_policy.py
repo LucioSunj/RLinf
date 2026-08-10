@@ -48,6 +48,7 @@ from .kv_replay import (
     pack_gate_kv,
 )
 from .routing_state import PendingRouteTracker
+from .visual_replay import validate_visual_forward_input_budget
 
 
 @dataclass(frozen=True)
@@ -131,6 +132,8 @@ class FastWAMAdaptivePolicyConfig:
     eval_routing_seed: int = 0
     eval_microbatch_size: int = 1
     eval_timing_cuda_synchronize: bool = False
+    gate_trainable: bool = True
+    training_route_override: str = "none"
     kv_replay: GateKVReplayConfig = field(default_factory=GateKVReplayConfig)
 
     def __post_init__(self) -> None:
@@ -142,6 +145,18 @@ class FastWAMAdaptivePolicyConfig:
             raise ValueError("`eval_microbatch_size` must be positive.")
         if not isinstance(self.eval_timing_cuda_synchronize, bool):
             raise TypeError("`eval_timing_cuda_synchronize` must be a boolean.")
+        if not isinstance(self.gate_trainable, bool):
+            raise TypeError("`gate_trainable` must be a boolean.")
+        if self.training_route_override not in {
+            "none",
+            "forced_uncond_after_initial",
+        }:
+            raise ValueError(
+                "`training_route_override` must be `none` or "
+                "`forced_uncond_after_initial`."
+            )
+        if self.training_route_override != "none" and self.gate_trainable:
+            raise ValueError("Training route override requires a frozen Gate.")
         evaluation = self.evaluation_routing
         object.__setattr__(self, "eval_routing_mode", evaluation.mode)
         object.__setattr__(self, "eval_idm_threshold", evaluation.idm_threshold)
@@ -218,6 +233,7 @@ class FastWAMAdaptivePolicy(nn.Module, BasePolicy):
         self.route_tracker = PendingRouteTracker()
         self.actor_version = 0
         self._enforce_frozen_actor()
+        self._enforce_gate_ownership()
         if self.visual_encoder is not None:
             self.visual_encoder.requires_grad_(False)
             self.visual_encoder.eval()
@@ -304,6 +320,12 @@ class FastWAMAdaptivePolicy(nn.Module, BasePolicy):
                 "pin_memory": replay.pin_memory,
                 "max_bytes_per_sample": replay.max_bytes_per_sample,
                 "max_aggregate_bytes": replay.max_aggregate_bytes,
+                "max_combined_gate_plus_visual_bytes_per_sample": (
+                    replay.max_combined_gate_plus_visual_bytes_per_sample
+                ),
+                "max_combined_gate_plus_visual_aggregate_bytes": (
+                    replay.max_combined_gate_plus_visual_aggregate_bytes
+                ),
             },
         }
 
@@ -357,12 +379,30 @@ class FastWAMAdaptivePolicy(nn.Module, BasePolicy):
                 f"FastWAM actor has trainable non-LoRA parameters: {unexpected}."
             )
 
+    def _enforce_gate_ownership(self) -> None:
+        """Apply the explicit Gate optimizer-ownership contract."""
+
+        gate_parameters = tuple(self.gate.parameters())
+        if not gate_parameters:
+            raise ValueError("FastWAM adaptive policy requires Gate parameters.")
+        for parameter in gate_parameters:
+            parameter.requires_grad_(self.config.gate_trainable)
+        if not self.config.gate_trainable:
+            self.gate.eval()
+
+    def additional_rollout_sync_parameter_names(self) -> tuple[str, ...]:
+        """Return frozen Gate tensors that rollout workers still receive."""
+
+        if self.config.gate_trainable:
+            return ()
+        return tuple(f"gate.{name}" for name, _ in self.gate.named_parameters())
+
     def train(self, mode: bool = True) -> FastWAMAdaptivePolicy:
         """Train adaptive modules while keeping the frozen actor in eval mode."""
 
         super().train(mode)
         self.actor.eval()
-        self.gate.train(mode)
+        self.gate.train(mode if self.config.gate_trainable else False)
         if self.visual_encoder is not None:
             self.visual_encoder.eval()
             self.visual_reader.train(mode)
@@ -469,7 +509,11 @@ class FastWAMAdaptivePolicy(nn.Module, BasePolicy):
             temperature=self.config.gate_temperature,
             epsilon=self.config.gate_epsilon,
         )
-        route = behavior.sample()
+        route = (
+            torch.zeros_like(logits, dtype=torch.long)
+            if self.config.training_route_override == "forced_uncond_after_initial"
+            else behavior.sample()
+        )
         logprob = behavior.log_prob(route)
         return (
             route,
@@ -791,6 +835,17 @@ class FastWAMAdaptivePolicy(nn.Module, BasePolicy):
             # them in forward_inputs would make rollout sharding split [L] by B.
             packed_inputs.pop("gate_kv_layer_indices", None)
             forward_inputs.update(packed_inputs)
+        if self.visual_reader is not None:
+            visual_replay = getattr(self.runtime, "visual_replay", None)
+            if visual_replay is None:
+                raise RuntimeError("P6 policy is missing its visual replay contract.")
+            validate_visual_forward_input_budget(
+                forward_inputs,
+                config=visual_replay,
+                gate_bytes_per_sample=(
+                    None if packed_kv is None else _bytes_per_sample(packed_kv)
+                ),
+            )
         if critic_prefix is not None:
             forward_inputs["critic_prefix"] = critic_prefix
         result = {
@@ -906,15 +961,6 @@ class FastWAMAdaptivePolicy(nn.Module, BasePolicy):
         critic = self._require_critic()
         groups = [
             {
-                "name": "gate",
-                "params": [
-                    parameter
-                    for parameter in self.gate.parameters()
-                    if parameter.requires_grad
-                ],
-                "lr": gate_lr,
-            },
-            {
                 "name": "uncond_lora",
                 "params": [
                     parameter
@@ -933,6 +979,19 @@ class FastWAMAdaptivePolicy(nn.Module, BasePolicy):
                 "lr": value_lr,
             },
         ]
+        if self.config.gate_trainable:
+            groups.insert(
+                0,
+                {
+                    "name": "gate",
+                    "params": [
+                        parameter
+                        for parameter in self.gate.parameters()
+                        if parameter.requires_grad
+                    ],
+                    "lr": gate_lr,
+                },
+            )
         if self.visual_reader is not None:
             if visual_router_lr is None or float(visual_router_lr) <= 0:
                 raise ValueError("Enabled P6 requires a positive `visual_router_lr`.")

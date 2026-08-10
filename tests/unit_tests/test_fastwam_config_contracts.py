@@ -24,6 +24,108 @@ MODULE = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(MODULE)
 
 
+def test_p6_readiness_gate_freeze_is_explicit_and_mutually_exclusive() -> None:
+    MODULE.validate_p6_readiness_gate_ownership(
+        p6_enabled=True,
+        gate_trainable=False,
+        readiness_endpoint=True,
+        stage2_systems_endpoint=False,
+        gate_lr=0.0,
+        gate_loss_weight=0.0,
+    )
+    MODULE.validate_p6_readiness_gate_ownership(
+        p6_enabled=False,
+        gate_trainable=True,
+        readiness_endpoint=False,
+        stage2_systems_endpoint=False,
+        gate_lr=1e-4,
+        gate_loss_weight=1.0,
+    )
+    with pytest.raises(ValueError, match="mutually exclusive"):
+        MODULE.validate_p6_readiness_gate_ownership(
+            p6_enabled=True,
+            gate_trainable=False,
+            readiness_endpoint=True,
+            stage2_systems_endpoint=True,
+            gate_lr=0.0,
+            gate_loss_weight=0.0,
+        )
+    with pytest.raises(ValueError, match="restricted"):
+        MODULE.validate_p6_readiness_gate_ownership(
+            p6_enabled=True,
+            gate_trainable=False,
+            readiness_endpoint=False,
+            stage2_systems_endpoint=False,
+            gate_lr=0.0,
+            gate_loss_weight=0.0,
+        )
+    with pytest.raises(ValueError, match="exact zero"):
+        MODULE.validate_p6_readiness_gate_ownership(
+            p6_enabled=True,
+            gate_trainable=False,
+            readiness_endpoint=True,
+            stage2_systems_endpoint=False,
+            gate_lr=1e-5,
+            gate_loss_weight=0.0,
+        )
+
+
+def test_p6_readiness_and_stage2_identities_fail_closed() -> None:
+    readiness = {
+        "max_steps": 2,
+        "max_epochs": 1,
+        "actor_total_training_steps": 2,
+        "actor_seed": 424242,
+        "global_batch_size": 1,
+        "env_seed": 424242,
+        "total_num_envs": 1,
+        "task_id_filter": [0],
+        "specific_reset_id": 1,
+        "use_fixed_reset_state_ids": True,
+        "training_route_override": "forced_uncond_after_initial",
+        "load_text_encoder": False,
+        "formal_training_authorized": False,
+        "final_ledger_path": None,
+        "replay_backend": "stored_native",
+    }
+    MODULE.validate_p6_readiness_endpoint_contract(**readiness)
+    for key, bad in (
+        ("actor_seed", 42),
+        ("specific_reset_id", 0),
+        ("replay_backend", "recompute_native"),
+        ("final_ledger_path", "/forbidden/final_ledger.json"),
+    ):
+        invalid = {**readiness, key: bad}
+        with pytest.raises(ValueError, match="P6 readiness endpoint"):
+            MODULE.validate_p6_readiness_endpoint_contract(**invalid)
+
+    systems = {
+        "max_steps": 1,
+        "max_epochs": 1,
+        "actor_total_training_steps": 1,
+        "actor_seed": 20260731,
+        "global_batch_size": 2,
+        "env_seed": 20260801,
+        "total_num_envs": 1,
+        "task_id_filter": [0],
+        "specific_reset_id": 0,
+        "use_fixed_reset_state_ids": True,
+        "training_route_override": "forced_uncond_after_initial",
+        "load_text_encoder": False,
+        "formal_training_authorized": False,
+        "final_ledger_path": None,
+        "replay_backend": "stored_native",
+        "route_seed": 20260801,
+    }
+    MODULE.validate_p6_stage2_systems_endpoint_contract(**systems)
+    systems["total_num_envs"] = 2
+    systems["global_batch_size"] = 4
+    MODULE.validate_p6_stage2_systems_endpoint_contract(**systems)
+    systems["route_seed"] = 1
+    with pytest.raises(ValueError, match="P6 Stage2 systems endpoint"):
+        MODULE.validate_p6_stage2_systems_endpoint_contract(**systems)
+
+
 def test_recompute_kv_requires_every_update_weight_sync() -> None:
     MODULE.validate_fastwam_kv_weight_sync("recompute", 1)
     MODULE.validate_fastwam_kv_weight_sync("stored", 4)

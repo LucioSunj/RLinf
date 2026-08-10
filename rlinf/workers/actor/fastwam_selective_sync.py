@@ -74,11 +74,7 @@ def capture_fastwam_sync_tensors(
     if len(sync_names) != len(set(sync_names)):
         raise RuntimeError("FastWAM selective sync names must be unique.")
 
-    parameters = {
-        name: parameter
-        for name, parameter in module.named_parameters(remove_duplicate=False)
-        if parameter.requires_grad
-    }
+    parameters = dict(module.named_parameters(remove_duplicate=False))
     buffers = dict(module.named_buffers(remove_duplicate=False))
 
     captured: dict[str, CapturedSyncTensor] = {}

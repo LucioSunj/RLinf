@@ -109,13 +109,22 @@ def _memory(batch: int = 1) -> NativePatchMemory:
     )
 
 
-def _config(backend="stored_native", *, per_sample=1 << 22, aggregate=1 << 24):
+def _config(
+    backend="stored_native",
+    *,
+    per_sample=1 << 22,
+    aggregate=1 << 24,
+    combined_per_sample=None,
+    combined_aggregate=None,
+):
     return _replay.VisualReplayConfig(
         backend=backend,
         storage_dtype="bfloat16",
         pin_memory=True,
         max_bytes_per_sample=per_sample,
         max_aggregate_bytes=aggregate,
+        max_combined_gate_plus_visual_bytes_per_sample=combined_per_sample,
+        max_combined_gate_plus_visual_aggregate_bytes=combined_aggregate,
     )
 
 
@@ -133,6 +142,7 @@ def test_stored_native_replay_scatter_roundtrip_and_hash_rejection() -> None:
     )
 
     assert packed["visual_route_mask"].tolist() == [False, True, False]
+    assert packed["visual_actor_versions"].tolist() == [0, 0, 0]
     restored = _replay.unpack_stored_native_memory(
         {name: value[1:2] for name, value in packed.items()},
         camera_ids=memory.camera_ids,
@@ -150,6 +160,24 @@ def test_stored_native_replay_scatter_roundtrip_and_hash_rejection() -> None:
 
     tampered = {name: value.clone() for name, value in packed.items()}
     tampered["visual_effective_transport_sha256"][1, 0] ^= 1
+    with pytest.raises(ValueError, match="content SHA256"):
+        _replay.unpack_stored_native_memory(
+            {name: value[1:2] for name, value in tampered.items()},
+            camera_ids=memory.camera_ids,
+            patch_grid=memory.grid,
+            source_revision=memory.source_revision,
+            weights_sha256=memory.weights_sha256,
+            input_contract_sha256=memory.input_contract_sha256,
+            preprocess_sha256=memory.preprocess_sha256,
+            output_contract_sha256=memory.output_contract_sha256,
+            memory_contract_sha256=memory.memory_contract_sha256,
+            transport=transport,
+            device="cpu",
+        )
+
+    # Re-sealing untrusted bytes must not bypass the independently resolved
+    # effective-transport contract.
+    tampered["visual_content_sha256"] = _replay._content_sha256(tampered)
     with pytest.raises(ValueError, match="effective transport hash"):
         _replay.unpack_stored_native_memory(
             {name: value[1:2] for name, value in tampered.items()},
@@ -196,6 +224,103 @@ def test_visual_replay_caps_and_recompute_camera_contract() -> None:
         memory=memory,
         transport=transport,
     )
+
+
+def test_visual_replay_integrity_survives_cat_shuffle_and_rejects_each_tamper() -> None:
+    transport = build_area_overlap_dino_wan_transport(_metadata())
+    first = _replay.pack_visual_replay(
+        config=_config(),
+        transport=transport,
+        camera_batch=_camera_batch(batch=2),
+        memory=_memory(batch=2),
+        actor_version=7,
+    )
+    second = _replay.pack_visual_replay(
+        config=_config(),
+        transport=transport,
+        camera_batch=_camera_batch(batch=2),
+        memory=_memory(batch=2),
+        actor_version=7,
+    )
+    concatenated = {
+        name: torch.cat((first[name], second[name]), dim=0) for name in first
+    }
+    _replay.validate_visual_replay_integrity(concatenated)
+    order = torch.tensor([3, 0, 2, 1])
+    shuffled = {name: tensor[order].clone() for name, tensor in concatenated.items()}
+    _replay.validate_visual_replay_integrity(shuffled)
+    repinned = _replay.pin_visual_replay_forward_inputs(shuffled)
+    _replay.validate_visual_replay_integrity(repinned)
+    assert repinned["visual_actor_versions"].tolist() == [7, 7, 7, 7]
+
+    for name, tensor in shuffled.items():
+        if name == "visual_content_sha256":
+            continue
+        tampered = {key: value.clone() for key, value in shuffled.items()}
+        flattened = tampered[name].reshape(-1)
+        if tensor.dtype is torch.bool:
+            flattened[0] = ~flattened[0]
+        elif tensor.is_floating_point():
+            flattened[0] += 1
+        else:
+            flattened[0] ^= 1
+        with pytest.raises(ValueError, match="content SHA256"):
+            _replay.validate_visual_replay_integrity(tampered)
+
+    missing = dict(shuffled)
+    missing.pop("visual_content_sha256")
+    with pytest.raises(KeyError, match="visual_content_sha256"):
+        _replay.validate_visual_replay_integrity(missing)
+
+
+def test_combined_gate_visual_caps_fail_closed_after_transport() -> None:
+    transport = build_area_overlap_dino_wan_transport(_metadata())
+    packed = _replay.pack_visual_replay(
+        config=_config(),
+        transport=transport,
+        camera_batch=_camera_batch(batch=2),
+        memory=_memory(batch=2),
+    )
+    visual_bytes = _replay.replay_bytes_by_prefix(packed, prefix="visual_")
+    gate_bytes = torch.full_like(visual_bytes, 257)
+    combined = visual_bytes + gate_bytes
+    exact = _config(
+        per_sample=int(visual_bytes.max()),
+        aggregate=int(visual_bytes.sum()),
+        combined_per_sample=int(combined.max()),
+        combined_aggregate=int(combined.sum()),
+    )
+    _replay.validate_visual_forward_input_budget(
+        packed,
+        config=exact,
+        gate_bytes_per_sample=gate_bytes,
+    )
+
+    per_sample_breach = _config(
+        per_sample=int(visual_bytes.max()),
+        aggregate=int(visual_bytes.sum()),
+        combined_per_sample=int(combined.max()) - 1,
+        combined_aggregate=int(combined.sum()),
+    )
+    with pytest.raises(MemoryError, match=r"combined Gate\+visual per-sample"):
+        _replay.validate_visual_forward_input_budget(
+            packed,
+            config=per_sample_breach,
+            gate_bytes_per_sample=gate_bytes,
+        )
+
+    aggregate_breach = _config(
+        per_sample=int(visual_bytes.max()),
+        aggregate=int(visual_bytes.sum()),
+        combined_per_sample=int(combined.max()),
+        combined_aggregate=int(combined.sum()) - 1,
+    )
+    with pytest.raises(MemoryError, match=r"combined Gate\+visual aggregate"):
+        _replay.validate_visual_forward_input_budget(
+            packed,
+            config=aggregate_breach,
+            gate_bytes_per_sample=gate_bytes,
+        )
 
 
 def test_cuda_host_never_silently_falls_back_from_pinned_replay(
@@ -286,6 +411,8 @@ def _enabled_payload() -> dict:
             "pin_memory": True,
             "max_bytes_per_sample": 1 << 22,
             "max_aggregate_bytes": 1 << 24,
+            "max_combined_gate_plus_visual_bytes_per_sample": 1 << 23,
+            "max_combined_gate_plus_visual_aggregate_bytes": 1 << 25,
         },
     }
 

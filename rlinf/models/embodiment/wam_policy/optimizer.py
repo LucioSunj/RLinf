@@ -10,6 +10,7 @@ import torch.nn as nn
 def partition_fastwam_trainable_parameters(
     named_parameters: Iterable[tuple[str, nn.Parameter]],
     *,
+    require_gate: bool = True,
     visual_router_parameter_ids: set[int] | frozenset[int] | None = None,
 ) -> dict[str, list[nn.Parameter]]:
     """Fail closed unless every trainable tensor has one intended owner.
@@ -27,10 +28,18 @@ def partition_fastwam_trainable_parameters(
     }
     unexpected: list[str] = []
     observed_visual_ids: set[int] = set()
+    seen_parameter_names_by_id: dict[int, str] = {}
     for name, parameter in named_parameters:
         if not parameter.requires_grad:
             continue
         parameter_id = id(parameter)
+        previous_name = seen_parameter_names_by_id.get(parameter_id)
+        if previous_name is not None:
+            raise RuntimeError(
+                "FastWAM adaptive optimizer received duplicate parameter ownership: "
+                f"{previous_name!r} and {name!r} identify the same parameter."
+            )
+        seen_parameter_names_by_id[parameter_id] = name
         visual_name = name.startswith("visual_reader.") or ".visual_reader." in name
         if (
             visual_router_parameter_ids is not None
@@ -62,6 +71,12 @@ def partition_fastwam_trainable_parameters(
             )
     if not groups["visual_router"]:
         groups.pop("visual_router")
+    if not require_gate and groups["gate"]:
+        raise RuntimeError(
+            "Frozen Gate endpoint exposed trainable Gate parameters to the optimizer."
+        )
+    if not require_gate:
+        groups.pop("gate")
     missing = [name for name, parameters in groups.items() if not parameters]
     if missing:
         raise RuntimeError(

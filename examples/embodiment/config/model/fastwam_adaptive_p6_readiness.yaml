@@ -1,0 +1,114 @@
+defaults:
+  - fastwam_adaptive
+  - _self_
+
+# Test-only P6 mechanics preset. It is not referenced by the default adaptive
+# configuration and cannot authorize formal training.
+gate_trainable: false
+training_route_override: forced_uncond_after_initial
+
+fastwam:
+  load_text_encoder: false
+
+runtime:
+  text_embedding_cache_dir: ${oc.env:FASTWAM_TEXT_EMBEDDING_CACHE}
+
+uncond_visual_sidecar:
+  enabled: true
+  type: dinov3_router_wan_value
+  enabled_regimes: [uncond]
+  dispatch_before_encoder: true
+  dino:
+    source_root: ${oc.env:FASTWAM_DINOV3_SOURCE_ROOT}
+    source_revision: 6876159a11b4df116f30f667f8c9888617df0751
+    model_name: dinov3_vits16
+    weights_path: ${oc.env:FASTWAM_DINOV3_WEIGHTS}
+    weights_sha256: 4610ad75edef83e75afdebf162d148dc628045ea6cbb83d67d4708c709c4f91d
+    preprocess_sha256: 0a70d846042c4bb29893ead5d9433e97d1ec5089875704e472dd821632e24dc0
+    output_contract_sha256: 631bb13876a3e9c79476eb1ac089bced12aae93302f117cfeb106dd8acfe9f18
+    compute_dtype: bfloat16
+    license_id: DINOv3 License
+    camera_input_contract_sha256: 336d06c39a488c89b1404154b6ed8a9ee25969507611d8b06b884f8c2945e8e7
+    token_kind: x_norm_patchtokens
+    per_camera: true
+    frozen: true
+    stop_gradient: true
+  router:
+    query_source: base_modulated_self_attn_input
+    query_projection: low_rank
+    query_rank: 32
+    temperature: 0.07
+    score_dtype: float32
+    per_camera_softmax: true
+    camera_mass: fixed
+    camera_mass_values: [0.5, 0.5]
+    invalid_camera_policy: renormalize_active_or_fail_closed
+  transport:
+    mode: deterministic_area_overlap
+    contract_sha256: 89ce4864e45350380fa1e9aab12522035fe1686bba6870b4e911d4a1c90b54ab
+    preserve_row_mass: true
+    fail_closed: true
+  optimizer:
+    family: visual_router
+    lr: 1.0e-5
+    weight_decay: 0.0
+    scheduler: cosine
+    parameter_allowlist:
+      - "routers.*.query_projection.*"
+      - "branches.*.*.raw_beta"
+    fail_on_empty_or_overlap: true
+  wan_value:
+    source: video_cache_current_prefix
+    flatten_order: t_h_w_row_major
+    output_projection: frozen_action_self_attn_o_weight_only
+    output_bias: false
+    reuse_base_gate_msa: true
+    spatial_metadata:
+      wan_grid_f: 1
+      wan_grid_h: 7
+      wan_grid_w: 14
+      current_frame_video_tokens: 98
+      wan_flatten_order: t_h_w_row_major
+      vae_model_type: WanVideoVAE38
+      vae_weights_sha256: 0e913a2ca571c75fcb63385a8edadcca73454af5842596cb1ad11e4142590996
+      vae_spatial_downsample_factor: 16
+      video_dit_weights_sha256: e979511a2d7a1310009496c6b2f06957171bba28b96aac0d513992c6ed21ca5a
+      video_dit_patch_size: [1, 2, 2]
+      video_attention_num_heads: 24
+      video_attention_head_dim: 128
+      video_value_layout: batch_sequence_flat_heads
+      video_value_rope_applied: false
+      camera_concat_mode: horizontal
+      camera_order: [main, wrist]
+      per_camera_post_crop_hw: [[224, 224], [224, 224]]
+      per_camera_combined_rgb_box:
+        - [0, 0, 224, 224]
+        - [0, 224, 224, 448]
+      per_camera_wan_grid_support:
+        - [0, 7, 0, 7]
+        - [0, 7, 7, 14]
+      dino_patch_grid: [14, 14]
+      dino_preprocess_sha256: 0a70d846042c4bb29893ead5d9433e97d1ec5089875704e472dd821632e24dc0
+      invalid_mask_policy: renormalize_active_or_fail_closed
+      query_source: base_modulated_self_attn_input
+      query_timing: pre_block
+      residual_timing: post_block
+      spatial_transport_contract_sha256: c58c1548b4b0ac6ddcc58266d4e4caf4ec9e5652aadfe29c17f4eff31195ac4e
+  injection:
+    query_timing: pre_block
+    residual_timing: post_block
+    layer_indices: [9, 15, 21]
+    beta_parameterization: bounded_tanh
+    beta_max: 1.0
+    zero_init: beta
+    modify_base_attention: false
+  replay:
+    backend: stored_native
+    storage_dtype: bfloat16
+    pin_memory: true
+    # These have no default: the readiness launcher supplies the immutable
+    # values produced by the batch-one calibration report.
+    max_bytes_per_sample: ${oc.env:P6_VISUAL_REPLAY_MAX_BYTES_PER_SAMPLE}
+    max_aggregate_bytes: ${oc.env:P6_VISUAL_REPLAY_MAX_AGGREGATE_BYTES}
+    max_combined_gate_plus_visual_bytes_per_sample: ${oc.env:P6_COMBINED_REPLAY_MAX_BYTES_PER_SAMPLE}
+    max_combined_gate_plus_visual_aggregate_bytes: ${oc.env:P6_COMBINED_REPLAY_MAX_AGGREGATE_BYTES}

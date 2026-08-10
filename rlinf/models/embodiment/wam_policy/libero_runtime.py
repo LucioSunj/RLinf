@@ -71,6 +71,8 @@ from .visual_replay import (
     unpack_recompute_camera_batch,
     unpack_stored_native_memory,
     validate_recomputed_effective_hash,
+    validate_visual_replay_integrity,
+    visual_replay_static_contract_sha256,
 )
 
 DEFAULT_FASTWAM_PROMPT_TEMPLATE = (
@@ -444,6 +446,20 @@ class LiberoFastWAMRuntime:
             else visual_sidecar.camera_input_contract_sha256
         )
         self.visual_replay = None if visual_sidecar is None else visual_sidecar.replay
+        self.visual_replay_static_contract_sha256 = (
+            None
+            if visual_sidecar is None
+            else visual_replay_static_contract_sha256(
+                config=self.visual_replay,
+                transport=self.visual_transport,
+                source_revision=self.visual_asset.source_revision,
+                weights_sha256=self.visual_asset.weights_sha256,
+                input_contract_sha256=self.visual_camera_input_contract_sha256,
+                preprocess_sha256=self.visual_asset.preprocess_sha256,
+                output_contract_sha256=self.visual_asset.output_contract_sha256,
+                memory_contract_sha256=self.visual_reader.memory_contract_sha256,
+            )
+        )
         if self.num_inference_steps < 1:
             raise ValueError("Inference steps must be positive.")
         if self.flow_sde_ignore_last_transition and self.num_inference_steps < 2:
@@ -606,6 +622,7 @@ class LiberoFastWAMRuntime:
         env_obs: dict[str, Any],
         routes: torch.Tensor,
         collect_replay: bool,
+        actor_version: int = 0,
     ) -> tuple[dict[int, NativePatchMemory], dict[str, torch.Tensor]]:
         """Run frozen DINO once for the consumed UNCOND subset, never for IDM."""
 
@@ -623,6 +640,8 @@ class LiberoFastWAMRuntime:
                     camera_count=len(self.visual_spatial_metadata.camera_order),
                     patch_grid=tuple(self.visual_spatial_metadata.dino_patch_grid),
                     camera_hw=(self.camera_height, self.camera_width),
+                    actor_version=actor_version,
+                    static_contract_sha256=(self.visual_replay_static_contract_sha256),
                 )
                 if collect_replay
                 else {}
@@ -649,6 +668,8 @@ class LiberoFastWAMRuntime:
                 transport=self.visual_transport,
                 camera_batch=camera_batch,
                 memory=memory,
+                actor_version=actor_version,
+                static_contract_sha256=self.visual_replay_static_contract_sha256,
                 sample_indices=uncond_indices,
                 full_batch_size=int(routes.shape[0]),
             )
@@ -981,6 +1002,7 @@ class LiberoFastWAMRuntime:
             env_obs=env_obs,
             routes=routes,
             collect_replay=collect_replay,
+            actor_version=actor_version,
         )
         timesteps, deltas = self._action_schedule()
         action_noise_override = env_obs.get("_fastwam_action_initial_noise")
@@ -1242,6 +1264,7 @@ class LiberoFastWAMRuntime:
 
         if self.visual_sidecar is None:
             return
+        validate_visual_replay_integrity(forward_inputs)
         route_mask = forward_inputs.get("visual_route_mask")
         if route_mask is None:
             raise KeyError("Enabled P6 replay is missing `visual_route_mask`.")
@@ -1254,6 +1277,35 @@ class LiberoFastWAMRuntime:
             raise ValueError(
                 "P6 visual replay rows do not match the consumed UNCOND routes."
             )
+        actor_versions = forward_inputs.get("visual_actor_versions")
+        if (
+            actor_versions is None
+            or actor_versions.dtype is not torch.long
+            or actor_versions.shape != route_info.actor_versions.shape
+            or not torch.equal(
+                actor_versions.to(route_info.actor_versions.device),
+                route_info.actor_versions,
+            )
+        ):
+            raise ValueError("P6 visual replay actor versions changed.")
+        static_hashes = forward_inputs.get("visual_static_contract_sha256")
+        expected_static_hash = torch.tensor(
+            list(bytes.fromhex(self.visual_replay_static_contract_sha256)),
+            dtype=torch.uint8,
+            device=static_hashes.device if static_hashes is not None else "cpu",
+        )
+        if (
+            static_hashes is None
+            or static_hashes.dtype is not torch.uint8
+            or static_hashes.ndim != 2
+            or static_hashes.shape[0] != route_mask.shape[0]
+            or static_hashes.shape[1] != 32
+            or not torch.equal(
+                static_hashes,
+                expected_static_hash.expand_as(static_hashes),
+            )
+        ):
+            raise ValueError("P6 visual replay static provenance changed.")
 
     def replay_action_batch(
         self,

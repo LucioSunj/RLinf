@@ -28,6 +28,10 @@ from omegaconf.dictconfig import DictConfig
 from rlinf.config_contracts import (
     validate_fastwam_kv_weight_sync,
     validate_libero_terminal_reward_config,
+    validate_p6_readiness_endpoint_contract,
+    validate_p6_readiness_gate_ownership,
+    validate_p6_readiness_mechanics_contract,
+    validate_p6_stage2_systems_endpoint_contract,
     validate_pi05_critic_artifact_config,
 )
 from rlinf.envs import SupportedEnvType
@@ -905,6 +909,8 @@ def _validate_fastwam_adaptive_cfg(cfg, *, only_eval: bool) -> None:
         "gate",
         "gate_epsilon",
         "gate_temperature",
+        "gate_trainable",
+        "training_route_override",
         "eval_routing_mode",
         "eval_idm_threshold",
         "eval_random_idm_probability",
@@ -1071,11 +1077,75 @@ def _validate_fastwam_adaptive_cfg(cfg, *, only_eval: bool) -> None:
             "shuffle does not preserve complete episodes or train-global batches."
         )
 
+    p6_readiness_endpoint = bool(cfg.runner.get("p6_readiness_endpoint", False))
+    p6_stage2_systems_endpoint = bool(
+        cfg.runner.get("p6_stage2_systems_endpoint", False)
+    )
+    validate_p6_readiness_gate_ownership(
+        p6_enabled=visual_enabled,
+        gate_trainable=actor_model.get("gate_trainable", True),
+        readiness_endpoint=p6_readiness_endpoint,
+        stage2_systems_endpoint=p6_stage2_systems_endpoint,
+        gate_lr=cfg.actor.optim.get("gate_lr", 0.0),
+        gate_loss_weight=cfg.algorithm.gate_ppo.get("loss_weight", 0.0),
+    )
+    if p6_readiness_endpoint or p6_stage2_systems_endpoint:
+        validate_p6_readiness_mechanics_contract(
+            visual_sidecar=actor_model.uncond_visual_sidecar,
+            precision=actor_model.get("precision", ""),
+            actor_checkpoint_sha256=actor_model.get("actor_checkpoint_sha256", ""),
+            text_embedding_cache_dir=actor_model.runtime.get(
+                "text_embedding_cache_dir"
+            ),
+        )
+    if p6_readiness_endpoint:
+        validate_p6_readiness_endpoint_contract(
+            max_steps=cfg.runner.get("max_steps", -1),
+            max_epochs=cfg.runner.get("max_epochs", -1),
+            actor_total_training_steps=cfg.actor.optim.get("total_training_steps", -1),
+            actor_seed=cfg.actor.get("seed", -1),
+            global_batch_size=cfg.actor.get("global_batch_size", -1),
+            env_seed=cfg.env.train.get("seed", -1),
+            total_num_envs=cfg.env.train.get("total_num_envs", -1),
+            task_id_filter=cfg.env.train.get("task_id_filter"),
+            specific_reset_id=cfg.env.train.get("specific_reset_id", -1),
+            use_fixed_reset_state_ids=cfg.env.train.get(
+                "use_fixed_reset_state_ids", False
+            ),
+            training_route_override=actor_model.get("training_route_override", "none"),
+            load_text_encoder=actor_model.fastwam.get("load_text_encoder", True),
+            formal_training_authorized=cfg.runner.get(
+                "formal_training_authorized", False
+            ),
+            final_ledger_path=cfg.runner.get("final_ledger_path"),
+            replay_backend=actor_model.uncond_visual_sidecar.replay.get("backend", ""),
+        )
+    if p6_stage2_systems_endpoint:
+        validate_p6_stage2_systems_endpoint_contract(
+            max_steps=cfg.runner.get("max_steps", -1),
+            max_epochs=cfg.runner.get("max_epochs", -1),
+            actor_total_training_steps=cfg.actor.optim.get("total_training_steps", -1),
+            actor_seed=cfg.actor.get("seed", -1),
+            global_batch_size=cfg.actor.get("global_batch_size", -1),
+            env_seed=cfg.env.train.get("seed", -1),
+            total_num_envs=cfg.env.train.get("total_num_envs", -1),
+            task_id_filter=cfg.env.train.get("task_id_filter"),
+            specific_reset_id=cfg.env.train.get("specific_reset_id", -1),
+            use_fixed_reset_state_ids=cfg.env.train.get(
+                "use_fixed_reset_state_ids", False
+            ),
+            training_route_override=actor_model.get("training_route_override", "none"),
+            load_text_encoder=actor_model.fastwam.get("load_text_encoder", True),
+            formal_training_authorized=cfg.runner.get(
+                "formal_training_authorized", False
+            ),
+            final_ledger_path=cfg.runner.get("final_ledger_path"),
+            replay_backend=actor_model.uncond_visual_sidecar.replay.get("backend", ""),
+            route_seed=cfg.runner.get("l11_route_seed", -1),
+        )
     for path in (
-        "actor.optim.gate_lr",
         "actor.optim.lora_lr",
         "actor.optim.value_lr",
-        "algorithm.gate_ppo.loss_weight",
         "algorithm.uncond_flow_ppo.loss_weight",
         "algorithm.critic_loss.loss_weight",
     ):

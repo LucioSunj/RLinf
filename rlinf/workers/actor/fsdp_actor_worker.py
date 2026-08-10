@@ -2354,7 +2354,10 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
                 group.get("name"): float(group["lr"])
                 for group in self.optimizer.param_groups
             }
-            expected = {"gate", "uncond_lora", "value_head"}
+            gate_trainable = bool(self.cfg.actor.model.get("gate_trainable", True))
+            expected = {"uncond_lora", "value_head"}
+            if gate_trainable:
+                expected.add("gate")
             if "visual_router" in lr_by_name:
                 expected.add("visual_router")
             if set(lr_by_name) != expected:
@@ -2364,11 +2367,12 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
                 )
             data.update(
                 {
-                    "gate/lr": lr_by_name["gate"],
                     "uncond_flow/lora_lr": lr_by_name["uncond_lora"],
                     "critic/lr": lr_by_name["value_head"],
                 }
             )
+            if gate_trainable:
+                data["gate/lr"] = lr_by_name["gate"]
             if "visual_router" in lr_by_name:
                 data["uncond_visual/router_lr"] = lr_by_name["visual_router"]
             return data
@@ -2451,9 +2455,19 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
             self.cfg.actor.model
         ):
             from rlinf.models.embodiment.wam_policy.visual_replay import (
+                VisualReplayConfig,
                 pin_visual_replay_forward_inputs,
+                validate_visual_forward_input_budget,
             )
 
+            replay_payload = OmegaConf.to_container(
+                self.cfg.actor.model.uncond_visual_sidecar.replay,
+                resolve=True,
+            )
+            validate_visual_forward_input_budget(
+                self.rollout_batch.get("forward_inputs", {}),
+                config=VisualReplayConfig(**replay_payload),
+            )
             self.rollout_batch["forward_inputs"] = pin_visual_replay_forward_inputs(
                 self.rollout_batch.get("forward_inputs", {})
             )

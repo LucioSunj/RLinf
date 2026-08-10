@@ -561,10 +561,11 @@ class FSDPModelManager:
                 candidate = next_candidate
             fastwam_groups = partition_fastwam_trainable_parameters(
                 model.named_parameters(),
+                require_gate=bool(self._cfg.model.get("gate_trainable", True)),
                 visual_router_parameter_ids=visual_router_parameter_ids,
             )
-            param_groups.extend(
-                [
+            if bool(self._cfg.model.get("gate_trainable", True)):
+                param_groups.append(
                     {
                         "name": "gate",
                         "params": fastwam_groups["gate"],
@@ -573,7 +574,10 @@ class FSDPModelManager:
                         "weight_decay": self._cfg.optim.get(
                             "gate_weight_decay", weight_decay
                         ),
-                    },
+                    }
+                )
+            param_groups.extend(
+                [
                     {
                         "name": "uncond_lora",
                         "params": fastwam_groups["uncond_lora"],

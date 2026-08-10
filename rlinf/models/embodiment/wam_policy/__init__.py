@@ -340,6 +340,8 @@ def get_model(cfg, torch_dtype):
         eval_timing_cuda_synchronize=bool(
             cfg.get("eval_timing_cuda_synchronize", False)
         ),
+        gate_trainable=cfg.get("gate_trainable", True),
+        training_route_override=str(cfg.get("training_route_override", "none")),
         kv_replay=replay_config,
     )
 

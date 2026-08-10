@@ -43,6 +43,11 @@ class _SelectiveModule(nn.Module):
         self.register_buffer("ephemeral", torch.tensor([8.0]), persistent=False)
 
 
+class _FrozenGateSyncModule(_SelectiveModule):
+    def additional_rollout_sync_parameter_names(self) -> tuple[str, ...]:
+        return ("frozen",)
+
+
 def test_capture_matches_trainable_and_persistent_sync_contract() -> None:
     module = _SelectiveModule()
 
@@ -53,6 +58,16 @@ def test_capture_matches_trainable_and_persistent_sync_contract() -> None:
     assert captured["trainable"].is_parameter
     assert captured["persistent"].tensor is module.persistent
     assert not captured["persistent"].is_parameter
+
+
+def test_capture_includes_explicit_frozen_gate_sync_parameter() -> None:
+    module = _FrozenGateSyncModule()
+
+    captured = capture_fastwam_sync_tensors(module)
+
+    assert list(captured) == ["trainable", "frozen", "persistent"]
+    assert captured["frozen"].tensor is module.frozen
+    assert captured["frozen"].is_parameter
 
 
 def test_capture_includes_visual_router_but_excludes_frozen_dino() -> None:
