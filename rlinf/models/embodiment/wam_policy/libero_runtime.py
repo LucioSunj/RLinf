@@ -259,6 +259,19 @@ def _seeded_randn(
     ).to(device=device, dtype=dtype)
 
 
+def _domain_separated_noise_seed(seed: int, *, domain: str) -> int:
+    """Derive a local substream without advancing any global RNG state."""
+
+    payload = b"\0".join(
+        (
+            b"fastwam-formal-training-noise-v1",
+            str(int(seed)).encode("ascii"),
+            str(domain).encode("utf-8"),
+        )
+    )
+    return int.from_bytes(hashlib.sha256(payload).digest()[:8], "big") & ((1 << 63) - 1)
+
+
 def _align_linear_normalizer(normalizer: Any, reference: torch.Tensor) -> None:
     """Move FastWAM's plain-tensor normalizer state beside its input."""
 
@@ -878,6 +891,15 @@ class LiberoFastWAMRuntime:
                 )
             else:
                 initial_noise = action_noise_override[index : index + 1]
+            flow_generator = None
+            if action_noise_seeds is not None:
+                flow_generator = torch.Generator(device=self.device)
+                flow_generator.manual_seed(
+                    _domain_separated_noise_seed(
+                        int(action_noise_seeds[index]),
+                        domain="flow-sde",
+                    )
+                )
             rollout = sample_action_flow_sde(
                 initial_noise,
                 velocity_fn=self._velocity(
@@ -892,6 +914,7 @@ class LiberoFastWAMRuntime:
                     self.actor.infer_action_scheduler.num_train_timesteps
                 ),
                 noise_level=self.flow_sde_noise_level,
+                generator=flow_generator,
                 gate_last_n=self.gate_denoise_last_n,
                 ignore_last_transition=self.flow_sde_ignore_last_transition,
                 stochastic=mode == "train" and regime is PolicyRegime.UNCOND,

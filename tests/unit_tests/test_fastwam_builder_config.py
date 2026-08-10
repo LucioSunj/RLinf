@@ -301,6 +301,8 @@ def test_formal_profile_requires_stage_invariant_internal_contract(
         ("runner.use_training_pipeline", False),
         ("actor.model.training_rollout_microbatch_size", 1),
         ("rollout.model.training_rollout_microbatch_size", 1),
+        ("actor.model.formal_training_sampling_seed", 42),
+        ("rollout.model.formal_training_sampling_seed", 42),
         ("env.train.stage_invariant_fixed_reset_ids", True),
         ("runner.formal_execution_profile", profile),
     ):
@@ -314,11 +316,15 @@ def test_formal_profile_requires_stage_invariant_internal_contract(
             "rollout.model.training_rollout_microbatch_size": 2,
         },
         {"env.train.stage_invariant_fixed_reset_ids": False},
+        {"rollout.model.formal_training_sampling_seed": 41},
     ):
         invalid = OmegaConf.create(OmegaConf.to_container(cfg, resolve=False))
         for path, value in updates.items():
             OmegaConf.update(invalid, path, value)
-        with pytest.raises(ValueError, match="shard-invariant"):
+        with pytest.raises(
+            ValueError,
+            match="shard-invariant|replay contracts differ",
+        ):
             _validate_fastwam_adaptive_cfg(invalid, only_eval=False)
 
 

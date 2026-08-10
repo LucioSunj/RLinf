@@ -18,6 +18,7 @@ import pytest
 import torch
 
 from rlinf.models.embodiment.wam_policy.libero_runtime import (
+    _domain_separated_noise_seed,
     _seeded_randn,
     _validate_noise_seeds,
 )
@@ -58,6 +59,15 @@ def test_seeded_noise_is_reproducible_batch_order_invariant_and_local() -> None:
     assert torch.equal(first[0], reversed_result[1])
     assert torch.equal(first[1], reversed_result[0])
     assert not torch.equal(first[0], first[1])
+
+
+def test_domain_separated_flow_seed_is_stable_and_distinct() -> None:
+    first = _domain_separated_noise_seed(101, domain="flow-sde")
+
+    assert first == _domain_separated_noise_seed(101, domain="flow-sde")
+    assert first != _domain_separated_noise_seed(102, domain="flow-sde")
+    assert first != _domain_separated_noise_seed(101, domain="other")
+    assert 0 <= first < 1 << 63
 
 
 @pytest.mark.parametrize(

@@ -122,6 +122,8 @@ class _Runtime:
         self.sample_batch_sizes = []
         self.collect_replay_flags = []
         self.grad_enabled_flags = []
+        self.action_noise_seeds = []
+        self.idm_noise_seeds = []
 
     def sample_action_batch(
         self,
@@ -137,6 +139,18 @@ class _Runtime:
         self.sample_batch_sizes.append(batch)
         self.collect_replay_flags.append(collect_replay)
         self.grad_enabled_flags.append(torch.is_grad_enabled())
+        self.action_noise_seeds.append(
+            env_obs.get("_fastwam_action_noise_seeds", torch.empty(0, dtype=torch.long))
+            .detach()
+            .cpu()
+            .clone()
+        )
+        self.idm_noise_seeds.append(
+            env_obs.get("_fastwam_idm_noise_seeds", torch.empty(0, dtype=torch.long))
+            .detach()
+            .cpu()
+            .clone()
+        )
         return FastWAMChunkSample(
             actions=torch.zeros(batch, 2, 3),
             old_flow_logprobs=torch.zeros(batch, 2, 3),
@@ -227,6 +241,7 @@ def _make_policy(
     eval_routing_seed=0,
     eval_timing_cuda_synchronize=False,
     training_rollout_microbatch_size=None,
+    formal_training_sampling_seed=None,
 ):
     return FastWAMAdaptivePolicy(
         actor=nn.Linear(1, 1),
@@ -242,6 +257,7 @@ def _make_policy(
             eval_routing_seed=eval_routing_seed,
             eval_timing_cuda_synchronize=eval_timing_cuda_synchronize,
             training_rollout_microbatch_size=training_rollout_microbatch_size,
+            formal_training_sampling_seed=formal_training_sampling_seed,
             kv_replay=_policy.GateKVReplayConfig(
                 backend=backend,
                 pin_memory=False,
@@ -309,12 +325,89 @@ def test_training_rollout_microbatch_is_exact_across_stage_shards() -> None:
     assert baseline.route_tracker.state_dict() == staged.route_tracker.state_dict()
 
 
+def test_formal_training_sampling_is_exact_across_stage_calls_and_rng_noise() -> None:
+    torch.manual_seed(123)
+    baseline = _make_policy(
+        training_rollout_microbatch_size=1,
+        formal_training_sampling_seed=42,
+    )
+    torch.manual_seed(123)
+    staged = _make_policy(
+        training_rollout_microbatch_size=1,
+        formal_training_sampling_seed=42,
+    )
+    observations = {
+        "states": torch.arange(12, dtype=torch.float32).reshape(4, 3),
+        "_fastwam_env_ids": torch.tensor([0, 1, 2, 3]),
+        "_fastwam_reset_mask": torch.tensor([True, True, True, True]),
+    }
+
+    for chunk_index in range(5):
+        baseline_actions, baseline_result = baseline.predict_action_batch(
+            observations,
+            mode="train",
+        )
+        staged_actions = []
+        staged_results = []
+        for start, end in ((0, 2), (2, 4)):
+            torch.rand(17 + chunk_index)
+            action, result = staged.predict_action_batch(
+                staged._slice_env_obs(
+                    observations,
+                    start=start,
+                    end=end,
+                    batch_size=4,
+                ),
+                mode="train",
+            )
+            staged_actions.append(action)
+            staged_results.append(result)
+        merged_actions, merged_result = staged._merge_training_microbatch_results(
+            staged_actions,
+            staged_results,
+        )
+
+        assert torch.equal(merged_actions, baseline_actions)
+        for key in ("route_info", "emitted_gate"):
+            _assert_tensor_record_equal(merged_result[key], baseline_result[key])
+        observations["_fastwam_reset_mask"] = torch.zeros(4, dtype=torch.bool)
+
+    assert baseline.route_tracker.state_dict() == staged.route_tracker.state_dict()
+    assert torch.equal(
+        torch.cat(baseline.runtime.action_noise_seeds),
+        torch.cat(staged.runtime.action_noise_seeds),
+    )
+    assert torch.equal(
+        torch.cat(baseline.runtime.idm_noise_seeds),
+        torch.cat(staged.runtime.idm_noise_seeds),
+    )
+
+
 @pytest.mark.parametrize("invalid", [True, 0, 1.5])
 def test_training_rollout_microbatch_rejects_invalid_values(invalid) -> None:
     with pytest.raises(
         (TypeError, ValueError), match="training_rollout_microbatch_size"
     ):
         FastWAMAdaptivePolicyConfig(training_rollout_microbatch_size=invalid)
+
+
+@pytest.mark.parametrize("invalid", [True, -1, 1.5])
+def test_formal_training_sampling_seed_rejects_invalid_values(invalid) -> None:
+    with pytest.raises((TypeError, ValueError), match="formal_training_sampling_seed"):
+        FastWAMAdaptivePolicyConfig(formal_training_sampling_seed=invalid)
+
+
+def test_formal_training_sampling_refuses_caller_seed_collision() -> None:
+    policy = _make_policy(formal_training_sampling_seed=42)
+    observations = {
+        "states": torch.ones(1, 3),
+        "_fastwam_env_ids": torch.tensor([0]),
+        "_fastwam_reset_mask": torch.tensor([True]),
+        "_fastwam_action_noise_seeds": torch.tensor([7]),
+    }
+
+    with pytest.raises(ValueError, match="caller-supplied sampling seeds"):
+        policy.predict_action_batch(observations, mode="train")
 
 
 def test_policy_forwards_and_deduplicates_critic_backbone_no_split_metadata():

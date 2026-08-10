@@ -333,6 +333,11 @@ def get_model(cfg, torch_dtype):
             if cfg.get("training_rollout_microbatch_size") is None
             else cfg.training_rollout_microbatch_size
         ),
+        formal_training_sampling_seed=(
+            None
+            if cfg.get("formal_training_sampling_seed") is None
+            else cfg.formal_training_sampling_seed
+        ),
         kv_replay=replay_config,
     )
 

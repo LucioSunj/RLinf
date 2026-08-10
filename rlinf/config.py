@@ -905,6 +905,7 @@ def _validate_fastwam_adaptive_cfg(cfg, *, only_eval: bool) -> None:
         "eval_routing_seed",
         "eval_microbatch_size",
         "training_rollout_microbatch_size",
+        "formal_training_sampling_seed",
         "kv_replay",
         "flow_sde",
         "runtime",
@@ -1058,10 +1059,24 @@ def _validate_fastwam_adaptive_cfg(cfg, *, only_eval: bool) -> None:
         invariant_resets = bool(
             cfg.env.train.get("stage_invariant_fixed_reset_ids", False)
         )
-        if not invariant_rollout_microbatches or not invariant_resets:
+        formal_sampling_seeds = (
+            cfg.actor.model.get("formal_training_sampling_seed"),
+            cfg.rollout.model.get("formal_training_sampling_seed"),
+        )
+        invariant_sampling = all(
+            not isinstance(value, bool)
+            and isinstance(value, int)
+            and value == int(cfg.actor.seed)
+            for value in formal_sampling_seeds
+        )
+        if (
+            not invariant_rollout_microbatches
+            or not invariant_resets
+            or not invariant_sampling
+        ):
             raise ValueError(
                 "FastWAM formal execution profiles require shard-invariant "
-                "rollout microbatches and reset identities."
+                "rollout microbatches, reset identities, and sampling streams."
             )
         if (
             str(cfg.env.train.env_type) != "libero"

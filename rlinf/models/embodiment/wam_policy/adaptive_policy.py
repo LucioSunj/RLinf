@@ -16,6 +16,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import math
 import time
 from collections.abc import Mapping
@@ -132,6 +133,7 @@ class FastWAMAdaptivePolicyConfig:
     eval_microbatch_size: int = 1
     eval_timing_cuda_synchronize: bool = False
     training_rollout_microbatch_size: int | None = None
+    formal_training_sampling_seed: int | None = None
     kv_replay: GateKVReplayConfig = field(default_factory=GateKVReplayConfig)
 
     def __post_init__(self) -> None:
@@ -154,6 +156,16 @@ class FastWAMAdaptivePolicyConfig:
             if training_microbatch < 1:
                 raise ValueError(
                     "`training_rollout_microbatch_size` must be positive or null."
+                )
+        sampling_seed = self.formal_training_sampling_seed
+        if sampling_seed is not None:
+            if isinstance(sampling_seed, bool) or not isinstance(sampling_seed, int):
+                raise TypeError(
+                    "`formal_training_sampling_seed` must be an integer or null."
+                )
+            if sampling_seed < 0:
+                raise ValueError(
+                    "`formal_training_sampling_seed` must be non-negative or null."
                 )
         evaluation = self.evaluation_routing
         object.__setattr__(self, "eval_routing_mode", evaluation.mode)
@@ -198,6 +210,31 @@ def _column_values(values: torch.Tensor, *, batch_size: int) -> torch.Tensor:
         "FastWAM critic values must have shape [B] or [B, 1], got "
         f"{tuple(values.shape)} for batch size {batch_size}."
     )
+
+
+def _formal_training_sample_seed(
+    *,
+    base_seed: int,
+    domain: str,
+    environment_id: int,
+    episode_id: int,
+    chunk_id: int,
+    actor_version: int,
+) -> int:
+    """Derive one stage-independent local seed for formal training sampling."""
+
+    payload = b"\0".join(
+        (
+            b"fastwam-formal-training-sampling-v1",
+            str(int(base_seed)).encode("ascii"),
+            str(domain).encode("utf-8"),
+            str(int(environment_id)).encode("ascii"),
+            str(int(episode_id)).encode("ascii"),
+            str(int(chunk_id)).encode("ascii"),
+            str(int(actor_version)).encode("ascii"),
+        )
+    )
+    return int.from_bytes(hashlib.sha256(payload).digest()[:8], "big") & ((1 << 63) - 1)
 
 
 class FastWAMAdaptivePolicy(nn.Module, BasePolicy):
@@ -352,13 +389,37 @@ class FastWAMAdaptivePolicy(nn.Module, BasePolicy):
         self,
         *,
         logits: torch.Tensor,
+        sampling_seeds: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         behavior = epsilon_mixture_bernoulli(
             logits,
             temperature=self.config.gate_temperature,
             epsilon=self.config.gate_epsilon,
         )
-        route = behavior.sample()
+        if sampling_seeds is None:
+            route = behavior.sample()
+        else:
+            seeds = torch.as_tensor(sampling_seeds, device="cpu", dtype=torch.long)
+            if seeds.shape != logits.shape:
+                raise ValueError(
+                    "Formal Gate sampling seeds must match Gate logits: "
+                    f"{tuple(seeds.shape)} != {tuple(logits.shape)}."
+                )
+            routes = []
+            for probability, seed in zip(
+                behavior.behavior_idm_probability.reshape(-1),
+                seeds.reshape(-1),
+                strict=True,
+            ):
+                generator = torch.Generator(device=probability.device)
+                generator.manual_seed(int(seed.item()))
+                routes.append(
+                    torch.bernoulli(
+                        probability.reshape(1),
+                        generator=generator,
+                    )
+                )
+            route = torch.cat(routes).reshape_as(logits).to(dtype=torch.long)
         logprob = behavior.log_prob(route)
         return (
             route,
@@ -366,6 +427,48 @@ class FastWAMAdaptivePolicy(nn.Module, BasePolicy):
             behavior.behavior_idm_probability,
             logprob,
         )
+
+    def _formal_training_sampling_seeds(
+        self,
+        *,
+        env_ids: torch.Tensor,
+        route_info: ChunkRouteRecord,
+    ) -> dict[str, torch.Tensor] | None:
+        """Build per-sample RNG streams that are invariant to stage sharding."""
+
+        base_seed = self.config.formal_training_sampling_seed
+        if base_seed is None:
+            return None
+        metadata = (
+            env_ids.detach().cpu().reshape(-1),
+            route_info.episode_ids.detach().cpu().reshape(-1),
+            route_info.chunk_ids.detach().cpu().reshape(-1),
+        )
+        if len({int(values.numel()) for values in metadata}) != 1:
+            raise ValueError("Formal training sampling metadata batch sizes differ.")
+        environments, episodes, chunks = metadata
+        result: dict[str, torch.Tensor] = {}
+        for domain in ("action", "idm", "gate"):
+            result[domain] = torch.tensor(
+                [
+                    _formal_training_sample_seed(
+                        base_seed=base_seed,
+                        domain=domain,
+                        environment_id=int(environment_id),
+                        episode_id=int(episode_id),
+                        chunk_id=int(chunk_id),
+                        actor_version=self.actor_version,
+                    )
+                    for environment_id, episode_id, chunk_id in zip(
+                        environments.tolist(),
+                        episodes.tolist(),
+                        chunks.tolist(),
+                        strict=True,
+                    )
+                ],
+                dtype=torch.long,
+            )
+        return result
 
     def _evaluation_gate_decision(
         self,
@@ -692,8 +795,25 @@ class FastWAMAdaptivePolicy(nn.Module, BasePolicy):
                 env_ids=env_ids,
             )
 
+        sampling_seeds = self._formal_training_sampling_seeds(
+            env_ids=env_ids,
+            route_info=route_info,
+        )
+        runtime_env_obs = env_obs
+        if sampling_seeds is not None:
+            seed_fields = {
+                "_fastwam_action_noise_seeds": sampling_seeds["action"],
+                "_fastwam_idm_noise_seeds": sampling_seeds["idm"],
+            }
+            collisions = sorted(set(env_obs).intersection(seed_fields))
+            if collisions:
+                raise ValueError(
+                    "Formal training refuses caller-supplied sampling seeds: "
+                    f"{collisions}."
+                )
+            runtime_env_obs = {**env_obs, **seed_fields}
         sample = self.runtime.sample_action_batch(
-            env_obs=env_obs,
+            env_obs=runtime_env_obs,
             routes=route_info.route_used,
             mode=mode,
             actor_version=self.actor_version,
@@ -701,7 +821,12 @@ class FastWAMAdaptivePolicy(nn.Module, BasePolicy):
         )
         logits = self.gate(sample.gate_snapshots)
         next_route, base_probability, behavior_probability, gate_logprob = (
-            self._training_gate_decision(logits=logits)
+            self._training_gate_decision(
+                logits=logits,
+                sampling_seeds=(
+                    None if sampling_seeds is None else sampling_seeds["gate"]
+                ),
+            )
         )
         self.route_tracker.emit(
             env_ids=env_ids,
