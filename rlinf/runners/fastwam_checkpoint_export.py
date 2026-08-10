@@ -76,7 +76,7 @@ def validate_initial_checkpoint_export_config(
     *,
     actor_world_size: int,
 ) -> Path:
-    """Validate the fixed E4 bootstrap checkpoint profile."""
+    """Validate a fixed native step-zero checkpoint export profile."""
 
     output_value = OmegaConf.select(
         cfg,
@@ -91,7 +91,37 @@ def validate_initial_checkpoint_export_config(
         "fastwam_adaptive"
     ):
         raise ValueError("Step-zero export requires fastwam_adaptive.")
-    if int(actor_world_size) != 1:
+    p8_formal_export = bool(
+        OmegaConf.select(
+            cfg,
+            "runner.p8_formal_stage2_endpoint",
+            default=False,
+        )
+    )
+    if p8_formal_export:
+        if (
+            str(
+                OmegaConf.select(
+                    cfg,
+                    "runner.p8_formal_stage2_mode",
+                    default="",
+                )
+            )
+            != "step_zero_export"
+        ):
+            raise ValueError(
+                "P8 formal step-zero export requires "
+                "runner.p8_formal_stage2_mode=step_zero_export."
+            )
+        if int(actor_world_size) != 2:
+            raise ValueError(
+                "P8 formal step-zero export requires exactly two actor ranks."
+            )
+        if OmegaConf.select(cfg, "runner.ckpt_path", default=None) is not None:
+            raise ValueError("P8 formal step-zero export forbids runner.ckpt_path.")
+        if _resolve_uncond_lora_bootstrap(cfg) is not None:
+            raise ValueError("P8 formal step-zero export requires a zero LoRA.")
+    elif int(actor_world_size) != 1:
         raise ValueError("Step-zero export requires exactly one actor rank.")
 
     num_layers = int(
@@ -127,7 +157,8 @@ def validate_initial_checkpoint_export_config(
         is not None
     ):
         raise ValueError("E4 all-layer export forbids layer subset arguments.")
-    _resolve_uncond_lora_bootstrap(cfg)
+    if not p8_formal_export:
+        _resolve_uncond_lora_bootstrap(cfg)
     return Path(str(output_value)).expanduser().resolve()
 
 

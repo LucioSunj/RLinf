@@ -143,6 +143,42 @@ def test_initial_checkpoint_export_requires_one_actor_rank(tmp_path: Path) -> No
         )
 
 
+def test_p8_formal_step_zero_export_requires_two_actor_ranks(
+    tmp_path: Path,
+) -> None:
+    cfg = _cfg(tmp_path / "formal-step-zero")
+    cfg.runner.p8_formal_stage2_endpoint = True
+    cfg.runner.p8_formal_stage2_mode = "step_zero_export"
+    cfg.runner.ckpt_path = None
+
+    validate_initial_checkpoint_export_config(cfg, actor_world_size=2)
+
+    with pytest.raises(ValueError, match="exactly two actor ranks"):
+        validate_initial_checkpoint_export_config(cfg, actor_world_size=1)
+
+    cfg.runner.p8_formal_stage2_mode = "training"
+    with pytest.raises(ValueError, match="step_zero_export"):
+        validate_initial_checkpoint_export_config(cfg, actor_world_size=2)
+
+
+def test_p8_formal_step_zero_export_rejects_nonzero_lora(
+    tmp_path: Path,
+) -> None:
+    sidecar = tmp_path / "sidecar.pt"
+    sidecar.write_bytes(b"nonzero")
+    cfg = _cfg(tmp_path / "formal-step-zero")
+    cfg.runner.p8_formal_stage2_endpoint = True
+    cfg.runner.p8_formal_stage2_mode = "step_zero_export"
+    cfg.runner.ckpt_path = None
+    cfg.runner.bootstrap_uncond_lora_sidecar = str(sidecar)
+    cfg.runner.bootstrap_uncond_lora_sidecar_sha256 = hashlib.sha256(
+        sidecar.read_bytes()
+    ).hexdigest()
+
+    with pytest.raises(ValueError, match="zero LoRA"):
+        validate_initial_checkpoint_export_config(cfg, actor_world_size=2)
+
+
 def test_export_explicit_bc_sidecar_loads_before_single_step_zero_save(
     tmp_path: Path,
 ) -> None:

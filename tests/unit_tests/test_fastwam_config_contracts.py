@@ -12,7 +12,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import hashlib
 import importlib.util
+import json
 from pathlib import Path
 
 import pytest
@@ -75,6 +77,14 @@ def test_p8_frozen_gate_endpoints_are_explicit_and_mutually_exclusive() -> None:
         gate_lr=0.0,
         gate_loss_weight=0.0,
     )
+    MODULE.validate_p8_readiness_gate_ownership(
+        p8_enabled=True,
+        gate_trainable=False,
+        readiness_endpoint=False,
+        formal_stage2_endpoint=True,
+        gate_lr=0.0,
+        gate_loss_weight=0.0,
+    )
 
     with pytest.raises(ValueError, match="mutually exclusive"):
         MODULE.validate_p8_readiness_gate_ownership(
@@ -93,6 +103,16 @@ def test_p8_frozen_gate_endpoints_are_explicit_and_mutually_exclusive() -> None:
             stage2_systems_endpoint=True,
             gate_lr=3e-5,
             gate_loss_weight=1.0,
+        )
+    with pytest.raises(ValueError, match="mutually exclusive"):
+        MODULE.validate_p8_readiness_gate_ownership(
+            p8_enabled=True,
+            gate_trainable=False,
+            readiness_endpoint=False,
+            stage2_systems_endpoint=True,
+            formal_stage2_endpoint=True,
+            gate_lr=0.0,
+            gate_loss_weight=0.0,
         )
 
 
@@ -176,6 +196,182 @@ def test_p8_stage2_systems_endpoint_is_distinct_and_fail_closed() -> None:
         invalid[key] = bad_value
         with pytest.raises(ValueError, match="one-update reset-0"):
             MODULE.validate_p8_stage2_systems_endpoint_contract(**invalid)
+
+
+def _write_p8_authorization(output_root: Path) -> str:
+    output_root.mkdir(parents=True)
+    stop_rules = list(MODULE.P8_FORMAL_STOP_RULES)
+    payload = {
+        "schema": "fastwam-p8-formal-training-authorization-v1",
+        "status": "READY-AUTHORIZED",
+        "candidate": "P8-A0/KV",
+        "formal_training_authorized": True,
+        "final_ledger_used": False,
+        "output_root": str(output_root),
+        "authorized_budget": {
+            "runner_steps": 100,
+            "optimizer_updates_per_runner_step": 10,
+            "optimizer_updates": 1000,
+            "environments": 4,
+            "global_batch_size": 28,
+            "seed": 42,
+        },
+        "candidate_evidence_sha256": {
+            "p8": "8" * 64,
+            "p6": "6" * 64,
+            "p7": "7" * 64,
+        },
+        "code_revisions": {
+            "outer": "a" * 40,
+            "FastWAM": "b" * 40,
+            "RLinf": "c" * 40,
+        },
+        "authorization_text_sha256": "d" * 64,
+        "formal_config_sha256": "e" * 64,
+        "asset_manifest_sha256": "f" * 64,
+        "stop_rules": stop_rules,
+        "stop_rules_sha256": MODULE._canonical_sha256(stop_rules),
+        "resource_caps": {
+            "gpu_used_bytes_per_device": 38 * 1024**3,
+            "process_tree_rss_bytes": 128 * 1024**3,
+            "output_bytes": 16 * 1024**3,
+            "minimum_free_fraction": 0.20,
+        },
+    }
+    raw = (json.dumps(payload, sort_keys=True, indent=2) + "\n").encode()
+    (output_root / "formal_training_authorization.json").write_bytes(raw)
+    return hashlib.sha256(raw).hexdigest()
+
+
+def _p8_formal_contract_values(output_root: Path) -> dict[str, object]:
+    authorization_sha256 = _write_p8_authorization(output_root)
+    output_root_value = str(output_root)
+    return {
+        "max_steps": 100,
+        "max_epochs": 100,
+        "save_interval": 10,
+        "optimizer_updates_per_runner_step": 10,
+        "actor_total_training_steps": 1000,
+        "actor_seed": 42,
+        "micro_batch_size": 1,
+        "global_batch_size": 28,
+        "env_seed": 42,
+        "total_num_envs": 4,
+        "task_id_filter": None,
+        "specific_reset_id": None,
+        "use_fixed_reset_state_ids": True,
+        "training_route_override": "forced_uncond_after_initial",
+        "load_text_encoder": False,
+        "formal_training_authorized": True,
+        "authorization_record_path": (
+            f"{output_root_value}/formal_training_authorization.json"
+        ),
+        "authorization_record_sha256": authorization_sha256,
+        "final_ledger_path": None,
+        "replay_backend": "stored_native",
+        "compile_enabled": False,
+        "update_epoch": 1,
+        "precision": "bf16",
+        "storage_dtype": "bfloat16",
+        "refiner_layer_indices": [12],
+        "refiner_query_rank": 32,
+        "refiner_output_rank": 32,
+        "refiner_temperature": 0.07,
+        "refiner_alpha": 1.0,
+        "lora_lr": 1.0e-5,
+        "refiner_lr": 1.0e-5,
+        "refiner_weight_decay": 0.0,
+        "value_lr": 1.0e-4,
+        "component_placement": {"actor": "0-1", "env,rollout": "2-3"},
+        "output_root": output_root_value,
+        "formal_stage2_mode": "training",
+        "checkpoint_path": f"{output_root_value}/step_zero/actor",
+        "bootstrap_checkpoint_dir": None,
+        "resume_dir": None,
+        "checkpoint_keep_last": 2,
+        "checkpoint_atomic": True,
+        "training_guard_enabled": False,
+    }
+
+
+def test_p8_formal_stage2_endpoint_locks_the_authorized_profile(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    output_parent = tmp_path / "p8-formal-training"
+    monkeypatch.setattr(MODULE, "P8_FORMAL_OUTPUT_PARENT", output_parent)
+    values = _p8_formal_contract_values(
+        output_parent / "p8_a0_kv_stage2_seed42_20260810T010203Z_v1"
+    )
+    MODULE.validate_p8_formal_stage2_endpoint_contract(**values)
+
+    for key, bad_value in (
+        ("max_steps", 101),
+        ("save_interval", 20),
+        ("optimizer_updates_per_runner_step", 9),
+        ("global_batch_size", 4),
+        ("task_id_filter", [0]),
+        ("specific_reset_id", 0),
+        ("formal_training_authorized", False),
+        ("authorization_record_path", "relative/authorization.json"),
+        ("authorization_record_sha256", "bad"),
+        ("replay_backend", "recompute_native"),
+        ("compile_enabled", True),
+        ("refiner_layer_indices", [12, 21]),
+        ("lora_lr", 3.0e-5),
+        ("component_placement", {"actor,env,rollout": "all"}),
+        ("checkpoint_keep_last", 3),
+        ("checkpoint_atomic", False),
+        ("final_ledger_path", "/forbidden/final_ledger.json"),
+    ):
+        invalid = dict(values)
+        invalid[key] = bad_value
+        with pytest.raises(ValueError, match="authorized 1000-update"):
+            MODULE.validate_p8_formal_stage2_endpoint_contract(**invalid)
+
+
+def test_p8_formal_step_zero_export_is_separate_from_training_load(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    output_parent = tmp_path / "p8-formal-training"
+    monkeypatch.setattr(MODULE, "P8_FORMAL_OUTPUT_PARENT", output_parent)
+    values = _p8_formal_contract_values(
+        output_parent / "p8_a0_kv_stage2_seed42_20260810T010203Z_v1"
+    )
+    output_root = str(values["output_root"])
+    values.update(
+        {
+            "formal_stage2_mode": "step_zero_export",
+            "checkpoint_path": None,
+            "bootstrap_checkpoint_dir": f"{output_root}/step_zero",
+        }
+    )
+    MODULE.validate_p8_formal_stage2_endpoint_contract(**values)
+
+    values["checkpoint_path"] = f"{output_root}/step_zero/actor"
+    with pytest.raises(ValueError, match="step-zero export"):
+        MODULE.validate_p8_formal_stage2_endpoint_contract(**values)
+
+
+def test_p8_formal_authorization_record_is_content_bound(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    output_parent = tmp_path / "p8-formal-training"
+    monkeypatch.setattr(MODULE, "P8_FORMAL_OUTPUT_PARENT", output_parent)
+    values = _p8_formal_contract_values(
+        output_parent / "p8_a0_kv_stage2_seed42_20260810T010203Z_v1"
+    )
+    record = Path(str(values["authorization_record_path"]))
+    payload = json.loads(record.read_text(encoding="utf-8"))
+    payload["candidate_evidence_sha256"]["p6"] = "forged"
+    raw = (json.dumps(payload, sort_keys=True, indent=2) + "\n").encode()
+    record.write_bytes(raw)
+    values["authorization_record_sha256"] = hashlib.sha256(raw).hexdigest()
+
+    with pytest.raises(ValueError, match="evidence SHA-256"):
+        MODULE.validate_p8_formal_stage2_endpoint_contract(**values)
 
 
 def test_pi05_critic_artifact_config_requires_path_and_hex_digest() -> None:
@@ -311,10 +507,23 @@ def test_p8_checkpoint_contract_binds_frozen_endpoint_without_changing_v1() -> N
         **v1["runner"],
         "p8_readiness_endpoint": False,
         "p8_stage2_systems_endpoint": True,
+        "p8_formal_stage2_endpoint": False,
         "formal_training_authorized": False,
+        "formal_training_authorization_record": None,
+        "formal_training_authorization_sha256": None,
     }
     cfg.runner.p8_stage2_systems_endpoint = False
     assert MODULE.build_fastwam_checkpoint_contract(cfg, world_size=2) != p8
+
+    cfg.runner.p8_formal_stage2_endpoint = True
+    cfg.runner.formal_training_authorized = True
+    cfg.runner.formal_training_authorization_record = "/tmp/authorization.json"
+    cfg.runner.formal_training_authorization_sha256 = "c" * 64
+    cfg.runner.formal_optimizer_updates_per_runner_step = 10
+    formal = MODULE.build_fastwam_checkpoint_contract(cfg, world_size=2)
+    assert formal["runner"]["p8_formal_stage2_endpoint"] is True
+    assert formal["runner"]["formal_training_authorization_sha256"] == "c" * 64
+    assert formal["runner"]["formal_optimizer_updates_per_runner_step"] == 10
 
 
 def test_checkpoint_contract_normalizes_validate_cfg_inserted_defaults() -> None:

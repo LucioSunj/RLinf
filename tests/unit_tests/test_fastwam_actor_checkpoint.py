@@ -41,6 +41,37 @@ class _RouteTracker:
         self.state = copy.deepcopy(state)
 
 
+def test_p8_formal_runner_step_requires_exactly_ten_optimizer_updates() -> None:
+    audit = worker_module._validate_p8_formal_optimizer_geometry(
+        enabled=True,
+        optimizer_steps_before=20,
+        optimizer_steps_after=30,
+        expected_updates=10,
+    )
+
+    assert audit == {
+        "optimizer_steps_before": 20,
+        "optimizer_steps_after": 30,
+        "optimizer_updates": 10,
+    }
+    assert (
+        worker_module._validate_p8_formal_optimizer_geometry(
+            enabled=False,
+            optimizer_steps_before=20,
+            optimizer_steps_after=21,
+            expected_updates=-1,
+        )
+        is None
+    )
+    with pytest.raises(RuntimeError, match="optimizer geometry changed"):
+        worker_module._validate_p8_formal_optimizer_geometry(
+            enabled=True,
+            optimizer_steps_before=20,
+            optimizer_steps_after=29,
+            expected_updates=10,
+        )
+
+
 class _Policy:
     def __init__(self) -> None:
         self.actor_version = 0
@@ -659,3 +690,69 @@ def test_fastwam_actor_bc_bootstrap_requires_pristine_rl_state(
 
     with pytest.raises(ValueError, match=message):
         worker.bootstrap_fastwam_uncond_lora(str(sidecar), digest)
+
+
+def test_frozen_gate_p8_optimizer_metrics_require_only_three_families() -> None:
+    worker = EmbodiedFSDPActor.__new__(EmbodiedFSDPActor)
+    worker.cfg = OmegaConf.create(
+        {
+            "actor": {
+                "model": {
+                    "model_type": "fastwam_adaptive",
+                    "gate_trainable": False,
+                    "uncond_visual_sidecar": {"enabled": True},
+                }
+            }
+        }
+    )
+    worker.optimizer = SimpleNamespace(
+        param_groups=[
+            {"name": "uncond_lora", "lr": 1.0e-5},
+            {"name": "wan_current_refiner", "lr": 1.0e-5},
+            {"name": "value_head", "lr": 1.0e-4},
+        ]
+    )
+
+    metrics = worker._optimizer_metrics(grad_norm=1.25, lr_list=[])
+
+    assert metrics == {
+        "actor/grad_norm": 1.25,
+        "uncond_flow/lora_lr": 1.0e-5,
+        "uncond_flow/refiner_lr": 1.0e-5,
+        "critic/lr": 1.0e-4,
+    }
+
+
+def test_p8_formal_first_update_requires_finite_nonzero_three_family_delta() -> None:
+    before = {
+        "uncond_lora": (torch.zeros(2),),
+        "wan_current_refiner": (torch.zeros(3),),
+        "value_head": (torch.zeros(1),),
+    }
+    after = {
+        name: tuple(tensor + float(index + 1) for tensor in tensors)
+        for index, (name, tensors) in enumerate(before.items())
+    }
+
+    summary = EmbodiedFSDPActor._summarize_p8_formal_optimizer_update(
+        before,
+        after,
+    )
+
+    assert set(summary) == set(before)
+    assert all(item["update_l2_norm"] > 0 for item in summary.values())
+    unchanged = dict(after)
+    unchanged["value_head"] = before["value_head"]
+    with pytest.raises(RuntimeError, match="did not update"):
+        EmbodiedFSDPActor._summarize_p8_formal_optimizer_update(
+            before,
+            unchanged,
+        )
+
+    nonfinite = dict(after)
+    nonfinite["uncond_lora"] = (torch.tensor([float("nan"), 1.0]),)
+    with pytest.raises(FloatingPointError, match="non-finite"):
+        EmbodiedFSDPActor._summarize_p8_formal_optimizer_update(
+            before,
+            nonfinite,
+        )

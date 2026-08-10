@@ -16,6 +16,8 @@
 
 from __future__ import annotations
 
+import json
+import os
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -35,8 +37,9 @@ class _Handle:
 
 
 class _WorkerGroup:
-    def __init__(self, *, loaded_steps=None):
+    def __init__(self, *, loaded_steps=None, save_error: Exception | None = None):
         self.loaded_steps = loaded_steps
+        self.save_error = save_error
         self.calls = []
 
     def init_worker(self):
@@ -49,6 +52,8 @@ class _WorkerGroup:
 
     def save_checkpoint(self, path, step):
         self.calls.append(("save_checkpoint", path, step))
+        if self.save_error is not None:
+            raise self.save_error
         return _Handle()
 
 
@@ -63,6 +68,9 @@ def _runner_cfg(
             "actor": {"model": {"model_type": "fastwam_adaptive"}},
             "runner": {
                 "resume_dir": resume_dir,
+                "p8_formal_stage2_endpoint": False,
+                "checkpoint_atomic": False,
+                "checkpoint_keep_last": None,
                 "fastwam_training_guard": {
                     "enabled": guard_enabled,
                     "zero_success_patience": 3,
@@ -112,6 +120,56 @@ def test_fastwam_save_pairs_actor_and_rollout_checkpoints(tmp_path: Path) -> Non
     assert rollout.calls == [("save_checkpoint", str(checkpoint / "rollout"), 3)]
     assert (checkpoint / "actor").is_dir()
     assert (checkpoint / "rollout").is_dir()
+
+
+def test_p8_formal_checkpoint_save_is_atomic_and_keeps_last_two(
+    tmp_path: Path,
+) -> None:
+    cfg = _runner_cfg(tmp_path)
+    cfg.runner.p8_formal_stage2_endpoint = True
+    cfg.runner.checkpoint_atomic = True
+    cfg.runner.checkpoint_keep_last = 2
+    runner = _bare_runner(cfg, actor=_WorkerGroup(), rollout=_WorkerGroup())
+
+    for step in (10, 20, 30):
+        runner.global_step = step
+        runner._save_checkpoint()
+
+    checkpoints = tmp_path / "l12/checkpoints"
+    assert sorted(path.name for path in checkpoints.iterdir()) == [
+        "global_step_20",
+        "global_step_30",
+    ]
+    for step in (20, 30):
+        marker = checkpoints / f"global_step_{step}/checkpoint_complete.json"
+        assert json.loads(marker.read_text(encoding="utf-8")) == {
+            "schema": "fastwam-p8-formal-checkpoint-complete-v1",
+            "global_step": step,
+        }
+
+
+def test_p8_formal_checkpoint_failure_never_publishes_final_directory(
+    tmp_path: Path,
+) -> None:
+    cfg = _runner_cfg(tmp_path)
+    cfg.runner.p8_formal_stage2_endpoint = True
+    cfg.runner.checkpoint_atomic = True
+    cfg.runner.checkpoint_keep_last = 2
+    runner = _bare_runner(
+        cfg,
+        actor=_WorkerGroup(save_error=RuntimeError("save failed")),
+        rollout=_WorkerGroup(),
+    )
+    runner.global_step = 10
+
+    with pytest.raises(RuntimeError, match="save failed"):
+        runner._save_checkpoint()
+
+    checkpoints = tmp_path / "l12/checkpoints"
+    assert not (checkpoints / "global_step_10").exists()
+    assert [path.name for path in checkpoints.iterdir()] == [
+        f".global_step_10.incomplete-{os.getpid()}"
+    ]
 
 
 def test_worker_global_step_is_awaited_before_training_continues(

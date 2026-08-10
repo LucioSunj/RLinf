@@ -28,6 +28,7 @@ from omegaconf.dictconfig import DictConfig
 from rlinf.config_contracts import (
     validate_fastwam_kv_weight_sync,
     validate_libero_terminal_reward_config,
+    validate_p8_formal_stage2_endpoint_contract,
     validate_p8_readiness_endpoint_contract,
     validate_p8_readiness_gate_ownership,
     validate_p8_stage2_systems_endpoint_contract,
@@ -1086,6 +1087,7 @@ def _validate_fastwam_adaptive_cfg(cfg, *, only_eval: bool) -> None:
     p8_stage2_systems_endpoint = bool(
         cfg.runner.get("p8_stage2_systems_endpoint", False)
     )
+    p8_formal_stage2_endpoint = bool(cfg.runner.get("p8_formal_stage2_endpoint", False))
     validate_p8_readiness_gate_ownership(
         p8_enabled=p8_enabled,
         gate_trainable=actor_model.get("gate_trainable", True),
@@ -1093,6 +1095,7 @@ def _validate_fastwam_adaptive_cfg(cfg, *, only_eval: bool) -> None:
         gate_lr=cfg.actor.optim.get("gate_lr", 0.0),
         gate_loss_weight=cfg.algorithm.gate_ppo.get("loss_weight", 0.0),
         stage2_systems_endpoint=p8_stage2_systems_endpoint,
+        formal_stage2_endpoint=p8_formal_stage2_endpoint,
     )
     if p8_readiness_endpoint:
         validate_p8_readiness_endpoint_contract(
@@ -1139,6 +1142,76 @@ def _validate_fastwam_adaptive_cfg(cfg, *, only_eval: bool) -> None:
             replay_backend=p8_replay.get("backend", ""),
             compile_enabled=actor_model.uncond_visual_sidecar.get("compile", True),
             route_seed=cfg.runner.get("l11_route_seed", -1),
+        )
+    if p8_formal_stage2_endpoint:
+        p8_replay = actor_model.uncond_visual_sidecar.get("replay", {})
+        validate_p8_formal_stage2_endpoint_contract(
+            max_steps=cfg.runner.get("max_steps", -1),
+            max_epochs=cfg.runner.get("max_epochs", -1),
+            save_interval=cfg.runner.get("save_interval", -1),
+            optimizer_updates_per_runner_step=cfg.runner.get(
+                "formal_optimizer_updates_per_runner_step", -1
+            ),
+            actor_total_training_steps=cfg.actor.optim.get("total_training_steps", -1),
+            actor_seed=cfg.actor.get("seed", -1),
+            micro_batch_size=cfg.actor.get("micro_batch_size", -1),
+            global_batch_size=cfg.actor.get("global_batch_size", -1),
+            env_seed=cfg.env.train.get("seed", -1),
+            total_num_envs=cfg.env.train.get("total_num_envs", -1),
+            task_id_filter=cfg.env.train.get("task_id_filter"),
+            specific_reset_id=cfg.env.train.get("specific_reset_id"),
+            use_fixed_reset_state_ids=cfg.env.train.get(
+                "use_fixed_reset_state_ids", False
+            ),
+            training_route_override=actor_model.get("training_route_override", "none"),
+            load_text_encoder=actor_model.fastwam.get("load_text_encoder", True),
+            formal_training_authorized=cfg.runner.get(
+                "formal_training_authorized", False
+            ),
+            authorization_record_path=cfg.runner.get(
+                "formal_training_authorization_record"
+            ),
+            authorization_record_sha256=cfg.runner.get(
+                "formal_training_authorization_sha256"
+            ),
+            final_ledger_path=cfg.runner.get("final_ledger_path"),
+            replay_backend=p8_replay.get("backend", ""),
+            compile_enabled=actor_model.uncond_visual_sidecar.get("compile", True),
+            update_epoch=cfg.algorithm.get("update_epoch", -1),
+            precision=actor_model.get("precision", ""),
+            storage_dtype=p8_replay.get("storage_dtype", ""),
+            refiner_layer_indices=actor_model.uncond_visual_sidecar.refiner.get(
+                "layer_indices", []
+            ),
+            refiner_query_rank=actor_model.uncond_visual_sidecar.refiner.get(
+                "query_rank", -1
+            ),
+            refiner_output_rank=actor_model.uncond_visual_sidecar.refiner.get(
+                "output_rank", -1
+            ),
+            refiner_temperature=actor_model.uncond_visual_sidecar.refiner.get(
+                "temperature", float("nan")
+            ),
+            refiner_alpha=actor_model.uncond_visual_sidecar.refiner.get(
+                "alpha", float("nan")
+            ),
+            lora_lr=cfg.actor.optim.get("lora_lr", float("nan")),
+            refiner_lr=cfg.actor.optim.get("refiner_lr", float("nan")),
+            refiner_weight_decay=cfg.actor.optim.get(
+                "refiner_weight_decay", float("nan")
+            ),
+            value_lr=cfg.actor.optim.get("value_lr", float("nan")),
+            component_placement=cfg.cluster.get("component_placement", {}),
+            output_root=cfg.runner.logger.get("log_path"),
+            formal_stage2_mode=cfg.runner.get("p8_formal_stage2_mode", ""),
+            checkpoint_path=cfg.runner.get("ckpt_path"),
+            bootstrap_checkpoint_dir=cfg.runner.get("bootstrap_project_checkpoint_dir"),
+            resume_dir=cfg.runner.get("resume_dir"),
+            checkpoint_keep_last=cfg.runner.get("checkpoint_keep_last", -1),
+            checkpoint_atomic=cfg.runner.get("checkpoint_atomic", False),
+            training_guard_enabled=cfg.runner.get("fastwam_training_guard", {}).get(
+                "enabled", False
+            ),
         )
     for path in (
         "actor.optim.lora_lr",

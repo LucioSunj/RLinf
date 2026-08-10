@@ -14,6 +14,7 @@
 
 import hashlib
 import importlib.util
+import json
 import sys
 from pathlib import Path
 from types import SimpleNamespace
@@ -22,6 +23,8 @@ import pytest
 import torch.nn as nn
 from hydra import compose, initialize_config_dir
 from omegaconf import OmegaConf, open_dict
+
+from rlinf import config_contracts
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 CONFIG_ROOT = REPO_ROOT / "examples/embodiment/config"
@@ -42,6 +45,51 @@ def _load_builder_package():
 
 
 _builder = _load_builder_package()
+
+
+def _write_p8_formal_authorization(output_root: Path) -> str:
+    output_root.mkdir(parents=True)
+    stop_rules = list(config_contracts.P8_FORMAL_STOP_RULES)
+    payload = {
+        "schema": "fastwam-p8-formal-training-authorization-v1",
+        "status": "READY-AUTHORIZED",
+        "candidate": "P8-A0/KV",
+        "formal_training_authorized": True,
+        "final_ledger_used": False,
+        "output_root": str(output_root),
+        "authorized_budget": {
+            "runner_steps": 100,
+            "optimizer_updates_per_runner_step": 10,
+            "optimizer_updates": 1000,
+            "environments": 4,
+            "global_batch_size": 28,
+            "seed": 42,
+        },
+        "candidate_evidence_sha256": {
+            "p8": "8" * 64,
+            "p6": "6" * 64,
+            "p7": "7" * 64,
+        },
+        "code_revisions": {
+            "outer": "a" * 40,
+            "FastWAM": "b" * 40,
+            "RLinf": "c" * 40,
+        },
+        "authorization_text_sha256": "d" * 64,
+        "formal_config_sha256": "e" * 64,
+        "asset_manifest_sha256": "f" * 64,
+        "stop_rules": stop_rules,
+        "stop_rules_sha256": config_contracts._canonical_sha256(stop_rules),
+        "resource_caps": {
+            "gpu_used_bytes_per_device": 38 * 1024**3,
+            "process_tree_rss_bytes": 128 * 1024**3,
+            "output_bytes": 16 * 1024**3,
+            "minimum_free_fraction": 0.20,
+        },
+    }
+    raw = (json.dumps(payload, sort_keys=True, indent=2) + "\n").encode()
+    (output_root / "formal_training_authorization.json").write_bytes(raw)
+    return hashlib.sha256(raw).hexdigest()
 
 
 def _critic_config():
@@ -318,6 +366,84 @@ def test_p8_stage2_systems_profile_passes_production_config_guard(monkeypatch) -
 
     _validate_fastwam_adaptive_cfg(cfg, only_eval=False)
     cfg.runner.p8_readiness_endpoint = True
+    with pytest.raises(ValueError, match="mutually exclusive"):
+        _validate_fastwam_adaptive_cfg(cfg, only_eval=False)
+
+
+def test_p8_formal_stage2_profile_is_distinct_and_fully_bound(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    from rlinf import config_contracts
+    from rlinf.config import _validate_fastwam_adaptive_cfg
+
+    output_parent = tmp_path / "p8-formal-training"
+    output_root = output_parent / "p8_a0_kv_stage2_seed42_20260810T010203Z_v1"
+    authorization_sha256 = _write_p8_formal_authorization(output_root)
+    monkeypatch.setattr(
+        config_contracts,
+        "P8_FORMAL_OUTPUT_PARENT",
+        output_parent,
+    )
+    monkeypatch.setenv("EMBODIED_PATH", str(REPO_ROOT / "examples/embodiment"))
+    monkeypatch.setenv("FASTWAM_CHECKPOINT", "/tmp/fastwam.pt")
+    monkeypatch.setenv("FASTWAM_CHECKPOINT_SHA256", "a" * 64)
+    monkeypatch.setenv("FASTWAM_DATASET_STATS", "/tmp/dataset_stats.json")
+    monkeypatch.setenv("PI05_CRITIC_CHECKPOINT", "/tmp/pi05")
+    monkeypatch.setenv("PI05_CRITIC_CHECKPOINT_SHA256", "b" * 64)
+    monkeypatch.setenv("FASTWAM_DINOV3_SOURCE_ROOT", "/tmp/dinov3")
+    monkeypatch.setenv("FASTWAM_DINOV3_WEIGHTS", "/tmp/dinov3.safetensors")
+    monkeypatch.setenv("FASTWAM_TEXT_EMBEDDING_CACHE", "/tmp/text-cache")
+    monkeypatch.setenv("P8_FORMAL_OUTPUT_ROOT", str(output_root))
+    monkeypatch.setenv(
+        "P8_FORMAL_AUTHORIZATION_RECORD",
+        str(output_root / "formal_training_authorization.json"),
+    )
+    monkeypatch.setenv("P8_FORMAL_AUTHORIZATION_SHA256", authorization_sha256)
+    monkeypatch.setenv(
+        "P8_FORMAL_STEP_ZERO_CHECKPOINT",
+        str(output_root / "step_zero"),
+    )
+
+    with initialize_config_dir(version_base=None, config_dir=str(CONFIG_ROOT)):
+        cfg = compose(config_name="libero_10_ppo_fastwam_adaptive_p8_stage2_formal")
+
+    _validate_fastwam_adaptive_cfg(cfg, only_eval=False)
+    assert cfg.runner.p8_formal_stage2_endpoint is True
+    assert cfg.runner.p8_formal_stage2_mode == "training"
+    assert cfg.runner.p8_readiness_endpoint is False
+    assert cfg.runner.p8_stage2_systems_endpoint is False
+    assert cfg.runner.formal_training_authorized is True
+    assert cfg.runner.final_ledger_path is None
+    assert cfg.runner.logger.log_path == str(output_root)
+    assert cfg.runner.ckpt_path == f"{output_root}/step_zero/actor"
+    assert cfg.runner.bootstrap_project_checkpoint_dir is None
+    assert cfg.runner.checkpoint_keep_last == 2
+    assert cfg.runner.checkpoint_atomic is True
+    assert cfg.runner.formal_optimizer_updates_per_runner_step == 10
+    assert cfg.cluster.component_placement == {
+        "actor": "0-1",
+        "env,rollout": "2-3",
+    }
+    assert cfg.env.train.total_num_envs == 4
+    assert cfg.actor.global_batch_size == 28
+    assert cfg.actor.micro_batch_size == 1
+    assert cfg.actor.optim.total_training_steps == 1000
+    assert cfg.actor.model.gate_trainable is False
+    assert cfg.actor.model.fastwam.load_text_encoder is False
+    assert cfg.actor.model.uncond_visual_sidecar.refiner.layer_indices == [12]
+
+    export_cfg = OmegaConf.create(OmegaConf.to_container(cfg, resolve=True))
+    with open_dict(export_cfg):
+        export_cfg.runner.p8_formal_stage2_mode = "step_zero_export"
+        export_cfg.runner.ckpt_path = None
+        export_cfg.runner.bootstrap_project_checkpoint_dir = str(
+            output_root / "step_zero"
+        )
+    _validate_fastwam_adaptive_cfg(export_cfg, only_eval=False)
+
+    with open_dict(cfg):
+        cfg.runner.p8_readiness_endpoint = True
     with pytest.raises(ValueError, match="mutually exclusive"):
         _validate_fastwam_adaptive_cfg(cfg, only_eval=False)
 

@@ -16,6 +16,8 @@ import json
 import logging
 import os
 import queue
+import re
+import shutil
 import threading
 import time
 from collections import defaultdict
@@ -685,19 +687,157 @@ class EmbodiedRunner:
 
     def _save_checkpoint(self):
         self.logger.info(f"Saving checkpoint at step {self.global_step}.")
-        base_output_dir = os.path.join(
+        checkpoints_root = Path(
             self.cfg.runner.logger.log_path,
             self.cfg.runner.logger.experiment_name,
-            f"checkpoints/global_step_{self.global_step}",
+            "checkpoints",
         )
-        actor_save_path = os.path.join(base_output_dir, "actor")
-        rollout_save_path = os.path.join(base_output_dir, "rollout")
-        os.makedirs(actor_save_path, exist_ok=True)
-        os.makedirs(rollout_save_path, exist_ok=True)
-        self.actor.save_checkpoint(actor_save_path, self.global_step).wait()
+        final_dir = checkpoints_root / f"global_step_{self.global_step}"
+        formal_atomic = bool(
+            self.cfg.runner.get("p8_formal_stage2_endpoint", False)
+        ) and bool(self.cfg.runner.get("checkpoint_atomic", False))
+        if formal_atomic:
+            checkpoints_root.mkdir(parents=True, exist_ok=True)
+            stale = sorted(
+                path.name
+                for path in checkpoints_root.iterdir()
+                if path.name.startswith(".global_step_")
+            )
+            if stale:
+                raise RuntimeError(
+                    "P8 formal checkpoint root contains an incomplete mutation: "
+                    f"{stale}."
+                )
+            if final_dir.exists() or final_dir.is_symlink():
+                raise FileExistsError(
+                    f"P8 formal checkpoint already exists: {final_dir}"
+                )
+            base_output_dir = checkpoints_root / (
+                f".global_step_{self.global_step}.incomplete-{os.getpid()}"
+            )
+        else:
+            base_output_dir = final_dir
+
+        actor_save_path = base_output_dir / "actor"
+        rollout_save_path = base_output_dir / "rollout"
+        actor_save_path.mkdir(parents=True, exist_ok=not formal_atomic)
+        rollout_save_path.mkdir(parents=True, exist_ok=not formal_atomic)
+        self.actor.save_checkpoint(str(actor_save_path), self.global_step).wait()
         if str(self.cfg.actor.model.model_type) == "fastwam_adaptive":
-            self.rollout.save_checkpoint(rollout_save_path, self.global_step).wait()
-        self._save_fastwam_training_guard(base_output_dir)
+            self.rollout.save_checkpoint(
+                str(rollout_save_path), self.global_step
+            ).wait()
+        self._save_fastwam_training_guard(str(base_output_dir))
+        if formal_atomic:
+            self._commit_and_retain_p8_formal_checkpoint(
+                staging_dir=base_output_dir,
+                final_dir=final_dir,
+                checkpoints_root=checkpoints_root,
+            )
+
+    @staticmethod
+    def _fsync_checkpoint_tree(root: Path) -> None:
+        for path in sorted(root.rglob("*")):
+            if path.is_symlink():
+                raise RuntimeError(
+                    f"P8 formal checkpoint may not contain symlinks: {path}"
+                )
+            if path.is_file():
+                descriptor = os.open(path, os.O_RDONLY)
+                try:
+                    os.fsync(descriptor)
+                finally:
+                    os.close(descriptor)
+        for path in sorted(
+            (item for item in root.rglob("*") if item.is_dir()),
+            key=lambda item: len(item.parts),
+            reverse=True,
+        ):
+            descriptor = os.open(path, os.O_RDONLY | os.O_DIRECTORY)
+            try:
+                os.fsync(descriptor)
+            finally:
+                os.close(descriptor)
+        root_descriptor = os.open(root, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            os.fsync(root_descriptor)
+        finally:
+            os.close(root_descriptor)
+
+    def _commit_and_retain_p8_formal_checkpoint(
+        self,
+        *,
+        staging_dir: Path,
+        final_dir: Path,
+        checkpoints_root: Path,
+    ) -> None:
+        marker = staging_dir / "checkpoint_complete.json"
+        marker_payload = {
+            "schema": "fastwam-p8-formal-checkpoint-complete-v1",
+            "global_step": int(self.global_step),
+        }
+        with marker.open("x", encoding="utf-8") as stream:
+            json.dump(marker_payload, stream, sort_keys=True, indent=2)
+            stream.write("\n")
+            stream.flush()
+            os.fsync(stream.fileno())
+        self._fsync_checkpoint_tree(staging_dir)
+        os.replace(staging_dir, final_dir)
+        root_descriptor = os.open(
+            checkpoints_root,
+            os.O_RDONLY | os.O_DIRECTORY,
+        )
+        try:
+            os.fsync(root_descriptor)
+        finally:
+            os.close(root_descriptor)
+        self._retain_p8_formal_checkpoints(checkpoints_root)
+
+    def _retain_p8_formal_checkpoints(self, checkpoints_root: Path) -> None:
+        keep_last = int(self.cfg.runner.get("checkpoint_keep_last", -1))
+        if keep_last != 2:
+            raise ValueError("P8 formal checkpoint retention must keep exactly two.")
+        pattern = re.compile(r"^global_step_([0-9]+)$")
+        completed: list[tuple[int, Path]] = []
+        for path in checkpoints_root.iterdir():
+            match = pattern.fullmatch(path.name)
+            if match is None:
+                if path.name.startswith(".global_step_"):
+                    raise RuntimeError(
+                        "P8 formal checkpoint root contains an incomplete mutation: "
+                        f"{path.name}."
+                    )
+                continue
+            if path.is_symlink() or not path.is_dir():
+                raise RuntimeError(f"Unsafe P8 formal checkpoint path: {path}")
+            step = int(match.group(1))
+            marker = path / "checkpoint_complete.json"
+            with marker.open("r", encoding="utf-8") as stream:
+                payload = json.load(stream)
+            if payload != {
+                "schema": "fastwam-p8-formal-checkpoint-complete-v1",
+                "global_step": step,
+            }:
+                raise RuntimeError(
+                    f"P8 formal checkpoint completion marker is invalid: {path}"
+                )
+            completed.append((step, path))
+        for step, path in sorted(completed)[:-keep_last]:
+            tombstone = checkpoints_root / f".global_step_{step}.prune-{os.getpid()}"
+            if tombstone.exists() or tombstone.is_symlink():
+                raise RuntimeError(
+                    f"P8 formal checkpoint prune target already exists: {tombstone}"
+                )
+            os.replace(path, tombstone)
+            shutil.rmtree(tombstone)
+        root_descriptor = os.open(
+            checkpoints_root,
+            os.O_RDONLY | os.O_DIRECTORY,
+        )
+        try:
+            os.fsync(root_descriptor)
+        finally:
+            os.close(root_descriptor)
 
     def set_max_steps(self):
         self.num_steps_per_epoch = 1

@@ -1,0 +1,53 @@
+defaults:
+  - fastwam_adaptive
+  - _self_
+
+# Separately authorized P8-A0/KV fixed-route Stage2 profile.  This file is
+# intentionally distinct from the bounded two-update readiness profile.
+runtime:
+  text_embedding_cache_dir: ${oc.env:FASTWAM_TEXT_EMBEDDING_CACHE}
+
+fastwam:
+  load_text_encoder: false
+
+gate_trainable: false
+training_route_override: forced_uncond_after_initial
+
+uncond_visual_sidecar:
+  type: dinov3_guided_wan_current_refinement
+  enabled: true
+  compile: false
+  enabled_regimes: [uncond]
+  dino:
+    source_root: ${oc.env:FASTWAM_DINOV3_SOURCE_ROOT}
+    source_revision: 6876159a11b4df116f30f667f8c9888617df0751
+    model_name: dinov3_vits16
+    weights_path: ${oc.env:FASTWAM_DINOV3_WEIGHTS}
+    weights_sha256: 4610ad75edef83e75afdebf162d148dc628045ea6cbb83d67d4708c709c4f91d
+    preprocess_sha256: 0a70d846042c4bb29893ead5d9433e97d1ec5089875704e472dd821632e24dc0
+    output_contract_sha256: 631bb13876a3e9c79476eb1ac089bced12aae93302f117cfeb106dd8acfe9f18
+    compute_dtype: bfloat16
+    license_id: DINOv3 License
+  refiner:
+    wan_hidden_dim: 3072
+    native_dim: 384
+    layer_indices: [12]
+    query_rank: 32
+    output_rank: 32
+    temperature: 0.07
+    alpha: 1.0
+    memory_contract_sha256: a6944c42efe5965a9b74ba158e84bb6d3c6cc11e3e33d6313d67c7b54dea49fd
+    source_contract_sha256: a25b6fe0e8207426f62d922f56af3211d7d27f4638f01692444df7b7241d75e5
+  replay:
+    backend: stored_native
+    storage_dtype: bfloat16
+    pin_memory: true
+    max_bytes_per_sample: 33554432
+    max_aggregate_bytes: 268435456
+    max_combined_gate_plus_p8_bytes_per_sample: 268435456
+    max_combined_gate_plus_p8_aggregate_bytes: 2147483648
+    fail_closed: true
+  camera_ids: [main, wrist]
+  camera_input_contract_sha256: 336d06c39a488c89b1404154b6ed8a9ee25969507611d8b06b884f8c2945e8e7
+  license_record_sha256: f1c95809b02025175eda20ca0af3168e60b86603cd3614d8631e5e12c66039e8
+  fixed_cost_profile_sha256: 6349872a6f9654eb68874c0673a48c558add180933718aa0e76bd47906390d5c

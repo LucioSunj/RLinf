@@ -165,6 +165,36 @@ _FASTWAM_BC_BOOTSTRAP_KEYS = {
     "sidecar_sha256",
     "parent_checkpoint_sha256",
 }
+FASTWAM_P8_FORMAL_FIRST_UPDATE_SENTINEL = "FASTWAM_P8_FORMAL_FIRST_UPDATE_AUDIT"
+FASTWAM_P8_FORMAL_STEP_SENTINEL = "FASTWAM_P8_FORMAL_RUNNER_STEP_AUDIT"
+
+
+def _validate_p8_formal_optimizer_geometry(
+    *,
+    enabled: bool,
+    optimizer_steps_before: int,
+    optimizer_steps_after: int,
+    expected_updates: int,
+) -> dict[str, int] | None:
+    """Require exactly ten optimizer updates per formal P8 runner step."""
+
+    if not enabled:
+        return None
+    before = int(optimizer_steps_before)
+    after = int(optimizer_steps_after)
+    expected = int(expected_updates)
+    observed = after - before
+    if expected != 10 or observed != expected:
+        raise RuntimeError(
+            "P8 formal runner-step optimizer geometry changed: "
+            f"before={before}, after={after}, observed={observed}, "
+            f"expected={expected}."
+        )
+    return {
+        "optimizer_steps_before": before,
+        "optimizer_steps_after": after,
+        "optimizer_updates": observed,
+    }
 
 
 def _fastwam_sha256_file(path: str) -> str:
@@ -1414,18 +1444,125 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
             "Could not unwrap the FastWAM adaptive policy from its FSDP wrapper."
         )
 
-    def _capture_fastwam_gate_parameters(self) -> dict[str, torch.Tensor]:
-        """Clone trainable Gate parameters to CPU for an audit-only delta."""
+    def _capture_fastwam_gate_parameters(
+        self,
+        *,
+        require_trainable: bool = True,
+    ) -> dict[str, torch.Tensor]:
+        """Clone Gate parameters to CPU for an audit-only delta."""
 
         gate = self._fastwam_policy_module().gate
         state = {
             name: parameter.detach().cpu().contiguous().clone()
             for name, parameter in gate.named_parameters()
-            if parameter.requires_grad
+            if parameter.requires_grad or not require_trainable
         }
         if not state:
-            raise RuntimeError("FastWAM Gate update audit found no trainable tensors.")
+            qualifier = "trainable " if require_trainable else ""
+            raise RuntimeError(
+                f"FastWAM Gate update audit found no {qualifier}tensors."
+            )
         return state
+
+    def _capture_p8_formal_optimizer_parameters(
+        self,
+    ) -> dict[str, tuple[torch.Tensor, ...]]:
+        expected = {"uncond_lora", "wan_current_refiner", "value_head"}
+        observed = {str(group.get("name")) for group in self.optimizer.param_groups}
+        if observed != expected:
+            raise RuntimeError(
+                "P8 formal optimizer families changed before the first update: "
+                f"{sorted(observed)}."
+            )
+        return {
+            str(group["name"]): tuple(
+                parameter.detach().cpu().contiguous().clone()
+                for parameter in group["params"]
+            )
+            for group in self.optimizer.param_groups
+        }
+
+    @staticmethod
+    def _summarize_p8_formal_optimizer_update(
+        before: dict[str, tuple[torch.Tensor, ...]],
+        after: dict[str, tuple[torch.Tensor, ...]],
+    ) -> dict[str, dict[str, float | int]]:
+        if set(before) != set(after):
+            raise RuntimeError("P8 formal optimizer families changed during update.")
+        result: dict[str, dict[str, float | int]] = {}
+        for family in sorted(before):
+            before_tensors = before[family]
+            after_tensors = after[family]
+            if len(before_tensors) != len(after_tensors) or not before_tensors:
+                raise RuntimeError(
+                    f"P8 formal optimizer family {family!r} changed tensor count."
+                )
+            update_square_sum = 0.0
+            update_max_abs = 0.0
+            parameter_count = 0
+            for before_tensor, after_tensor in zip(before_tensors, after_tensors):
+                if (
+                    before_tensor.shape != after_tensor.shape
+                    or before_tensor.dtype != after_tensor.dtype
+                ):
+                    raise RuntimeError(
+                        f"P8 formal optimizer family {family!r} changed metadata."
+                    )
+                update = after_tensor.float() - before_tensor.float()
+                if not bool(torch.isfinite(update).all().item()):
+                    raise FloatingPointError(
+                        f"P8 formal optimizer family {family!r} has a non-finite update."
+                    )
+                parameter_count += int(update.numel())
+                update_square_sum += float(
+                    update.square().to(torch.float64).sum().item()
+                )
+                if update.numel():
+                    update_max_abs = max(
+                        update_max_abs,
+                        float(update.abs().max().item()),
+                    )
+            update_l2_norm = math.sqrt(update_square_sum)
+            if update_l2_norm <= 0.0 or update_max_abs <= 0.0:
+                raise RuntimeError(
+                    f"P8 formal optimizer family {family!r} did not update."
+                )
+            result[family] = {
+                "tensor_count": len(before_tensors),
+                "parameter_count": parameter_count,
+                "update_l2_norm": update_l2_norm,
+                "update_max_abs": update_max_abs,
+            }
+        return result
+
+    def _audit_p8_formal_nonoptimizer_parameters(self) -> dict[str, int]:
+        optimizer_ids = {
+            id(parameter)
+            for group in self.optimizer.param_groups
+            for parameter in group["params"]
+        }
+        unexpected_trainable = []
+        unexpected_gradients = []
+        frozen_parameter_count = 0
+        for name, parameter in self.model.named_parameters():
+            if id(parameter) in optimizer_ids:
+                continue
+            frozen_parameter_count += int(parameter.numel())
+            if parameter.requires_grad:
+                unexpected_trainable.append(name)
+            if parameter.grad is not None:
+                unexpected_gradients.append(name)
+        if unexpected_trainable or unexpected_gradients:
+            raise RuntimeError(
+                "P8 formal frozen ownership changed: "
+                f"trainable={unexpected_trainable}, gradients={unexpected_gradients}."
+            )
+        return {
+            "optimizer_parameter_ids": len(optimizer_ids),
+            "frozen_parameter_count": frozen_parameter_count,
+            "unexpected_trainable_count": 0,
+            "unexpected_gradient_count": 0,
+        }
 
     @staticmethod
     def _summarize_fastwam_gate_update(
@@ -2367,7 +2504,10 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
                 for group in self.optimizer.param_groups
             }
             p8_enabled = _fastwam_p8_enabled(self.cfg.actor.model)
-            expected = {"gate", "uncond_lora", "value_head"}
+            gate_trainable = bool(self.cfg.actor.model.get("gate_trainable", True))
+            expected = {"uncond_lora", "value_head"}
+            if gate_trainable:
+                expected.add("gate")
             if p8_enabled:
                 expected.add("wan_current_refiner")
             if set(lr_by_name) != expected:
@@ -2377,11 +2517,12 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
                 )
             data.update(
                 {
-                    "gate/lr": lr_by_name["gate"],
                     "uncond_flow/lora_lr": lr_by_name["uncond_lora"],
                     "critic/lr": lr_by_name["value_head"],
                 }
             )
+            if gate_trainable:
+                data["gate/lr"] = lr_by_name["gate"]
             if p8_enabled:
                 data["uncond_flow/refiner_lr"] = lr_by_name["wan_current_refiner"]
             return data
@@ -2411,6 +2552,18 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
         ):
             gate_update_before = self._capture_fastwam_gate_parameters()
             gate_optimizer_steps_before = int(self.optimizer_steps)
+
+        p8_formal_endpoint = bool(
+            self.cfg.runner.get("p8_formal_stage2_endpoint", False)
+        )
+        formal_step_optimizer_before = int(self.optimizer_steps)
+        formal_optimizer_before = None
+        formal_gate_before = None
+        if p8_formal_endpoint and int(self.optimizer_steps) == 0:
+            formal_optimizer_before = self._capture_p8_formal_optimizer_parameters()
+            formal_gate_before = self._capture_fastwam_gate_parameters(
+                require_trainable=False
+            )
 
         if self.cfg.algorithm.loss_type == "opd":
             target_steps = int(self.rollout_batch["advantages"].shape[0])
@@ -2574,6 +2727,79 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
                 grad_norm, lr_list = self.optimizer_step()
                 data = self._optimizer_metrics(grad_norm, lr_list)
                 append_to_dict(metrics, data)
+                if formal_optimizer_before is not None:
+                    grad_norm_value = float(torch.as_tensor(grad_norm).item())
+                    if not math.isfinite(grad_norm_value):
+                        raise FloatingPointError(
+                            "P8 formal first optimizer update has a non-finite "
+                            "gradient norm."
+                        )
+                    formal_optimizer_after = (
+                        self._capture_p8_formal_optimizer_parameters()
+                    )
+                    family_updates = self._summarize_p8_formal_optimizer_update(
+                        formal_optimizer_before,
+                        formal_optimizer_after,
+                    )
+                    formal_gate_after = self._capture_fastwam_gate_parameters(
+                        require_trainable=False
+                    )
+                    gate_audit = self._summarize_fastwam_gate_update(
+                        before=formal_gate_before,
+                        after=formal_gate_after,
+                        optimizer_steps_before=0,
+                        optimizer_steps_after=int(self.optimizer_steps),
+                    )
+                    if (
+                        gate_audit.update_l2_norm != 0.0
+                        or gate_audit.update_max_abs != 0.0
+                        or gate_audit.nonfinite_update_count != 0
+                    ):
+                        raise RuntimeError(
+                            "P8 formal frozen Gate changed during the first update."
+                        )
+                    frozen_ownership = self._audit_p8_formal_nonoptimizer_parameters()
+                    print(
+                        f"{FASTWAM_P8_FORMAL_FIRST_UPDATE_SENTINEL} "
+                        + json.dumps(
+                            {
+                                "schema": ("fastwam-p8-formal-first-update-audit-v1"),
+                                "status": "PASS",
+                                "rank": int(self._rank),
+                                "optimizer_steps": int(self.optimizer_steps),
+                                "grad_norm": grad_norm_value,
+                                "families": family_updates,
+                                "gate": gate_audit.to_artifact(),
+                                "frozen_ownership": frozen_ownership,
+                            },
+                            sort_keys=True,
+                        ),
+                        flush=True,
+                    )
+                    formal_optimizer_before = None
+                    formal_gate_before = None
+        formal_geometry = _validate_p8_formal_optimizer_geometry(
+            enabled=p8_formal_endpoint,
+            optimizer_steps_before=formal_step_optimizer_before,
+            optimizer_steps_after=int(self.optimizer_steps),
+            expected_updates=int(
+                self.cfg.runner.get("formal_optimizer_updates_per_runner_step", -1)
+            ),
+        )
+        if formal_geometry is not None:
+            print(
+                f"{FASTWAM_P8_FORMAL_STEP_SENTINEL} "
+                + json.dumps(
+                    {
+                        "schema": "fastwam-p8-formal-runner-step-audit-v1",
+                        "status": "PASS",
+                        "rank": int(self._rank),
+                        **formal_geometry,
+                    },
+                    sort_keys=True,
+                ),
+                flush=True,
+            )
         # put LR scheduler step here
         self.lr_scheduler.step()
         self.optimizer.zero_grad()

@@ -15,12 +15,133 @@
 """Small fail-fast contracts shared by RLinf configuration entry points."""
 
 import copy
+import hashlib
+import json
 import math
+import re
+import stat
 from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
 
 from omegaconf import OmegaConf
+
+P8_FORMAL_OUTPUT_PARENT = Path("/data0/p8-formal-training")
+P8_FORMAL_AUTHORIZATION_SCHEMA = "fastwam-p8-formal-training-authorization-v1"
+P8_FORMAL_STOP_RULES = (
+    "nonfinite_update",
+    "cuda_oom",
+    "action_out_of_bounds",
+    "asset_hash_drift",
+    "route_contract_violation",
+    "frozen_or_gate_parameter_change",
+    "checkpoint_failure",
+    "gpu_or_host_or_disk_cap_breach",
+)
+
+
+def _is_sha256(value: object) -> bool:
+    digest = str(value or "").strip().lower()
+    return len(digest) == 64 and all(
+        character in "0123456789abcdef" for character in digest
+    )
+
+
+def _is_git_revision(value: object) -> bool:
+    revision = str(value or "").strip().lower()
+    return len(revision) == 40 and all(
+        character in "0123456789abcdef" for character in revision
+    )
+
+
+def _canonical_sha256(value: object) -> str:
+    return hashlib.sha256(
+        json.dumps(value, sort_keys=True, separators=(",", ":")).encode()
+    ).hexdigest()
+
+
+def _validate_p8_formal_authorization_record(
+    *,
+    path: Path,
+    expected_sha256: str,
+    output_root: Path,
+) -> None:
+    """Read and validate the small, hash-bound P8 launch authorization."""
+
+    try:
+        metadata = path.lstat()
+    except FileNotFoundError as error:
+        raise ValueError("P8 formal authorization record does not exist.") from error
+    if (
+        not stat.S_ISREG(metadata.st_mode)
+        or metadata.st_nlink != 1
+        or path.is_symlink()
+        or path.resolve(strict=True) != path
+        or metadata.st_size < 2
+        or metadata.st_size > 1024 * 1024
+    ):
+        raise ValueError("P8 formal authorization record is not a safe regular file.")
+    raw = path.read_bytes()
+    if hashlib.sha256(raw).hexdigest() != expected_sha256:
+        raise ValueError("P8 formal authorization record SHA-256 mismatch.")
+    try:
+        payload = json.loads(raw)
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise ValueError("P8 formal authorization record is not valid JSON.") from error
+    if not isinstance(payload, Mapping):
+        raise ValueError("P8 formal authorization record must be a JSON object.")
+    if (
+        payload.get("schema") != P8_FORMAL_AUTHORIZATION_SCHEMA
+        or payload.get("status") != "READY-AUTHORIZED"
+        or payload.get("candidate") != "P8-A0/KV"
+        or payload.get("formal_training_authorized") is not True
+        or payload.get("final_ledger_used") is not False
+        or payload.get("output_root") != str(output_root)
+    ):
+        raise ValueError("P8 formal authorization record identity is invalid.")
+    budget = payload.get("authorized_budget")
+    if not isinstance(budget, Mapping) or dict(budget) != {
+        "runner_steps": 100,
+        "optimizer_updates_per_runner_step": 10,
+        "optimizer_updates": 1000,
+        "environments": 4,
+        "global_batch_size": 28,
+        "seed": 42,
+    }:
+        raise ValueError("P8 formal authorization record budget is invalid.")
+    evidence = payload.get("candidate_evidence_sha256")
+    if not isinstance(evidence, Mapping) or set(evidence) != {"p8", "p6", "p7"}:
+        raise ValueError("P8 formal authorization record evidence set is invalid.")
+    if any(not _is_sha256(value) for value in evidence.values()):
+        raise ValueError("P8 formal authorization evidence SHA-256 is invalid.")
+    revisions = payload.get("code_revisions")
+    if not isinstance(revisions, Mapping) or set(revisions) != {
+        "outer",
+        "FastWAM",
+        "RLinf",
+    }:
+        raise ValueError("P8 formal authorization code revisions are invalid.")
+    if any(not _is_git_revision(value) for value in revisions.values()):
+        raise ValueError("P8 formal authorization revision is invalid.")
+    if payload.get("resource_caps") != {
+        "gpu_used_bytes_per_device": 38 * 1024**3,
+        "process_tree_rss_bytes": 128 * 1024**3,
+        "output_bytes": 16 * 1024**3,
+        "minimum_free_fraction": 0.20,
+    }:
+        raise ValueError("P8 formal authorization resource caps are invalid.")
+    if payload.get("stop_rules") != list(P8_FORMAL_STOP_RULES) or payload.get(
+        "stop_rules_sha256"
+    ) != _canonical_sha256(P8_FORMAL_STOP_RULES):
+        raise ValueError("P8 formal authorization stop rules are invalid.")
+    for name in (
+        "authorization_text_sha256",
+        "formal_config_sha256",
+        "asset_manifest_sha256",
+        "stop_rules_sha256",
+    ):
+        if not _is_sha256(payload.get(name)):
+            raise ValueError(f"P8 formal authorization {name} is invalid.")
 
 
 def validate_pi05_critic_artifact_config(
@@ -59,6 +180,7 @@ def validate_p8_readiness_gate_ownership(
     gate_lr: float,
     gate_loss_weight: float,
     stage2_systems_endpoint: bool = False,
+    formal_stage2_endpoint: bool = False,
 ) -> None:
     """Validate opt-in frozen-Gate P8 engineering endpoint ownership."""
 
@@ -68,28 +190,253 @@ def validate_p8_readiness_gate_ownership(
         raise TypeError("`runner.p8_readiness_endpoint` must be a boolean.")
     if not isinstance(stage2_systems_endpoint, bool):
         raise TypeError("`runner.p8_stage2_systems_endpoint` must be a boolean.")
-    if readiness_endpoint and stage2_systems_endpoint:
+    if not isinstance(formal_stage2_endpoint, bool):
+        raise TypeError("`runner.p8_formal_stage2_endpoint` must be a boolean.")
+    endpoints = (
+        readiness_endpoint,
+        stage2_systems_endpoint,
+        formal_stage2_endpoint,
+    )
+    if sum(endpoints) > 1:
         raise ValueError(
-            "P8 readiness and Stage2 systems endpoints are mutually exclusive."
+            "P8 readiness, Stage2 systems, and formal Stage2 endpoints are "
+            "mutually exclusive."
         )
     gate_lr = float(gate_lr)
     gate_loss_weight = float(gate_loss_weight)
     if not math.isfinite(gate_lr) or not math.isfinite(gate_loss_weight):
         raise ValueError("FastWAM Gate LR and loss weight must be finite.")
     if gate_trainable:
-        if readiness_endpoint or stage2_systems_endpoint:
+        if any(endpoints):
             raise ValueError(
                 "P8 frozen-Gate endpoints require an explicitly frozen Gate."
             )
         if gate_lr <= 0 or gate_loss_weight <= 0:
             raise ValueError("Trainable FastWAM Gate requires positive LR and loss.")
         return
-    if not p8_enabled or not (readiness_endpoint or stage2_systems_endpoint):
+    if not p8_enabled or not any(endpoints):
         raise ValueError(
             "Frozen Gate is restricted to an explicit enabled P8 endpoint."
         )
     if gate_lr != 0 or gate_loss_weight != 0:
         raise ValueError("Frozen P8 readiness Gate requires exact zero LR and loss.")
+
+
+def validate_p8_formal_stage2_endpoint_contract(
+    *,
+    max_steps: int,
+    max_epochs: int,
+    save_interval: int,
+    optimizer_updates_per_runner_step: int,
+    actor_total_training_steps: int,
+    actor_seed: int,
+    micro_batch_size: int,
+    global_batch_size: int,
+    env_seed: int,
+    total_num_envs: int,
+    task_id_filter: object,
+    specific_reset_id: object,
+    use_fixed_reset_state_ids: bool,
+    training_route_override: str,
+    load_text_encoder: bool,
+    formal_training_authorized: bool,
+    authorization_record_path: object,
+    authorization_record_sha256: object,
+    final_ledger_path: object,
+    replay_backend: str,
+    compile_enabled: bool,
+    update_epoch: int,
+    precision: str,
+    storage_dtype: str,
+    refiner_layer_indices: object,
+    refiner_query_rank: int,
+    refiner_output_rank: int,
+    refiner_temperature: float,
+    refiner_alpha: float,
+    lora_lr: float,
+    refiner_lr: float,
+    refiner_weight_decay: float,
+    value_lr: float,
+    component_placement: object,
+    output_root: object,
+    formal_stage2_mode: str,
+    checkpoint_path: object,
+    bootstrap_checkpoint_dir: object,
+    resume_dir: object,
+    checkpoint_keep_last: int,
+    checkpoint_atomic: bool,
+    training_guard_enabled: bool,
+) -> None:
+    """Validate the separately authorized 1000-update P8 Stage2 run."""
+
+    exact_values = {
+        "runner.max_steps": (int(max_steps), 100),
+        "runner.max_epochs": (int(max_epochs), 100),
+        "runner.save_interval": (int(save_interval), 10),
+        "runner.formal_optimizer_updates_per_runner_step": (
+            int(optimizer_updates_per_runner_step),
+            10,
+        ),
+        "actor.optim.total_training_steps": (
+            int(actor_total_training_steps),
+            1000,
+        ),
+        "actor.seed": (int(actor_seed), 42),
+        "actor.micro_batch_size": (int(micro_batch_size), 1),
+        "actor.global_batch_size": (int(global_batch_size), 28),
+        "env.train.seed": (int(env_seed), 42),
+        "env.train.total_num_envs": (int(total_num_envs), 4),
+        "algorithm.update_epoch": (int(update_epoch), 1),
+        "actor.optim.lora_lr": (float(lora_lr), 1.0e-5),
+        "actor.optim.refiner_lr": (float(refiner_lr), 1.0e-5),
+        "actor.optim.refiner_weight_decay": (
+            float(refiner_weight_decay),
+            0.0,
+        ),
+        "actor.optim.value_lr": (float(value_lr), 1.0e-4),
+        "refiner.query_rank": (int(refiner_query_rank), 32),
+        "refiner.output_rank": (int(refiner_output_rank), 32),
+        "refiner.temperature": (float(refiner_temperature), 0.07),
+        "refiner.alpha": (float(refiner_alpha), 1.0),
+        "runner.checkpoint_keep_last": (int(checkpoint_keep_last), 2),
+    }
+    mismatches = [
+        f"{name}={actual!r} (expected {expected!r})"
+        for name, (actual, expected) in exact_values.items()
+        if actual != expected
+    ]
+    if OmegaConf.is_config(task_id_filter):
+        task_id_filter = OmegaConf.to_container(task_id_filter, resolve=True)
+    if task_id_filter is not None:
+        mismatches.append(
+            "env.train.task_id_filter must be null so formal training uses "
+            "the complete LIBERO-10 suite"
+        )
+    if specific_reset_id is not None:
+        mismatches.append(
+            "env.train.specific_reset_id must be null for formal training"
+        )
+    if use_fixed_reset_state_ids is not True:
+        mismatches.append("env.train.use_fixed_reset_state_ids must be true")
+    if training_route_override != "forced_uncond_after_initial":
+        mismatches.append(
+            "training_route_override must be `forced_uncond_after_initial`"
+        )
+    if load_text_encoder is not False:
+        mismatches.append(
+            "fastwam.load_text_encoder must be false so formal Stage2 uses only "
+            "the pinned text cache"
+        )
+    if formal_training_authorized is not True:
+        mismatches.append("runner.formal_training_authorized must be true")
+    authorization_path = str(authorization_record_path or "").strip()
+    if not authorization_path or not Path(authorization_path).is_absolute():
+        mismatches.append(
+            "runner.formal_training_authorization_record must be an absolute path"
+        )
+    authorization_sha = str(authorization_record_sha256 or "").strip().lower()
+    if len(authorization_sha) != 64 or any(
+        character not in "0123456789abcdef" for character in authorization_sha
+    ):
+        mismatches.append(
+            "runner.formal_training_authorization_sha256 must be a SHA-256"
+        )
+    if final_ledger_path is not None:
+        mismatches.append("runner.final_ledger_path must be null")
+    if replay_backend != "stored_native":
+        mismatches.append("P8 formal Stage2 replay.backend must be `stored_native`")
+    if compile_enabled is not False:
+        mismatches.append("P8 formal Stage2 compile must be false")
+    if str(precision).lower() != "bf16":
+        mismatches.append("P8 formal Stage2 precision must be `bf16`")
+    if str(storage_dtype).lower() != "bfloat16":
+        mismatches.append("P8 formal Stage2 storage dtype must be `bfloat16`")
+    if OmegaConf.is_config(refiner_layer_indices):
+        refiner_layer_indices = OmegaConf.to_container(
+            refiner_layer_indices,
+            resolve=True,
+        )
+    if refiner_layer_indices != [12]:
+        mismatches.append("P8 formal Stage2 refiner layers must be exactly [12]")
+    if checkpoint_atomic is not True:
+        mismatches.append("runner.checkpoint_atomic must be true")
+    if training_guard_enabled is not False:
+        mismatches.append(
+            "runner.fastwam_training_guard.enabled must be false for the "
+            "fixed-route endpoint"
+        )
+
+    if OmegaConf.is_config(component_placement):
+        component_placement = OmegaConf.to_container(
+            component_placement,
+            resolve=True,
+        )
+    expected_placement = {"actor": "0-1", "env,rollout": "2-3"}
+    if component_placement != expected_placement:
+        mismatches.append(
+            "cluster.component_placement must dedicate actor=0-1 and env,rollout=2-3"
+        )
+
+    output_path = Path(str(output_root or "").strip())
+    output_name_pattern = re.compile(r"^p8_a0_kv_stage2_seed42_[0-9]{8}T[0-9]{6}Z_v1$")
+    if (
+        not output_path.is_absolute()
+        or output_path.parent != P8_FORMAL_OUTPUT_PARENT
+        or output_name_pattern.fullmatch(output_path.name) is None
+    ):
+        mismatches.append(
+            "runner.logger.log_path must be the exact absolute P8 formal output "
+            "root under /data0/p8-formal-training"
+        )
+    elif authorization_path:
+        expected_authorization_path = output_path / "formal_training_authorization.json"
+        if Path(authorization_path) != expected_authorization_path:
+            mismatches.append(
+                "runner.formal_training_authorization_record must be the "
+                "hash-bound record inside the formal output root"
+            )
+        else:
+            try:
+                _validate_p8_formal_authorization_record(
+                    path=expected_authorization_path,
+                    expected_sha256=authorization_sha,
+                    output_root=output_path,
+                )
+            except ValueError as error:
+                mismatches.append(str(error))
+
+    mode = str(formal_stage2_mode).strip()
+    checkpoint_value = str(checkpoint_path or "").strip()
+    bootstrap_value = str(bootstrap_checkpoint_dir or "").strip()
+    if resume_dir is not None:
+        mismatches.append("runner.resume_dir must be null for a fresh formal launch")
+    if mode == "training":
+        expected_checkpoint = output_path / "step_zero" / "actor"
+        if checkpoint_value != str(expected_checkpoint):
+            mismatches.append(
+                "runner.ckpt_path must load the fresh formal step-zero actor directory"
+            )
+        if bootstrap_checkpoint_dir is not None:
+            mismatches.append(
+                "runner.bootstrap_project_checkpoint_dir must be null while training"
+            )
+    elif mode == "step_zero_export":
+        expected_bootstrap = output_path / "step_zero"
+        if checkpoint_path is not None:
+            mismatches.append("step-zero export requires runner.ckpt_path=null")
+        if bootstrap_value != str(expected_bootstrap):
+            mismatches.append(
+                "step-zero export must write inside the formal output root"
+            )
+    else:
+        mismatches.append(
+            "runner.p8_formal_stage2_mode must be `training` or `step_zero_export`"
+        )
+    if mismatches:
+        raise ValueError(
+            "P8 formal Stage2 endpoint differs from its authorized 1000-update "
+            "fixed-route contract: " + "; ".join(mismatches)
+        )
 
 
 def validate_p8_stage2_systems_endpoint_contract(
@@ -547,6 +894,13 @@ def build_fastwam_checkpoint_contract(cfg: Any, *, world_size: int) -> dict[str,
         p8_sidecar.get("enabled", False) if hasattr(p8_sidecar, "get") else False
     )
     if p8_enabled:
+        formal_stage2_endpoint = bool(
+            OmegaConf.select(
+                cfg,
+                "runner.p8_formal_stage2_endpoint",
+                default=False,
+            )
+        )
         runner.update(
             {
                 "p8_readiness_endpoint": bool(
@@ -563,6 +917,7 @@ def build_fastwam_checkpoint_contract(cfg: Any, *, world_size: int) -> dict[str,
                         default=False,
                     )
                 ),
+                "p8_formal_stage2_endpoint": formal_stage2_endpoint,
                 "formal_training_authorized": bool(
                     OmegaConf.select(
                         cfg,
@@ -570,8 +925,26 @@ def build_fastwam_checkpoint_contract(cfg: Any, *, world_size: int) -> dict[str,
                         default=False,
                     )
                 ),
+                "formal_training_authorization_record": OmegaConf.select(
+                    cfg,
+                    "runner.formal_training_authorization_record",
+                    default=None,
+                ),
+                "formal_training_authorization_sha256": OmegaConf.select(
+                    cfg,
+                    "runner.formal_training_authorization_sha256",
+                    default=None,
+                ),
             }
         )
+        if formal_stage2_endpoint:
+            runner["formal_optimizer_updates_per_runner_step"] = int(
+                OmegaConf.select(
+                    cfg,
+                    "runner.formal_optimizer_updates_per_runner_step",
+                    default=-1,
+                )
+            )
     return {
         "schema": "fastwam-adaptive-checkpoint-contract-v2",
         "model": _resolved_checkpoint_value(cfg.actor.model),

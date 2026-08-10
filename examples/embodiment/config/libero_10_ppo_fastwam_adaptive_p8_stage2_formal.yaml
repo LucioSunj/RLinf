@@ -1,0 +1,191 @@
+defaults:
+  - env/libero_10@env.train
+  - env/libero_10@env.eval
+  - model/fastwam_adaptive_p8_stage2_formal@actor.model
+  - model/fastwam_adaptive_p8_stage2_formal@rollout.model
+  - hybrid_engines/fsdp@actor.fsdp_config
+  - weight_syncer/patch_syncer@weight_syncer
+  - override hydra/job_logging: stdout
+  - _self_
+
+hydra:
+  run:
+    dir: .
+  output_subdir: null
+  searchpath:
+    - file://${oc.env:EMBODIED_PATH}/config/
+
+cluster:
+  num_nodes: 1
+  component_placement:
+    actor: 0-1
+    env,rollout: 2-3
+
+runner:
+  task_type: embodied
+  p8_readiness_endpoint: false
+  p8_stage2_systems_endpoint: false
+  p8_formal_stage2_endpoint: true
+  p8_formal_stage2_mode: training
+  formal_training_authorized: true
+  formal_training_authorization_record: ${oc.env:P8_FORMAL_AUTHORIZATION_RECORD}
+  formal_training_authorization_sha256: ${oc.env:P8_FORMAL_AUTHORIZATION_SHA256}
+  final_ledger_path: null
+  weight_sync_interval: 1
+  logger:
+    log_path: ${oc.env:P8_FORMAL_OUTPUT_ROOT}
+    project_name: rlinf
+    experiment_name: p8_a0_kv_stage2_seed42
+    logger_backends: [tensorboard]
+  max_epochs: 100
+  max_steps: 100
+  formal_optimizer_updates_per_runner_step: 10
+  only_eval: false
+  val_check_interval: -1
+  save_interval: 10
+  checkpoint_keep_last: 2
+  checkpoint_atomic: true
+  resume_dir: null
+  ckpt_path: ${oc.env:P8_FORMAL_STEP_ZERO_CHECKPOINT}/actor
+  short_rl_canary_require_success_signal: false
+  fastwam_training_guard:
+    # The existing adaptive-Gate guard is inapplicable to a frozen fixed-route
+    # endpoint. The formal launcher supplies P8-specific route/gradient/hash
+    # watchdogs instead.
+    enabled: false
+    zero_success_patience: 1
+    window_size: 3
+    eligible_idm_fraction_min: 0.0
+    eligible_idm_fraction_max: 1.0
+    gate_entropy_min: 0.0
+    gate_kl_median_max: 0.0
+    gate_kl_single_max: 0.0
+    gate_clip_median_max: 0.0
+    gate_clip_single_max: 0.0
+    cost_audit:
+      enabled: false
+      counterfactual_idm_costs: []
+  bootstrap_project_checkpoint_dir: null
+
+algorithm:
+  normalize_advantages: true
+  group_size: 1
+  reward_coef: 1.0
+  reward_type: chunk_level
+  logprob_type: chunk_level
+  entropy_type: token_level
+  update_epoch: 1
+  adv_type: gae
+  loss_type: fastwam_dual_ppo
+  loss_agg_func: token-mean
+  gamma: 0.99
+  gae_lambda: 0.95
+  gate_ppo:
+    clip_ratio_low: 0.2
+    clip_ratio_high: 0.2
+    entropy_coefficient: 0.0
+    loss_weight: 0.0
+  uncond_flow_ppo:
+    clip_ratio_low: 0.2
+    clip_ratio_high: 0.2
+    entropy_coefficient: 0.0
+    loss_weight: 1.0
+  critic_loss:
+    value_clip: 0.2
+    huber_delta: 10.0
+    loss_weight: 1.0
+    warmup_steps: 0
+  regularization:
+    base_uncond_kl:
+      enabled: false
+      coefficient: 0.0
+      log_metric: true
+    collapse:
+      enabled: false
+      coefficient: 0.0
+      tau_calls: 1.0
+      scope: microbatch
+  fixed_branch_cost:
+    enabled: true
+    idm_cost: 0.1
+    uncond_cost: 0.0
+  p8:
+    fixed_idm_differential_cost: 0.1
+    runtime_cost_profile_sha256: 6349872a6f9654eb68874c0673a48c558add180933718aa0e76bd47906390d5c
+    correction_bound: 1.0
+    bound_semantics: fixed_alpha_upper_bound
+
+env:
+  group_name: EnvGroup
+  train:
+    rollout_epoch: 1
+    total_num_envs: 4
+    task_id_filter: null
+    specific_reset_id: null
+    seed: 42
+    reward_coef: ${algorithm.reward_coef}
+    use_step_penalty: false
+    video_cfg:
+      save_video: false
+      info_on_video: false
+  eval:
+    rollout_epoch: 1
+    total_num_envs: 4
+    reward_coef: ${algorithm.reward_coef}
+    auto_reset: true
+    ignore_terminations: true
+    group_size: 1
+    is_eval: true
+    use_step_penalty: false
+    video_cfg:
+      save_video: false
+      info_on_video: false
+
+rollout:
+  group_name: RolloutGroup
+  generation_backend: huggingface
+  recompute_logprobs: false
+  unnorm_key: libero_10
+  enable_offload: false
+  pipeline_stage_num: 1
+
+actor:
+  group_name: ActorGroup
+  training_backend: fsdp
+  micro_batch_size: 1
+  global_batch_size: 28
+  seed: 42
+  enable_offload: false
+  optim:
+    lr: 1.0e-5
+    gate_lr: 0.0
+    lora_lr: 1.0e-5
+    value_lr: 1.0e-4
+    refiner_lr: 1.0e-5
+    refiner_weight_decay: 0.0
+    adam_beta1: 0.9
+    adam_beta2: 0.95
+    adam_eps: 1.0e-8
+    weight_decay: 0.0
+    clip_grad: 1.0
+    critic_warmup_steps: 0
+    total_training_steps: 1000
+    min_lr_rate: 0.1
+    lr_scheduler: cosine
+  fsdp_config:
+    strategy: fsdp
+    sharding_strategy: no_shard
+    save_full_model_weights: false
+    use_orig_params: true
+    ignore_frozen_parameters: true
+    gradient_checkpointing: false
+    mixed_precision:
+      param_dtype: ${actor.model.precision}
+      reduce_dtype: ${actor.model.precision}
+      buffer_dtype: ${actor.model.precision}
+
+reward:
+  use_reward_model: false
+
+critic:
+  use_critic_model: false
