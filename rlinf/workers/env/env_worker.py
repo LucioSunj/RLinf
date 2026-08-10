@@ -700,14 +700,27 @@ class EnvWorker(Worker):
 
     def _setup_env_and_wrappers(self, env_cls, env_cfg, num_envs_per_stage: int):
         env_list = []
+        stage_invariant_resets = bool(
+            env_cfg.get("stage_invariant_fixed_reset_ids", False)
+        )
 
         for stage_id in range(self.stage_num):
+            env_kwargs = {
+                "cfg": env_cfg,
+                "num_envs": num_envs_per_stage,
+                "seed_offset": self._rank * self.stage_num + stage_id,
+                "total_num_processes": self._world_size * self.stage_num,
+                "worker_info": self.worker_info,
+            }
+            if stage_invariant_resets:
+                env_kwargs.update(
+                    global_environment_offset=(
+                        (self._rank * self.stage_num + stage_id) * num_envs_per_stage
+                    ),
+                    total_global_environments=int(env_cfg.total_num_envs),
+                )
             env = env_cls(
-                cfg=env_cfg,
-                num_envs=num_envs_per_stage,
-                seed_offset=self._rank * self.stage_num + stage_id,
-                total_num_processes=self._world_size * self.stage_num,
-                worker_info=self.worker_info,
+                **env_kwargs,
             )
             if env_cfg.video_cfg.save_video:
                 env = RecordVideo(env, env_cfg.video_cfg)
@@ -1482,12 +1495,30 @@ class EnvWorker(Worker):
                 decoupled_mode=self.env_decoupled_mode,
             )
 
-    def _bootstrap_and_send_train(self, rollout_channel: Channel) -> list[EnvOutput]:
+    def _set_formal_runner_step(self, runner_step: int | None) -> None:
+        if runner_step is None:
+            return
+        for environment in self.env_list:
+            setter = get_env_attr(environment, "set_formal_runner_step")
+            if callable(setter):
+                setter(int(runner_step))
+
+    def _bootstrap_and_send_train(
+        self,
+        rollout_channel: Channel,
+        *,
+        runner_step: int | None = None,
+    ) -> list[EnvOutput]:
+        self._set_formal_runner_step(runner_step)
         env_outputs = self.bootstrap_step()
         self._send_train_bootstrap(rollout_channel, env_outputs)
         return env_outputs
 
-    def prefetch_train_bootstrap(self, rollout_channel: Channel) -> None:
+    def prefetch_train_bootstrap(
+        self,
+        rollout_channel: Channel,
+        runner_step: int | None = None,
+    ) -> None:
         """Prepare and send the first env batch for the next training rollout."""
         if self._prefetched_train_bootstrap is not None:
             raise RuntimeError(
@@ -1495,7 +1526,8 @@ class EnvWorker(Worker):
                 "Call interact() to consume it before prefetching again."
             )
         self._prefetched_train_bootstrap = self._bootstrap_and_send_train(
-            rollout_channel
+            rollout_channel,
+            runner_step=runner_step,
         )
 
     def record_env_metrics(
@@ -2013,7 +2045,9 @@ class EnvWorker(Worker):
         rollout_channel: Channel,
         reward_channel: Channel | None,
         actor_channel: Channel | None = None,
+        runner_step: int | None = None,
     ):
+        self._set_formal_runner_step(runner_step)
         env_metrics = await self._run_interact_once(
             input_channel,
             rollout_channel,

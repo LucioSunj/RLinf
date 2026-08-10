@@ -111,6 +111,63 @@ def _contract() -> LiberoActionContract:
     )
 
 
+def _formal_reset_env(*, num_envs: int, global_offset: int) -> LiberoEnv:
+    env = object.__new__(LiberoEnv)
+    env.cfg = OmegaConf.create({"seed": 42})
+    env.num_envs = num_envs
+    env.num_group = num_envs
+    env.group_size = 1
+    env.global_environment_offset = global_offset
+    env.total_global_environments = 4
+    env.total_num_group_envs = 500
+    env._valid_reset_state_ids = None
+    env.specific_reset_id = None
+    env.formal_runner_step = 0
+    env.stage_invariant_fixed_reset_ids = True
+    return env
+
+
+@pytest.mark.parametrize("runner_step", [0, 1, 9, 100])
+def test_formal_reset_identity_and_simulator_seed_are_stage_invariant(
+    runner_step: int,
+) -> None:
+    baseline = _formal_reset_env(num_envs=4, global_offset=0)
+    stage_zero = _formal_reset_env(num_envs=2, global_offset=0)
+    stage_one = _formal_reset_env(num_envs=2, global_offset=2)
+    for env in (baseline, stage_zero, stage_one):
+        env.formal_runner_step = runner_step
+
+    baseline_resets = baseline._get_stage_invariant_reset_state_ids()
+    staged_resets = np.concatenate(
+        (
+            stage_zero._get_stage_invariant_reset_state_ids(),
+            stage_one._get_stage_invariant_reset_state_ids(),
+        )
+    )
+    baseline_seeds = [
+        baseline._stage_invariant_environment_seed(index) for index in range(4)
+    ]
+    staged_seeds = [
+        stage_zero._stage_invariant_environment_seed(index) for index in range(2)
+    ] + [stage_one._stage_invariant_environment_seed(index) for index in range(2)]
+
+    assert np.array_equal(staged_resets, baseline_resets)
+    assert staged_seeds == baseline_seeds == [42, 43, 44, 45]
+
+
+def test_formal_runner_step_replaces_reset_ids_without_rng_history() -> None:
+    direct = _formal_reset_env(num_envs=4, global_offset=0)
+    direct.formal_runner_step = 7
+    expected = direct._get_stage_invariant_reset_state_ids()
+
+    advanced = _formal_reset_env(num_envs=4, global_offset=0)
+    advanced.reset_state_ids = np.zeros(4, dtype=np.int64)
+    advanced.set_formal_runner_step(2)
+    advanced.set_formal_runner_step(7)
+
+    assert np.array_equal(advanced.reset_state_ids, expected)
+
+
 def test_chunk_step_never_steps_inactive_ledger_slots_and_keeps_batch_shape() -> None:
     env = _libero_env()
     actions = np.zeros((3, 2, 7), dtype=np.float32)

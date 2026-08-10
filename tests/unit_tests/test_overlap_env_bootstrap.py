@@ -206,6 +206,66 @@ class TestOverlapEnvBootstrap(unittest.TestCase):
 
         self.assertIn("A prefetched train bootstrap already exists", str(cm.exception))
 
+    def test_formal_runner_step_reaches_every_stage_and_prefetch(self):
+        """Current and overlapped bootstraps bind the intended runner step."""
+
+        first_setter = MagicMock()
+        second_setter = MagicMock()
+        first_env = MagicMock()
+        second_env = MagicMock()
+        first_env.get_wrapper_attr.return_value = first_setter
+        second_env.get_wrapper_attr.return_value = second_setter
+        self.worker.env_list = [first_env, second_env]
+
+        self.worker._set_formal_runner_step(7)
+
+        first_env.get_wrapper_attr.assert_called_once_with("set_formal_runner_step")
+        second_env.get_wrapper_attr.assert_called_once_with("set_formal_runner_step")
+        first_setter.assert_called_once_with(7)
+        second_setter.assert_called_once_with(7)
+
+        rollout_channel = MagicMock()
+        self.worker._bootstrap_and_send_train = MagicMock(return_value=[])
+        self.worker.prefetch_train_bootstrap(rollout_channel, runner_step=8)
+        self.worker._bootstrap_and_send_train.assert_called_once_with(
+            rollout_channel,
+            runner_step=8,
+        )
+
+    def test_stage_invariant_env_construction_uses_global_offsets(self):
+        """Stage shards receive non-overlapping global environment identities."""
+
+        self.worker.stage_num = 2
+        self.worker._worker_info = {"worker": "unit"}
+        env_cfg = OmegaConf.create(
+            {
+                "total_num_envs": 4,
+                "stage_invariant_fixed_reset_ids": True,
+                "video_cfg": {"save_video": False},
+            }
+        )
+        calls = []
+
+        def env_cls(**kwargs):
+            calls.append(kwargs)
+            return kwargs
+
+        environments = self.worker._setup_env_and_wrappers(
+            env_cls,
+            env_cfg,
+            num_envs_per_stage=2,
+        )
+
+        self.assertEqual(environments, calls)
+        self.assertEqual(
+            [call["global_environment_offset"] for call in calls],
+            [0, 2],
+        )
+        self.assertEqual(
+            [call["total_global_environments"] for call in calls],
+            [4, 4],
+        )
+
     def test_record_env_metrics_appends_values(self):
         """record_env_metrics should append env info tensors as-is."""
         env_metrics = {}

@@ -269,6 +269,59 @@ def test_libero_adaptive_config_composes_with_confirmed_defaults(monkeypatch) ->
     _builder._validate_exact_pi05_critic_config(cfg.actor.model.critic)
 
 
+def test_formal_profile_requires_stage_invariant_internal_contract(
+    monkeypatch,
+) -> None:
+    from rlinf.config import _validate_fastwam_adaptive_cfg
+
+    monkeypatch.setenv("EMBODIED_PATH", str(REPO_ROOT / "examples/embodiment"))
+    monkeypatch.setenv("FASTWAM_CHECKPOINT", "/tmp/fastwam.pt")
+    monkeypatch.setenv("FASTWAM_CHECKPOINT_SHA256", "a" * 64)
+    monkeypatch.setenv("FASTWAM_DATASET_STATS", "/tmp/dataset_stats.json")
+    monkeypatch.setenv("PI05_CRITIC_CHECKPOINT", "/tmp/pi05")
+    monkeypatch.setenv("PI05_CRITIC_CHECKPOINT_SHA256", "b" * 64)
+    profile_path = (
+        REPO_ROOT.parent / "configs/formal_execution_profiles/s2_m1_overlap_v1.json"
+    ).resolve()
+    profile = {
+        "schema": "fastwam-formal-execution-profile-v1",
+        "path": str(profile_path),
+        "sha256": hashlib.sha256(profile_path.read_bytes()).hexdigest(),
+        "rollout_pipeline_stage_num": 2,
+        "actor_micro_batch_size": 1,
+        "overlap_env_bootstrap": True,
+        "use_training_pipeline": False,
+    }
+    with initialize_config_dir(version_base=None, config_dir=str(CONFIG_ROOT)):
+        cfg = compose(config_name="libero_10_ppo_fastwam_adaptive_formal")
+    cfg.rollout.pipeline_stage_num = 2
+    cfg.actor.micro_batch_size = 1
+    for path, value in (
+        ("runner.overlap_env_bootstrap", True),
+        ("runner.use_training_pipeline", False),
+        ("actor.model.training_rollout_microbatch_size", 1),
+        ("rollout.model.training_rollout_microbatch_size", 1),
+        ("env.train.stage_invariant_fixed_reset_ids", True),
+        ("runner.formal_execution_profile", profile),
+    ):
+        OmegaConf.update(cfg, path, value, force_add=True)
+
+    _validate_fastwam_adaptive_cfg(cfg, only_eval=False)
+
+    for updates in (
+        {
+            "actor.model.training_rollout_microbatch_size": 2,
+            "rollout.model.training_rollout_microbatch_size": 2,
+        },
+        {"env.train.stage_invariant_fixed_reset_ids": False},
+    ):
+        invalid = OmegaConf.create(OmegaConf.to_container(cfg, resolve=False))
+        for path, value in updates.items():
+            OmegaConf.update(invalid, path, value)
+        with pytest.raises(ValueError, match="shard-invariant"):
+            _validate_fastwam_adaptive_cfg(invalid, only_eval=False)
+
+
 def test_hydra_overrides_select_recompute_and_gate_subsets(monkeypatch) -> None:
     monkeypatch.setenv("EMBODIED_PATH", str(REPO_ROOT / "examples/embodiment"))
     monkeypatch.setenv("FASTWAM_CHECKPOINT", "/tmp/fastwam.pt")

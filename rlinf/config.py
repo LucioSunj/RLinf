@@ -904,6 +904,7 @@ def _validate_fastwam_adaptive_cfg(cfg, *, only_eval: bool) -> None:
         "eval_random_idm_probability",
         "eval_routing_seed",
         "eval_microbatch_size",
+        "training_rollout_microbatch_size",
         "kv_replay",
         "flow_sde",
         "runtime",
@@ -1045,6 +1046,32 @@ def _validate_fastwam_adaptive_cfg(cfg, *, only_eval: bool) -> None:
         if observed_profile != expected_profile:
             raise ValueError(
                 "FastWAM formal execution profile differs from the resolved config."
+            )
+        rollout_microbatches = (
+            cfg.actor.model.get("training_rollout_microbatch_size"),
+            cfg.rollout.model.get("training_rollout_microbatch_size"),
+        )
+        invariant_rollout_microbatches = all(
+            not isinstance(value, bool) and isinstance(value, int) and value == 1
+            for value in rollout_microbatches
+        )
+        invariant_resets = bool(
+            cfg.env.train.get("stage_invariant_fixed_reset_ids", False)
+        )
+        if not invariant_rollout_microbatches or not invariant_resets:
+            raise ValueError(
+                "FastWAM formal execution profiles require shard-invariant "
+                "rollout microbatches and reset identities."
+            )
+        if (
+            str(cfg.env.train.env_type) != "libero"
+            or str(cfg.env.train.get("libero_variant", "standard")) != "standard"
+            or not bool(cfg.env.train.use_fixed_reset_state_ids)
+            or int(cfg.env.train.group_size) != 1
+        ):
+            raise ValueError(
+                "FastWAM formal shard-invariant resets require standard LIBERO, "
+                "fixed reset identities, and group_size=1."
             )
     if bool(cfg.rollout.get("enable_cuda_graph", False)):
         raise ValueError(

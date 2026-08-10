@@ -131,6 +131,7 @@ class FastWAMAdaptivePolicyConfig:
     eval_routing_seed: int = 0
     eval_microbatch_size: int = 1
     eval_timing_cuda_synchronize: bool = False
+    training_rollout_microbatch_size: int | None = None
     kv_replay: GateKVReplayConfig = field(default_factory=GateKVReplayConfig)
 
     def __post_init__(self) -> None:
@@ -142,6 +143,18 @@ class FastWAMAdaptivePolicyConfig:
             raise ValueError("`eval_microbatch_size` must be positive.")
         if not isinstance(self.eval_timing_cuda_synchronize, bool):
             raise TypeError("`eval_timing_cuda_synchronize` must be a boolean.")
+        training_microbatch = self.training_rollout_microbatch_size
+        if training_microbatch is not None:
+            if isinstance(training_microbatch, bool) or not isinstance(
+                training_microbatch, int
+            ):
+                raise TypeError(
+                    "`training_rollout_microbatch_size` must be an integer or null."
+                )
+            if training_microbatch < 1:
+                raise ValueError(
+                    "`training_rollout_microbatch_size` must be positive or null."
+                )
         evaluation = self.evaluation_routing
         object.__setattr__(self, "eval_routing_mode", evaluation.mode)
         object.__setattr__(self, "eval_idm_threshold", evaluation.idm_threshold)
@@ -413,6 +426,106 @@ class FastWAMAdaptivePolicy(nn.Module, BasePolicy):
                 result[key] = value
         return result
 
+    @staticmethod
+    def _cat_training_tensors(values: list[torch.Tensor]) -> torch.Tensor:
+        """Concatenate one sharding-invariant training tensor batch."""
+
+        if not values or any(value.ndim == 0 for value in values):
+            raise ValueError("Training rollout tensors must be batch-first.")
+        reference = values[0]
+        if any(
+            value.device != reference.device or value.dtype != reference.dtype
+            for value in values[1:]
+        ):
+            raise ValueError("Training rollout tensor shards disagree on placement.")
+        if reference.device.type == "cpu" and all(
+            value.is_pinned() for value in values
+        ):
+            output_shape = list(reference.shape)
+            output_shape[0] = sum(int(value.shape[0]) for value in values)
+            output = torch.empty(
+                output_shape,
+                dtype=reference.dtype,
+                device="cpu",
+                pin_memory=True,
+            )
+            return torch.cat(values, dim=0, out=output)
+        return torch.cat(values, dim=0)
+
+    def _merge_training_microbatch_results(
+        self,
+        actions: list[torch.Tensor],
+        results: list[dict[str, Any]],
+    ) -> tuple[torch.Tensor, dict[str, Any]]:
+        """Restore global-environment order after invariant rollout microbatches."""
+
+        if not actions or len(actions) != len(results):
+            raise ValueError("Training rollout microbatch results are incomplete.")
+        forward_key_sets = [set(result["forward_inputs"]) for result in results]
+        if any(keys != forward_key_sets[0] for keys in forward_key_sets[1:]):
+            raise ValueError("Training rollout microbatches changed replay fields.")
+        forward_inputs = {
+            key: self._cat_training_tensors(
+                [result["forward_inputs"][key] for result in results]
+            )
+            for key in sorted(forward_key_sets[0])
+        }
+        traces = [result.get("action_execution_trace") for result in results]
+        if any(trace is None for trace in traces) and not all(
+            trace is None for trace in traces
+        ):
+            raise ValueError("Training rollout microbatches returned partial traces.")
+        return self._cat_training_tensors(actions), {
+            "prev_logprobs": self._cat_training_tensors(
+                [result["prev_logprobs"] for result in results]
+            ),
+            "prev_values": self._cat_training_tensors(
+                [result["prev_values"] for result in results]
+            ),
+            "forward_inputs": forward_inputs,
+            "route_info": ChunkRouteRecord.cat(
+                [result["route_info"] for result in results]
+            ),
+            "emitted_gate": GateDecisionRecord.cat(
+                [result["emitted_gate"] for result in results]
+            ),
+            "action_execution_trace": (
+                None
+                if all(trace is None for trace in traces)
+                else ActionExecutionTrace.cat(
+                    [trace for trace in traces if trace is not None], dim=0
+                )
+            ),
+        }
+
+    def _predict_training_microbatches(
+        self,
+        *,
+        env_obs: dict[str, Any],
+        batch_size: int,
+        compute_values: bool,
+        microbatch_size: int,
+    ) -> tuple[torch.Tensor, dict[str, Any]]:
+        """Run training in stable global-environment order across stage shards."""
+
+        actions: list[torch.Tensor] = []
+        results: list[dict[str, Any]] = []
+        for start in range(0, batch_size, microbatch_size):
+            end = min(start + microbatch_size, batch_size)
+            action, result = self.predict_action_batch(
+                self._slice_env_obs(
+                    env_obs,
+                    start=start,
+                    end=end,
+                    batch_size=batch_size,
+                ),
+                mode="train",
+                compute_values=compute_values,
+            )
+            actions.append(action)
+            results.append(result)
+        return self._merge_training_microbatch_results(actions, results)
+
     @torch.no_grad()
     def _predict_eval_action_batch(
         self,
@@ -552,6 +665,18 @@ class FastWAMAdaptivePolicy(nn.Module, BasePolicy):
         if mode not in {"train", "eval"}:
             raise ValueError(f"Unsupported FastWAM policy mode {mode!r}.")
         batch_size = int(env_obs["states"].shape[0])
+        training_microbatch = self.config.training_rollout_microbatch_size
+        if (
+            mode == "train"
+            and training_microbatch is not None
+            and batch_size > training_microbatch
+        ):
+            return self._predict_training_microbatches(
+                env_obs=env_obs,
+                batch_size=batch_size,
+                compute_values=compute_values,
+                microbatch_size=training_microbatch,
+            )
         device = env_obs["states"].device
         env_ids, reset_mask = self._routing_metadata(env_obs, batch_size, device)
         route_info = self.route_tracker.consume(

@@ -348,13 +348,25 @@ def build_fastwam_checkpoint_contract(cfg: Any, *, world_size: int) -> dict[str,
         runner["formal_execution_profile"] = _resolved_checkpoint_value(
             formal_execution_profile
         )
+    env_train = _selected_checkpoint_values(cfg.env.train, env_keys)
+    if formal_execution_profile is not None:
+        env_train["stage_invariant_fixed_reset_ids"] = bool(
+            OmegaConf.select(
+                cfg.env.train,
+                "stage_invariant_fixed_reset_ids",
+                default=False,
+            )
+        )
+        env_train["libero_variant"] = str(
+            OmegaConf.select(cfg.env.train, "libero_variant", default="standard")
+        )
     return {
         "schema": "fastwam-adaptive-checkpoint-contract-v2",
         "model": _resolved_checkpoint_value(cfg.actor.model),
         "algorithm": _resolved_checkpoint_value(cfg.algorithm),
         "actor": _normalized_fastwam_actor_contract(cfg),
         "rollout": _selected_checkpoint_values(cfg.rollout, rollout_keys),
-        "env_train": _selected_checkpoint_values(cfg.env.train, env_keys),
+        "env_train": env_train,
         "runner": runner,
         "weight_syncer": _resolved_checkpoint_value(cfg.weight_syncer),
         "component_placement": _resolved_checkpoint_value(

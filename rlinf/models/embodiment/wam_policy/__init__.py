@@ -328,6 +328,11 @@ def get_model(cfg, torch_dtype):
         eval_timing_cuda_synchronize=bool(
             cfg.get("eval_timing_cuda_synchronize", False)
         ),
+        training_rollout_microbatch_size=(
+            None
+            if cfg.get("training_rollout_microbatch_size") is None
+            else cfg.training_rollout_microbatch_size
+        ),
         kv_replay=replay_config,
     )
 

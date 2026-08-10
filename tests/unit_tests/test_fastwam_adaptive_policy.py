@@ -226,6 +226,7 @@ def _make_policy(
     eval_random_idm_probability=None,
     eval_routing_seed=0,
     eval_timing_cuda_synchronize=False,
+    training_rollout_microbatch_size=None,
 ):
     return FastWAMAdaptivePolicy(
         actor=nn.Linear(1, 1),
@@ -240,12 +241,80 @@ def _make_policy(
             eval_random_idm_probability=eval_random_idm_probability,
             eval_routing_seed=eval_routing_seed,
             eval_timing_cuda_synchronize=eval_timing_cuda_synchronize,
+            training_rollout_microbatch_size=training_rollout_microbatch_size,
             kv_replay=_policy.GateKVReplayConfig(
                 backend=backend,
                 pin_memory=False,
             ),
         ),
     )
+
+
+def _assert_tensor_record_equal(left, right) -> None:
+    assert type(left) is type(right)
+    for name in left.__dataclass_fields__:
+        left_value = getattr(left, name)
+        right_value = getattr(right, name)
+        if isinstance(left_value, torch.Tensor):
+            assert torch.equal(left_value, right_value), name
+        elif hasattr(left_value, "__dataclass_fields__"):
+            _assert_tensor_record_equal(left_value, right_value)
+        else:
+            assert left_value == right_value, name
+
+
+def test_training_rollout_microbatch_is_exact_across_stage_shards() -> None:
+    torch.manual_seed(123)
+    baseline = _make_policy(training_rollout_microbatch_size=1)
+    torch.manual_seed(123)
+    staged = _make_policy(training_rollout_microbatch_size=1)
+    obs = {
+        "states": torch.arange(12, dtype=torch.float32).reshape(4, 3),
+        "_fastwam_env_ids": torch.tensor([0, 1, 2, 3]),
+        "_fastwam_reset_mask": torch.tensor([True, True, True, True]),
+    }
+
+    torch.manual_seed(999)
+    baseline_actions, baseline_result = baseline.predict_action_batch(
+        obs,
+        mode="train",
+    )
+    torch.manual_seed(999)
+    staged_actions = []
+    staged_results = []
+    for start, end in ((0, 2), (2, 4)):
+        action, result = staged.predict_action_batch(
+            staged._slice_env_obs(obs, start=start, end=end, batch_size=4),
+            mode="train",
+        )
+        staged_actions.append(action)
+        staged_results.append(result)
+    merged_actions, merged_result = staged._merge_training_microbatch_results(
+        staged_actions,
+        staged_results,
+    )
+
+    assert torch.equal(merged_actions, baseline_actions)
+    assert set(merged_result["forward_inputs"]) == set(
+        baseline_result["forward_inputs"]
+    )
+    for key, value in baseline_result["forward_inputs"].items():
+        assert torch.equal(merged_result["forward_inputs"][key], value), key
+    for key in ("prev_logprobs", "prev_values"):
+        assert torch.equal(merged_result[key], baseline_result[key]), key
+    for key in ("route_info", "emitted_gate"):
+        _assert_tensor_record_equal(merged_result[key], baseline_result[key])
+    assert baseline.runtime.sample_batch_sizes == staged.runtime.sample_batch_sizes
+    assert baseline.runtime.sample_batch_sizes == [1, 1, 1, 1]
+    assert baseline.route_tracker.state_dict() == staged.route_tracker.state_dict()
+
+
+@pytest.mark.parametrize("invalid", [True, 0, 1.5])
+def test_training_rollout_microbatch_rejects_invalid_values(invalid) -> None:
+    with pytest.raises(
+        (TypeError, ValueError), match="training_rollout_microbatch_size"
+    ):
+        FastWAMAdaptivePolicyConfig(training_rollout_microbatch_size=invalid)
 
 
 def test_policy_forwards_and_deduplicates_critic_backbone_no_split_metadata():

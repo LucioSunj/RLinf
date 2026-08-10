@@ -176,6 +176,8 @@ def test_checkpoint_contract_binds_only_explicit_formal_execution_profile() -> N
     profiled = _checkpoint_cfg()
     profiled.rollout.pipeline_stage_num = 2
     profiled.actor.micro_batch_size = 2
+    profiled.actor.model.training_rollout_microbatch_size = 1
+    profiled.env.train.stage_invariant_fixed_reset_ids = True
     profiled.runner.overlap_env_bootstrap = True
     profiled.runner.formal_execution_profile = {
         "schema": "fastwam-formal-execution-profile-v1",
@@ -190,6 +192,9 @@ def test_checkpoint_contract_binds_only_explicit_formal_execution_profile() -> N
     contract = MODULE.build_fastwam_checkpoint_contract(profiled, world_size=2)
 
     assert contract["runner"]["formal_execution_profile"]["sha256"] == "a" * 64
+    assert contract["model"]["training_rollout_microbatch_size"] == 1
+    assert contract["env_train"]["stage_invariant_fixed_reset_ids"] is True
+    assert contract["env_train"]["libero_variant"] == "standard"
     assert contract != legacy_contract
 
 

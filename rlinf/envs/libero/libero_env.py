@@ -14,6 +14,7 @@
 
 import copy
 import glob
+import hashlib
 import importlib
 import os
 import sys
@@ -96,7 +97,17 @@ else:
 
 
 class LiberoEnv(gym.Env):
-    def __init__(self, cfg, num_envs, seed_offset, total_num_processes, worker_info):
+    def __init__(
+        self,
+        cfg,
+        num_envs,
+        seed_offset,
+        total_num_processes,
+        worker_info,
+        *,
+        global_environment_offset: int = 0,
+        total_global_environments: int | None = None,
+    ):
         self.seed_offset = seed_offset
         self.cfg = cfg
         self.total_num_processes = total_num_processes
@@ -104,7 +115,19 @@ class LiberoEnv(gym.Env):
 
         if seed_offset == 0:
             self._log_evaluation_mode()
-        self.seed = self.cfg.seed + seed_offset
+        self.stage_invariant_fixed_reset_ids = bool(
+            cfg.get("stage_invariant_fixed_reset_ids", False)
+        )
+        self.global_environment_offset = int(global_environment_offset)
+        self.total_global_environments = int(
+            num_envs if total_global_environments is None else total_global_environments
+        )
+        self.formal_runner_step = 0
+        self.seed = (
+            int(self.cfg.seed)
+            if self.stage_invariant_fixed_reset_ids
+            else self.cfg.seed + seed_offset
+        )
         self._is_start = True
         self.num_envs = num_envs
         self.group_size = self.cfg.group_size
@@ -121,6 +144,32 @@ class LiberoEnv(gym.Env):
         self.ignore_terminations = cfg.ignore_terminations
         self.auto_reset = cfg.auto_reset
         self.is_eval = cfg.get("is_eval", False)
+        if self.stage_invariant_fixed_reset_ids:
+            if self.is_eval:
+                raise ValueError("stage_invariant_fixed_reset_ids is training-only.")
+            if not self.use_fixed_reset_state_ids:
+                raise ValueError(
+                    "stage_invariant_fixed_reset_ids requires "
+                    "use_fixed_reset_state_ids=true."
+                )
+            if self.group_size != 1:
+                raise ValueError(
+                    "stage_invariant_fixed_reset_ids currently requires group_size=1."
+                )
+            if str(cfg.get("libero_variant", "standard")) != "standard":
+                raise ValueError(
+                    "stage_invariant_fixed_reset_ids currently requires standard "
+                    "LIBERO."
+                )
+            if (
+                self.global_environment_offset < 0
+                or self.total_global_environments < 1
+                or self.global_environment_offset + self.num_envs
+                > self.total_global_environments
+            ):
+                raise ValueError(
+                    "Stage-invariant LIBERO global environment bounds are invalid."
+                )
         reset_wait_steps = cfg.get("reset_wait_steps", 15)
         if (
             isinstance(reset_wait_steps, bool)
@@ -422,7 +471,11 @@ class LiberoEnv(gym.Env):
                 {
                     **base_env_args,
                     "bddl_file_name": final_path,
-                    "seed": self.seed,
+                    "seed": (
+                        self._stage_invariant_environment_seed(env_id)
+                        if self.stage_invariant_fixed_reset_ids
+                        else self.seed
+                    ),
                 }
             )
             task_descriptions.append(task.language)
@@ -504,11 +557,64 @@ class LiberoEnv(gym.Env):
             )
 
     def update_reset_state_ids(self):
-        if self.is_eval or self.cfg.use_ordered_reset_state_ids:
+        if self.stage_invariant_fixed_reset_ids:
+            reset_state_ids = self._get_stage_invariant_reset_state_ids()
+        elif self.is_eval or self.cfg.use_ordered_reset_state_ids:
             reset_state_ids = self._get_ordered_reset_state_ids(self.num_group)
         else:
             reset_state_ids = self._get_random_reset_state_ids(self.num_group)
         self.reset_state_ids = reset_state_ids.repeat(self.group_size)
+
+    def set_formal_runner_step(self, runner_step: int) -> None:
+        """Select the deterministic reset identities for one formal runner step."""
+
+        if isinstance(runner_step, bool) or int(runner_step) != runner_step:
+            raise TypeError("Formal runner step must be an integer.")
+        if int(runner_step) < 0:
+            raise ValueError("Formal runner step must be non-negative.")
+        self.formal_runner_step = int(runner_step)
+        if self.stage_invariant_fixed_reset_ids:
+            self.update_reset_state_ids()
+
+    def _get_stage_invariant_reset_state_ids(self) -> np.ndarray:
+        """Derive one reset identity per global environment without shard state."""
+
+        if self.specific_reset_id is not None:
+            return self.specific_reset_id * np.ones((self.num_group,), dtype=np.int64)
+        pool = (
+            self._valid_reset_state_ids
+            if self._valid_reset_state_ids is not None
+            else np.arange(self.total_num_group_envs, dtype=np.int64)
+        )
+        if len(pool) < 1:
+            raise ValueError("Stage-invariant LIBERO reset pool is empty.")
+        reset_state_ids = []
+        for local_environment_index in range(self.num_group):
+            global_environment_index = (
+                self.global_environment_offset + local_environment_index
+            )
+            payload = b"\0".join(
+                (
+                    b"fastwam-formal-libero-reset-v1",
+                    str(int(self.cfg.seed)).encode("ascii"),
+                    str(self.formal_runner_step).encode("ascii"),
+                    str(global_environment_index).encode("ascii"),
+                )
+            )
+            offset = int.from_bytes(hashlib.sha256(payload).digest()[:8], "big")
+            reset_state_ids.append(int(pool[offset % len(pool)]))
+        return np.asarray(reset_state_ids, dtype=np.int64)
+
+    def _stage_invariant_environment_seed(self, local_environment_index: int) -> int:
+        """Return the simulator seed attached to one global environment id."""
+
+        if not 0 <= int(local_environment_index) < self.num_envs:
+            raise ValueError("Local LIBERO environment index is out of range.")
+        return (
+            int(self.cfg.seed)
+            + self.global_environment_offset
+            + int(local_environment_index)
+        )
 
     def _init_task_and_trial_ids(self):
         self.task_ids, self.trial_ids = (
@@ -737,7 +843,15 @@ class LiberoEnv(gym.Env):
         if reconfig_env_idx:
             env_fn_params = self.get_env_fn_params(reconfig_env_idx)
             self.env.reconfigure_env_fns(env_fn_params, reconfig_env_idx)
-        self.env.seed(self.seed * len(env_idx))
+        if self.stage_invariant_fixed_reset_ids:
+            self.env.seed(
+                [
+                    self._stage_invariant_environment_seed(local_environment_index)
+                    for local_environment_index in range(self.num_envs)
+                ]
+            )
+        else:
+            self.env.seed(self.seed * len(env_idx))
         self.env.reset(id=env_idx)
         variant = os.environ.get(
             "LIBERO_TYPE",
