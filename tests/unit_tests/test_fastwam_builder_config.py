@@ -426,6 +426,19 @@ def test_p8_formal_stage2_profile_is_distinct_and_fully_bound(
         "actor": "0-1",
         "env,rollout": "2-3",
     }
+    assert OmegaConf.to_container(
+        cfg.cluster.p8_formal_fresh_local_ray,
+        resolve=True,
+    ) == {
+        "enabled": True,
+        "num_nodes": 1,
+        "logical_gpu_count": 4,
+        "cuda_visible_devices": "0,1,2,3",
+        "namespace_prefix": "FastWAMP8Formal",
+        "session_root": f"{output_root}/ray",
+        "phase": "training",
+        "worker_placement_audit": True,
+    }
     assert cfg.env.train.total_num_envs == 4
     assert cfg.actor.global_batch_size == 28
     assert cfg.actor.micro_batch_size == 1
@@ -466,6 +479,7 @@ def test_p8_formal_stage2_profile_is_distinct_and_fully_bound(
         export_cfg.runner.bootstrap_project_checkpoint_dir = str(
             output_root / "step_zero"
         )
+        export_cfg.cluster.p8_formal_fresh_local_ray.phase = "step_zero_export"
     _validate_fastwam_adaptive_cfg(export_cfg, only_eval=False)
 
     with open_dict(cfg):

@@ -1160,6 +1160,8 @@ def _validate_fastwam_adaptive_cfg(cfg, *, only_eval: bool) -> None:
             global_batch_size=cfg.actor.get("global_batch_size", -1),
             env_seed=cfg.env.train.get("seed", -1),
             total_num_envs=cfg.env.train.get("total_num_envs", -1),
+            rollout_epoch=cfg.env.train.get("rollout_epoch", -1),
+            pipeline_stage_num=cfg.rollout.get("pipeline_stage_num", -1),
             task_id_filter=cfg.env.train.get("task_id_filter"),
             specific_reset_id=cfg.env.train.get("specific_reset_id"),
             use_fixed_reset_state_ids=cfg.env.train.get(
@@ -1218,6 +1220,7 @@ def _validate_fastwam_adaptive_cfg(cfg, *, only_eval: bool) -> None:
             ),
             value_lr=cfg.actor.optim.get("value_lr", float("nan")),
             component_placement=cfg.cluster.get("component_placement", {}),
+            fresh_local_ray_config=cfg.cluster.get("p8_formal_fresh_local_ray", None),
             output_root=cfg.runner.logger.get("log_path"),
             formal_stage2_mode=cfg.runner.get("p8_formal_stage2_mode", ""),
             checkpoint_path=cfg.runner.get("ckpt_path"),

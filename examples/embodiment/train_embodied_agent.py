@@ -22,6 +22,9 @@ from omegaconf.omegaconf import OmegaConf
 from rlinf.config import validate_cfg
 from rlinf.runners.embodied_runner import EmbodiedRunner
 from rlinf.scheduler import Cluster
+from rlinf.scheduler.cluster.p8_formal import (
+    resolve_p8_formal_fresh_local_ray_config,
+)
 from rlinf.utils.placement import HybridComponentPlacement
 from rlinf.workers.env.env_worker import EnvWorker
 from rlinf.workers.reward import EmbodiedAPIRewardWorker, EmbodiedRewardWorker
@@ -40,7 +43,9 @@ def main(cfg) -> None:
     print(json.dumps(OmegaConf.to_container(cfg, resolve=True), indent=2))
 
     cluster = Cluster(
-        cluster_cfg=cfg.cluster, distributed_log_dir=cfg.runner.per_worker_log_path
+        cluster_cfg=cfg.cluster,
+        distributed_log_dir=cfg.runner.per_worker_log_path,
+        p8_formal_fresh_local_ray=resolve_p8_formal_fresh_local_ray_config(cfg),
     )
     component_placement = HybridComponentPlacement(cfg, cluster)
 

@@ -54,6 +54,7 @@ from rlinf.models.embodiment.wam_policy.libero_runtime import (
 from rlinf.workers.env.env_worker import (
     EnvWorker,
     _fastwam_training_action_audit_enabled,
+    _fastwam_training_action_audit_identity,
     build_fastwam_episode_identity_sha256,
     summarize_fastwam_flow_sde_denoise_indices,
 )
@@ -87,6 +88,65 @@ def test_action_audit_defaults_off_without_changing_the_legacy_path() -> None:
     cfg = OmegaConf.create({"runner": {}})
 
     assert _fastwam_training_action_audit_enabled(cfg) is False
+    assert _fastwam_training_action_audit_identity(None) == {
+        "schema": "fastwam-training-action-audit-v1"
+    }
+
+
+def test_p8_formal_action_payload_carries_explicit_runner_step() -> None:
+    assert _fastwam_training_action_audit_identity(37) == {
+        "schema": "fastwam-p8-formal-action-audit-v1",
+        "status": "PASS",
+        "runner_step": 37,
+    }
+    for invalid in (True, 0, 101):
+        with pytest.raises(ValueError, match="1..100"):
+            _fastwam_training_action_audit_identity(invalid)
+
+
+def test_p8_formal_action_runner_steps_are_explicit_unique_and_contiguous() -> None:
+    worker = object.__new__(EnvWorker)
+    worker.cfg = OmegaConf.create(
+        {
+            "runner": {
+                "p8_formal_stage2_endpoint": True,
+                "p8_formal_action_audit": True,
+                "max_steps": 100,
+            }
+        }
+    )
+    worker._p8_formal_last_action_runner_step = 0
+    worker._p8_formal_pending_action_runner_step = None
+
+    worker.set_p8_formal_action_runner_step(1)
+    with pytest.raises(RuntimeError, match="unique contiguous"):
+        worker.set_p8_formal_action_runner_step(1)
+    assert worker._consume_p8_formal_action_runner_step() == 1
+    with pytest.raises(RuntimeError, match="missing its unique"):
+        worker._consume_p8_formal_action_runner_step()
+    with pytest.raises(RuntimeError, match="unique contiguous"):
+        worker.set_p8_formal_action_runner_step(1)
+
+    worker.set_p8_formal_action_runner_step(2)
+    assert worker._consume_p8_formal_action_runner_step() == 2
+
+
+def test_nonformal_action_path_never_accepts_a_formal_runner_step() -> None:
+    worker = object.__new__(EnvWorker)
+    worker.cfg = OmegaConf.create(
+        {
+            "runner": {
+                "p8_formal_stage2_endpoint": False,
+                "p8_formal_action_audit": False,
+            }
+        }
+    )
+    worker._p8_formal_last_action_runner_step = 0
+    worker._p8_formal_pending_action_runner_step = None
+
+    assert worker._consume_p8_formal_action_runner_step() is None
+    with pytest.raises(RuntimeError, match="only by the formal endpoint"):
+        worker.set_p8_formal_action_runner_step(1)
 
 
 class _Controller:

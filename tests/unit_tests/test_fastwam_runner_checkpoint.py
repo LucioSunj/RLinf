@@ -210,6 +210,53 @@ def test_worker_global_step_is_awaited_before_training_continues(
     ]
 
 
+def test_p8_formal_runner_publishes_explicit_one_based_env_step(
+    tmp_path: Path,
+) -> None:
+    events = []
+
+    class _StepHandle:
+        def __init__(self, owner: str) -> None:
+            self.owner = owner
+
+        def wait(self):
+            events.append(("wait", self.owner))
+
+    class _StepWorkerGroup(_WorkerGroup):
+        def __init__(self, owner: str) -> None:
+            super().__init__()
+            self.owner = owner
+
+        def set_global_step(self, step: int):
+            events.append(("global", self.owner, step))
+            return _StepHandle(self.owner)
+
+        def set_p8_formal_action_runner_step(self, step: int):
+            events.append(("action", self.owner, step))
+            return _StepHandle(self.owner)
+
+    cfg = _runner_cfg(tmp_path)
+    cfg.runner.p8_formal_stage2_endpoint = True
+    runner = _bare_runner(
+        cfg,
+        actor=_StepWorkerGroup("actor"),
+        rollout=_StepWorkerGroup("rollout"),
+        env=_StepWorkerGroup("env"),
+    )
+    runner.global_step = 7
+
+    runner._set_worker_global_step()
+
+    assert events == [
+        ("global", "actor", 7),
+        ("global", "rollout", 7),
+        ("action", "env", 8),
+        ("wait", "actor"),
+        ("wait", "rollout"),
+        ("wait", "env"),
+    ]
+
+
 def test_fastwam_resume_restores_paired_actor_and_rollout_steps(tmp_path: Path) -> None:
     checkpoint = tmp_path / "global_step_7"
     (checkpoint / "actor").mkdir(parents=True)

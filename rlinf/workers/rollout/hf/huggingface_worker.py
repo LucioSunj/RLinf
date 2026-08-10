@@ -43,6 +43,9 @@ from rlinf.hybrid_engines.weight_syncer import WeightSyncer
 from rlinf.models import get_model
 from rlinf.models.embodiment.base_policy import BasePolicy
 from rlinf.scheduler import Channel, Cluster, Worker, split_channel_message
+from rlinf.scheduler.cluster.p8_formal import (
+    emit_p8_formal_worker_placement_audit,
+)
 from rlinf.utils.checkpoint_state import (
     FASTWAM_RESUME_AUDIT_SCHEMA,
     FASTWAM_ROLLOUT_RESUME_AUDIT_SENTINEL,
@@ -111,6 +114,7 @@ def _build_evaluation_rollout_result(
 class MultiStepRolloutWorker(Worker):
     def __init__(self, cfg: DictConfig):
         Worker.__init__(self)
+        emit_p8_formal_worker_placement_audit(cfg, self, role="rollout")
 
         self.cfg = cfg
         self.should_stop = False

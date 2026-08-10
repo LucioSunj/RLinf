@@ -26,6 +26,9 @@ from rlinf.runners.fastwam_checkpoint_export import (
     validate_initial_checkpoint_export_config,
 )
 from rlinf.scheduler import Cluster
+from rlinf.scheduler.cluster.p8_formal import (
+    resolve_p8_formal_fresh_local_ray_config,
+)
 from rlinf.utils.placement import HybridComponentPlacement
 from rlinf.workers.actor.fsdp_actor_worker import EmbodiedFSDPActor
 
@@ -45,6 +48,7 @@ def main(cfg) -> None:
     cluster = Cluster(
         cluster_cfg=cfg.cluster,
         distributed_log_dir=cfg.runner.per_worker_log_path,
+        p8_formal_fresh_local_ray=resolve_p8_formal_fresh_local_ray_config(cfg),
     )
     component_placement = HybridComponentPlacement(cfg, cluster)
     actor_world_size = component_placement.get_world_size("actor")

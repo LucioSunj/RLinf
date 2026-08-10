@@ -231,8 +231,15 @@ class EmbodiedRunner:
 
         actor_handle: Handle = self.actor.set_global_step(self.global_step)
         rollout_handle: Handle = self.rollout.set_global_step(self.global_step)
+        formal_env_handle: Handle | None = None
+        if bool(self.cfg.runner.get("p8_formal_stage2_endpoint", False)):
+            formal_env_handle = self.env.set_p8_formal_action_runner_step(
+                self.global_step + 1
+            )
         actor_handle.wait()
         rollout_handle.wait()
+        if formal_env_handle is not None:
+            formal_env_handle.wait()
 
     def evaluate(self):
         env_handle: Handle = self.env.evaluate(

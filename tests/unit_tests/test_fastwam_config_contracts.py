@@ -257,6 +257,8 @@ def _p8_formal_contract_values(output_root: Path) -> dict[str, object]:
         "global_batch_size": 28,
         "env_seed": 42,
         "total_num_envs": 4,
+        "rollout_epoch": 1,
+        "pipeline_stage_num": 1,
         "task_id_filter": None,
         "specific_reset_id": None,
         "use_fixed_reset_state_ids": True,
@@ -291,6 +293,16 @@ def _p8_formal_contract_values(output_root: Path) -> dict[str, object]:
         "refiner_weight_decay": 0.0,
         "value_lr": 1.0e-4,
         "component_placement": {"actor": "0-1", "env,rollout": "2-3"},
+        "fresh_local_ray_config": {
+            "enabled": True,
+            "num_nodes": 1,
+            "logical_gpu_count": 4,
+            "cuda_visible_devices": "0,1,2,3",
+            "namespace_prefix": "FastWAMP8Formal",
+            "session_root": f"{output_root_value}/ray",
+            "phase": "training",
+            "worker_placement_audit": True,
+        },
         "output_root": output_root_value,
         "formal_stage2_mode": "training",
         "checkpoint_path": f"{output_root_value}/step_zero/actor",
@@ -319,6 +331,8 @@ def test_p8_formal_stage2_endpoint_locks_the_authorized_profile(
         ("save_interval", 20),
         ("optimizer_updates_per_runner_step", 9),
         ("global_batch_size", 4),
+        ("rollout_epoch", 2),
+        ("pipeline_stage_num", 2),
         ("task_id_filter", [0]),
         ("specific_reset_id", 0),
         ("preserve_fixed_route_across_actor_updates", False),
@@ -337,6 +351,7 @@ def test_p8_formal_stage2_endpoint_locks_the_authorized_profile(
         ("refiner_layer_indices", [12, 21]),
         ("lora_lr", 3.0e-5),
         ("component_placement", {"actor,env,rollout": "all"}),
+        ("fresh_local_ray_config", None),
         ("checkpoint_keep_last", 3),
         ("checkpoint_atomic", False),
         ("formal_action_audit", False),
@@ -365,6 +380,10 @@ def test_p8_formal_step_zero_export_is_separate_from_training_load(
             "bootstrap_checkpoint_dir": f"{output_root}/step_zero",
         }
     )
+    values["fresh_local_ray_config"] = {
+        **values["fresh_local_ray_config"],
+        "phase": "step_zero_export",
+    }
     MODULE.validate_p8_formal_stage2_endpoint_contract(**values)
 
     values["checkpoint_path"] = f"{output_root}/step_zero/actor"

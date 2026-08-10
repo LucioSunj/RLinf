@@ -35,6 +35,7 @@ from ray.util.state import list_actors
 from ..hardware.accelerators.accelerator import ProfileConfig
 from .config import ClusterConfig
 from .node import NodeGroupInfo, NodeInfo, NodeProbe
+from .p8_formal import P8FormalFreshLocalRayRuntime
 from .utils import DistributedRayLogCollector, without_http_proxies
 
 ray_version = version("ray")
@@ -107,6 +108,16 @@ class ClusterEnvVar(str, Enum):
     Set explicitly when workers do not share a filesystem with the launch node.
     """
 
+    P8_FORMAL_RAY_ENABLED = "P8_FORMAL_RAY_ENABLED"
+    P8_FORMAL_RAY_NAMESPACE = "P8_FORMAL_RAY_NAMESPACE"
+    P8_FORMAL_RAY_SESSION_ROOT = "P8_FORMAL_RAY_SESSION_ROOT"
+    P8_FORMAL_RAY_SESSION_DIR = "P8_FORMAL_RAY_SESSION_DIR"
+    P8_FORMAL_RAY_PHASE = "P8_FORMAL_RAY_PHASE"
+    P8_FORMAL_RAY_DRIVER_HOSTNAME = "P8_FORMAL_RAY_DRIVER_HOSTNAME"
+    P8_FORMAL_RAY_NODE_ID = "P8_FORMAL_RAY_NODE_ID"
+    P8_FORMAL_RAY_GPU_INVENTORY = "P8_FORMAL_RAY_GPU_INVENTORY"
+    """Formal-only local-Ray provenance forwarded to every worker."""
+
 
 class PathEnvMergeMode(str, Enum):
     """Merge mode for path-like worker env vars."""
@@ -133,6 +144,14 @@ class Cluster:
         ClusterEnvVar.EXT_MODULE: None,
         ClusterEnvVar.PATH_ENV_MERGE_MODE: PathEnvMergeMode.APPEND.value,
         ClusterEnvVar.CODE_WORKING_DIR: "0",
+        ClusterEnvVar.P8_FORMAL_RAY_ENABLED: None,
+        ClusterEnvVar.P8_FORMAL_RAY_NAMESPACE: None,
+        ClusterEnvVar.P8_FORMAL_RAY_SESSION_ROOT: None,
+        ClusterEnvVar.P8_FORMAL_RAY_SESSION_DIR: None,
+        ClusterEnvVar.P8_FORMAL_RAY_PHASE: None,
+        ClusterEnvVar.P8_FORMAL_RAY_DRIVER_HOSTNAME: None,
+        ClusterEnvVar.P8_FORMAL_RAY_NODE_ID: None,
+        ClusterEnvVar.P8_FORMAL_RAY_GPU_INVENTORY: None,
     }
     PATH_LIKE_ENV_VARS = {
         "PYTHONPATH",
@@ -173,6 +192,7 @@ class Cluster:
         num_nodes: Optional[int] = None,
         cluster_cfg: Optional[DictConfig] = None,
         distributed_log_dir: Optional[str] = None,
+        p8_formal_fresh_local_ray: Optional[DictConfig] = None,
     ):
         """Initialize the cluster.
 
@@ -180,9 +200,20 @@ class Cluster:
             num_nodes (int): The number of nodes in the cluster. When you wish to acquire the cluster instance in a processes other than the main driver process, do not pass this argument. Instead, use the `Cluster()` constructor without arguments. If num_nodes is 0, it will initialize the cluster with all ray-connected nodes.
             cluster_cfg (Optional[DictConfig]): The cluster's configuration dictionary. If set, num_nodes will be ignored and inferred from the config.
             distributed_log_dir (Optional[str]): Output directory for split logs. This must be provided when ``distributed_logging`` is True.
+            p8_formal_fresh_local_ray (Optional[DictConfig]): Exact formal-only
+                config that starts a new, isolated local Ray session. All other
+                callers leave this unset and retain the existing attach-first
+                behavior.
         """
         if self._has_initialized:
             return
+        self._p8_formal_ray_runtime = (
+            P8FormalFreshLocalRayRuntime.from_config(p8_formal_fresh_local_ray)
+            if p8_formal_fresh_local_ray is not None
+            else None
+        )
+        if self._p8_formal_ray_runtime is not None:
+            Cluster.NAMESPACE = self._p8_formal_ray_runtime.namespace
         self._setup_logger()
         self._distributed_log_collector: Optional[DistributedRayLogCollector] = None
         self._ray_code_sync_fragment: Optional[dict[str, Any]] = None
@@ -198,6 +229,11 @@ class Cluster:
                     )
                     break
                 except Cluster.NamespaceConflictError:
+                    if self._p8_formal_ray_runtime is not None:
+                        raise RuntimeError(
+                            "P8 formal fresh-local-Ray encountered an unexpected "
+                            "namespace conflict."
+                        )
                     # Switch the namespace when multiple ray instances are created in the same node
                     self._ray_instance_count += 1
                     self._logger.info(
@@ -320,32 +356,50 @@ class Cluster:
             Cluster._prepare_ray_code_sync_runtime_env_fragment()
         )
 
-        try:
-            # First try to connect to an existing Ray cluster
-            ray_init_kwargs: dict[str, Any] = {
-                "address": "auto",
-                "logging_level": Cluster.LOGGING_LEVEL,
-                "namespace": Cluster.NAMESPACE,
-            }
-            if self._ray_code_sync_fragment is not None:
-                ray_init_kwargs["runtime_env"] = dict(self._ray_code_sync_fragment)
-                py_mods = ray_init_kwargs["runtime_env"].get("py_modules") or ()
-                self._logger.info(
-                    "%s Ray code sync is enabled (py_modules=%r); workers receive "
-                    "only the rlinf package from the launch node. Disable with %s=0.",
-                    Cluster.SYS_NAME,
-                    tuple(py_mods),
-                    Cluster.get_full_env_var_name(ClusterEnvVar.CODE_WORKING_DIR),
+        if self._p8_formal_ray_runtime is not None:
+            if self._num_nodes != self._p8_formal_ray_runtime.num_nodes:
+                raise RuntimeError(
+                    "P8 formal fresh-local-Ray requires cluster.num_nodes=1."
                 )
-            ray.init(**ray_init_kwargs)
-        except ConnectionError:
-            ray_init_kwargs = {
-                "logging_level": Cluster.LOGGING_LEVEL,
-                "namespace": Cluster.NAMESPACE,
-            }
-            if self._ray_code_sync_fragment is not None:
-                ray_init_kwargs["runtime_env"] = dict(self._ray_code_sync_fragment)
-            ray.init(**ray_init_kwargs)
+            ray_init_kwargs, formal_gpu_inventory = (
+                self._p8_formal_ray_runtime.prepare_ray_init_kwargs(
+                    logging_level=Cluster.LOGGING_LEVEL,
+                    runtime_env=self._ray_code_sync_fragment,
+                )
+            )
+            ray_context = ray.init(**ray_init_kwargs)
+            self._p8_formal_ray_runtime.complete_ray_startup(
+                ray_context=ray_context,
+                alive_nodes=Cluster.get_alive_nodes(),
+                inventory=formal_gpu_inventory,
+            )
+        else:
+            # First try to connect to an existing Ray cluster.
+            try:
+                ray_init_kwargs: dict[str, Any] = {
+                    "address": "auto",
+                    "logging_level": Cluster.LOGGING_LEVEL,
+                    "namespace": Cluster.NAMESPACE,
+                }
+                if self._ray_code_sync_fragment is not None:
+                    ray_init_kwargs["runtime_env"] = dict(self._ray_code_sync_fragment)
+                    py_mods = ray_init_kwargs["runtime_env"].get("py_modules") or ()
+                    self._logger.info(
+                        "%s Ray code sync is enabled (py_modules=%r); workers receive "
+                        "only the rlinf package from the launch node. Disable with %s=0.",
+                        Cluster.SYS_NAME,
+                        tuple(py_mods),
+                        Cluster.get_full_env_var_name(ClusterEnvVar.CODE_WORKING_DIR),
+                    )
+                ray.init(**ray_init_kwargs)
+            except ConnectionError:
+                ray_init_kwargs = {
+                    "logging_level": Cluster.LOGGING_LEVEL,
+                    "namespace": Cluster.NAMESPACE,
+                }
+                if self._ray_code_sync_fragment is not None:
+                    ray_init_kwargs["runtime_env"] = dict(self._ray_code_sync_fragment)
+                ray.init(**ray_init_kwargs)
 
         # Ray log collector
         if distributed_log_dir is not None:
@@ -371,6 +425,15 @@ class Cluster:
         self._node_probe = NodeProbe(self._num_nodes, self._cluster_cfg)
         self._nodes = self._node_probe.nodes
         self._node_groups = self._node_probe.node_groups
+        if self._p8_formal_ray_runtime is not None and (
+            len(self._nodes) != 1
+            or self._nodes[0].num_accelerators
+            != self._p8_formal_ray_runtime.logical_gpu_count
+        ):
+            raise RuntimeError(
+                "P8 formal fresh-local-Ray node probe did not retain one node and "
+                "four logical GPUs."
+            )
 
         self._logger.info(
             f"{Cluster.SYS_NAME} is running on a cluster with {len(self._nodes)} node{'s' if len(self._nodes) > 1 else ''} and {self.num_accelerators} accelerator{'s' if self.num_accelerators > 1 else ''}. The nodes' details are: "

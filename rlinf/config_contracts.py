@@ -237,6 +237,8 @@ def validate_p8_formal_stage2_endpoint_contract(
     global_batch_size: int,
     env_seed: int,
     total_num_envs: int,
+    rollout_epoch: int,
+    pipeline_stage_num: int,
     task_id_filter: object,
     specific_reset_id: object,
     use_fixed_reset_state_ids: bool,
@@ -269,6 +271,7 @@ def validate_p8_formal_stage2_endpoint_contract(
     refiner_weight_decay: float,
     value_lr: float,
     component_placement: object,
+    fresh_local_ray_config: object,
     output_root: object,
     formal_stage2_mode: str,
     checkpoint_path: object,
@@ -298,6 +301,8 @@ def validate_p8_formal_stage2_endpoint_contract(
         "actor.global_batch_size": (int(global_batch_size), 28),
         "env.train.seed": (int(env_seed), 42),
         "env.train.total_num_envs": (int(total_num_envs), 4),
+        "env.train.rollout_epoch": (int(rollout_epoch), 1),
+        "rollout.pipeline_stage_num": (int(pipeline_stage_num), 1),
         "algorithm.update_epoch": (int(update_epoch), 1),
         "algorithm.fixed_branch_cost.idm_cost": (
             float(fixed_branch_idm_cost),
@@ -445,6 +450,26 @@ def validate_p8_formal_stage2_endpoint_contract(
                 mismatches.append(str(error))
 
     mode = str(formal_stage2_mode).strip()
+    if OmegaConf.is_config(fresh_local_ray_config):
+        fresh_local_ray_config = OmegaConf.to_container(
+            fresh_local_ray_config,
+            resolve=True,
+        )
+    expected_fresh_local_ray = {
+        "enabled": True,
+        "num_nodes": 1,
+        "logical_gpu_count": 4,
+        "cuda_visible_devices": "0,1,2,3",
+        "namespace_prefix": "FastWAMP8Formal",
+        "session_root": str(output_path / "ray"),
+        "phase": mode,
+        "worker_placement_audit": True,
+    }
+    if fresh_local_ray_config != expected_fresh_local_ray:
+        mismatches.append(
+            "cluster.p8_formal_fresh_local_ray must start a fresh, one-node "
+            "four-GPU phase-exclusive local Ray session"
+        )
     checkpoint_value = str(checkpoint_path or "").strip()
     bootstrap_value = str(bootstrap_checkpoint_dir or "").strip()
     if resume_dir is not None:

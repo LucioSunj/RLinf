@@ -56,6 +56,9 @@ from rlinf.scheduler import (
     Worker,
     merge_batches,
 )
+from rlinf.scheduler.cluster.p8_formal import (
+    emit_p8_formal_worker_placement_audit,
+)
 from rlinf.utils.checkpoint_state import checkpoint_state_sha256
 from rlinf.utils.data_iter_utils import split_list
 from rlinf.utils.distributed import masked_stats, normalize_from_stats
@@ -76,6 +79,7 @@ from rlinf.workers.env.history_manager import HistoryManager
 
 FASTWAM_TRAINING_ACTION_AUDIT_SENTINEL = "FASTWAM_TRAINING_ACTION_AUDIT"
 FASTWAM_TRAINING_ACTION_AUDIT_SCHEMA = "fastwam-training-action-audit-v1"
+FASTWAM_P8_FORMAL_ACTION_AUDIT_SCHEMA = "fastwam-p8-formal-action-audit-v1"
 FASTWAM_TRAINING_ACTION_FAILURE_SENTINEL = "FASTWAM_TRAINING_ACTION_FAILURE"
 FASTWAM_TRAINING_ACTION_FAILURE_SCHEMA = "fastwam-training-action-failure-v1"
 
@@ -96,6 +100,22 @@ def _fastwam_training_action_audit_enabled(
         )
     generic_audit = bool(runner.get("fastwam_training_guard", {}).get("enabled", False))
     return bool(not eval_mode and (generic_audit or formal_audit))
+
+
+def _fastwam_training_action_audit_identity(
+    formal_runner_step: int | None,
+) -> dict[str, Any]:
+    """Build the schema/step identity without changing the generic payload."""
+
+    if formal_runner_step is None:
+        return {"schema": FASTWAM_TRAINING_ACTION_AUDIT_SCHEMA}
+    if isinstance(formal_runner_step, bool) or not 1 <= int(formal_runner_step) <= 100:
+        raise ValueError("P8 formal Action runner_step must be in 1..100.")
+    return {
+        "schema": FASTWAM_P8_FORMAL_ACTION_AUDIT_SCHEMA,
+        "status": "PASS",
+        "runner_step": int(formal_runner_step),
+    }
 
 
 def _batch_metadata_value(value: Any, index: int) -> int | None:
@@ -349,11 +369,14 @@ def _mark_terminal_gate_unused(
 class EnvWorker(Worker):
     def __init__(self, cfg: DictConfig):
         Worker.__init__(self)
+        emit_p8_formal_worker_placement_audit(cfg, self, role="env")
 
         self.cfg = cfg
         self.train_video_cnt = 0
         self.eval_video_cnt = 0
         self.should_stop = False
+        self._p8_formal_last_action_runner_step = 0
+        self._p8_formal_pending_action_runner_step: int | None = None
 
         self.env_list = []
         self.eval_env_list = []
@@ -504,6 +527,50 @@ class EnvWorker(Worker):
             EmbodiedRolloutResult(max_episode_length=max_episode_length)
             for _ in range(self.stage_num)
         ]
+
+    def set_p8_formal_action_runner_step(self, runner_step: int) -> None:
+        """Bind the next formal Action audit to one explicit 1-based step."""
+
+        runner = self.cfg.get("runner", {})
+        if not bool(runner.get("p8_formal_stage2_endpoint", False)) or not bool(
+            runner.get("p8_formal_action_audit", False)
+        ):
+            raise RuntimeError(
+                "P8 formal Action runner steps may be set only by the formal endpoint."
+            )
+        if isinstance(runner_step, bool):
+            raise TypeError("P8 formal Action runner_step must be an integer.")
+        runner_step = int(runner_step)
+        max_steps = int(runner.get("max_steps", -1))
+        expected = self._p8_formal_last_action_runner_step + 1
+        if (
+            max_steps != 100
+            or not 1 <= runner_step <= max_steps
+            or runner_step != expected
+            or self._p8_formal_pending_action_runner_step is not None
+        ):
+            raise RuntimeError(
+                "P8 formal Action runner_step must be a unique contiguous value "
+                f"in 1..100: got {runner_step}, expected {expected}."
+            )
+        self._p8_formal_pending_action_runner_step = runner_step
+
+    def _consume_p8_formal_action_runner_step(self) -> int | None:
+        """Consume the runner-supplied step exactly once for this rollout."""
+
+        runner = self.cfg.get("runner", {})
+        formal_endpoint = bool(runner.get("p8_formal_stage2_endpoint", False))
+        if not formal_endpoint:
+            return None
+        pending = self._p8_formal_pending_action_runner_step
+        expected = self._p8_formal_last_action_runner_step + 1
+        if pending is None or pending != expected:
+            raise RuntimeError(
+                "P8 formal Action rollout is missing its unique runner_step."
+            )
+        self._p8_formal_pending_action_runner_step = None
+        self._p8_formal_last_action_runner_step = pending
+        return pending
 
     def init_worker(self):
         # This is a barrier to ensure all envs' initial setup upon import is done
@@ -1568,6 +1635,11 @@ class EnvWorker(Worker):
         env_metrics = defaultdict(list)
         rlt_pending_obs: list[dict[str, Any] | None] = [None] * self.stage_num
         training_action_audit = _fastwam_training_action_audit_enabled(self.cfg)
+        formal_action_runner_step = (
+            self._consume_p8_formal_action_runner_step()
+            if training_action_audit
+            else None
+        )
         training_action_traces: list[list[ActionExecutionTrace]] = [
             [] for _ in range(self.stage_num)
         ]
@@ -1855,7 +1927,9 @@ class EnvWorker(Worker):
                         "FastWAM training Action identity/trace counts disagree."
                     )
                 payload = {
-                    "schema": FASTWAM_TRAINING_ACTION_AUDIT_SCHEMA,
+                    **_fastwam_training_action_audit_identity(
+                        formal_action_runner_step
+                    ),
                     "worker_rank": int(self._rank),
                     "pipeline_stage_id": int(stage_id),
                     "stage_order": list(merged_trace.stage_names),

@@ -76,6 +76,9 @@ from rlinf.models import get_model
 from rlinf.models.embodiment.base_policy import ForwardType
 from rlinf.models.embodiment.wam_policy.contracts import ChunkRouteRecord, WAMRoute
 from rlinf.scheduler import Channel, Cluster, CommMapper, Worker
+from rlinf.scheduler.cluster.p8_formal import (
+    emit_p8_formal_worker_placement_audit,
+)
 from rlinf.utils.checkpoint_state import (
     FASTWAM_ACTOR_RESUME_AUDIT_SENTINEL,
     FASTWAM_RESUME_AUDIT_SCHEMA,
@@ -1375,6 +1378,7 @@ class FSDPActor(FSDPModelManager, Worker):
 class EmbodiedFSDPActor(FSDPModelManager, Worker):
     def __init__(self, cfg: DictConfig):
         Worker.__init__(self)
+        emit_p8_formal_worker_placement_audit(cfg, self, role="actor")
         super().__init__(cfg.actor, self._world_size, self._rank)
         self.cfg = cfg
         self._env_group_name = cfg.env.group_name

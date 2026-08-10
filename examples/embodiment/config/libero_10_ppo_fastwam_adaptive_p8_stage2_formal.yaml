@@ -20,6 +20,15 @@ cluster:
   component_placement:
     actor: 0-1
     env,rollout: 2-3
+  p8_formal_fresh_local_ray:
+    enabled: true
+    num_nodes: 1
+    logical_gpu_count: 4
+    cuda_visible_devices: 0,1,2,3
+    namespace_prefix: FastWAMP8Formal
+    session_root: ${oc.env:P8_FORMAL_OUTPUT_ROOT}/ray
+    phase: ${runner.p8_formal_stage2_mode}
+    worker_placement_audit: true
 
 runner:
   task_type: embodied
