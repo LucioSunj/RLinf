@@ -152,6 +152,31 @@ def build_fastwam_episode_identity_sha256(
     return checkpoint_state_sha256(identity)
 
 
+def build_fastwam_episode_identity_sha256_by_environment(
+    *,
+    route: ChunkRouteRecord,
+    task_ids: Any,
+    trial_ids: Any,
+    reset_state_ids: Any,
+) -> tuple[str, ...]:
+    """Hash each environment identity independently of pipeline sharding."""
+
+    values = []
+    for index in range(int(route.route_used.numel())):
+        record = {
+            "task_id": _batch_metadata_value(task_ids, index),
+            "trial_id": _batch_metadata_value(trial_ids, index),
+            "reset_state_id": _batch_metadata_value(reset_state_ids, index),
+            "episode_id": int(route.episode_ids.reshape(-1)[index].item()),
+        }
+        if any(value is None for value in record.values()):
+            raise ValueError(
+                "FastWAM training environment identity metadata is incomplete."
+            )
+        values.append(checkpoint_state_sha256(record))
+    return tuple(values)
+
+
 def build_fastwam_action_failure_audit(
     *,
     trace: ActionExecutionTrace,
@@ -887,6 +912,14 @@ class EnvWorker(Worker):
             "truncations": chunk_truncations,
             "infos_list": infos_list,
             "action_execution_trace": combined_action_trace,
+            "submitted_action_sha256_by_environment": (
+                [
+                    checkpoint_state_sha256(exec_actions[index])
+                    for index in range(int(exec_actions.shape[0]))
+                ]
+                if training_action_audit
+                else None
+            ),
         }
         return env_output, env_info, chunk_step_payload
 
@@ -1559,6 +1592,12 @@ class EnvWorker(Worker):
         training_action_episode_identity_hashes: list[list[str]] = [
             [] for _ in range(self.stage_num)
         ]
+        training_action_episode_identity_streams: list[list[tuple[str, ...]]] = [
+            [] for _ in range(self.stage_num)
+        ]
+        training_submitted_action_streams: list[list[list[str]]] = [
+            [] for _ in range(self.stage_num)
+        ]
         training_flow_sde_denoise_indices: list[list[torch.Tensor]] = [
             [] for _ in range(self.stage_num)
         ]
@@ -1669,6 +1708,16 @@ class EnvWorker(Worker):
                                 ),
                             )
                         )
+                        training_action_episode_identity_streams[stage_id].append(
+                            build_fastwam_episode_identity_sha256_by_environment(
+                                route=rollout_result.route_info,
+                                task_ids=get_env_attr(environment, "task_ids"),
+                                trial_ids=get_env_attr(environment, "trial_ids"),
+                                reset_state_ids=get_env_attr(
+                                    environment, "reset_state_ids"
+                                ),
+                            )
+                        )
                         denoise_indices = rollout_result.forward_inputs.get(
                             "denoise_indices"
                         )
@@ -1692,8 +1741,15 @@ class EnvWorker(Worker):
                     action_trace = chunk_step_payload.pop(
                         "action_execution_trace", None
                     )
+                    submitted_action_hashes = chunk_step_payload.pop(
+                        "submitted_action_sha256_by_environment", None
+                    )
                     if action_trace is not None:
                         training_action_traces[stage_id].append(action_trace)
+                    if submitted_action_hashes is not None:
+                        training_submitted_action_streams[stage_id].append(
+                            submitted_action_hashes
+                        )
                     stage_rollout = self.rollout_results[stage_id]
                     if isinstance(stage_rollout, EmbodiedLerobotRolloutResult):
                         stage_rollout.append_chunk_episode_data(
@@ -1846,6 +1902,28 @@ class EnvWorker(Worker):
                     raise RuntimeError(
                         "FastWAM training Action identity/trace counts disagree."
                     )
+                identity_streams = training_action_episode_identity_streams[stage_id]
+                submitted_streams = training_submitted_action_streams[stage_id]
+                if len(identity_streams) != len(traces) or len(
+                    submitted_streams
+                ) != len(traces):
+                    raise RuntimeError(
+                        "FastWAM training Action stream/trace counts disagree."
+                    )
+                environment_count = len(identity_streams[0])
+                if any(
+                    len(stream) != environment_count
+                    for stream in (*identity_streams, *submitted_streams)
+                ):
+                    raise RuntimeError(
+                        "FastWAM training Action stream environment counts differ."
+                    )
+                denoise_streams = training_flow_sde_denoise_indices[stage_id]
+                if len(denoise_streams) != len(traces):
+                    raise RuntimeError(
+                        "FastWAM denoise-index stream/trace counts disagree."
+                    )
+                global_environment_offset = stage_id * self.train_num_envs_per_stage
                 payload = {
                     "schema": FASTWAM_TRAINING_ACTION_AUDIT_SCHEMA,
                     "worker_rank": int(self._rank),
@@ -1857,6 +1935,48 @@ class EnvWorker(Worker):
                     "episode_identity_sequence_sha256": checkpoint_state_sha256(
                         identity_hashes
                     ),
+                    "episode_identity_stream_sha256_by_global_environment": [
+                        {
+                            "global_environment_index": (
+                                global_environment_offset + environment_index
+                            ),
+                            "sha256": checkpoint_state_sha256(
+                                [
+                                    stream[environment_index]
+                                    for stream in identity_streams
+                                ]
+                            ),
+                        }
+                        for environment_index in range(environment_count)
+                    ],
+                    "submitted_action_stream_sha256_by_global_environment": [
+                        {
+                            "global_environment_index": (
+                                global_environment_offset + environment_index
+                            ),
+                            "sha256": checkpoint_state_sha256(
+                                [
+                                    stream[environment_index]
+                                    for stream in submitted_streams
+                                ]
+                            ),
+                        }
+                        for environment_index in range(environment_count)
+                    ],
+                    "denoise_index_stream_sha256_by_global_environment": [
+                        {
+                            "global_environment_index": (
+                                global_environment_offset + environment_index
+                            ),
+                            "sha256": checkpoint_state_sha256(
+                                [
+                                    stream.reshape(-1)[environment_index]
+                                    for stream in denoise_streams
+                                ]
+                            ),
+                        }
+                        for environment_index in range(environment_count)
+                    ],
                     "flow_sde_denoise_indices": (
                         summarize_fastwam_flow_sde_denoise_indices(
                             training_flow_sde_denoise_indices[stage_id],

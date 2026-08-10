@@ -135,6 +135,7 @@ from rlinf.workers.actor.fastwam_selective_sync import (
 from rlinf.workers.rollout.utils import RankMapper
 
 _FASTWAM_BC_BOOTSTRAP_SCHEMA = "fastwam-uncond-bc-bootstrap-v1"
+FASTWAM_ACCELERATION_SEMANTICS_AUDIT_SENTINEL = "FASTWAM_ACCELERATION_SEMANTICS_AUDIT"
 _FASTWAM_BC_BOOTSTRAP_KEYS = {
     "schema",
     "bc_step",
@@ -2115,6 +2116,105 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
                 print(
                     f"{FASTWAM_ROLLOUT_STATE_AUDIT_SENTINEL} "
                     + json.dumps(rollout_state_audit.to_artifact(), sort_keys=True),
+                    flush=True,
+                )
+            formal_execution_profile = self.cfg.runner.get(
+                "formal_execution_profile", None
+            )
+            if formal_execution_profile is not None:
+                route = self.rollout_batch["route_info"]
+                emitted = self.rollout_batch["emitted_gate"]
+                kv_metadata = emitted.kv_metadata
+                rollout_state = {
+                    "actions": self.rollout_batch.get("actions"),
+                    "raw_environment_rewards": raw_environment_rewards,
+                    "dones": self.rollout_batch.get("dones"),
+                    "terminations": self.rollout_batch.get("terminations"),
+                    "truncations": self.rollout_batch.get("truncations"),
+                    "prev_logprobs": self.rollout_batch.get("prev_logprobs"),
+                    "prev_values": self.rollout_batch.get("prev_values"),
+                    "versions": self.rollout_batch.get("versions"),
+                    "loss_mask": self.rollout_batch.get("loss_mask"),
+                    "denoise_indices": self.rollout_batch.get("forward_inputs", {}).get(
+                        "denoise_indices"
+                    ),
+                    "route": {
+                        name: getattr(route, name)
+                        for name in (
+                            "route_used",
+                            "route_was_forced",
+                            "chunk_ids",
+                            "episode_ids",
+                            "route_source_chunk_ids",
+                            "actor_versions",
+                        )
+                    },
+                    "emitted_gate": {
+                        name: getattr(emitted, name)
+                        for name in (
+                            "next_route",
+                            "base_probability",
+                            "behavior_probability",
+                            "old_logprob",
+                            "epsilon",
+                            "temperature",
+                            "valid",
+                            "source_chunk_ids",
+                            "episode_ids",
+                            "actor_versions",
+                        )
+                    },
+                    "kv_metadata": (
+                        None
+                        if kv_metadata is None
+                        else {
+                            "layer_indices": kv_metadata.layer_indices,
+                            "denoise_timesteps": kv_metadata.denoise_timesteps,
+                            "total_bytes": kv_metadata.total_bytes,
+                            "storage_dtype": kv_metadata.storage_dtype,
+                            "tensor_shapes": kv_metadata.tensor_shapes,
+                            "payload_reference_ids": (
+                                kv_metadata.payload_reference_ids
+                            ),
+                        }
+                    ),
+                }
+                gae_state = {
+                    name: self.rollout_batch.get(name)
+                    for name in (
+                        "advantages",
+                        "returns",
+                        "flow_advantages",
+                        "flow_valid_mask",
+                        "gate_advantages",
+                        "gate_valid_mask",
+                        "loss_mask",
+                        "loss_mask_sum",
+                    )
+                }
+                semantics_audit = {
+                    "schema": "fastwam-acceleration-semantics-audit-v1",
+                    "runner_step": int(self.version),
+                    "execution_profile_sha256": str(
+                        formal_execution_profile.sha256
+                    ).lower(),
+                    "rollout_sha256": checkpoint_state_sha256(rollout_state),
+                    "gae_sha256": checkpoint_state_sha256(gae_state),
+                    "sample_coverage": {
+                        "valid_chunk_count": int(
+                            self.rollout_batch["loss_mask"].sum().item()
+                        ),
+                        "gate_sample_count": int(
+                            alignment.gate_valid_mask.sum().item()
+                        ),
+                        "uncond_flow_sample_count": int(
+                            alignment.flow_valid_mask.sum().item()
+                        ),
+                    },
+                }
+                print(
+                    f"{FASTWAM_ACCELERATION_SEMANTICS_AUDIT_SENTINEL} "
+                    + json.dumps(semantics_audit, sort_keys=True),
                     flush=True,
                 )
         if kwargs["loss_mask"] is not None:

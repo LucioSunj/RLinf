@@ -13,11 +13,14 @@
 # limitations under the License.
 
 import dataclasses
+import hashlib
 import importlib.util
+import json
 import logging
 import math
 import os
 from dataclasses import asdict
+from pathlib import Path
 from typing import TYPE_CHECKING, Callable, ClassVar, Optional, Union
 
 import torch
@@ -950,6 +953,99 @@ def _validate_fastwam_adaptive_cfg(cfg, *, only_eval: bool) -> None:
             "FastWAM adaptive v0 does not support the pipeline runner because it "
             "does not preserve delayed Gate advantage records."
         )
+    formal_execution_profile = cfg.runner.get("formal_execution_profile", None)
+    if formal_execution_profile is not None:
+        expected_profile_keys = {
+            "schema",
+            "path",
+            "sha256",
+            "rollout_pipeline_stage_num",
+            "actor_micro_batch_size",
+            "overlap_env_bootstrap",
+            "use_training_pipeline",
+        }
+        if set(formal_execution_profile) != expected_profile_keys:
+            raise ValueError("FastWAM formal execution-profile fields changed.")
+        if (
+            str(formal_execution_profile.schema)
+            != "fastwam-formal-execution-profile-v1"
+        ):
+            raise ValueError("FastWAM formal execution-profile schema is unsupported.")
+        profile_sha256 = str(formal_execution_profile.sha256).strip().lower()
+        if len(profile_sha256) != 64 or any(
+            character not in "0123456789abcdef" for character in profile_sha256
+        ):
+            raise ValueError("FastWAM formal execution-profile SHA-256 is invalid.")
+        profile_path = Path(str(formal_execution_profile.path)).resolve()
+        if not profile_path.is_file():
+            raise FileNotFoundError(
+                f"FastWAM formal execution-profile file is missing: {profile_path}"
+            )
+        digest = hashlib.sha256()
+        with profile_path.open("rb") as handle:
+            for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                digest.update(chunk)
+        if digest.hexdigest() != profile_sha256:
+            raise ValueError("FastWAM formal execution-profile file hash changed.")
+        with profile_path.open(encoding="utf-8") as handle:
+            profile_file = json.load(handle)
+        expected_file_keys = {
+            "schema",
+            "rollout_pipeline_stage_num",
+            "actor_micro_batch_size",
+            "overlap_env_bootstrap",
+            "use_training_pipeline",
+        }
+        if (
+            not isinstance(profile_file, dict)
+            or set(profile_file) != expected_file_keys
+            or profile_file["schema"] != "fastwam-formal-execution-profile-v1"
+        ):
+            raise ValueError("FastWAM formal execution-profile file is malformed.")
+        if (
+            isinstance(formal_execution_profile.rollout_pipeline_stage_num, bool)
+            or formal_execution_profile.rollout_pipeline_stage_num not in {1, 2, 4}
+            or isinstance(formal_execution_profile.actor_micro_batch_size, bool)
+            or formal_execution_profile.actor_micro_batch_size not in {1, 2, 4}
+        ):
+            raise ValueError(
+                "FastWAM formal execution-profile stage/microbatch is unsupported."
+            )
+        observed_profile = {
+            "rollout_pipeline_stage_num": int(cfg.rollout.pipeline_stage_num),
+            "actor_micro_batch_size": int(cfg.actor.micro_batch_size),
+            "overlap_env_bootstrap": bool(
+                cfg.runner.get("overlap_env_bootstrap", False)
+            ),
+            "use_training_pipeline": bool(
+                cfg.runner.get("use_training_pipeline", False)
+            ),
+        }
+        expected_profile = {
+            key: formal_execution_profile[key]
+            for key in (
+                "rollout_pipeline_stage_num",
+                "actor_micro_batch_size",
+                "overlap_env_bootstrap",
+                "use_training_pipeline",
+            )
+        }
+        if expected_profile != {
+            key: profile_file[key]
+            for key in (
+                "rollout_pipeline_stage_num",
+                "actor_micro_batch_size",
+                "overlap_env_bootstrap",
+                "use_training_pipeline",
+            )
+        }:
+            raise ValueError(
+                "FastWAM formal execution profile differs from its bound file."
+            )
+        if observed_profile != expected_profile:
+            raise ValueError(
+                "FastWAM formal execution profile differs from the resolved config."
+            )
     if bool(cfg.rollout.get("enable_cuda_graph", False)):
         raise ValueError(
             "FastWAM adaptive uses stateful delayed routing and cannot use CUDA graphs."

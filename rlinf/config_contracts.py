@@ -339,6 +339,15 @@ def build_fastwam_checkpoint_contract(cfg: Any, *, world_size: int) -> dict[str,
         overlap = False
     env_offload = bool(OmegaConf.select(cfg, "env.train.enable_offload", default=False))
     runner["overlap_env_bootstrap"] = bool(overlap) and not env_offload
+    formal_execution_profile = OmegaConf.select(
+        cfg.runner,
+        "formal_execution_profile",
+        default=None,
+    )
+    if formal_execution_profile is not None:
+        runner["formal_execution_profile"] = _resolved_checkpoint_value(
+            formal_execution_profile
+        )
     return {
         "schema": "fastwam-adaptive-checkpoint-contract-v2",
         "model": _resolved_checkpoint_value(cfg.actor.model),

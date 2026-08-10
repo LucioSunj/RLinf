@@ -34,6 +34,15 @@ runner:
   save_interval: 40
   resume_dir: null
   ckpt_path: null
+  # Formal launchers may overlap only the next environment bootstrap with the
+  # synchronous actor update. The generic training pipeline remains forbidden.
+  overlap_env_bootstrap: false
+  # Keep null for exact legacy-checkpoint compatibility. A versioned formal
+  # execution profile binds this to false; true is always rejected.
+  use_training_pipeline: null
+  # A qualification launcher replaces null with a SHA-bound
+  # fastwam-formal-execution-profile-v1 mapping. Legacy checkpoints keep null.
+  formal_execution_profile: null
   # Diagnostic-only guard. The audited short-RL launcher enables this so a
   # zero-success rollout stops before branch cost, GAE, or any optimizer step.
   short_rl_canary_require_success_signal: false

@@ -168,6 +168,31 @@ def test_checkpoint_contract_normalizes_validate_cfg_inserted_defaults() -> None
     ) == MODULE.build_fastwam_checkpoint_contract(validated, world_size=2)
 
 
+def test_checkpoint_contract_binds_only_explicit_formal_execution_profile() -> None:
+    legacy = _checkpoint_cfg()
+    legacy_contract = MODULE.build_fastwam_checkpoint_contract(legacy, world_size=2)
+    assert "formal_execution_profile" not in legacy_contract["runner"]
+
+    profiled = _checkpoint_cfg()
+    profiled.rollout.pipeline_stage_num = 2
+    profiled.actor.micro_batch_size = 2
+    profiled.runner.overlap_env_bootstrap = True
+    profiled.runner.formal_execution_profile = {
+        "schema": "fastwam-formal-execution-profile-v1",
+        "path": "/profiles/s2_m2.json",
+        "sha256": "a" * 64,
+        "rollout_pipeline_stage_num": 2,
+        "actor_micro_batch_size": 2,
+        "overlap_env_bootstrap": True,
+        "use_training_pipeline": False,
+    }
+
+    contract = MODULE.build_fastwam_checkpoint_contract(profiled, world_size=2)
+
+    assert contract["runner"]["formal_execution_profile"]["sha256"] == "a" * 64
+    assert contract != legacy_contract
+
+
 def _eval_model_cfg():
     return OmegaConf.create(
         {

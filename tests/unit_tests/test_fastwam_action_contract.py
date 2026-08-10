@@ -54,6 +54,7 @@ from rlinf.models.embodiment.wam_policy.libero_runtime import (
 from rlinf.workers.env.env_worker import (
     EnvWorker,
     build_fastwam_episode_identity_sha256,
+    build_fastwam_episode_identity_sha256_by_environment,
     summarize_fastwam_flow_sde_denoise_indices,
 )
 
@@ -654,6 +655,53 @@ def test_training_episode_identity_hash_is_compact_and_deterministic() -> None:
     assert len(first) == 64
     assert first == second
     assert first != changed
+
+
+def test_training_episode_identity_stream_is_stable_across_stage_partitioning() -> None:
+    route = ChunkRouteRecord(
+        route_used=torch.tensor([WAMRoute.IDM, WAMRoute.UNCOND]),
+        route_was_forced=torch.tensor([True, False]),
+        chunk_ids=torch.tensor([0, 5]),
+        episode_ids=torch.tensor([9, 11]),
+        route_source_chunk_ids=torch.tensor([-1, 4]),
+        actor_versions=torch.tensor([0, 0]),
+    )
+    kwargs = {
+        "route": route,
+        "task_ids": np.asarray([0, 3]),
+        "trial_ids": np.asarray([24, 49]),
+        "reset_state_ids": np.asarray([24, 199]),
+    }
+
+    hashes = build_fastwam_episode_identity_sha256_by_environment(**kwargs)
+    first = build_fastwam_episode_identity_sha256_by_environment(
+        route=ChunkRouteRecord(
+            route_used=route.route_used[:1],
+            route_was_forced=route.route_was_forced[:1],
+            chunk_ids=route.chunk_ids[:1],
+            episode_ids=route.episode_ids[:1],
+            route_source_chunk_ids=route.route_source_chunk_ids[:1],
+            actor_versions=route.actor_versions[:1],
+        ),
+        task_ids=np.asarray([0]),
+        trial_ids=np.asarray([24]),
+        reset_state_ids=np.asarray([24]),
+    )
+    second = build_fastwam_episode_identity_sha256_by_environment(
+        route=ChunkRouteRecord(
+            route_used=route.route_used[1:],
+            route_was_forced=route.route_was_forced[1:],
+            chunk_ids=route.chunk_ids[1:],
+            episode_ids=route.episode_ids[1:],
+            route_source_chunk_ids=route.route_source_chunk_ids[1:],
+            actor_versions=route.actor_versions[1:],
+        ),
+        task_ids=np.asarray([3]),
+        trial_ids=np.asarray([49]),
+        reset_state_ids=np.asarray([199]),
+    )
+
+    assert hashes == first + second
 
 
 def test_guarded_training_rollout_input_injects_live_action_contract() -> None:
