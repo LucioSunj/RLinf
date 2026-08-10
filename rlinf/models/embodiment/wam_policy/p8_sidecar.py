@@ -6,11 +6,13 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
+from copy import deepcopy
 from dataclasses import dataclass
 from typing import Any
 
 import torch
 from fastwam.models.wan22.visual_contracts import validate_sha256
+from fastwam.models.wan22.wan_current_refiner import WanCurrentRefinerConfig
 from fastwam.runtime import (
     WAN_CURRENT_REFINEMENT_SIDECAR_TYPE,
     create_wan_current_refinement_sidecar,
@@ -137,3 +139,28 @@ def build_p8_sidecar(
         license_record_sha256=fastwam_build.license_record_sha256,
         fixed_cost_profile_sha256=payload["fixed_cost_profile_sha256"],
     )
+
+
+def build_p8_checkpoint_contract(config: Any) -> dict[str, Any] | None:
+    """Build the exact tensor-free P8 checkpoint contract from config alone.
+
+    This uses the same strict sidecar parser as model construction but performs
+    no asset I/O and creates neither the DINO encoder nor the refiner module.
+    Checkpoint inspectors can therefore bind saved P8 provenance to the full
+    resolved Hydra graph before trusting any serialized trainable tensors.
+    """
+
+    payload = validate_p8_sidecar_config(config)
+    if not payload["enabled"]:
+        return None
+    refiner = WanCurrentRefinerConfig.from_mapping(payload["refiner"])
+    return {
+        "resolved_sidecar": deepcopy(payload),
+        "refiner": refiner.as_contract(),
+        "replay": deepcopy(payload["replay"]),
+        "camera_ids": list(payload["camera_ids"]),
+        "camera_input_contract_sha256": payload["camera_input_contract_sha256"],
+        "license_record_sha256": payload["license_record_sha256"],
+        "fixed_cost_profile_sha256": payload["fixed_cost_profile_sha256"],
+        "cache_visibility": "gate_base__uncond_action_shadow",
+    }

@@ -32,6 +32,7 @@ from rlinf.models.embodiment.wam_policy.optimizer import (
     partition_fastwam_trainable_parameters,
 )
 from rlinf.models.embodiment.wam_policy.p8_sidecar import (
+    build_p8_checkpoint_contract,
     build_p8_sidecar,
     validate_p8_sidecar_config,
 )
@@ -466,6 +467,68 @@ def test_default_off_never_resolves_assets_and_enabled_compile_rejects() -> None
     }
     with pytest.raises(ValueError, match="compiled execution is not implemented"):
         validate_p8_sidecar_config(enabled)
+
+
+def test_p8_checkpoint_contract_is_full_and_config_derived(tmp_path) -> None:
+    enabled = {
+        "type": "dinov3_guided_wan_current_refinement",
+        "enabled": True,
+        "compile": False,
+        "enabled_regimes": ["uncond"],
+        "dino": {
+            "source_root": str(tmp_path / "dinov3"),
+            "source_revision": "6876159a11b4df116f30f667f8c9888617df0751",
+            "model_name": "dinov3_vits16",
+            "weights_path": str(tmp_path / "model.safetensors"),
+            "weights_sha256": _hash("weights"),
+            "preprocess_sha256": (
+                "0a70d846042c4bb29893ead5d9433e97d1ec5089875704e472dd821632e24dc0"
+            ),
+            "output_contract_sha256": (
+                "631bb13876a3e9c79476eb1ac089bced12aae93302f117cfeb106dd8acfe9f18"
+            ),
+            "compute_dtype": "bfloat16",
+            "license_id": "DINOv3 License",
+        },
+        "refiner": {
+            "wan_hidden_dim": 3072,
+            "native_dim": 384,
+            "layer_indices": [12],
+            "query_rank": 32,
+            "output_rank": 32,
+            "temperature": 0.07,
+            "alpha": 1.0,
+            "memory_contract_sha256": _hash("memory"),
+            "source_contract_sha256": _hash("source"),
+        },
+        "replay": {
+            "backend": "stored_native",
+            "storage_dtype": "bfloat16",
+            "pin_memory": True,
+            "max_bytes_per_sample": 32 * 1024**2,
+            "max_aggregate_bytes": 256 * 1024**2,
+            "max_combined_gate_plus_p8_bytes_per_sample": 256 * 1024**2,
+            "max_combined_gate_plus_p8_aggregate_bytes": 2 * 1024**3,
+            "fail_closed": True,
+        },
+        "camera_ids": ["main", "wrist"],
+        "camera_input_contract_sha256": _hash("camera"),
+        "license_record_sha256": _hash("license"),
+        "fixed_cost_profile_sha256": _hash("cost"),
+    }
+
+    contract = build_p8_checkpoint_contract(enabled)
+
+    assert contract is not None
+    assert contract["resolved_sidecar"]["refiner"]["layer_indices"] == (12,)
+    assert contract["refiner"]["schema"] == "fastwam-wan-current-refiner-v1"
+    assert contract["refiner"]["source_scope"] == "current_frame_only"
+    assert contract["replay"] == enabled["replay"]
+    assert contract["cache_visibility"] == "gate_base__uncond_action_shadow"
+    assert build_p8_checkpoint_contract({"enabled": False}) is None
+
+    changed = {**enabled, "refiner": {**enabled["refiner"], "alpha": 0.5}}
+    assert build_p8_checkpoint_contract(changed) != contract
 
 
 def test_p8_outer_checkpoint_schemas_share_versioned_suffix() -> None:

@@ -251,7 +251,11 @@ def get_model(cfg, torch_dtype):
         FastWAMAdaptivePolicyConfig,
     )
     from .kv_replay import GateKVReplayConfig
-    from .p8_sidecar import build_p8_sidecar, validate_p8_sidecar_config
+    from .p8_sidecar import (
+        build_p8_checkpoint_contract,
+        build_p8_sidecar,
+        validate_p8_sidecar_config,
+    )
     from .p8_visual_replay import P8VisualReplayConfig
     from .pi05_critic import Pi05ValueAfterVLMCritic
 
@@ -425,18 +429,7 @@ def get_model(cfg, torch_dtype):
         p8_checkpoint_contract=(
             None
             if p8_sidecar is None
-            else {
-                "resolved_sidecar": p8_config_payload,
-                "refiner": p8_sidecar.refiner.config.as_contract(),
-                "replay": p8_config_payload["replay"],
-                "camera_ids": list(p8_sidecar.camera_ids),
-                "camera_input_contract_sha256": (
-                    p8_sidecar.camera_input_contract_sha256
-                ),
-                "license_record_sha256": p8_sidecar.license_record_sha256,
-                "fixed_cost_profile_sha256": p8_sidecar.fixed_cost_profile_sha256,
-                "cache_visibility": "gate_base__uncond_action_shadow",
-            }
+            else build_p8_checkpoint_contract(p8_config_payload)
         ),
     )
 
