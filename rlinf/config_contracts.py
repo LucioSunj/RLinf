@@ -28,6 +28,9 @@ from omegaconf import OmegaConf
 
 P8_FORMAL_OUTPUT_PARENT = Path("/data0/p8-formal-training")
 P8_FORMAL_AUTHORIZATION_SCHEMA = "fastwam-p8-formal-training-authorization-v1"
+P8_FORMAL_RUNTIME_COST_PROFILE_SHA256 = (
+    "6349872a6f9654eb68874c0673a48c558add180933718aa0e76bd47906390d5c"
+)
 P8_FORMAL_STOP_RULES = (
     "nonfinite_update",
     "cuda_oom",
@@ -247,6 +250,13 @@ def validate_p8_formal_stage2_endpoint_contract(
     replay_backend: str,
     compile_enabled: bool,
     update_epoch: int,
+    fixed_branch_cost_enabled: bool,
+    fixed_branch_idm_cost: float,
+    fixed_branch_uncond_cost: float,
+    fixed_idm_differential_cost: float,
+    runtime_cost_profile_sha256: object,
+    correction_bound: float,
+    bound_semantics: str,
     precision: str,
     storage_dtype: str,
     refiner_layer_indices: object,
@@ -289,6 +299,19 @@ def validate_p8_formal_stage2_endpoint_contract(
         "env.train.seed": (int(env_seed), 42),
         "env.train.total_num_envs": (int(total_num_envs), 4),
         "algorithm.update_epoch": (int(update_epoch), 1),
+        "algorithm.fixed_branch_cost.idm_cost": (
+            float(fixed_branch_idm_cost),
+            0.1,
+        ),
+        "algorithm.fixed_branch_cost.uncond_cost": (
+            float(fixed_branch_uncond_cost),
+            0.0,
+        ),
+        "algorithm.p8.fixed_idm_differential_cost": (
+            float(fixed_idm_differential_cost),
+            0.1,
+        ),
+        "algorithm.p8.correction_bound": (float(correction_bound), 1.0),
         "actor.optim.lora_lr": (float(lora_lr), 1.0e-5),
         "actor.optim.refiner_lr": (float(refiner_lr), 1.0e-5),
         "actor.optim.refiner_weight_decay": (
@@ -320,6 +343,16 @@ def validate_p8_formal_stage2_endpoint_contract(
         )
     if use_fixed_reset_state_ids is not True:
         mismatches.append("env.train.use_fixed_reset_state_ids must be true")
+    if fixed_branch_cost_enabled is not True:
+        mismatches.append("algorithm.fixed_branch_cost.enabled must be true")
+    if str(runtime_cost_profile_sha256) != P8_FORMAL_RUNTIME_COST_PROFILE_SHA256:
+        mismatches.append(
+            "algorithm.p8.runtime_cost_profile_sha256 must equal the frozen profile"
+        )
+    if str(bound_semantics) != "fixed_alpha_upper_bound":
+        mismatches.append(
+            "algorithm.p8.bound_semantics must be `fixed_alpha_upper_bound`"
+        )
     if training_route_override != "forced_uncond_after_initial":
         mismatches.append(
             "training_route_override must be `forced_uncond_after_initial`"

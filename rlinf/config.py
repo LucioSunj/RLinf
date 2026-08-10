@@ -1145,6 +1145,8 @@ def _validate_fastwam_adaptive_cfg(cfg, *, only_eval: bool) -> None:
         )
     if p8_formal_stage2_endpoint:
         p8_replay = actor_model.uncond_visual_sidecar.get("replay", {})
+        fixed_branch_cost = cfg.algorithm.get("fixed_branch_cost", {})
+        formal_p8_algorithm = cfg.algorithm.get("p8", {})
         validate_p8_formal_stage2_endpoint_contract(
             max_steps=cfg.runner.get("max_steps", -1),
             max_epochs=cfg.runner.get("max_epochs", -1),
@@ -1181,6 +1183,17 @@ def _validate_fastwam_adaptive_cfg(cfg, *, only_eval: bool) -> None:
             replay_backend=p8_replay.get("backend", ""),
             compile_enabled=actor_model.uncond_visual_sidecar.get("compile", True),
             update_epoch=cfg.algorithm.get("update_epoch", -1),
+            fixed_branch_cost_enabled=fixed_branch_cost.get("enabled", False),
+            fixed_branch_idm_cost=fixed_branch_cost.get("idm_cost", float("nan")),
+            fixed_branch_uncond_cost=fixed_branch_cost.get("uncond_cost", float("nan")),
+            fixed_idm_differential_cost=formal_p8_algorithm.get(
+                "fixed_idm_differential_cost", float("nan")
+            ),
+            runtime_cost_profile_sha256=formal_p8_algorithm.get(
+                "runtime_cost_profile_sha256"
+            ),
+            correction_bound=formal_p8_algorithm.get("correction_bound", float("nan")),
+            bound_semantics=formal_p8_algorithm.get("bound_semantics", ""),
             precision=actor_model.get("precision", ""),
             storage_dtype=p8_replay.get("storage_dtype", ""),
             refiner_layer_indices=actor_model.uncond_visual_sidecar.refiner.get(

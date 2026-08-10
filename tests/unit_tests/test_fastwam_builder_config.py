@@ -434,6 +434,30 @@ def test_p8_formal_stage2_profile_is_distinct_and_fully_bound(
     assert cfg.actor.model.preserve_fixed_route_across_actor_updates is True
     assert cfg.actor.model.fastwam.load_text_encoder is False
     assert cfg.actor.model.uncond_visual_sidecar.refiner.layer_indices == [12]
+    assert cfg.algorithm.fixed_branch_cost.enabled is True
+    assert cfg.algorithm.fixed_branch_cost.idm_cost == 0.1
+    assert cfg.algorithm.fixed_branch_cost.uncond_cost == 0.0
+    assert cfg.algorithm.p8.fixed_idm_differential_cost == 0.1
+    assert (
+        cfg.algorithm.p8.runtime_cost_profile_sha256
+        == config_contracts.P8_FORMAL_RUNTIME_COST_PROFILE_SHA256
+    )
+    assert cfg.algorithm.p8.correction_bound == 1.0
+    assert cfg.algorithm.p8.bound_semantics == "fixed_alpha_upper_bound"
+
+    for path, bad_value in (
+        ("algorithm.fixed_branch_cost.enabled", False),
+        ("algorithm.fixed_branch_cost.idm_cost", 0.2),
+        ("algorithm.fixed_branch_cost.uncond_cost", 0.1),
+        ("algorithm.p8.fixed_idm_differential_cost", 0.2),
+        ("algorithm.p8.runtime_cost_profile_sha256", "0" * 64),
+        ("algorithm.p8.correction_bound", 2.0),
+        ("algorithm.p8.bound_semantics", "dynamic_alpha"),
+    ):
+        invalid_cfg = OmegaConf.create(OmegaConf.to_container(cfg, resolve=True))
+        OmegaConf.update(invalid_cfg, path, bad_value)
+        with pytest.raises(ValueError):
+            _validate_fastwam_adaptive_cfg(invalid_cfg, only_eval=False)
 
     export_cfg = OmegaConf.create(OmegaConf.to_container(cfg, resolve=True))
     with open_dict(export_cfg):
