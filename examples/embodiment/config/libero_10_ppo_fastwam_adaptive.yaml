@@ -27,6 +27,19 @@ runner:
     project_name: rlinf
     experiment_name: libero_10_ppo_fastwam_adaptive
     logger_backends: [tensorboard]
+    fastwam_observability:
+      enabled: true
+      tensorboard:
+        custom_scalars: true
+        flush_every_step: true
+        flush_secs: 10
+      static_plots:
+        enabled: true
+        output_dir: null
+        interval_steps: 5
+        smoothing: 0.6
+        dpi: 160
+        export_all_scalars_on_finish: true
   max_epochs: 1000
   max_steps: -1
   only_eval: false

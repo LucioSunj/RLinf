@@ -74,6 +74,23 @@ class FastWAMScalarAudit:
             "sum": self.total,
         }
 
+    def to_metrics(self, *, prefix: str) -> dict[str, float]:
+        """Return finite scalar summaries suitable for metric backends."""
+
+        metrics = {
+            f"{prefix}/count": float(self.count),
+            f"{prefix}/finite_count": float(self.finite_count),
+            f"{prefix}/nonfinite_count": float(self.nonfinite_count),
+            f"{prefix}/sum": self.total,
+        }
+        if self.finite_count:
+            metrics[f"{prefix}/mean"] = self.total / self.finite_count
+        if self.minimum is not None:
+            metrics[f"{prefix}/min"] = self.minimum
+        if self.maximum is not None:
+            metrics[f"{prefix}/max"] = self.maximum
+        return metrics
+
 
 @dataclass(frozen=True, slots=True, kw_only=True)
 class FastWAMChunkCostAudit:
@@ -118,6 +135,38 @@ class FastWAMChunkCostAudit:
                 self.shaped_reward_identity_max_abs_error
             ),
         }
+
+    def to_metrics(self) -> dict[str, float]:
+        """Return reward/cost decomposition for live training diagnostics."""
+
+        metrics = {
+            "fastwam/cost/idm_per_chunk": self.idm_cost,
+            "fastwam/cost/uncond_per_chunk": self.uncond_cost,
+            "fastwam/cost/expected_sum": self.expected_cost_sum,
+            "fastwam/cost/identity_max_abs_error": (
+                self.shaped_reward_identity_max_abs_error
+            ),
+            "fastwam/cost/forced_idm_chunk_count": float(self.forced_idm_chunk_count),
+            "fastwam/cost/eligible_idm_chunk_count": float(
+                self.eligible_idm_chunk_count
+            ),
+            # Preserve the established flat tags used by training guards and
+            # historical validators while adding grouped TensorBoard views.
+            "fastwam/branch_cost_sum": self.actual_branch_costs.total,
+            "fastwam/shaped_reward_sum": self.shaped_rewards.total,
+            "fastwam/cost_identity_max_abs_error": (
+                self.shaped_reward_identity_max_abs_error
+            ),
+        }
+        summaries = {
+            "fastwam/reward/raw_primitive": self.raw_primitive_rewards,
+            "fastwam/reward/raw_chunk": self.aggregated_raw_rewards,
+            "fastwam/reward/shaped_chunk": self.shaped_rewards,
+            "fastwam/cost/actual_chunk": self.actual_branch_costs,
+        }
+        for prefix, summary in summaries.items():
+            metrics.update(summary.to_metrics(prefix=prefix))
+        return metrics
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
@@ -185,6 +234,73 @@ class FastWAMCounterfactualCostAudit:
             "eligible_uncond_decision_count": self.eligible_uncond_decision_count,
             "entries": [entry.to_artifact() for entry in self.entries],
         }
+
+    def to_metrics(self) -> dict[str, float]:
+        """Return configured-cost counterfactual diagnostics for live curves."""
+
+        metrics = {
+            "fastwam/counterfactual/configured_idm_cost": self.configured_idm_cost,
+            "fastwam/counterfactual/alignment_max_abs_error": (
+                self.configured_alignment_max_abs_error
+            ),
+            "fastwam/counterfactual/eligible_gate_decision_count": float(
+                self.eligible_gate_decision_count
+            ),
+            "fastwam/counterfactual/eligible_idm_decision_count": float(
+                self.eligible_idm_decision_count
+            ),
+            "fastwam/counterfactual/eligible_uncond_decision_count": float(
+                self.eligible_uncond_decision_count
+            ),
+            # Preserve the established validator-facing tag.
+            "fastwam/counterfactual_alignment_max_abs_error": (
+                self.configured_alignment_max_abs_error
+            ),
+        }
+        configured = next(
+            (
+                entry
+                for entry in self.entries
+                if math.isclose(
+                    entry.idm_cost,
+                    self.configured_idm_cost,
+                    rel_tol=0.0,
+                    abs_tol=1.0e-12,
+                )
+            ),
+            None,
+        )
+        if configured is None:
+            return metrics
+        summaries = {
+            "fastwam/counterfactual/gate_advantage_unnormalized": (
+                configured.unnormalized_gate_advantage
+            ),
+            "fastwam/counterfactual/gate_advantage_normalized": (
+                configured.normalized_gate_advantage
+            ),
+            "fastwam/counterfactual/idm_gate_advantage_unnormalized": (
+                configured.unnormalized_idm_gate_advantage
+            ),
+            "fastwam/counterfactual/idm_gate_advantage_normalized": (
+                configured.normalized_idm_gate_advantage
+            ),
+            "fastwam/counterfactual/uncond_gate_advantage_unnormalized": (
+                configured.unnormalized_uncond_gate_advantage
+            ),
+            "fastwam/counterfactual/uncond_gate_advantage_normalized": (
+                configured.normalized_uncond_gate_advantage
+            ),
+            "fastwam/counterfactual/idm_delta_from_zero_unnormalized": (
+                configured.unnormalized_idm_delta_from_zero
+            ),
+            "fastwam/counterfactual/idm_delta_from_zero_normalized": (
+                configured.normalized_idm_delta_from_zero
+            ),
+        }
+        for prefix, summary in summaries.items():
+            metrics.update(summary.to_metrics(prefix=prefix))
+        return metrics
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
@@ -265,6 +381,37 @@ class FastWAMEnvironmentRewardAudit:
             "valid_reward_max": self.valid_reward_max,
             "valid_reward_sum": self.valid_reward_sum,
         }
+
+    def to_metrics(self) -> dict[str, float]:
+        """Return raw sparse-reward health metrics for live monitoring."""
+
+        metrics = {
+            "fastwam/reward/raw_positive_success_signal_count": float(
+                self.positive_success_signal_count
+            ),
+            "fastwam/reward/successful_trajectory_count": float(
+                self.successful_trajectory_count
+            ),
+            "fastwam/reward/valid_value_count": float(self.valid_value_count),
+            "fastwam/reward/nonfinite_value_count": float(self.nonfinite_value_count),
+            "fastwam/reward/raw_sum": self.valid_reward_sum,
+            # Preserve the established flat tags used by the guard.
+            "fastwam/raw_positive_success_signal_count": float(
+                self.positive_success_signal_count
+            ),
+            "fastwam/successful_trajectory_count": float(
+                self.successful_trajectory_count
+            ),
+        }
+        if self.valid_reward_min is not None:
+            metrics["fastwam/reward/raw_min"] = self.valid_reward_min
+        if self.valid_reward_max is not None:
+            metrics["fastwam/reward/raw_max"] = self.valid_reward_max
+        if self.valid_value_count:
+            metrics["fastwam/reward/raw_mean"] = (
+                self.valid_reward_sum / self.valid_value_count
+            )
+        return metrics
 
     def require_success_signal(self) -> None:
         """Fail before optimization when the audited rollout is unsafe to train."""
@@ -373,6 +520,82 @@ class FastWAMRolloutStateAudit:
                 "maximum_bytes_per_sample": (self.kv_eligible_maximum_bytes_per_sample),
             },
         }
+
+    def to_metrics(self) -> dict[str, float]:
+        """Return Gate output, route, and K/V summaries for live monitoring."""
+
+        executed_idm_fraction = self.valid_idm_chunk_count / self.valid_chunk_count
+        eligible_idm_fraction = (
+            self.eligible_idm_decision_count / self.eligible_gate_decision_count
+        )
+        forced_fraction = self.forced_route_count / self.valid_chunk_count
+        metrics = {
+            "fastwam/route/valid_chunk_count": float(self.valid_chunk_count),
+            "fastwam/route/valid_idm_chunk_count": float(self.valid_idm_chunk_count),
+            "fastwam/route/valid_uncond_chunk_count": float(
+                self.valid_uncond_chunk_count
+            ),
+            "fastwam/route/forced_count": float(self.forced_route_count),
+            "fastwam/route/forced_fraction": forced_fraction,
+            "fastwam/route/executed_idm_fraction": executed_idm_fraction,
+            "fastwam/route/emitted_decision_count": float(self.emitted_decision_count),
+            "fastwam/route/eligible_gate_decision_count": float(
+                self.eligible_gate_decision_count
+            ),
+            "fastwam/route/eligible_idm_decision_count": float(
+                self.eligible_idm_decision_count
+            ),
+            "fastwam/route/eligible_idm_fraction": eligible_idm_fraction,
+            "fastwam/route/unused_emitted_decision_count": float(
+                self.unused_emitted_decision_count
+            ),
+            "fastwam/gate/base_idm_probability_min": self.base_probability_min,
+            "fastwam/gate/base_idm_probability_max": self.base_probability_max,
+            "fastwam/gate/base_idm_probability_mean": self.base_probability_mean,
+            "fastwam/gate/behavior_idm_probability_min": (
+                self.behavior_probability_min
+            ),
+            "fastwam/gate/behavior_idm_probability_max": (
+                self.behavior_probability_max
+            ),
+            "fastwam/gate/behavior_idm_probability_mean": (
+                self.behavior_probability_mean
+            ),
+            "fastwam/kv/all_emitted_sample_count": float(
+                self.kv_all_emitted_sample_count
+            ),
+            "fastwam/kv/all_emitted_nonzero_sample_count": float(
+                self.kv_all_emitted_nonzero_sample_count
+            ),
+            "fastwam/kv/all_emitted_total_bytes": float(
+                self.kv_all_emitted_total_bytes
+            ),
+            "fastwam/kv/all_emitted_max_bytes_per_sample": float(
+                self.kv_all_emitted_maximum_bytes_per_sample
+            ),
+            "fastwam/kv/eligible_sample_count": float(self.kv_eligible_sample_count),
+            "fastwam/kv/eligible_nonzero_sample_count": float(
+                self.kv_eligible_nonzero_sample_count
+            ),
+            "fastwam/kv/eligible_total_bytes": float(self.kv_eligible_total_bytes),
+            "fastwam/kv/eligible_max_bytes_per_sample": float(
+                self.kv_eligible_maximum_bytes_per_sample
+            ),
+            # Preserve the established guard-facing tags.
+            "fastwam/eligible_idm_fraction": eligible_idm_fraction,
+            "fastwam/eligible_gate_decision_count": float(
+                self.eligible_gate_decision_count
+            ),
+            "fastwam/eligible_idm_decision_count": float(
+                self.eligible_idm_decision_count
+            ),
+            "fastwam/valid_uncond_chunk_count": float(self.valid_uncond_chunk_count),
+        }
+        if self.kv_configured_max_bytes_per_sample is not None:
+            metrics["fastwam/kv/configured_max_bytes_per_sample"] = float(
+                self.kv_configured_max_bytes_per_sample
+            )
+        return metrics
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)

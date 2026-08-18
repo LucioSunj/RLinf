@@ -2224,48 +2224,13 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
 
         rollout_metrics = compute_rollout_metrics(self.rollout_batch)
         if reward_audit is not None:
-            rollout_metrics.update(
-                {
-                    "fastwam/raw_positive_success_signal_count": float(
-                        reward_audit.positive_success_signal_count
-                    ),
-                    "fastwam/successful_trajectory_count": float(
-                        reward_audit.successful_trajectory_count
-                    ),
-                }
-            )
+            rollout_metrics.update(reward_audit.to_metrics())
         if rollout_state_audit is not None:
-            rollout_metrics.update(
-                {
-                    "fastwam/eligible_idm_fraction": (
-                        rollout_state_audit.eligible_idm_decision_count
-                        / rollout_state_audit.eligible_gate_decision_count
-                    ),
-                    "fastwam/eligible_gate_decision_count": float(
-                        rollout_state_audit.eligible_gate_decision_count
-                    ),
-                    "fastwam/eligible_idm_decision_count": float(
-                        rollout_state_audit.eligible_idm_decision_count
-                    ),
-                    "fastwam/valid_uncond_chunk_count": float(
-                        rollout_state_audit.valid_uncond_chunk_count
-                    ),
-                }
-            )
+            rollout_metrics.update(rollout_state_audit.to_metrics())
         if cost_audit is not None:
-            rollout_metrics.update(
-                {
-                    "fastwam/branch_cost_sum": cost_audit.actual_branch_costs.total,
-                    "fastwam/shaped_reward_sum": cost_audit.shaped_rewards.total,
-                    "fastwam/cost_identity_max_abs_error": (
-                        cost_audit.shaped_reward_identity_max_abs_error
-                    ),
-                }
-            )
+            rollout_metrics.update(cost_audit.to_metrics())
         if counterfactual_cost_audit is not None:
-            rollout_metrics["fastwam/counterfactual_alignment_max_abs_error"] = (
-                counterfactual_cost_audit.configured_alignment_max_abs_error
-            )
+            rollout_metrics.update(counterfactual_cost_audit.to_metrics())
         return rollout_metrics
 
     @Worker.timer("actor/compute_opd_teacher_logprobs")

@@ -489,6 +489,7 @@ class EmbodiedRunner:
         self.print_metrics_table_async(
             step, self.max_steps, start_time, logging_metrics, start_step
         )
+        self.metric_logger.commit_step(step)
 
     def _finish_run(self) -> None:
         self.metric_logger.finish()

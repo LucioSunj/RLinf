@@ -264,6 +264,12 @@ def test_chunk_cost_audit_reconciles_forced_eligible_and_padded_routes():
     assert artifact["actual_branch_costs"]["sum"] == 1.0
     assert artifact["shaped_reward_identity_max_abs_error"] == 0.0
     assert artifact["raw_primitive_rewards"]["count"] == 33
+    metrics = audit.to_metrics()
+    assert metrics["fastwam/cost/actual_chunk/sum"] == pytest.approx(1.0)
+    assert metrics["fastwam/cost/actual_chunk/mean"] == pytest.approx(1 / 11)
+    assert metrics["fastwam/reward/shaped_chunk/count"] == 11.0
+    assert metrics["fastwam/cost/identity_max_abs_error"] == 0.0
+    assert metrics["fastwam/branch_cost_sum"] == pytest.approx(1.0)
     json.dumps(artifact, sort_keys=True)
 
 
@@ -390,6 +396,11 @@ def test_counterfactual_cost_audit_is_read_only_and_lowers_idm_advantage():
         entry["idm_destination_delta_from_zero"]["unnormalized"]["sum"] < 0.0
         for entry in artifact["entries"][1:]
     )
+    metrics = audit.to_metrics()
+    assert metrics["fastwam/counterfactual/configured_idm_cost"] == 0.025
+    assert metrics["fastwam/counterfactual/alignment_max_abs_error"] == 0.0
+    assert metrics["fastwam/counterfactual/gate_advantage_normalized/count"] == 4.0
+    assert metrics["fastwam/counterfactual/idm_delta_from_zero_unnormalized/sum"] < 0
     assert torch.equal(rewards, input_clones["rewards"])
     assert torch.equal(values, input_clones["values"])
     assert torch.equal(route.route_used, input_clones["routes"])
@@ -435,6 +446,13 @@ def test_environment_reward_audit_counts_only_valid_success_signals():
     assert artifact["valid_reward_min"] == -0.5
     assert artifact["valid_reward_max"] == 1.0
     assert artifact["valid_reward_sum"] == 0.5
+    metrics = audit.to_metrics()
+    assert metrics["fastwam/reward/raw_sum"] == pytest.approx(0.5)
+    assert metrics["fastwam/reward/raw_mean"] == pytest.approx(0.025)
+    assert metrics["fastwam/reward/raw_min"] == pytest.approx(-0.5)
+    assert metrics["fastwam/reward/raw_max"] == pytest.approx(1.0)
+    assert metrics["fastwam/reward/successful_trajectory_count"] == 1.0
+    assert metrics["fastwam/successful_trajectory_count"] == 1.0
     json.dumps(artifact, sort_keys=True)
     audit.require_success_signal()
 
@@ -502,6 +520,14 @@ def test_rollout_state_audit_records_route_probabilities_and_stored_kv_bytes():
         "total_bytes": 512,
         "maximum_bytes_per_sample": 64,
     }
+    metrics = audit.to_metrics()
+    assert metrics["fastwam/route/executed_idm_fraction"] == pytest.approx(1 / 3)
+    assert metrics["fastwam/route/eligible_idm_fraction"] == 0.0
+    assert metrics["fastwam/route/forced_fraction"] == pytest.approx(1 / 3)
+    assert metrics["fastwam/gate/base_idm_probability_mean"] == pytest.approx(0.375)
+    assert metrics["fastwam/gate/behavior_idm_probability_mean"] == pytest.approx(0.4)
+    assert metrics["fastwam/kv/eligible_total_bytes"] == 512.0
+    assert metrics["fastwam/eligible_idm_fraction"] == 0.0
     json.dumps(artifact, sort_keys=True)
 
 

@@ -401,10 +401,13 @@ def compute_rollout_metrics(data_buffer: dict) -> dict:
     if "rewards" in data_buffer:
         rewards = data_buffer["rewards"]
         rewards = valid_values(rewards)
-        mean_rewards, _, _ = reduce_metrics(rewards)
+        mean_rewards, min_rewards, max_rewards = reduce_metrics(rewards)
 
         rewards_metrics = {
             "rewards": mean_rewards,
+            "rewards_mean": mean_rewards,
+            "rewards_min": min_rewards,
+            "rewards_max": max_rewards,
         }
         rollout_metrics.update(rewards_metrics)
 
@@ -447,6 +450,29 @@ def compute_rollout_metrics(data_buffer: dict) -> dict:
                 "values_mean": mean_value,
                 "values_max": max_value,
                 "values_min": min_value,
+            }
+        )
+
+    for name in ("gate_advantages", "flow_advantages"):
+        if data_buffer.get(name, None) is None:
+            continue
+        values = data_buffer[name]
+        branch_mask = data_buffer.get(name.replace("advantages", "valid_mask"))
+        if branch_mask is None:
+            selected = valid_values(values)
+        else:
+            branch_mask = branch_mask.to(device=values.device, dtype=torch.bool)
+            while branch_mask.ndim < values.ndim:
+                branch_mask = branch_mask.unsqueeze(-1)
+            if branch_mask.shape != values.shape:
+                branch_mask = torch.broadcast_to(branch_mask, values.shape)
+            selected = values[branch_mask]
+        mean_value, min_value, max_value = reduce_metrics(selected)
+        rollout_metrics.update(
+            {
+                f"{name}_mean": mean_value,
+                f"{name}_max": max_value,
+                f"{name}_min": min_value,
             }
         )
 
