@@ -367,6 +367,10 @@ class MetricLogger:
                 tensorboard_logger = logger.get("tensorboard")
                 if tensorboard_logger is not None:
                     tensorboard_logger.flush()
+        for logger in self._all_loggers:
+            wandb_logger = logger.get("wandb")
+            if wandb_logger is not None:
+                wandb_logger.log(data={}, step=step, commit=True)
         if self._fastwam_plotter is not None:
             self._fastwam_plotter.maybe_render(step)
 

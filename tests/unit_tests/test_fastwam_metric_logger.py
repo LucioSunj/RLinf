@@ -105,6 +105,24 @@ def test_fastwam_tensorboard_registers_project_dashboard(
     assert ("flush",) in calls
 
 
+def test_fastwam_commit_step_publishes_wandb_metrics() -> None:
+    calls = []
+
+    class _Wandb:
+        def log(self, *, data, step, commit):
+            calls.append((data, step, commit))
+
+    logger = object.__new__(MetricLogger)
+    logger.tensorboard_flush_every_step = True
+    logger._all_loggers = [{"wandb": _Wandb()}]
+    logger._fastwam_plotter = None
+    logger._finished = True
+
+    logger.commit_step(7)
+
+    assert calls == [({}, 7, True)]
+
+
 def test_fastwam_static_plotting_is_switchable_and_committed_per_step(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
