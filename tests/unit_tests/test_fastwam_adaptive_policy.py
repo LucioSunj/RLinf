@@ -73,6 +73,33 @@ def _load_policy_package():
 
 
 _policy = _load_policy_package()
+
+
+def _load_dual_ppo_module():
+    repo = Path(__file__).resolve().parents[2]
+    module_name = "fastwam_dual_ppo_sparse_parity_under_test"
+    contracts_name = "rlinf.models.embodiment.wam_policy.contracts"
+    previous_contracts = sys.modules.get(contracts_name)
+    sys.modules[contracts_name] = sys.modules[
+        "fastwam_policy_composite_under_test.contracts"
+    ]
+    try:
+        spec = importlib.util.spec_from_file_location(
+            module_name,
+            repo / "rlinf/algorithms/fastwam_dual_ppo.py",
+        )
+        module = importlib.util.module_from_spec(spec)
+        sys.modules[module_name] = module
+        spec.loader.exec_module(module)
+        return module
+    finally:
+        if previous_contracts is None:
+            sys.modules.pop(contracts_name, None)
+        else:
+            sys.modules[contracts_name] = previous_contracts
+
+
+_dual_ppo = _load_dual_ppo_module()
 _runtime_module = sys.modules["fastwam_policy_composite_under_test.libero_runtime"]
 FastWAMAdaptivePolicy = _policy.FastWAMAdaptivePolicy
 FastWAMAdaptivePolicyConfig = _policy.FastWAMAdaptivePolicyConfig
@@ -806,6 +833,167 @@ def test_policy_sparse_handle_replay_preserves_eligible_gate_values():
         assert sparse[key][0].item() == 0
     torch.testing.assert_close(sparse["flow_logprobs"], full["flow_logprobs"])
     torch.testing.assert_close(sparse["values"], full["values"])
+
+
+def test_sparse_handle_replay_matches_full_loss_gradients_and_optimizer_delta():
+    from rlinf.models.embodiment.wam_policy.tiered_kv_store import (
+        GATE_KV_BATCH_INDICES,
+    )
+
+    torch.manual_seed(2026)
+    full_policy = _make_policy()
+    torch.manual_seed(2026)
+    sparse_policy = _make_policy()
+
+    def bind_differentiable_flow(policy):
+        flow_parameter = policy.lora_adapter.parameter
+
+        def replay_action_batch(*, forward_inputs, route_info):
+            del route_info
+            batch_size = forward_inputs["critic_states"].shape[0]
+            return {
+                "flow_logprobs": flow_parameter.expand(batch_size, 2, 3),
+                "flow_entropy": torch.ones(batch_size, 1, dtype=torch.float32),
+            }
+
+        policy.runtime.replay_action_batch = replay_action_batch
+
+    bind_differentiable_flow(full_policy)
+    bind_differentiable_flow(sparse_policy)
+    observations = {
+        "states": torch.tensor([[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]]),
+        "_fastwam_env_ids": torch.tensor([1, 2]),
+        "_fastwam_reset_mask": torch.tensor([True, True]),
+    }
+    _, rollout = full_policy.predict_action_batch(observations, mode="train")
+
+    full_replay = full_policy.default_forward(
+        rollout["forward_inputs"],
+        route_info=rollout["route_info"],
+        emitted_gate=rollout["emitted_gate"],
+    )
+    sparse_inputs = {
+        key: value[1:2] if key.startswith("gate_kv_") else value
+        for key, value in rollout["forward_inputs"].items()
+    }
+    sparse_inputs[GATE_KV_BATCH_INDICES] = torch.tensor([1])
+    sparse_replay = sparse_policy.default_forward(
+        sparse_inputs,
+        route_info=rollout["route_info"],
+        emitted_gate=rollout["emitted_gate"],
+    )
+
+    for key in (
+        "gate_logprobs",
+        "gate_entropy",
+        "gate_base_probabilities",
+        "gate_behavior_probabilities",
+    ):
+        torch.testing.assert_close(sparse_replay[key][1], full_replay[key][1])
+        assert sparse_replay[key][0].item() == 0
+    torch.testing.assert_close(
+        sparse_replay["flow_logprobs"], full_replay["flow_logprobs"]
+    )
+    torch.testing.assert_close(sparse_replay["values"], full_replay["values"])
+
+    gate_old_logprobs = full_replay["gate_logprobs"].detach().clone()
+    flow_old_logprobs = full_replay["flow_logprobs"].detach().clone()
+    gate_advantages = torch.tensor([0.25, -0.75], dtype=torch.float32)
+    flow_advantages = torch.tensor([0.5, -1.25], dtype=torch.float32)
+    gate_valid_mask = torch.tensor([False, True])
+    flow_valid_mask = torch.tensor([True, True])
+    route_used = torch.tensor([0, 0], dtype=torch.long)
+    value_targets = torch.tensor([[0.25], [-0.5]], dtype=torch.float32)
+
+    def losses(replay):
+        policy_loss, metrics = _dual_ppo.compute_fastwam_dual_ppo_loss(
+            gate_logprobs=replay["gate_logprobs"],
+            gate_old_logprobs=gate_old_logprobs,
+            gate_advantages=gate_advantages,
+            gate_valid_mask=gate_valid_mask,
+            gate_clip_ratio_low=0.2,
+            gate_clip_ratio_high=0.2,
+            flow_logprobs=replay["flow_logprobs"],
+            flow_old_logprobs=flow_old_logprobs,
+            flow_advantages=flow_advantages,
+            route_used=route_used,
+            flow_clip_ratio_low=0.2,
+            flow_clip_ratio_high=0.2,
+            flow_valid_mask=flow_valid_mask,
+            gate_behavior_probabilities=replay["gate_behavior_probabilities"],
+            flow_entropy=replay["flow_entropy"],
+        )
+        value_loss = torch.nn.functional.mse_loss(replay["values"], value_targets)
+        return policy_loss, value_loss, policy_loss + value_loss, metrics
+
+    full_losses = losses(full_replay)
+    sparse_losses = losses(sparse_replay)
+    for full_loss, sparse_loss in zip(full_losses[:3], sparse_losses[:3], strict=True):
+        torch.testing.assert_close(sparse_loss, full_loss)
+    assert set(full_losses[3]) == set(sparse_losses[3])
+    for key in full_losses[3]:
+        torch.testing.assert_close(sparse_losses[3][key], full_losses[3][key])
+
+    optimizer_kwargs = {
+        "gate_lr": 3e-3,
+        "lora_lr": 1e-3,
+        "value_lr": 1e-2,
+    }
+    full_optimizer = torch.optim.SGD(
+        full_policy.optimizer_parameter_groups(**optimizer_kwargs)
+    )
+    sparse_optimizer = torch.optim.SGD(
+        sparse_policy.optimizer_parameter_groups(**optimizer_kwargs)
+    )
+    full_before = [
+        parameter.detach().clone()
+        for group in full_optimizer.param_groups
+        for parameter in group["params"]
+    ]
+    sparse_before = [
+        parameter.detach().clone()
+        for group in sparse_optimizer.param_groups
+        for parameter in group["params"]
+    ]
+    full_losses[2].backward()
+    sparse_losses[2].backward()
+
+    for full_group, sparse_group in zip(
+        full_optimizer.param_groups,
+        sparse_optimizer.param_groups,
+        strict=True,
+    ):
+        assert full_group["name"] == sparse_group["name"]
+        for full_parameter, sparse_parameter in zip(
+            full_group["params"], sparse_group["params"], strict=True
+        ):
+            torch.testing.assert_close(sparse_parameter.grad, full_parameter.grad)
+
+    full_optimizer.step()
+    sparse_optimizer.step()
+    full_after = [
+        parameter.detach().clone()
+        for group in full_optimizer.param_groups
+        for parameter in group["params"]
+    ]
+    sparse_after = [
+        parameter.detach().clone()
+        for group in sparse_optimizer.param_groups
+        for parameter in group["params"]
+    ]
+    for full_start, sparse_start, full_end, sparse_end in zip(
+        full_before,
+        sparse_before,
+        full_after,
+        sparse_after,
+        strict=True,
+    ):
+        torch.testing.assert_close(sparse_start, full_start)
+        torch.testing.assert_close(sparse_end, full_end)
+        torch.testing.assert_close(sparse_end - sparse_start, full_end - full_start)
+    assert all(
+        not torch.equal(start, end) for start, end in zip(full_before, full_after)
+    )
 
 
 def test_nn_module_forward_dispatches_and_actor_stays_in_eval_mode():
