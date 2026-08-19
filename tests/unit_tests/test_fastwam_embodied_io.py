@@ -127,3 +127,43 @@ def test_embodied_rollout_stacks_splits_and_batches_route_records():
     batch = convert_trajectories_to_batch(split)
     assert batch["route_info"].shape == torch.Size([2, 2])
     assert batch["emitted_gate"].shape == torch.Size([2, 2])
+
+
+def test_consuming_handoff_preserves_values_and_releases_sources():
+    rollout = EmbodiedRolloutResult(max_episode_length=2)
+    expected = []
+    for chunk_id in range(2):
+        route, emitted = _step_records(chunk_id)
+        replay = torch.full((2, 3), float(chunk_id + 1))
+        expected.append(replay)
+        rollout.append_step_result(
+            ChunkStepResult(
+                actions=torch.full((2, 2), float(chunk_id)),
+                rewards=torch.ones(2),
+                dones=torch.zeros(2, dtype=torch.bool),
+                forward_inputs={"gate_kv_action_key": replay},
+                route_info=route,
+                emitted_gate=emitted,
+            )
+        )
+
+    trajectories = rollout.to_splited_trajectories_by_sizes([1, 1], consume=True)
+    assert rollout.forward_inputs == []
+    assert rollout.actions == []
+    assert rollout.route_info == []
+    assert torch.equal(
+        torch.cat(
+            [item.forward_inputs["gate_kv_action_key"] for item in trajectories],
+            dim=1,
+        ),
+        torch.stack(expected, dim=0),
+    )
+
+    batch = convert_trajectories_to_batch(trajectories, consume=True)
+    assert trajectories == []
+    assert torch.equal(
+        batch["forward_inputs"]["gate_kv_action_key"],
+        torch.stack(expected, dim=0),
+    )
+    assert batch["route_info"].shape == torch.Size([2, 2])
+    assert batch["emitted_gate"].shape == torch.Size([2, 2])

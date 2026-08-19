@@ -18,6 +18,7 @@ import gc
 import json
 import os
 import time
+from dataclasses import replace
 from typing import Any, Callable, Literal, Optional
 
 import numpy as np
@@ -32,8 +33,10 @@ from rlinf.algorithms.rlt import (
 )
 from rlinf.config import SupportedModel
 from rlinf.config_contracts import (
+    FASTWAM_RESUME_MODE_N4_TO_THREE_ROLLOUT,
     build_fastwam_checkpoint_contract,
     validate_fastwam_eval_checkpoint_contract,
+    validate_fastwam_training_checkpoint_contract,
 )
 from rlinf.data.embodied_io_struct import (
     EvaluationRolloutControl,
@@ -49,7 +52,7 @@ from rlinf.utils.checkpoint_state import (
     checkpoint_state_sha256,
 )
 from rlinf.utils.placement import HybridComponentPlacement
-from rlinf.utils.utils import get_rng_state, set_rng_state
+from rlinf.utils.utils import get_rng_state, seed_everything, set_rng_state
 
 
 def _fastwam_checkpoint_cpu_clone(value: Any) -> Any:
@@ -181,6 +184,7 @@ class MultiStepRolloutWorker(Worker):
                 "rollout_results": [],
             }
         self.rollout_queue_size = self.cfg.rollout.get("rollout_queue_size", 0)
+        self._fastwam_kv_store = None
 
     def init_worker(self):
         rollout_model_config = copy.deepcopy(self.model_cfg)
@@ -274,6 +278,26 @@ class MultiStepRolloutWorker(Worker):
             )
 
         self.setup_sample_params()
+        if (
+            SupportedModel(self.model_cfg.model_type) is SupportedModel.FASTWAM_ADAPTIVE
+            and str(self.model_cfg.kv_replay.backend) == "stored"
+            and not self.only_eval
+        ):
+            from rlinf.models.embodiment.wam_policy.tiered_kv_store import (
+                TieredGateKVStore,
+            )
+
+            actor_world_size = self.placement.get_world_size("actor")
+            if actor_world_size != 1:
+                raise ValueError(
+                    "Handle-based stored Gate K/V replay currently requires one "
+                    f"logical actor rank, got {actor_world_size}."
+                )
+            self._fastwam_kv_store = TieredGateKVStore(
+                source_rank=self._rank,
+                device=self.device,
+                config=self.hf_model.config.kv_replay,
+            )
         if self.enable_offload:
             self.offload_model()
 
@@ -417,7 +441,15 @@ class MultiStepRolloutWorker(Worker):
             )
         if not hasattr(self.hf_model, "load_rollout_runtime_state_dict"):
             raise TypeError("FastWAM rollout policy has no runtime-state loader.")
-        checkpoint_path = os.path.join(load_path, f"rank_{self._rank}.pt")
+        allow_capacity_expansion = bool(
+            getattr(
+                self.cfg.runner,
+                "fastwam_n4_to_three_rollout_resume",
+                False,
+            )
+        )
+        checkpoint_rank = 0 if allow_capacity_expansion else int(self._rank)
+        checkpoint_path = os.path.join(load_path, f"rank_{checkpoint_rank}.pt")
         payload = torch.load(
             checkpoint_path,
             map_location="cpu",
@@ -441,10 +473,6 @@ class MultiStepRolloutWorker(Worker):
             )
         if payload.get("schema") != "fastwam-adaptive-rollout-runtime-v1":
             raise ValueError("Unsupported FastWAM rollout-runtime schema.")
-        if int(payload.get("rank", -1)) != int(self._rank) or int(
-            payload.get("world_size", -1)
-        ) != int(self._world_size):
-            raise ValueError("FastWAM rollout-runtime rank/world-size mismatch.")
         expected_parent = str(self.model_cfg.actor_checkpoint_sha256).lower()
         if payload.get("parent_checkpoint_sha256") != expected_parent:
             raise ValueError("FastWAM rollout-runtime parent hash mismatch.")
@@ -453,8 +481,29 @@ class MultiStepRolloutWorker(Worker):
         ).lower()
         if payload.get("critic_parent_checkpoint_sha256") != expected_critic_parent:
             raise ValueError("FastWAM rollout-runtime pi0.5 parent hash mismatch.")
-        if payload.get("contract") != self._fastwam_checkpoint_contract():
-            raise ValueError("FastWAM rollout-runtime config contract mismatch.")
+        resume_contract = validate_fastwam_training_checkpoint_contract(
+            payload.get("contract"),
+            self._fastwam_checkpoint_contract(),
+            allow_n4_to_three_rollout_expansion=allow_capacity_expansion,
+            owner="rollout",
+        )
+        is_capacity_expansion = (
+            resume_contract["mode"] == FASTWAM_RESUME_MODE_N4_TO_THREE_ROLLOUT
+        )
+        if is_capacity_expansion:
+            if (
+                int(payload.get("rank", -1)) != 0
+                or int(payload.get("world_size", -1)) != 1
+                or int(payload.get("step", -1)) != 100
+            ):
+                raise ValueError(
+                    "FastWAM N=4 capacity resume requires rollout rank 0 / "
+                    "world-size 1 at step 100."
+                )
+        elif int(payload.get("rank", -1)) != int(self._rank) or int(
+            payload.get("world_size", -1)
+        ) != int(self._world_size):
+            raise ValueError("FastWAM rollout-runtime rank/world-size mismatch.")
         step = int(payload.get("step", -1))
         rollout_actor_version = int(payload.get("rollout_actor_version", -1))
         if step < 1 or rollout_actor_version not in {step - 1, step}:
@@ -469,35 +518,76 @@ class MultiStepRolloutWorker(Worker):
             raise ValueError("FastWAM rollout-runtime policy/worker version mismatch.")
         if "route_tracker" not in policy_runtime:
             raise ValueError("FastWAM rollout checkpoint omits delayed-route state.")
-        saved_route_sha256 = checkpoint_state_sha256(policy_runtime["route_tracker"])
-        saved_rng_sha256 = checkpoint_state_sha256(payload["rng"])
-        self.hf_model.load_rollout_runtime_state_dict(policy_runtime)
+        source_route_sha256 = checkpoint_state_sha256(policy_runtime["route_tracker"])
+        source_rng_sha256 = checkpoint_state_sha256(payload["rng"])
+        restored_policy_runtime = policy_runtime
+        if is_capacity_expansion:
+            restored_policy_runtime = copy.deepcopy(policy_runtime)
+            restored_policy_runtime["route_tracker"] = {
+                "next_episode_id": 0,
+                "next_episode_ids": {},
+                "states": {},
+            }
+        expected_route_sha256 = checkpoint_state_sha256(
+            restored_policy_runtime["route_tracker"]
+        )
+        self.hf_model.load_rollout_runtime_state_dict(restored_policy_runtime)
         self.version = rollout_actor_version
         restored_runtime = self.hf_model.rollout_runtime_state_dict()
         restored_route_sha256 = checkpoint_state_sha256(
             restored_runtime["route_tracker"]
         )
-        if restored_route_sha256 != saved_route_sha256:
+        if restored_route_sha256 != expected_route_sha256:
             raise ValueError("FastWAM rollout delayed-route state changed during load.")
-        set_rng_state(payload["rng"])
+        expanded_rng_seed = None
+        if is_capacity_expansion and int(self._rank) > 0:
+            expanded_rng_seed = (
+                int(self.cfg.actor.seed)
+                + step * int(self._world_size)
+                + int(self._rank)
+            )
+            seed_everything(expanded_rng_seed)
+            rng_mode = "deterministic_new_rank"
+        else:
+            set_rng_state(payload["rng"])
+            rng_mode = "source_exact"
         restored_rng_sha256 = checkpoint_state_sha256(get_rng_state())
-        if restored_rng_sha256 != saved_rng_sha256:
+        if rng_mode == "source_exact" and restored_rng_sha256 != source_rng_sha256:
             raise ValueError("FastWAM rollout RNG state changed during load.")
+        resume_audit = {
+            "schema": FASTWAM_RESUME_AUDIT_SCHEMA,
+            "owner": "rollout",
+            "rank": int(self._rank),
+            "step": step,
+            "actor_version": rollout_actor_version,
+            "route_state_sha256": restored_route_sha256,
+            "rng_sha256": restored_rng_sha256,
+            "status": "PASS",
+        }
+        if is_capacity_expansion:
+            resume_audit.update(
+                {
+                    "resume_mode": resume_contract["mode"],
+                    "source_rank": 0,
+                    "source_world_size": resume_contract["source_world_size"],
+                    "target_world_size": resume_contract["target_world_size"],
+                    "source_environment_count": resume_contract[
+                        "source_environment_count"
+                    ],
+                    "target_environment_count": resume_contract[
+                        "target_environment_count"
+                    ],
+                    "source_route_state_sha256": source_route_sha256,
+                    "source_rng_sha256": source_rng_sha256,
+                    "route_state_mode": "reset_for_topology_expansion",
+                    "rng_mode": rng_mode,
+                }
+            )
+            if expanded_rng_seed is not None:
+                resume_audit["rng_seed"] = expanded_rng_seed
         print(
             f"{FASTWAM_ROLLOUT_RESUME_AUDIT_SENTINEL} "
-            + json.dumps(
-                {
-                    "schema": FASTWAM_RESUME_AUDIT_SCHEMA,
-                    "owner": "rollout",
-                    "rank": int(self._rank),
-                    "step": step,
-                    "actor_version": rollout_actor_version,
-                    "route_state_sha256": restored_route_sha256,
-                    "rng_sha256": restored_rng_sha256,
-                    "status": "PASS",
-                },
-                sort_keys=True,
-            ),
+            + json.dumps(resume_audit, sort_keys=True),
             flush=True,
         )
         return step
@@ -860,8 +950,99 @@ class MultiStepRolloutWorker(Worker):
         if isinstance(actions, np.ndarray):
             actions = torch.from_numpy(actions)
 
+        if (
+            mode == "train"
+            and SupportedModel(self.model_cfg.model_type)
+            is SupportedModel.FASTWAM_ADAPTIVE
+            and self._fastwam_kv_store is not None
+        ):
+            forward_inputs, references = self._fastwam_kv_store.register_forward_inputs(
+                result["forward_inputs"]
+            )
+            emitted_gate = result.get("emitted_gate")
+            if emitted_gate is None or emitted_gate.kv_metadata is None:
+                raise ValueError(
+                    "Handle-based stored replay requires emitted Gate K/V metadata."
+                )
+            if emitted_gate.kv_metadata.payload_reference_ids is not None:
+                raise RuntimeError("Gate K/V payload references were already assigned.")
+            result["forward_inputs"] = forward_inputs
+            result["emitted_gate"] = replace(
+                emitted_gate,
+                kv_metadata=replace(
+                    emitted_gate.kv_metadata,
+                    payload_reference_ids=references,
+                ),
+            )
+
         result["expert_label_flag"] = bool(expert_label_flag)
         return actions, result
+
+    @Worker.timer("rollout/serve_gate_kv")
+    async def serve_gate_kv_requests(
+        self,
+        request_channel: Channel,
+        response_channel: Channel,
+    ) -> dict[str, float]:
+        """Serve bounded actor requests while keeping K/V rollout-resident."""
+
+        if self._fastwam_kv_store is None:
+            raise RuntimeError("This rollout rank has no stored Gate K/V owner.")
+        from rlinf.models.embodiment.wam_policy.tiered_kv_store import (
+            GateKVStoreRequest,
+            decode_gate_kv_handle,
+            gate_kv_request_key,
+            gate_kv_response_key,
+        )
+
+        request_key = gate_kv_request_key(self._rank)
+        while True:
+            request = await request_channel.get(
+                key=request_key,
+                async_op=True,
+            ).async_wait()
+            if not isinstance(request, GateKVStoreRequest):
+                raise TypeError("Gate K/V service received an untyped request.")
+            if any(
+                decode_gate_kv_handle(handle)[0] != self._rank
+                for handle in request.handles
+            ):
+                raise ValueError("Gate K/V request was routed to the wrong rank.")
+            response_key = gate_kv_response_key(
+                actor_rank=request.actor_rank,
+                request_id=request.request_id,
+            )
+            if request.command == "retain":
+                self._fastwam_kv_store.retain(request.handles)
+                response = {"retained": len(request.handles)}
+            elif request.command == "fetch":
+                response = self._fastwam_kv_store.fetch(request.handles)
+            elif request.command == "release":
+                self._fastwam_kv_store.release(request.handles)
+                continue
+            elif request.command == "stop":
+                if self._fastwam_kv_store.entry_count:
+                    raise RuntimeError(
+                        "Gate K/V service stopped before last-consumption release: "
+                        f"rank={self._rank}, entries="
+                        f"{self._fastwam_kv_store.entry_count}."
+                    )
+                break
+            else:  # pragma: no cover - dataclass validation owns this branch.
+                raise AssertionError(request.command)
+            if request.command == "retain":
+                response_channel.put_via_ray(
+                    response,
+                    key=response_key,
+                    async_op=False,
+                )
+            else:
+                response_channel.put(
+                    response,
+                    key=response_key,
+                    async_op=False,
+                )
+        return self._fastwam_kv_store.metrics()
 
     def _predict_rollout_actions(
         self,
@@ -1485,5 +1666,7 @@ class MultiStepRolloutWorker(Worker):
         ]
 
     def set_global_step(self, global_step: int):
+        if self._fastwam_kv_store is not None:
+            self._fastwam_kv_store.begin_generation(global_step)
         if hasattr(self.hf_model, "set_global_step"):
             self.hf_model.set_global_step(global_step)

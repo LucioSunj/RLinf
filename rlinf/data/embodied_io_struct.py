@@ -26,6 +26,7 @@ from rlinf.utils.nested_dict_process import (
     split_dict,
     split_dict_to_chunk,
     stack_list_of_dict_tensor,
+    stack_list_of_dict_tensor_consuming,
 )
 
 if TYPE_CHECKING:
@@ -808,41 +809,55 @@ class EmbodiedRolloutResult:
         self.curr_obs.clear()
         self.next_obs.clear()
 
-    def to_trajectory(self) -> Trajectory:
+    def to_trajectory(self, *, consume: bool = False) -> Trajectory:
+        """Stack collected chunk results into a trajectory.
+
+        Args:
+            consume: Release each collected source field immediately after it
+                has been stacked.  Use this for one-way worker handoff to avoid
+                retaining a complete duplicate of large replay payloads.
+
+        Returns:
+            A time-major trajectory.
+        """
+
+        def stack_tensor_list(values: list[torch.Tensor]) -> torch.Tensor:
+            stacked = torch.stack(values, dim=0).cpu().contiguous()
+            if consume:
+                values.clear()
+            return stacked
+
         # return [trajectory_length, B, ...]
         trajectory = Trajectory(
             max_episode_length=self.max_episode_length,
         )
         if len(self.actions) > 0:
-            trajectory.actions = torch.stack(self.actions, dim=0).cpu().contiguous()
+            trajectory.actions = stack_tensor_list(self.actions)
         if len(self.intervene_flags) > 0:
-            trajectory.intervene_flags = (
-                torch.stack(self.intervene_flags, dim=0).cpu().contiguous()
-            )
+            trajectory.intervene_flags = stack_tensor_list(self.intervene_flags)
         if len(self.rewards) > 0:
-            trajectory.rewards = torch.stack(self.rewards, dim=0).cpu().contiguous()
+            trajectory.rewards = stack_tensor_list(self.rewards)
         if len(self.terminations) > 0:
-            trajectory.terminations = (
-                torch.stack(self.terminations, dim=0).cpu().contiguous()
-            )
+            trajectory.terminations = stack_tensor_list(self.terminations)
         if len(self.truncations) > 0:
-            trajectory.truncations = (
-                torch.stack(self.truncations, dim=0).cpu().contiguous()
-            )
+            trajectory.truncations = stack_tensor_list(self.truncations)
         if len(self.dones) > 0:
-            trajectory.dones = torch.stack(self.dones, dim=0).cpu().contiguous()
+            trajectory.dones = stack_tensor_list(self.dones)
         if len(self.prev_logprobs) > 0:
-            trajectory.prev_logprobs = (
-                torch.stack(self.prev_logprobs, dim=0).cpu().contiguous()
-            )
+            trajectory.prev_logprobs = stack_tensor_list(self.prev_logprobs)
         if len(self.prev_values) > 0:
-            trajectory.prev_values = (
-                torch.stack(self.prev_values, dim=0).cpu().contiguous()
-            )
+            trajectory.prev_values = stack_tensor_list(self.prev_values)
         if len(self.versions) > 0:
-            trajectory.versions = torch.stack(self.versions, dim=0).cpu().contiguous()
+            trajectory.versions = stack_tensor_list(self.versions)
         if len(self.forward_inputs) > 0:
-            trajectory.forward_inputs = stack_list_of_dict_tensor(self.forward_inputs)
+            stack_dict = (
+                stack_list_of_dict_tensor_consuming
+                if consume
+                else stack_list_of_dict_tensor
+            )
+            trajectory.forward_inputs = stack_dict(self.forward_inputs)
+            if consume:
+                self.forward_inputs.clear()
             for key in trajectory.forward_inputs.keys():
                 trajectory.forward_inputs[key] = (
                     trajectory.forward_inputs[key].cpu().contiguous()
@@ -850,16 +865,34 @@ class EmbodiedRolloutResult:
         if len(self.route_info) > 0:
             record_type = type(self.route_info[0])
             trajectory.route_info = record_type.stack(self.route_info, dim=0).cpu()
+            if consume:
+                self.route_info.clear()
         if len(self.emitted_gate) > 0:
             record_type = type(self.emitted_gate[0])
             trajectory.emitted_gate = record_type.stack(self.emitted_gate, dim=0).cpu()
+            if consume:
+                self.emitted_gate.clear()
 
         if len(self.curr_obs) > 0:
-            trajectory.curr_obs = stack_list_of_dict_tensor(self.curr_obs)
+            stack_dict = (
+                stack_list_of_dict_tensor_consuming
+                if consume
+                else stack_list_of_dict_tensor
+            )
+            trajectory.curr_obs = stack_dict(self.curr_obs)
+            if consume:
+                self.curr_obs.clear()
             for key in trajectory.curr_obs.keys():
                 trajectory.curr_obs[key] = trajectory.curr_obs[key].cpu().contiguous()
         if len(self.next_obs) > 0:
-            trajectory.next_obs = stack_list_of_dict_tensor(self.next_obs)
+            stack_dict = (
+                stack_list_of_dict_tensor_consuming
+                if consume
+                else stack_list_of_dict_tensor
+            )
+            trajectory.next_obs = stack_dict(self.next_obs)
+            if consume:
+                self.next_obs.clear()
             for key in trajectory.next_obs.keys():
                 trajectory.next_obs[key] = trajectory.next_obs[key].cpu().contiguous()
 
@@ -927,9 +960,9 @@ class EmbodiedRolloutResult:
         return splited_trajectories
 
     def to_splited_trajectories_by_sizes(
-        self, split_sizes: list[int]
+        self, split_sizes: list[int], *, consume: bool = False
     ) -> list[Trajectory]:
-        trajectory = self.to_trajectory()
+        trajectory = self.to_trajectory(consume=consume)
         trajectories = [Trajectory() for _ in split_sizes]
 
         for field_name in trajectory.__dataclass_fields__:
@@ -1584,9 +1617,16 @@ class EmbodiedLerobotRolloutResult(EmbodiedRolloutResult):
 
 def convert_trajectories_to_batch(
     trajectories: list[Trajectory],
+    *,
+    consume: bool = False,
 ) -> dict[str, torch.Tensor]:
     """
     convert a list of trajectories to a batch dict, the shape of the batch is [T, B, ...].
+
+    When ``consume`` is true, trajectory fields are released as soon as their
+    concatenated output has been materialized.  This preserves values and
+    ordering while bounding the transient memory overhead to one field instead
+    of retaining a second complete replay batch.
     """
     if not trajectories:
         return {}
@@ -1601,10 +1641,13 @@ def convert_trajectories_to_batch(
         batch["curr_obs"] = {}
         for key in all_keys:
             tensors = [
-                traj.curr_obs[key] for traj in trajectories if key in traj.curr_obs
+                (traj.curr_obs.pop(key) if consume else traj.curr_obs[key])
+                for traj in trajectories
+                if key in traj.curr_obs
             ]
             if tensors:
                 batch["curr_obs"][key] = torch.cat(tensors, dim=1)
+            del tensors
 
     if trajectories[0].next_obs:
         all_keys: set[str] = set()
@@ -1613,10 +1656,13 @@ def convert_trajectories_to_batch(
         batch["next_obs"] = {}
         for key in all_keys:
             tensors = [
-                traj.next_obs[key] for traj in trajectories if key in traj.next_obs
+                (traj.next_obs.pop(key) if consume else traj.next_obs[key])
+                for traj in trajectories
+                if key in traj.next_obs
             ]
             if tensors:
                 batch["next_obs"][key] = torch.cat(tensors, dim=1)
+            del tensors
 
     if trajectories[0].forward_inputs:
         all_keys: set[str] = set()
@@ -1625,12 +1671,13 @@ def convert_trajectories_to_batch(
         batch["forward_inputs"] = {}
         for key in all_keys:
             tensors = [
-                traj.forward_inputs[key]
+                (traj.forward_inputs.pop(key) if consume else traj.forward_inputs[key])
                 for traj in trajectories
                 if key in traj.forward_inputs
             ]
             if tensors:
                 batch["forward_inputs"][key] = torch.cat(tensors, dim=1)
+            del tensors
 
     # -------- tensor fields --------
     reference_trajectory = trajectories[0]
@@ -1643,8 +1690,12 @@ def convert_trajectories_to_batch(
                 if getattr(traj, field_name) is not None
             ]
             if field_list:
+                if consume:
+                    for trajectory in trajectories:
+                        setattr(trajectory, field_name, None)
                 record_type = type(field_list[0])
                 batch[field_name] = record_type.cat(field_list, dim=1)
+            del field_list
             continue
         if not isinstance(reference_value, torch.Tensor):
             continue
@@ -1654,6 +1705,13 @@ def convert_trajectories_to_batch(
             if getattr(traj, field_name) is not None
         ]
         if field_list:
+            if consume:
+                for trajectory in trajectories:
+                    setattr(trajectory, field_name, None)
             batch[field_name] = torch.cat(field_list, dim=1)
+        del field_list
+
+    if consume:
+        trajectories.clear()
 
     return batch

@@ -17,10 +17,13 @@ import json
 import math
 import os
 import time
+from collections import deque
+from concurrent.futures import Future, ThreadPoolExecutor
 from functools import partial
-from typing import Optional
+from typing import Any, Optional
 
 import numpy as np
+import psutil
 import torch
 from omegaconf import DictConfig, OmegaConf
 from torch import nn
@@ -56,7 +59,11 @@ from rlinf.algorithms.utils import (
     kl_penalty,
 )
 from rlinf.config import SupportedModel, torch_dtype_from_precision
-from rlinf.config_contracts import build_fastwam_checkpoint_contract
+from rlinf.config_contracts import (
+    FASTWAM_RESUME_MODE_N4_TO_THREE_ROLLOUT,
+    build_fastwam_checkpoint_contract,
+    validate_fastwam_training_checkpoint_contract,
+)
 from rlinf.data.embodied_io_struct import (
     ACTOR_TRAJECTORY_CHANNEL_TAG,
     Trajectory,
@@ -106,6 +113,7 @@ from rlinf.utils.metric_utils import (
 )
 from rlinf.utils.nested_dict_process import (
     flatten_time_batch,
+    flatten_time_batch_consuming,
     map_nested_tensors,
     merge_rollout_epoch_batch,
     put_tensor_device,
@@ -284,9 +292,22 @@ def process_nested_dict_for_adv(nested_dict, rollout_epoch):
     return merge_rollout_epoch_batch(nested_dict, rollout_epoch)
 
 
-def process_nested_dict_for_train(nested_dict, shuffle_id):
+def process_nested_dict_for_train(nested_dict, shuffle_id, *, consume=False):
+    """Flatten and shuffle a rollout batch for actor training.
+
+    Args:
+        nested_dict: Time-major rollout batch.
+        shuffle_id: Shared flattened-sample permutation.
+        consume: Pop source fields while shuffling. This bounds peak memory for
+            one-way stored-replay handoff without changing the permutation.
+
+    Returns:
+        Flattened and shuffled training batch.
+    """
+
     ret_dict = {}
-    for key, value in nested_dict.items():
+    for key in list(nested_dict):
+        value = nested_dict.pop(key) if consume else nested_dict[key]
         if key in ["dones", "terminations", "truncations", "prev_values"]:
             value = value[:-1]
         if "env_info" in key:
@@ -295,7 +316,9 @@ def process_nested_dict_for_train(nested_dict, shuffle_id):
             ret_dict[key] = None
             continue
 
-        ret_dict[key] = flatten_time_batch(value, shuffle_id, field_name=key)
+        flatten = flatten_time_batch_consuming if consume else flatten_time_batch
+        ret_dict[key] = flatten(value, shuffle_id, field_name=key)
+        del value
     return ret_dict
 
 
@@ -1287,6 +1310,17 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
         self._rollout_all_ranks = list(
             range(self._component_placement.get_world_size("rollout"))
         )
+        self._fastwam_kv_request_channel = None
+        self._fastwam_kv_response_channel = None
+        self._fastwam_kv_request_id = 0
+        self._fastwam_kv_executor: ThreadPoolExecutor | None = None
+        self._fastwam_kv_prefetch_stream: torch.cuda.Stream | None = None
+        self._fastwam_kv_h2d_events: list[
+            tuple[torch.cuda.Event, torch.cuda.Event]
+        ] = []
+        self._fastwam_kv_prefetch_wait_seconds = 0.0
+        self._fastwam_kv_h2d_bytes = 0
+        self._fastwam_kv_use_counts: dict[int, int] = {}
 
     def init_worker(self) -> None:
         """
@@ -1708,9 +1742,27 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
                         f"{payload.get('critic_parent_checkpoint_sha256')}."
                     )
                 expected_contract = self._fastwam_checkpoint_contract()
-                if payload.get("contract") != expected_contract:
+                resume_contract = validate_fastwam_training_checkpoint_contract(
+                    payload.get("contract"),
+                    expected_contract,
+                    allow_n4_to_three_rollout_expansion=bool(
+                        getattr(
+                            self.cfg.runner,
+                            "fastwam_n4_to_three_rollout_resume",
+                            False,
+                        )
+                    ),
+                    owner="actor",
+                )
+                if resume_contract[
+                    "mode"
+                ] == FASTWAM_RESUME_MODE_N4_TO_THREE_ROLLOUT and (
+                    int(payload.get("step", -1)) != 100
+                    or int(payload.get("optimizer_steps", -1)) != 1000
+                ):
                     raise ValueError(
-                        "FastWAM adaptive checkpoint/config contract mismatch."
+                        "FastWAM N=4 capacity resume requires the step-100 / "
+                        "optimizer-step-1000 actor checkpoint."
                     )
 
                 policy = self._fastwam_policy_module()
@@ -1744,22 +1796,36 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
                 restored_rng_sha256 = checkpoint_state_sha256(get_rng_state())
                 if restored_rng_sha256 != saved_rng_sha256:
                     raise ValueError("FastWAM actor RNG state changed during load.")
+                resume_audit = {
+                    "schema": FASTWAM_RESUME_AUDIT_SCHEMA,
+                    "owner": "actor",
+                    "rank": int(self._rank),
+                    "step": int(self.version),
+                    "optimizer_steps": int(self.optimizer_steps),
+                    "actor_version": int(policy.actor_version),
+                    "route_state_sha256": restored_route_sha256,
+                    "rng_sha256": restored_rng_sha256,
+                    "status": "PASS",
+                }
+                if resume_contract["mode"] == FASTWAM_RESUME_MODE_N4_TO_THREE_ROLLOUT:
+                    resume_audit.update(
+                        {
+                            "resume_mode": resume_contract["mode"],
+                            "source_world_size": resume_contract["source_world_size"],
+                            "target_world_size": resume_contract["target_world_size"],
+                            "source_environment_count": resume_contract[
+                                "source_environment_count"
+                            ],
+                            "target_environment_count": resume_contract[
+                                "target_environment_count"
+                            ],
+                            "route_state_mode": "source_exact",
+                            "rng_mode": "source_exact",
+                        }
+                    )
                 print(
                     f"{FASTWAM_ACTOR_RESUME_AUDIT_SENTINEL} "
-                    + json.dumps(
-                        {
-                            "schema": FASTWAM_RESUME_AUDIT_SCHEMA,
-                            "owner": "actor",
-                            "rank": int(self._rank),
-                            "step": int(self.version),
-                            "optimizer_steps": int(self.optimizer_steps),
-                            "actor_version": int(policy.actor_version),
-                            "route_state_sha256": restored_route_sha256,
-                            "rng_sha256": restored_rng_sha256,
-                            "status": "PASS",
-                        },
-                        sort_keys=True,
-                    ),
+                    + json.dumps(resume_audit, sort_keys=True),
                     flush=True,
                 )
                 self._fastwam_bc_bootstrap = bc_bootstrap
@@ -1789,6 +1855,8 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
             if self.is_weight_offloaded:
                 self.load_param_and_grad(self.device, False)
 
+        if self._uses_fastwam_handle_replay():
+            self._initialize_fastwam_fsdp_for_handle_replay()
         state_dict = self.get_rollout_state_dict()
 
         async def send_func(data):
@@ -1867,7 +1935,7 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
         ]
         recv_list: list[Trajectory] = [await work.async_wait() for work in works]
 
-        self.rollout_batch = convert_trajectories_to_batch(recv_list)
+        self.rollout_batch = convert_trajectories_to_batch(recv_list, consume=True)
 
         self.rollout_batch = self._process_received_rollout_batch(self.rollout_batch)
 
@@ -1960,6 +2028,7 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
         """
         Compute the advantages and returns.
         """
+        model_type = SupportedModel(self.cfg.actor.model.model_type)
         if self.cfg.algorithm.adv_type == "opd":
             self.compute_opd_teacher_logprobs()
 
@@ -1967,7 +2036,6 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
         cost_audit = None
         counterfactual_cost_audit = None
         rollout_state_audit = None
-        model_type = SupportedModel(self.cfg.actor.model.model_type)
         if model_type is SupportedModel.FASTWAM_ADAPTIVE:
             if self.cfg.algorithm.reward_type != "chunk_level":
                 raise ValueError(
@@ -2426,8 +2494,426 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
             data["critic/lr"] = lr_list[1]
         return data
 
+    def _uses_fastwam_handle_replay(self) -> bool:
+        return (
+            SupportedModel(self.cfg.actor.model.model_type)
+            is SupportedModel.FASTWAM_ADAPTIVE
+            and str(self.cfg.actor.model.kv_replay.backend) == "stored"
+        )
+
+    def _initialize_fastwam_fsdp_for_handle_replay(self) -> None:
+        """Finish FSDP lazy init before the asynchronous K/V CUDA stream starts.
+
+        Classic FSDP initializes its flat-parameter runtime storage on the
+        first forward.  Handle replay starts a dedicated CUDA prefetch stream
+        before that forward, so initialize the hierarchy synchronously and
+        restore the ``use_orig_params`` views against the resulting flat
+        storage first.  Rebinding preserves the original Parameter identities
+        held by the optimizer.
+        """
+
+        if getattr(self, "_fastwam_handle_replay_fsdp_initialized", False):
+            return
+        from torch.distributed.fsdp import FullyShardedDataParallel
+        from torch.distributed.fsdp._runtime_utils import _lazy_init
+
+        if not isinstance(self.model, FullyShardedDataParallel):
+            raise TypeError("FastWAM handle replay requires a classic FSDP actor.")
+        _lazy_init(self.model, self.model)
+        handles = self._strategy._iter_fsdp_handles(self.model)
+        if not handles:
+            raise RuntimeError("FastWAM handle replay found no FSDP handles.")
+        for handle in handles:
+            self._strategy._rebind_handle_views(handle)
+        self._fastwam_handle_replay_fsdp_initialized = True
+
+    def _restore_fastwam_fsdp_parameter_views_after_backward(self) -> int:
+        """Restore original Parameters after a conditionally unused handle.
+
+        Classic FSDP exposes autograd-tracked Tensor views during backward.
+        When a whole ``NO_SHARD`` handle is unused, PyTorch 2.7 returns before
+        restoring the original ``use_orig_params`` Parameter objects.  The
+        next forward then mistakes those shaped views for externally replaced
+        parameters.  Rebind only that exact same-storage Tensor-view state and
+        fail closed for any genuine storage or Parameter replacement.
+
+        Returns:
+            Number of FSDP handles whose original Parameter views were restored.
+        """
+
+        restored_handles = 0
+        for handle in self._strategy._iter_fsdp_handles(self.model):
+            flat_param = handle.flat_param
+            flat_storage = flat_param.untyped_storage().data_ptr()
+            restore_handle = False
+            for parameter, shard_info, (name, owner, module_name) in zip(
+                flat_param._params,
+                flat_param._shard_param_infos,
+                flat_param._param_infos,
+                strict=True,
+            ):
+                if not shard_info.in_shard:
+                    continue
+                current = getattr(owner, name, None)
+                if current is parameter:
+                    if parameter.untyped_storage().data_ptr() != flat_storage:
+                        raise RuntimeError(
+                            "FastWAM FSDP Parameter detached from flat storage "
+                            f"after backward: {module_name}.{name}."
+                        )
+                    continue
+                recoverable_view = (
+                    not handle.uses_sharded_strategy
+                    and isinstance(current, torch.Tensor)
+                    and not isinstance(current, nn.Parameter)
+                    and current.shape == parameter.shape
+                    and current.dtype == parameter.dtype
+                    and current.device == parameter.device
+                    and current.untyped_storage().data_ptr() == flat_storage
+                    and parameter.untyped_storage().data_ptr() == flat_storage
+                )
+                if not recoverable_view:
+                    raise RuntimeError(
+                        "FastWAM FSDP observed a non-recoverable parameter "
+                        "replacement after backward: "
+                        f"{module_name}.{name}, current={type(current).__qualname__}, "
+                        f"shape={getattr(current, 'shape', None)}."
+                    )
+                restore_handle = True
+            if restore_handle:
+                self._strategy._rebind_handle_views(handle)
+                restored_handles += 1
+        return restored_handles
+
+    def _next_fastwam_kv_request_id(self) -> int:
+        request_id = self._fastwam_kv_request_id
+        self._fastwam_kv_request_id += 1
+        return request_id
+
+    def _post_fastwam_kv_request(
+        self,
+        *,
+        source_rank: int,
+        command: str,
+        handles: tuple[int, ...],
+        expect_response: bool,
+    ):
+        from rlinf.models.embodiment.wam_policy.tiered_kv_store import (
+            GateKVStoreRequest,
+            gate_kv_request_key,
+            gate_kv_response_key,
+        )
+
+        if self._fastwam_kv_request_channel is None:
+            raise RuntimeError("Gate K/V request channel is not configured.")
+        request_id = self._next_fastwam_kv_request_id()
+        response_work = None
+        if expect_response:
+            if self._fastwam_kv_response_channel is None:
+                raise RuntimeError("Gate K/V response channel is not configured.")
+            response_work = self._fastwam_kv_response_channel.get(
+                key=gate_kv_response_key(
+                    actor_rank=self._rank,
+                    request_id=request_id,
+                ),
+                async_op=True,
+            )
+        request = GateKVStoreRequest(
+            command=command,
+            actor_rank=self._rank,
+            request_id=request_id,
+            handles=handles,
+        )
+        put_work = self._fastwam_kv_request_channel.put_via_ray(
+            request,
+            key=gate_kv_request_key(source_rank),
+            async_op=True,
+        )
+        if put_work is not None:
+            put_work.wait()
+        return response_work
+
+    @staticmethod
+    def _group_fastwam_handles(handles: tuple[int, ...]) -> dict[int, tuple[int, ...]]:
+        from rlinf.models.embodiment.wam_policy.tiered_kv_store import (
+            decode_gate_kv_handle,
+        )
+
+        grouped: dict[int, list[int]] = {}
+        for handle in handles:
+            source_rank, _, _ = decode_gate_kv_handle(handle)
+            grouped.setdefault(source_rank, []).append(handle)
+        return {rank: tuple(values) for rank, values in grouped.items()}
+
+    def _start_fastwam_handle_replay(
+        self,
+        *,
+        request_channel: Channel,
+        response_channel: Channel,
+        update_epoch: int,
+    ) -> None:
+        emitted = self.rollout_batch.get("emitted_gate")
+        metadata = None if emitted is None else emitted.kv_metadata
+        if metadata is None or metadata.payload_reference_ids is None:
+            raise ValueError(
+                "Stored Gate replay trajectories must carry payload references."
+            )
+        gate_valid = self.rollout_batch.get("gate_valid_mask")
+        if (
+            gate_valid is None
+            or gate_valid.shape != metadata.payload_reference_ids.shape
+        ):
+            raise ValueError(
+                "Gate-valid mask and K/V payload references must have equal shape."
+            )
+        all_handles = tuple(
+            int(value)
+            for value in metadata.payload_reference_ids.detach().cpu().reshape(-1)
+        )
+        eligible_handles = tuple(
+            int(value)
+            for value in metadata.payload_reference_ids[gate_valid.bool()]
+            .detach()
+            .cpu()
+            .reshape(-1)
+        )
+        if len(set(all_handles)) != len(all_handles):
+            raise ValueError(
+                "One rollout update repeated a Gate K/V payload reference."
+            )
+        self._fastwam_kv_request_channel = request_channel
+        self._fastwam_kv_response_channel = response_channel
+        self._fastwam_kv_prefetch_wait_seconds = 0.0
+        self._fastwam_kv_h2d_bytes = 0
+        self._fastwam_kv_h2d_events = []
+        self._fastwam_kv_use_counts = {
+            handle: int(update_epoch) for handle in eligible_handles
+        }
+        self._fastwam_kv_all_handles = all_handles
+        self._fastwam_kv_executor = ThreadPoolExecutor(
+            max_workers=1,
+            thread_name_prefix=f"gate-kv-prefetch-{self._rank}",
+        )
+        if torch.cuda.is_available():
+            self._fastwam_kv_prefetch_stream = torch.cuda.Stream(device=self.device)
+
+        grouped = self._group_fastwam_handles(eligible_handles)
+        responses = []
+        for source_rank in self._rollout_all_ranks:
+            responses.append(
+                self._post_fastwam_kv_request(
+                    source_rank=source_rank,
+                    command="retain",
+                    handles=grouped.get(source_rank, ()),
+                    expect_response=True,
+                )
+            )
+        retained = 0
+        for response_work in responses:
+            response = response_work.wait()
+            retained += int(response["retained"])
+        if retained != len(eligible_handles):
+            raise RuntimeError(
+                "Rollout stores retained a different eligible K/V count: "
+                f"{retained} != {len(eligible_handles)}."
+            )
+
+    @staticmethod
+    def _pin_fastwam_response_tensor(tensor: torch.Tensor) -> torch.Tensor:
+        tensor = tensor.contiguous()
+        if tensor.device.type != "cpu" or tensor.is_pinned():
+            return tensor
+        try:
+            return tensor.pin_memory()
+        except RuntimeError:
+            return tensor
+
+    def _finish_fastwam_kv_prefetch(
+        self,
+        *,
+        response_works: list[Any],
+        handles: tuple[int, ...],
+        batch_indices: torch.Tensor,
+    ) -> tuple[dict[str, torch.Tensor], torch.cuda.Event | None]:
+        from rlinf.models.embodiment.wam_policy.tiered_kv_store import (
+            GATE_KV_BATCH_INDICES,
+            GATE_KV_FORWARD_KEYS,
+            GATE_KV_RESPONSE_HANDLES,
+        )
+
+        responses = [work.wait() for work in response_works]
+        locations: dict[int, tuple[dict[str, torch.Tensor], int]] = {}
+        for response in responses:
+            response_handles = response[GATE_KV_RESPONSE_HANDLES].tolist()
+            for index, handle in enumerate(response_handles):
+                locations[int(handle)] = (response, index)
+        missing = [handle for handle in handles if handle not in locations]
+        if missing:
+            raise KeyError(f"Gate K/V prefetch omitted handles {missing[:8]}.")
+
+        host_payload = {}
+        for key in GATE_KV_FORWARD_KEYS:
+            ordered = [
+                locations[handle][0][key][
+                    locations[handle][1] : locations[handle][1] + 1
+                ]
+                for handle in handles
+            ]
+            host_payload[key] = self._pin_fastwam_response_tensor(
+                torch.cat(ordered, dim=0)
+            )
+        host_payload[GATE_KV_BATCH_INDICES] = batch_indices
+        self._fastwam_kv_h2d_bytes += sum(
+            int(tensor.numel() * tensor.element_size())
+            for tensor in host_payload.values()
+        )
+
+        if self._fastwam_kv_prefetch_stream is None:
+            return {
+                key: value.to(self.device) for key, value in host_payload.items()
+            }, None
+        start_event = torch.cuda.Event(enable_timing=True)
+        end_event = torch.cuda.Event(enable_timing=True)
+        with torch.cuda.stream(self._fastwam_kv_prefetch_stream):
+            start_event.record()
+            device_payload = {
+                key: value.to(
+                    self.device,
+                    non_blocking=value.device.type == "cpu" and value.is_pinned(),
+                )
+                for key, value in host_payload.items()
+            }
+            end_event.record()
+        self._fastwam_kv_h2d_events.append((start_event, end_event))
+        return device_payload, end_event
+
+    def _schedule_fastwam_kv_prefetch(self, micro_batch: dict) -> Future:
+        if self._fastwam_kv_executor is None:
+            raise RuntimeError("Gate K/V prefetch executor is not running.")
+        emitted = micro_batch["emitted_gate"]
+        metadata = emitted.kv_metadata
+        gate_valid = micro_batch["gate_valid_mask"].bool().reshape(-1)
+        references = metadata.payload_reference_ids.reshape(-1)
+        batch_indices = gate_valid.nonzero(as_tuple=False).reshape(-1).cpu()
+        handles = tuple(
+            int(value) for value in references[gate_valid].detach().cpu().reshape(-1)
+        )
+        if not handles:
+            from rlinf.models.embodiment.wam_policy.tiered_kv_store import (
+                GATE_KV_BATCH_INDICES,
+            )
+
+            future: Future = Future()
+            future.set_result(
+                (
+                    {
+                        GATE_KV_BATCH_INDICES: torch.empty(
+                            0,
+                            dtype=torch.long,
+                            device=self.device,
+                        )
+                    },
+                    None,
+                    handles,
+                )
+            )
+            return future
+        response_works = []
+        for source_rank, grouped_handles in self._group_fastwam_handles(
+            handles
+        ).items():
+            response_works.append(
+                self._post_fastwam_kv_request(
+                    source_rank=source_rank,
+                    command="fetch",
+                    handles=grouped_handles,
+                    expect_response=True,
+                )
+            )
+
+        def finish():
+            payload, event = self._finish_fastwam_kv_prefetch(
+                response_works=response_works,
+                handles=handles,
+                batch_indices=batch_indices,
+            )
+            return payload, event, handles
+
+        return self._fastwam_kv_executor.submit(finish)
+
+    def _consume_fastwam_kv_prefetch(
+        self,
+        micro_batch: dict,
+        future: Future,
+    ) -> tuple[int, ...]:
+        wait_start = time.perf_counter()
+        payload, event, handles = future.result()
+        self._fastwam_kv_prefetch_wait_seconds += time.perf_counter() - wait_start
+        if event is not None:
+            torch.cuda.current_stream(self.device).wait_event(event)
+        forward_inputs = dict(micro_batch.get("forward_inputs", {}))
+        forward_inputs.update(payload)
+        micro_batch["forward_inputs"] = forward_inputs
+        return handles
+
+    def _release_consumed_fastwam_kv(self, handles: tuple[int, ...]) -> None:
+        releasable: dict[int, list[int]] = {}
+        for handle in handles:
+            remaining = self._fastwam_kv_use_counts[handle] - 1
+            self._fastwam_kv_use_counts[handle] = remaining
+            if remaining == 0:
+                source_rank = next(iter(self._group_fastwam_handles((handle,))))
+                releasable.setdefault(source_rank, []).append(handle)
+        for source_rank, values in releasable.items():
+            self._post_fastwam_kv_request(
+                source_rank=source_rank,
+                command="release",
+                handles=tuple(values),
+                expect_response=False,
+            )
+
+    def _stop_fastwam_handle_replay(self) -> dict[str, float]:
+        for source_rank in self._rollout_all_ranks:
+            self._post_fastwam_kv_request(
+                source_rank=source_rank,
+                command="stop",
+                handles=(),
+                expect_response=False,
+            )
+        if self._fastwam_kv_executor is not None:
+            self._fastwam_kv_executor.shutdown(wait=True)
+            self._fastwam_kv_executor = None
+        h2d_seconds = 0.0
+        for start_event, end_event in self._fastwam_kv_h2d_events:
+            end_event.synchronize()
+            h2d_seconds += float(start_event.elapsed_time(end_event)) / 1000.0
+        process_memory = psutil.Process(os.getpid()).memory_full_info()
+        free_gpu = peak_gpu = 0
+        if torch.cuda.is_available():
+            free_gpu, _ = torch.cuda.mem_get_info(self.device)
+            peak_gpu = torch.cuda.max_memory_allocated(self.device)
+        return {
+            "kv_cache/prefetch_wait_seconds": self._fastwam_kv_prefetch_wait_seconds,
+            "kv_cache/prefetch_wait_time": self._fastwam_kv_prefetch_wait_seconds,
+            "kv_cache/h2d_bytes": float(self._fastwam_kv_h2d_bytes),
+            "kv_cache/h2d_seconds": h2d_seconds,
+            "kv_cache/d2d_bytes": 0.0,
+            "kv_cache/d2d_seconds": 0.0,
+            "kv_cache/actor_mig_free_bytes": float(free_gpu),
+            "kv_cache/actor_mig_peak_allocated_bytes": float(peak_gpu),
+            "kv_cache/node_available_bytes": float(psutil.virtual_memory().available),
+            "kv_cache/actor_rss_bytes": float(process_memory.rss),
+            "kv_cache/actor_uss_bytes": float(
+                getattr(process_memory, "uss", process_memory.rss)
+            ),
+        }
+
     @Worker.timer("run_training")
-    def run_training(self) -> None:
+    def run_training(
+        self,
+        kv_request_channel: Channel | None = None,
+        kv_response_channel: Channel | None = None,
+    ) -> None:
         """
         Run the training process using the received rollout batch.
         """
@@ -2435,6 +2921,9 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
             self.load_param_and_grad(self.device)
         if self.is_optimizer_offloaded:
             self.load_optimizer(self.device)
+
+        if self._uses_fastwam_handle_replay():
+            self._initialize_fastwam_fsdp_for_handle_replay()
 
         gate_update_before = None
         gate_optimizer_steps_before = None
@@ -2479,20 +2968,25 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
 
         with torch.no_grad():
             self.rollout_batch = process_nested_dict_for_train(
-                self.rollout_batch, shuffle_id
+                self.rollout_batch,
+                shuffle_id,
+                consume=(
+                    SupportedModel(self.cfg.actor.model.model_type)
+                    is SupportedModel.FASTWAM_ADAPTIVE
+                    and str(self.cfg.actor.model.kv_replay.backend) == "stored"
+                ),
             )
-        if (
-            SupportedModel(self.cfg.actor.model.model_type)
-            is SupportedModel.FASTWAM_ADAPTIVE
-            and str(self.cfg.actor.model.kv_replay.backend) == "stored"
-            and bool(self.cfg.actor.model.kv_replay.get("pin_memory", True))
-        ):
-            from rlinf.models.embodiment.wam_policy.kv_replay import (
-                pin_gate_kv_forward_inputs,
-            )
-
-            self.rollout_batch["forward_inputs"] = pin_gate_kv_forward_inputs(
-                self.rollout_batch.get("forward_inputs", {})
+        update_epoch = int(self.cfg.algorithm.get("update_epoch", 1))
+        if self._uses_fastwam_handle_replay():
+            if kv_request_channel is None or kv_response_channel is None:
+                raise ValueError(
+                    "Handle-based stored Gate replay requires request and "
+                    "response channels."
+                )
+            self._start_fastwam_handle_replay(
+                request_channel=kv_request_channel,
+                response_channel=kv_response_channel,
+                update_epoch=update_epoch,
             )
 
         # Split to make minibatch iterator for updating the actor
@@ -2503,7 +2997,6 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
             f"{rollout_size} is not divisible by {batch_size_per_rank}"
         )
         metrics = {}
-        update_epoch = self.cfg.algorithm.get("update_epoch", 1)
         for _ in range(update_epoch):
             rollout_dataloader_iter = split_dict_to_chunk(
                 self.rollout_batch,
@@ -2562,13 +3055,43 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
                     }
 
                 self.optimizer.zero_grad()
+                pending_prefetches: deque[Future] = deque()
+                next_prefetch_index = 0
+                if self._uses_fastwam_handle_replay():
+                    prefetch_depth = min(
+                        int(self.cfg.actor.model.kv_replay.prefetch_depth),
+                        len(train_micro_batch),
+                    )
+                    while next_prefetch_index < prefetch_depth:
+                        pending_prefetches.append(
+                            self._schedule_fastwam_kv_prefetch(
+                                train_micro_batch[next_prefetch_index]
+                            )
+                        )
+                        next_prefetch_index += 1
                 for idx, batch in enumerate(train_micro_batch):
+                    consumed_handles: tuple[int, ...] = ()
+                    if self._uses_fastwam_handle_replay():
+                        prefetch = pending_prefetches.popleft()
+                        if next_prefetch_index < len(train_micro_batch):
+                            pending_prefetches.append(
+                                self._schedule_fastwam_kv_prefetch(
+                                    train_micro_batch[next_prefetch_index]
+                                )
+                            )
+                            next_prefetch_index += 1
+                        consumed_handles = self._consume_fastwam_kv_prefetch(
+                            batch,
+                            prefetch,
+                        )
                     self.train_micro_batch(
                         micro_batch=batch,
                         metrics=metrics,
                         is_last=(idx + 1) == self.gradient_accumulation,
                         selected_loss_scales=selected_loss_scales,
                     )
+                    if consumed_handles:
+                        self._release_consumed_fastwam_kv(consumed_handles)
                     # avoid gpu memory leak
                     train_micro_batch[idx] = None
                     del batch
@@ -2607,6 +3130,9 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
                     ),
                 },
             )
+        if self._uses_fastwam_handle_replay():
+            kv_metrics = self._stop_fastwam_handle_replay()
+            append_to_dict(metrics, kv_metrics)
         clear_memory()
         explained_variance_stats = pop_critic_explained_variance_stats(metrics)
         weighted_sums = {}
@@ -2925,6 +3451,10 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
         loss /= self.gradient_accumulation
         with backward_ctx:
             self.grad_scaler.scale(loss).backward()
+        if is_fastwam:
+            metrics_data["fastwam/fsdp_view_restore_handles"] = float(
+                self._restore_fastwam_fsdp_parameter_views_after_backward()
+            )
 
         metrics_data["actor/total_loss"] = loss.detach().item()
         append_to_dict(metrics, metrics_data)

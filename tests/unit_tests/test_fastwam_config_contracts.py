@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import copy
 import importlib.util
 from pathlib import Path
 
@@ -198,6 +199,93 @@ def test_checkpoint_contract_binds_only_explicit_formal_execution_profile() -> N
     assert contract["env_train"]["stage_invariant_fixed_reset_ids"] is True
     assert contract["env_train"]["libero_variant"] == "standard"
     assert contract != legacy_contract
+
+
+def _n4_capacity_resume_contracts(*, owner: str):
+    source_cfg = _checkpoint_cfg()
+    source_cfg.actor.global_batch_size = 28
+    source_cfg.actor.model.kv_replay = {
+        "backend": "stored",
+        "storage_dtype": "bfloat16",
+    }
+    source_cfg.env.train.total_num_envs = 4
+    source_cfg.cluster.component_placement = {
+        "actor": "0-0",
+        "env": "1-1",
+        "rollout": "1-1",
+    }
+    target_cfg = copy.deepcopy(source_cfg)
+    target_cfg.actor.global_batch_size = 84
+    target_cfg.actor.model.kv_replay.update(
+        {
+            "hot_capacity_bytes_per_rollout_rank": 12 * 1024**3,
+            "cold_capacity_bytes_per_rollout_rank": 24 * 1024**3,
+            "nvme_capacity_bytes_per_rollout_rank": 0,
+            "nvme_path": None,
+            "hot_min_free_bytes": 4 * 1024**3,
+            "prefetch_depth": 3,
+            "transport": "host_staging",
+        }
+    )
+    target_cfg.env.train.total_num_envs = 12
+    target_cfg.cluster.component_placement.env = "1-3"
+    target_cfg.cluster.component_placement.rollout = "1-3"
+    target_cfg.weight_syncer.patch.transport_device = "cpu"
+    return (
+        MODULE.build_fastwam_checkpoint_contract(source_cfg, world_size=1),
+        MODULE.build_fastwam_checkpoint_contract(
+            target_cfg,
+            world_size=1 if owner == "actor" else 3,
+        ),
+    )
+
+
+@pytest.mark.parametrize("owner", ["actor", "rollout"])
+def test_n4_capacity_resume_allows_only_geometry_and_kv_runtime(owner: str) -> None:
+    source, target = _n4_capacity_resume_contracts(owner=owner)
+
+    result = MODULE.validate_fastwam_training_checkpoint_contract(
+        source,
+        target,
+        allow_n4_to_three_rollout_expansion=True,
+        owner=owner,
+    )
+
+    assert result["mode"] == "n4_to_three_rollout"
+    assert result["source_environment_count"] == 4
+    assert result["target_environment_count"] == 12
+    assert result["target_world_size"] == (1 if owner == "actor" else 3)
+
+    with pytest.raises(ValueError, match="contract mismatch"):
+        MODULE.validate_fastwam_training_checkpoint_contract(
+            source,
+            target,
+            allow_n4_to_three_rollout_expansion=False,
+            owner=owner,
+        )
+
+    changed_science = copy.deepcopy(target)
+    changed_science["actor"]["optim"]["gate_lr"] = 3e-5
+    with pytest.raises(ValueError, match="changed scientific config.*gate_lr"):
+        MODULE.validate_fastwam_training_checkpoint_contract(
+            source,
+            changed_science,
+            allow_n4_to_three_rollout_expansion=True,
+            owner=owner,
+        )
+
+
+def test_n4_capacity_resume_rejects_non_7n_global_batch() -> None:
+    source, target = _n4_capacity_resume_contracts(owner="actor")
+    target["actor"]["global_batch_size"] = 83
+
+    with pytest.raises(ValueError, match="N>=12/gbs=7\\*N"):
+        MODULE.validate_fastwam_training_checkpoint_contract(
+            source,
+            target,
+            allow_n4_to_three_rollout_expansion=True,
+            owner="actor",
+        )
 
 
 def _eval_model_cfg():

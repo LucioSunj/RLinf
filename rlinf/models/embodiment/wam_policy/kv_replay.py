@@ -22,7 +22,6 @@ from enum import Enum
 from typing import Any
 
 import torch
-
 from fastwam.models.wan22.kv_tap import (
     GateKVSnapshot,
     GateLayerKV,
@@ -46,13 +45,20 @@ _DTYPES = {
 
 @dataclass(frozen=True)
 class GateKVReplayConfig:
-    """Storage policy; stored BF16 CPU replay is the production default."""
+    """Storage policy for exact, handle-based Gate K/V replay."""
 
     backend: GateKVReplayBackend = GateKVReplayBackend.STORED
     storage_dtype: str = "bfloat16"
     pin_memory: bool = True
     deduplicate_static_banks: bool = True
     max_bytes_per_sample: int | None = None
+    hot_capacity_bytes_per_rollout_rank: int = 25 * 1024**3 // 2
+    cold_capacity_bytes_per_rollout_rank: int = 24 * 1024**3
+    nvme_capacity_bytes_per_rollout_rank: int = 0
+    nvme_path: str | None = None
+    hot_min_free_bytes: int = 4 * 1024**3
+    prefetch_depth: int = 3
+    transport: str = "host_staging"
 
     def __post_init__(self) -> None:
         backend = GateKVReplayBackend(self.backend)
@@ -64,6 +70,26 @@ class GateKVReplayConfig:
         object.__setattr__(self, "backend", backend)
         if self.max_bytes_per_sample is not None and self.max_bytes_per_sample <= 0:
             raise ValueError("`max_bytes_per_sample` must be positive when set.")
+        for name in (
+            "hot_capacity_bytes_per_rollout_rank",
+            "cold_capacity_bytes_per_rollout_rank",
+            "nvme_capacity_bytes_per_rollout_rank",
+            "hot_min_free_bytes",
+        ):
+            value = getattr(self, name)
+            if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+                raise ValueError(f"`{name}` must be a non-negative integer.")
+        if self.nvme_capacity_bytes_per_rollout_rank and not self.nvme_path:
+            raise ValueError("`nvme_path` is required when the NVMe tier is enabled.")
+        if (
+            isinstance(self.prefetch_depth, bool)
+            or not isinstance(self.prefetch_depth, int)
+            or self.prefetch_depth < 1
+            or self.prefetch_depth > 16
+        ):
+            raise ValueError("`prefetch_depth` must be an integer in [1, 16].")
+        if self.transport not in {"host_staging", "cuda_direct"}:
+            raise ValueError("`transport` must be `host_staging` or `cuda_direct`.")
         if backend is GateKVReplayBackend.STORED and not self.deduplicate_static_banks:
             raise ValueError(
                 "Packed stored-K/V replay always stores video/context once per layer; "
@@ -311,9 +337,7 @@ class GateKVReplayRecord:
         *,
         device: torch.device | str,
         dtype: torch.dtype,
-        recompute_fn: Callable[
-            [Mapping[str, Any]], tuple[GateKVSnapshot, ...]
-        ]
+        recompute_fn: Callable[[Mapping[str, Any]], tuple[GateKVSnapshot, ...]]
         | None = None,
     ) -> tuple[GateKVSnapshot, ...]:
         if self.backend is GateKVReplayBackend.STORED:
@@ -322,8 +346,7 @@ class GateKVReplayRecord:
             raise ValueError("Recompute Gate replay requires `recompute_fn`.")
         snapshots = recompute_fn(self.recompute_inputs)
         return tuple(
-            snapshot.detached().to(device=device, dtype=dtype)
-            for snapshot in snapshots
+            snapshot.detached().to(device=device, dtype=dtype) for snapshot in snapshots
         )
 
 
@@ -358,16 +381,9 @@ class PackedGateKVTaps:
             raise ValueError("`current_modes` must have shape [B].")
         if self.actor_versions.shape != (batch_size,):
             raise ValueError("`actor_versions` must have shape [B].")
-        if bool(
-            (
-                (self.current_modes != 0)
-                & (self.current_modes != 1)
-            ).any()
-        ):
+        if bool(((self.current_modes != 0) & (self.current_modes != 1)).any()):
             raise ValueError("`current_modes` must contain only UNCOND=0 or IDM=1.")
-        if batch_size and bool(
-            (self.actor_versions != self.actor_versions[0]).any()
-        ):
+        if batch_size and bool((self.actor_versions != self.actor_versions[0]).any()):
             raise ValueError(
                 "One packed Gate K/V batch must contain exactly one actor version."
             )
@@ -445,9 +461,7 @@ class PackedGateKVTaps:
         missing = [name for name in names if f"{prefix}_{name}" not in forward_inputs]
         if missing:
             raise KeyError(f"Missing packed Gate K/V fields: {missing}.")
-        return cls(
-            **{name: forward_inputs[f"{prefix}_{name}"] for name in names}
-        )
+        return cls(**{name: forward_inputs[f"{prefix}_{name}"] for name in names})
 
     def materialize(
         self,
@@ -487,11 +501,7 @@ class PackedGateKVTaps:
             tap_layers = []
             for layer_offset, layer_index in enumerate(layers):
                 modes = tuple(
-                    (
-                        "idm"
-                        if int(mode) == 1
-                        else "uncond"
-                    )
+                    ("idm" if int(mode) == 1 else "uncond")
                     for mode in tensors["current_modes"].tolist()
                 )
                 tap_layers.append(
@@ -537,15 +547,26 @@ def _kv_source(value: str):
 def pack_gate_kv(
     snapshots: tuple[GateKVSnapshot, ...] | list[GateKVSnapshot],
     config: GateKVReplayConfig,
+    *,
+    storage_device: torch.device | str | None = None,
 ) -> PackedGateKVTaps:
-    """Pack stored Gate K/V into batch-first tensors with static-bank dedup."""
+    """Pack stored Gate K/V into batch-first tensors with static-bank dedup.
+
+    ``storage_device=None`` preserves the producing device.  Production
+    rollout workers use that path so the hot tier never takes an eager
+    full-batch detour through host memory.  CPU callers retain the historical
+    pinned-host behavior.
+    """
 
     if config.backend is not GateKVReplayBackend.STORED:
         raise ValueError("Tensor packing is available only for stored Gate K/V.")
     if not snapshots:
         raise ValueError("At least one Gate K/V snapshot is required.")
+    if storage_device is None:
+        storage_device = snapshots[0].layers[0].action.key.device
+    storage_device = torch.device(storage_device)
     snapshots = tuple(
-        snapshot.detached().to(device="cpu", dtype=config.torch_dtype)
+        snapshot.detached().to(device=storage_device, dtype=config.torch_dtype)
         for snapshot in snapshots
     )
     first = snapshots[0]
@@ -597,10 +618,7 @@ def pack_gate_kv(
             dim=1,
         ),
         current_modes=torch.tensor(
-            [
-                1 if mode.value == "idm" else 0
-                for mode in first.layers[0].current_mode
-            ],
+            [1 if mode.value == "idm" else 0 for mode in first.layers[0].current_mode],
             dtype=torch.long,
         ),
         actor_versions=torch.full(
@@ -618,7 +636,7 @@ def pack_gate_kv(
         context_value=stack_static("context", "value"),
         context_mask=stack_static("context", "valid_mask"),
     )
-    if not config.pin_memory:
+    if not config.pin_memory or storage_device.type != "cpu":
         return packed
     return PackedGateKVTaps(
         **{

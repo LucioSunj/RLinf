@@ -30,6 +30,7 @@ from rlinf.scheduler import (
     PackedPlacementStrategy,
     Worker,
 )
+from rlinf.scheduler.channel import channel as channel_module
 from rlinf.scheduler.channel.channel_worker import ChannelWorker
 
 # --- Constants ---
@@ -537,6 +538,54 @@ def get_test_data():
             PlainMessage(id=1, name="channel_plain", value=3.14),
         ),
     ]
+
+
+@pytest.mark.parametrize("async_op", [False, True])
+def test_put_via_ray_uses_actor_rpc_from_worker_context(monkeypatch, async_op):
+    """The explicit control path must not enter worker send/recv transport."""
+
+    remote_calls = []
+    created_works = []
+
+    class FakeRemoteMethod:
+        def remote(self, **kwargs):
+            remote_calls.append(kwargs)
+            return object()
+
+    class FakeActor:
+        put_via_ray = FakeRemoteMethod()
+
+    class FakeRayWork:
+        def __init__(self, object_ref):
+            self.object_ref = object_ref
+            self.waited = False
+            created_works.append(self)
+
+        def wait(self):
+            self.waited = True
+
+    channel = Channel()
+    channel._local_channel = None
+    channel._get_channel_rank_by_key = lambda key: 3
+    channel._get_channel_actor = lambda rank: FakeActor()
+    monkeypatch.setattr(channel_module, "AsyncRayWork", FakeRayWork)
+
+    result = channel.put_via_ray(
+        {"command": "stop"},
+        weight=2,
+        key="control",
+        async_op=async_op,
+    )
+
+    assert remote_calls == [
+        {"item": {"command": "stop"}, "weight": 2, "key": "control"}
+    ]
+    assert len(created_works) == 1
+    assert created_works[0].waited is not async_op
+    if async_op:
+        assert result is created_works[0]
+    else:
+        assert result is None
 
 
 # --- Test Class ---

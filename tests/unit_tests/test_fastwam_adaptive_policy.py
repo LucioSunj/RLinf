@@ -768,6 +768,46 @@ def test_policy_replay_exposes_separate_gate_and_flow_outputs():
     assert replay["values"].shape == (2, 1)
 
 
+def test_policy_sparse_handle_replay_preserves_eligible_gate_values():
+    from rlinf.models.embodiment.wam_policy.tiered_kv_store import (
+        GATE_KV_BATCH_INDICES,
+    )
+
+    policy = _make_policy()
+    obs = {
+        "states": torch.ones(2, 3),
+        "_fastwam_env_ids": torch.tensor([1, 2]),
+        "_fastwam_reset_mask": torch.tensor([True, True]),
+    }
+    _, rollout = policy.predict_action_batch(obs, mode="train")
+    full = policy.default_forward(
+        rollout["forward_inputs"],
+        route_info=rollout["route_info"],
+        emitted_gate=rollout["emitted_gate"],
+    )
+    sparse_inputs = {}
+    for key, value in rollout["forward_inputs"].items():
+        sparse_inputs[key] = value[1:2] if key.startswith("gate_kv_") else value
+    sparse_inputs[GATE_KV_BATCH_INDICES] = torch.tensor([1])
+
+    sparse = policy.default_forward(
+        sparse_inputs,
+        route_info=rollout["route_info"],
+        emitted_gate=rollout["emitted_gate"],
+    )
+
+    for key in (
+        "gate_logprobs",
+        "gate_entropy",
+        "gate_base_probabilities",
+        "gate_behavior_probabilities",
+    ):
+        torch.testing.assert_close(sparse[key][1], full[key][1])
+        assert sparse[key][0].item() == 0
+    torch.testing.assert_close(sparse["flow_logprobs"], full["flow_logprobs"])
+    torch.testing.assert_close(sparse["values"], full["values"])
+
+
 def test_nn_module_forward_dispatches_and_actor_stays_in_eval_mode():
     policy = _make_policy()
     policy.train()

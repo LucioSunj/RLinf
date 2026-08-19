@@ -420,6 +420,50 @@ class Channel:
             else:
                 async_channel_work.wait()
 
+    def put_via_ray(
+        self,
+        item: Any,
+        weight: int = 0,
+        key: Any = DEFAULT_KEY,
+        async_op: bool = False,
+    ) -> Optional[AsyncWork]:
+        """Put a small object through Ray even when called by a worker.
+
+        The normal worker path pairs a worker-to-worker ``send`` with a
+        channel-actor ``recv``.  That path is useful for tensor payloads, but
+        its two-sided handshake is unnecessary for small control messages and
+        can block the channel actor if either side is interrupted.  This
+        explicit path uses the channel actor's ordinary Ray call instead.
+
+        Args:
+            item (Any): The item to put into the channel queue.
+            weight (int): The priority weight. Defaults to 0.
+            key (Any): The queue key. Defaults to ``DEFAULT_KEY``.
+            async_op (bool): Return an asynchronous work handle when true.
+
+        Returns:
+            An asynchronous work handle when ``async_op`` is true, otherwise
+            ``None`` after the put completes.
+        """
+        if self._local_channel is not None:
+            assert async_op is False, "Local channel does not support async put."
+            self._local_channel.put(item, weight, key)
+            return None
+
+        target_rank = self._get_channel_rank_by_key(key)
+        target_actor = self._get_channel_actor(target_rank)
+        work = AsyncRayWork(
+            target_actor.put_via_ray.remote(
+                item=item,
+                weight=weight,
+                key=key,
+            )
+        )
+        if async_op:
+            return work
+        work.wait()
+        return None
+
     def put_nowait(self, item: Any, weight: int = 0, key: Any = DEFAULT_KEY):
         """Put an item into the channel queue without waiting. Raises asyncio.QueueFull if the queue is full.
 

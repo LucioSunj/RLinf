@@ -64,6 +64,12 @@ class _Policy:
 
 def _worker() -> MultiStepRolloutWorker:
     worker = MultiStepRolloutWorker.__new__(MultiStepRolloutWorker)
+    worker.cfg = OmegaConf.create(
+        {
+            "runner": {"fastwam_n4_to_three_rollout_resume": False},
+            "actor": {"seed": 11},
+        }
+    )
     worker.model_cfg = SimpleNamespace(
         model_type="fastwam_adaptive",
         actor_checkpoint_sha256="a" * 64,
@@ -123,6 +129,73 @@ def test_rollout_runtime_checkpoint_round_trip(
     audit_output = capsys.readouterr().out
     assert "FASTWAM_ROLLOUT_RESUME_AUDIT" in audit_output
     assert '"route_state_sha256"' in audit_output
+
+
+def test_rollout_step100_capacity_resume_forks_new_rank_rng_and_resets_routes(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    current_rng = {"value": {"cpu": torch.tensor([7], dtype=torch.int64)}}
+    seeded = []
+
+    def set_rng_state(state: dict[str, Any]) -> None:
+        current_rng["value"] = state
+
+    def seed_everything(seed: int) -> int:
+        seeded.append(seed)
+        current_rng["value"] = {"cpu": torch.tensor([seed], dtype=torch.int64)}
+        return seed
+
+    monkeypatch.setattr(
+        worker_module,
+        "get_rng_state",
+        lambda: current_rng["value"],
+    )
+    monkeypatch.setattr(worker_module, "set_rng_state", set_rng_state)
+    monkeypatch.setattr(worker_module, "seed_everything", seed_everything)
+    monkeypatch.setattr(
+        worker_module,
+        "validate_fastwam_training_checkpoint_contract",
+        lambda *_args, **_kwargs: {
+            "mode": "n4_to_three_rollout",
+            "source_world_size": 1,
+            "target_world_size": 3,
+            "source_environment_count": 4,
+            "target_environment_count": 15,
+        },
+    )
+    worker = _worker()
+    worker.version = 99
+    worker.hf_model.actor_version = 99
+    checkpoint_dir = tmp_path / "rollout"
+    worker.save_checkpoint(str(checkpoint_dir), step=100)
+
+    worker._rank = 1
+    worker._world_size = 3
+    worker.cfg.runner.fastwam_n4_to_three_rollout_resume = True
+    worker.version = 0
+    worker.hf_model.actor_version = 0
+    worker.hf_model.route_state = {"next_episode_id": 99, "states": {}}
+
+    assert worker.load_checkpoint(str(checkpoint_dir)) == 100
+    assert worker.version == 99
+    assert worker.hf_model.actor_version == 99
+    assert worker.hf_model.route_state == {
+        "next_episode_id": 0,
+        "next_episode_ids": {},
+        "states": {},
+    }
+    assert seeded == [312]
+    assert torch.equal(
+        current_rng["value"]["cpu"],
+        torch.tensor([312], dtype=torch.int64),
+    )
+    audit_output = capsys.readouterr().out
+    assert '"resume_mode": "n4_to_three_rollout"' in audit_output
+    assert '"rng_mode": "deterministic_new_rank"' in audit_output
+    assert '"rng_seed": 312' in audit_output
+    assert '"source_rank": 0' in audit_output
 
 
 def test_step_zero_training_bootstrap_restores_rollout_rng_and_route(

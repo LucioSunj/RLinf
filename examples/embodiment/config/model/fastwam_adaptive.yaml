@@ -106,13 +106,28 @@ eval_microbatch_size: 1
 eval_timing_cuda_synchronize: false
 
 kv_replay:
-  # Set to recompute only for the explicit memory ablation.
+  # Set to recompute only for the explicit memory ablation. Stored replay keeps
+  # payloads on the producing rollout rank and transports eligible microbatches
+  # by handle; trajectories never contain the K/V tensors themselves.
   backend: stored
   storage_dtype: bfloat16
   pin_memory: true
   deduplicate_static_banks: true
   # Fail closed if a shape/config change exceeds the measured all-layer budget.
   max_bytes_per_sample: 268435456
+  # Per-rollout-rank bounded tiers. The 12.5 GiB hot limit plus the dynamic 4 GiB
+  # free-memory floor applies to the 40 GiB MIG profile used by the formal run.
+  hot_capacity_bytes_per_rollout_rank: 13421772800
+  cold_capacity_bytes_per_rollout_rank: 25769803776
+  # Disabled by default. Capacity experiments may enable one exact mmap shard
+  # per rollout rank only after measuring the local NVMe throughput.
+  nvme_capacity_bytes_per_rollout_rank: 0
+  nvme_path: null
+  hot_min_free_bytes: 4294967296
+  # Keep 2-4 eligible microbatches in flight on a dedicated actor CUDA stream.
+  prefetch_depth: 3
+  # The 2026-08-19 MIG P2P/IPC/NCCL probe rejected CUDA-direct transport.
+  transport: host_staging
 
 flow_sde:
   enabled: true

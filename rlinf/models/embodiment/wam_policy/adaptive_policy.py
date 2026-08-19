@@ -941,9 +941,31 @@ class FastWAMAdaptivePolicy(nn.Module, BasePolicy):
     ) -> dict[str, torch.Tensor]:
         gate_device = next(self.gate.parameters()).device
         gate_dtype = next(self.gate.parameters()).dtype
+        batch_size = int(route_info.route_used.shape[0])
         if self.config.kv_replay.backend is GateKVReplayBackend.STORED:
+            from .tiered_kv_store import GATE_KV_BATCH_INDICES
+
             packed_inputs = forward_inputs
-            if "gate_kv_layer_indices" not in packed_inputs:
+            batch_indices = packed_inputs.get(GATE_KV_BATCH_INDICES)
+            if batch_indices is None:
+                batch_indices = torch.arange(
+                    batch_size,
+                    device=gate_device,
+                    dtype=torch.long,
+                )
+            else:
+                batch_indices = batch_indices.to(
+                    device=gate_device,
+                    dtype=torch.long,
+                )
+            if batch_indices.ndim != 1:
+                raise ValueError("Sparse Gate K/V batch indices must be 1D.")
+            if (
+                bool(((batch_indices < 0) | (batch_indices >= batch_size)).any())
+                or batch_indices.unique().numel() != batch_indices.numel()
+            ):
+                raise ValueError("Sparse Gate K/V batch indices are invalid.")
+            if batch_indices.numel() and "gate_kv_layer_indices" not in packed_inputs:
                 if emitted_gate.kv_metadata is None:
                     raise ValueError("Stored Gate K/V replay requires metadata.")
                 packed_inputs = dict(packed_inputs)
@@ -951,8 +973,20 @@ class FastWAMAdaptivePolicy(nn.Module, BasePolicy):
                     emitted_gate.kv_metadata.layer_indices,
                     dtype=torch.long,
                 )
-            packed = PackedGateKVTaps.from_forward_inputs(packed_inputs)
-            snapshots = packed.materialize(device=gate_device, dtype=gate_dtype)
+            if batch_indices.numel():
+                packed = PackedGateKVTaps.from_forward_inputs(packed_inputs)
+                if packed.batch_size != batch_indices.numel():
+                    raise ValueError(
+                        "Sparse Gate K/V payload count does not match batch indices."
+                    )
+                snapshots = packed.materialize(device=gate_device, dtype=gate_dtype)
+                selected_logits = self.gate(snapshots)
+            else:
+                selected_logits = torch.empty(
+                    0,
+                    device=gate_device,
+                    dtype=gate_dtype,
+                )
         else:
             snapshots = self.runtime.recompute_gate_snapshots(
                 forward_inputs=forward_inputs,
@@ -964,15 +998,42 @@ class FastWAMAdaptivePolicy(nn.Module, BasePolicy):
             )
             if not snapshots:
                 raise RuntimeError("Gate K/V recomputation returned no snapshots.")
-        gate_logits = self.gate(snapshots)
-        behavior = epsilon_mixture_bernoulli(
-            gate_logits,
-            temperature=emitted_gate.temperature.to(gate_logits.device),
-            epsilon=emitted_gate.epsilon.to(gate_logits.device),
-        )
-        gate_routes = emitted_gate.next_route.to(gate_logits.device)
-        gate_logprobs = behavior.log_prob(gate_routes)
-        gate_entropy = behavior.distribution.entropy()
+            batch_indices = torch.arange(
+                batch_size,
+                device=gate_device,
+                dtype=torch.long,
+            )
+            selected_logits = self.gate(snapshots)
+
+        selected_temperature = emitted_gate.temperature.to(gate_device)[batch_indices]
+        selected_epsilon = emitted_gate.epsilon.to(gate_device)[batch_indices]
+        selected_routes = emitted_gate.next_route.to(gate_device)[batch_indices]
+        if batch_indices.numel():
+            behavior = epsilon_mixture_bernoulli(
+                selected_logits,
+                temperature=selected_temperature,
+                epsilon=selected_epsilon,
+            )
+            selected_logprobs = behavior.log_prob(selected_routes)
+            selected_entropy = behavior.distribution.entropy()
+            selected_base = behavior.base_idm_probability
+            selected_behavior = behavior.behavior_idm_probability
+        else:
+            selected_logprobs = selected_entropy = selected_logits
+            selected_base = selected_behavior = selected_logits
+
+        def scatter_selected(values: torch.Tensor) -> torch.Tensor:
+            return torch.zeros(
+                batch_size,
+                device=gate_device,
+                dtype=values.dtype,
+            ).index_copy(0, batch_indices, values)
+
+        gate_logits = scatter_selected(selected_logits)
+        gate_logprobs = scatter_selected(selected_logprobs)
+        gate_entropy = scatter_selected(selected_entropy)
+        gate_base_probabilities = scatter_selected(selected_base)
+        gate_behavior_probabilities = scatter_selected(selected_behavior)
 
         # Recompute may temporarily restore the behavior LoRA. Finish that
         # no-grad observation reconstruction before building the live LoRA
@@ -996,19 +1057,19 @@ class FastWAMAdaptivePolicy(nn.Module, BasePolicy):
                 values = critic.predict_value_batch(critic_obs)
         else:
             values = torch.zeros(
-                (gate_logits.shape[0], 1),
+                (batch_size, 1),
                 device=gate_logits.device,
                 dtype=torch.float32,
             )
-        values = _column_values(values, batch_size=gate_logits.shape[0])
+        values = _column_values(values, batch_size=batch_size)
         result = {
             "logprobs": replay["flow_logprobs"],
             "flow_logprobs": replay["flow_logprobs"],
             "flow_entropy": replay["flow_entropy"],
             "gate_logprobs": gate_logprobs,
             "gate_entropy": gate_entropy,
-            "gate_base_probabilities": behavior.base_idm_probability,
-            "gate_behavior_probabilities": behavior.behavior_idm_probability,
+            "gate_base_probabilities": gate_base_probabilities,
+            "gate_behavior_probabilities": gate_behavior_probabilities,
             "values": values,
         }
         if compute_base_logprobs:

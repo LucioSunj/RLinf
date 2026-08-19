@@ -47,6 +47,10 @@ runner:
   save_interval: 40
   resume_dir: null
   ckpt_path: null
+  # Narrow opt-in for resuming the seed-11, cost-0.025 N=4 step-100
+  # checkpoint on the verified actor-0 / rollout-1..3 capacity topology.
+  # The loader still requires every non-geometry scientific field to match.
+  fastwam_n4_to_three_rollout_resume: false
   # Formal launchers may overlap only the next environment bootstrap with the
   # synchronous actor update. The generic training pipeline remains forbidden.
   overlap_env_bootstrap: false

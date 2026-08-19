@@ -67,10 +67,12 @@ class _Channel:
 class _RolloutResult:
     def __init__(self):
         self.split_sizes = None
+        self.consumed = False
         self.cleared = False
 
-    def to_splited_trajectories_by_sizes(self, split_sizes):
+    def to_splited_trajectories_by_sizes(self, split_sizes, *, consume=False):
         self.split_sizes = list(split_sizes)
+        self.consumed = bool(consume)
         return [f"trajectory_{index}" for index in range(len(split_sizes))]
 
     def clear(self):
@@ -103,6 +105,7 @@ def test_env_trajectory_send_uses_logical_stage_rank_and_keyed_fanout() -> None:
     )
 
     assert rollout_result.split_sizes == [2, 2]
+    assert rollout_result.consumed is True
     assert rollout_result.cleared is True
     assert [key for key, _, _ in channel.puts] == [
         f"1_2_{ACTOR_TRAJECTORY_CHANNEL_TAG}",
@@ -135,10 +138,16 @@ def test_actor_trajectory_receive_uses_stable_logical_source_order(monkeypatch) 
         expected_keys[1]: "logical_env_1",
     }
     monkeypatch.setattr(actor_worker_module, "clear_memory", lambda **_: None)
+    consume_calls = []
+
+    def convert(trajectories, *, consume=False):
+        consume_calls.append(bool(consume))
+        return {"received": list(trajectories)}
+
     monkeypatch.setattr(
         actor_worker_module,
         "convert_trajectories_to_batch",
-        lambda trajectories: {"received": list(trajectories)},
+        convert,
     )
 
     asyncio.run(
@@ -146,6 +155,7 @@ def test_actor_trajectory_receive_uses_stable_logical_source_order(monkeypatch) 
     )
 
     assert channel.gets == expected_keys
+    assert consume_calls == [True]
     assert worker.rollout_batch == {"processed": ["logical_env_0", "logical_env_1"]}
 
 

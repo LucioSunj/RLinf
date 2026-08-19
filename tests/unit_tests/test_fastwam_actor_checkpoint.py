@@ -266,6 +266,52 @@ def test_fastwam_actor_checkpoint_rank_file_round_trip(
     assert '"route_state_sha256"' in audit_output
 
 
+def test_fastwam_actor_step100_capacity_resume_preserves_training_state(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    rng_state = {"cpu": torch.tensor([7], dtype=torch.uint8)}
+    monkeypatch.setattr(worker_module, "get_rng_state", lambda: rng_state)
+    monkeypatch.setattr(worker_module, "set_rng_state", lambda _state: None)
+    monkeypatch.setattr(torch.distributed, "is_initialized", lambda: False)
+    monkeypatch.setattr(
+        worker_module,
+        "validate_fastwam_training_checkpoint_contract",
+        lambda *_args, **_kwargs: {
+            "mode": "n4_to_three_rollout",
+            "source_world_size": 1,
+            "target_world_size": 1,
+            "source_environment_count": 4,
+            "target_environment_count": 15,
+        },
+    )
+    worker = _checkpoint_worker()
+    worker.cfg.runner.fastwam_n4_to_three_rollout_resume = True
+    worker.optimizer_steps = 1000
+    checkpoint_dir = tmp_path / "actor"
+    worker.save_checkpoint(str(checkpoint_dir), step=100)
+
+    worker.model.weight.fill_(9.0)
+    worker.model.set_global_step(999)
+    worker.optimizer.value.fill_(9.0)
+    worker.lr_scheduler.value.fill_(9.0)
+    worker.grad_scaler.value.fill_(9.0)
+    worker.optimizer_steps = 9999
+
+    assert worker.load_checkpoint(str(checkpoint_dir)) == 100
+    assert worker.version == 100
+    assert worker.model.actor_version == 100
+    assert worker.optimizer_steps == 1000
+    assert torch.equal(worker.model.weight, torch.tensor([1.0]))
+    assert torch.equal(worker.optimizer.value, torch.tensor([2.0]))
+    assert torch.equal(worker.lr_scheduler.value, torch.tensor([3.0]))
+    assert torch.equal(worker.grad_scaler.value, torch.tensor([4.0]))
+    audit_output = capsys.readouterr().out
+    assert '"resume_mode": "n4_to_three_rollout"' in audit_output
+    assert '"target_environment_count": 15' in audit_output
+
+
 def test_fastwam_actor_checkpoint_round_trips_native_step_zero(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

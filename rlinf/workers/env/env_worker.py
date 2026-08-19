@@ -1565,7 +1565,8 @@ class EnvWorker(Worker):
         )
         trajectories: list[Trajectory] = (
             rollout_result.to_splited_trajectories_by_sizes(
-                [batch_size for _, batch_size in routes]
+                [batch_size for _, batch_size in routes],
+                consume=True,
             )
         )
         rollout_result.clear()

@@ -101,6 +101,23 @@ class EmbodiedRunner:
         self.env_channel = Channel.create("Env")
         self.rollout_channel = Channel.create("Rollout")
         self.actor_channel = Channel.create("Actor")
+        self.gate_kv_request_channel = None
+        self.gate_kv_response_channel = None
+        if (
+            str(self.cfg.actor.model.model_type) == "fastwam_adaptive"
+            and str(self.cfg.actor.model.kv_replay.backend) == "stored"
+        ):
+            rollout_world_size = int(self.cfg.rollout.get("world_size", 1))
+            prefetch_depth = int(self.cfg.actor.model.kv_replay.prefetch_depth)
+            channel_size = max(8, rollout_world_size * (prefetch_depth + 3))
+            self.gate_kv_request_channel = Channel.create(
+                "GateKVRequest",
+                maxsize=channel_size,
+            )
+            self.gate_kv_response_channel = Channel.create(
+                "GateKVResponse",
+                maxsize=channel_size,
+            )
         if self.reward is not None:
             self.reward_channel = Channel.create("Reward")
         else:
@@ -286,6 +303,102 @@ class EmbodiedRunner:
             for key, values in merged_metrics.items()
             if values
         }
+
+    @staticmethod
+    def _merge_gate_kv_service_metrics(
+        actor_training_metrics: list[dict],
+        service_metrics: list[dict] | None,
+    ) -> None:
+        """Attach aggregate and per-rollout-rank cache metrics to train logs."""
+
+        if not service_metrics:
+            return
+        if not actor_training_metrics:
+            actor_training_metrics.append({})
+        destination = actor_training_metrics[0]
+        sum_fields = {
+            "gpu_bytes",
+            "cpu_bytes",
+            "nvme_bytes",
+            "peak_gpu_bytes",
+            "peak_cpu_bytes",
+            "peak_nvme_bytes",
+            "emitted_samples",
+            "emitted_bytes",
+            "eligible_samples",
+            "eligible_bytes",
+            "discarded_samples",
+            "discarded_bytes",
+            "fetched_samples",
+            "gpu_hit_samples",
+            "transfer_bytes",
+            "d2h_bytes",
+            "nvme_read_bytes",
+            "nvme_write_bytes",
+            "rollout_rss_bytes",
+            "rollout_uss_bytes",
+        }
+        max_fields = {
+            "transfer_seconds",
+            "d2h_seconds",
+            "nvme_read_seconds",
+            "nvme_write_seconds",
+            "mig_peak_used_bytes",
+            "mig_peak_allocated_bytes",
+        }
+        min_fields = {
+            "mig_free_bytes",
+            "mig_min_free_bytes",
+            "node_available_bytes",
+            "node_min_available_bytes",
+        }
+        for rank, metrics in enumerate(service_metrics):
+            for key, value in metrics.items():
+                destination[f"kv_cache/rollout_rank_{rank}/{key}"] = value
+            destination[f"kv_cache/gpu_bytes_rank_{rank}"] = metrics.get(
+                "peak_gpu_bytes", 0.0
+            )
+            destination[f"kv_cache/cpu_bytes_rank_{rank}"] = metrics.get(
+                "peak_cpu_bytes", 0.0
+            )
+            destination[f"kv_cache/nvme_bytes_rank_{rank}"] = metrics.get(
+                "peak_nvme_bytes", 0.0
+            )
+            destination[f"kv_cache/mig_min_free_bytes_rank_{rank}"] = metrics.get(
+                "mig_min_free_bytes", 0.0
+            )
+            destination[f"kv_cache/mig_peak_used_bytes_rank_{rank}"] = metrics.get(
+                "mig_peak_used_bytes", 0.0
+            )
+        all_keys = set().union(*(metrics.keys() for metrics in service_metrics))
+        for key in all_keys:
+            values = [
+                float(metrics[key]) for metrics in service_metrics if key in metrics
+            ]
+            if key in sum_fields:
+                reduced = sum(values)
+            elif key in max_fields:
+                reduced = max(values)
+            elif key in min_fields:
+                reduced = min(values)
+            else:
+                reduced = sum(values) / len(values)
+            destination[f"kv_cache/{key}"] = reduced
+        destination["kv_cache/discarded_ineligible_bytes"] = destination.get(
+            "kv_cache/discarded_bytes", 0.0
+        )
+        fetched = destination.get("kv_cache/fetched_samples", 0.0)
+        destination["kv_cache/hit_fraction"] = (
+            destination.get("kv_cache/gpu_hit_samples", 0.0) / fetched
+            if fetched
+            else 0.0
+        )
+        destination["kv_cache/transfer_time"] = destination.get(
+            "kv_cache/transfer_seconds", 0.0
+        )
+        destination["kv_cache/node_physical_min_available_bytes"] = destination.get(
+            "kv_cache/node_min_available_bytes", 0.0
+        )
 
     def _process_ranked_numeric_results(
         self, results: list[dict], metric_field: str
@@ -574,7 +687,18 @@ class EmbodiedRunner:
 
                 # actor training.
                 with self.timer("actor_training"):
-                    actor_training_handle: Handle = self.actor.run_training()
+                    gate_kv_service_handle: Handle | None = None
+                    if self.gate_kv_request_channel is not None:
+                        gate_kv_service_handle = self.rollout.serve_gate_kv_requests(
+                            request_channel=self.gate_kv_request_channel,
+                            response_channel=self.gate_kv_response_channel,
+                        )
+                        actor_training_handle = self.actor.run_training(
+                            kv_request_channel=self.gate_kv_request_channel,
+                            kv_response_channel=self.gate_kv_response_channel,
+                        )
+                    else:
+                        actor_training_handle = self.actor.run_training()
                     env_bootstrap_handle: Handle | None = None
                     if self.overlap_env_bootstrap and _step + 1 < self.max_steps:
                         env_bootstrap_handle = self.env.prefetch_train_bootstrap(
@@ -583,6 +707,12 @@ class EmbodiedRunner:
                         )
 
                     actor_training_metrics = actor_training_handle.wait()
+                    if gate_kv_service_handle is not None:
+                        gate_kv_service_metrics = gate_kv_service_handle.wait()
+                        self._merge_gate_kv_service_metrics(
+                            actor_training_metrics,
+                            gate_kv_service_metrics,
+                        )
                     self.fastwam_training_guard.observe_training(actor_training_metrics)
                     if env_bootstrap_handle is not None:
                         env_bootstrap_handle.wait()

@@ -121,6 +121,74 @@ def flatten_time_batch(
     return map_nested_tensors(value, flatten_tensor)
 
 
+def flatten_time_batch_consuming(
+    value: Any,
+    shuffle_id: torch.Tensor,
+    *,
+    field_name: str = "batch",
+):
+    """Flatten and shuffle while releasing mutable dictionary sources.
+
+    Large stored-replay batches are dictionaries containing many independent
+    tensor fields. A regular recursive mapping retains the complete source
+    dictionary until every shuffled output has been built, temporarily keeping
+    two full replay batches alive. This variant pops each dictionary field as
+    soon as its shuffled replacement is materialized. Non-dictionary structured
+    values keep the same behavior as :func:`flatten_time_batch`.
+
+    Args:
+        value: Mutable nested batch value that will not be reused.
+        shuffle_id: Shared one-dimensional sample permutation.
+        field_name: Name used in shape-validation errors.
+
+    Returns:
+        The flattened and shuffled value. Every mutable dictionary in ``value``
+        is empty after a successful call.
+    """
+
+    if shuffle_id.ndim != 1:
+        raise ValueError("shuffle_id must be one-dimensional.")
+
+    def flatten_tensor(tensor: torch.Tensor) -> torch.Tensor:
+        if tensor.ndim < 2:
+            raise ValueError(
+                f"Training field {field_name!r} must have leading [time, batch] "
+                f"dimensions, got {tuple(tensor.shape)}."
+            )
+        flattened = tensor.reshape(-1, *tensor.shape[2:])
+        if flattened.shape[0] != shuffle_id.numel():
+            raise ValueError(
+                f"Training field {field_name!r} flattened to {flattened.shape[0]} "
+                f"items, expected {shuffle_id.numel()}."
+            )
+        return flattened[shuffle_id].contiguous()
+
+    def transform(item: Any):
+        if isinstance(item, torch.Tensor):
+            return flatten_tensor(item)
+        if isinstance(item, dict):
+            transformed = {}
+            for key in list(item):
+                source = item.pop(key)
+                transformed[key] = transform(source)
+                del source
+            return transformed
+        if is_dataclass(item) and not isinstance(item, type):
+            updates = {
+                field.name: transform(getattr(item, field.name))
+                for field in fields(item)
+                if field.init
+            }
+            return replace(item, **updates)
+        if isinstance(item, list):
+            return [transform(nested) for nested in item]
+        if isinstance(item, tuple):
+            return tuple(transform(nested) for nested in item)
+        return item
+
+    return transform(value)
+
+
 def copy_dict_tensor(next_extracted_obs: dict):
     """
     Recursively clones all torch tensors in a dict.
@@ -283,6 +351,48 @@ def stack_list_of_dict_tensor(list_of_dict: list, dim=0):
             pass
         else:
             raise ValueError(f"{key=}, {type(_v0)} is not supported!")
+    return ret
+
+
+def stack_list_of_dict_tensor_consuming(list_of_dict: list, dim=0):
+    """Stack nested tensor dictionaries while releasing source fields eagerly.
+
+    This is intended for one-way trajectory handoff.  Each source dictionary is
+    consumed as soon as its corresponding output field has been materialized,
+    so large replay payloads do not retain a complete pre-stack copy until the
+    whole nested dictionary has finished stacking.
+
+    Args:
+        list_of_dict: Mutable dictionaries that are no longer needed by the
+            caller after this operation.
+        dim: Dimension inserted by ``torch.stack``.
+
+    Returns:
+        The same stacked structure produced by ``stack_list_of_dict_tensor``.
+    """
+
+    if len(list_of_dict) == 0:
+        return {}
+    keys = list(list_of_dict[0].keys())
+
+    ret = {}
+    for key in keys:
+        value = list_of_dict[0][key]
+        values = [item.pop(key) for item in list_of_dict]
+        if isinstance(value, torch.Tensor):
+            ret[key] = torch.stack(values, dim=dim)
+        elif isinstance(value, dict):
+            ret[key] = stack_list_of_dict_tensor_consuming(values, dim=dim)
+        elif is_dataclass(value) and not isinstance(value, type):
+            stack_method = getattr(type(value), "stack", None)
+            if not callable(stack_method):
+                raise TypeError(
+                    f"Dataclass batch field {type(value).__name__} must implement stack()."
+                )
+            ret[key] = stack_method(values, dim=dim)
+        elif value is not None:
+            raise ValueError(f"{key=}, {type(value)} is not supported!")
+        del values
     return ret
 
 

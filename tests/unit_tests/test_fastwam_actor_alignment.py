@@ -642,3 +642,45 @@ def test_route_records_survive_epoch_fold_and_train_flatten():
         flattened["route_info"].chunk_ids,
         route.chunk_ids.reshape(-1)[shuffle],
     )
+
+
+def test_consuming_flatten_matches_regular_and_releases_sources():
+    route, emitted, _ = _alignment_records()
+    replay = torch.arange(12 * 8, dtype=torch.bfloat16).reshape(3, 4, 8)
+    batch = {
+        "forward_inputs": {
+            "gate_kv_action_key": replay,
+            "nested": {"gate_kv_action_value": replay + 1},
+        },
+        "route_info": route,
+        "emitted_gate": emitted,
+    }
+    shuffle = torch.arange(11, -1, -1)
+    regular_source = nested.map_nested_tensors(batch, torch.Tensor.clone)
+    consuming_source = nested.map_nested_tensors(batch, torch.Tensor.clone)
+
+    expected = nested.flatten_time_batch(
+        regular_source,
+        shuffle,
+        field_name="batch",
+    )
+    actual = nested.flatten_time_batch_consuming(
+        consuming_source,
+        shuffle,
+        field_name="batch",
+    )
+
+    assert consuming_source == {}
+    assert torch.equal(
+        actual["forward_inputs"]["gate_kv_action_key"],
+        expected["forward_inputs"]["gate_kv_action_key"],
+    )
+    assert torch.equal(
+        actual["forward_inputs"]["nested"]["gate_kv_action_value"],
+        expected["forward_inputs"]["nested"]["gate_kv_action_value"],
+    )
+    assert torch.equal(actual["route_info"].chunk_ids, expected["route_info"].chunk_ids)
+    assert torch.equal(
+        actual["emitted_gate"].old_logprob,
+        expected["emitted_gate"].old_logprob,
+    )

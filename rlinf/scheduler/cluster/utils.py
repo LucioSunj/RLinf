@@ -587,16 +587,20 @@ def extract_dataclass_tensor_fields(
             result[f.name] = val
             tensors_list.append(val)
             metadata.append((f.name, "tensor", None))
-        elif isinstance(val, (list, tuple)) and all(
-            isinstance(item, torch.Tensor) for item in val
+        elif (
+            isinstance(val, (list, tuple))
+            and val
+            and all(isinstance(item, torch.Tensor) for item in val)
         ):
             # Preserve list vs tuple; flatten/unflatten will distinguish for wire format.
             result[f.name] = val
             tensors_list.extend(val)
             kind = "list" if isinstance(val, list) else "tuple"
             metadata.append((f.name, kind, len(val)))
-        elif isinstance(val, dict) and all(
-            isinstance(v, torch.Tensor) for v in val.values()
+        elif (
+            isinstance(val, dict)
+            and val
+            and all(isinstance(v, torch.Tensor) for v in val.values())
         ):
             result[f.name] = val
             keys = list(val.keys())

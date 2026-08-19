@@ -376,6 +376,204 @@ def build_fastwam_checkpoint_contract(cfg: Any, *, world_size: int) -> dict[str,
     }
 
 
+FASTWAM_RESUME_MODE_EXACT = "exact"
+FASTWAM_RESUME_MODE_N4_TO_THREE_ROLLOUT = "n4_to_three_rollout"
+
+_FASTWAM_N4_EXPANSION_GEOMETRY_PATHS = {
+    "actor.global_batch_size",
+    "component_placement.env",
+    "component_placement.rollout",
+    "env_train.total_num_envs",
+    "world_size",
+}
+_FASTWAM_N4_EXPANSION_RUNTIME_PATHS = {
+    "model.kv_replay.cold_capacity_bytes_per_rollout_rank",
+    "model.kv_replay.hot_capacity_bytes_per_rollout_rank",
+    "model.kv_replay.hot_min_free_bytes",
+    "model.kv_replay.nvme_capacity_bytes_per_rollout_rank",
+    "model.kv_replay.nvme_path",
+    "model.kv_replay.prefetch_depth",
+    "model.kv_replay.transport",
+    "weight_syncer.patch.transport_device",
+}
+
+
+def _contract_difference_paths(
+    checkpoint_contract: Mapping[str, Any],
+    live_contract: Mapping[str, Any],
+) -> tuple[list[str], list[str]]:
+    checkpoint_flat = _flatten_contract(checkpoint_contract)
+    live_flat = _flatten_contract(live_contract)
+    paths = []
+    descriptions = []
+    missing = object()
+    for path in sorted(set(checkpoint_flat) | set(live_flat)):
+        checkpoint_value = checkpoint_flat.get(path, missing)
+        live_value = live_flat.get(path, missing)
+        if checkpoint_value == live_value:
+            continue
+        paths.append(path)
+        checkpoint_display = (
+            "<missing>" if checkpoint_value is missing else repr(checkpoint_value)
+        )
+        live_display = "<missing>" if live_value is missing else repr(live_value)
+        descriptions.append(
+            f"{path}: checkpoint={checkpoint_display}, live={live_display}"
+        )
+    return paths, descriptions
+
+
+def validate_fastwam_training_checkpoint_contract(
+    checkpoint_contract: Any,
+    live_contract: Any,
+    *,
+    allow_n4_to_three_rollout_expansion: bool,
+    owner: str,
+) -> dict[str, Any]:
+    """Validate exact resume or the explicit N=4 capacity expansion.
+
+    The expansion changes only batch geometry and bounded K/V transport
+    capacities. All model, sampling, reward, optimizer, and loss fields remain
+    exact because every non-enumerated contract difference is rejected.
+    """
+
+    checkpoint = _resolved_mapping(
+        checkpoint_contract,
+        name="FastWAM checkpoint continuation contract",
+    )
+    live = _resolved_mapping(
+        live_contract,
+        name="FastWAM live continuation contract",
+    )
+    if checkpoint == live:
+        return {
+            "mode": FASTWAM_RESUME_MODE_EXACT,
+            "source_world_size": int(checkpoint.get("world_size", -1)),
+            "target_world_size": int(live.get("world_size", -1)),
+        }
+
+    difference_paths, difference_descriptions = _contract_difference_paths(
+        checkpoint,
+        live,
+    )
+    if not allow_n4_to_three_rollout_expansion:
+        raise ValueError(
+            "FastWAM adaptive checkpoint/config contract mismatch: "
+            + "; ".join(difference_descriptions[:16])
+        )
+    if owner not in {"actor", "rollout"}:
+        raise ValueError(f"Unsupported FastWAM checkpoint owner {owner!r}.")
+    if checkpoint.get("schema") != "fastwam-adaptive-checkpoint-contract-v2" or (
+        live.get("schema") != "fastwam-adaptive-checkpoint-contract-v2"
+    ):
+        raise ValueError("FastWAM capacity resume requires checkpoint contract v2.")
+
+    allowed_paths = (
+        _FASTWAM_N4_EXPANSION_GEOMETRY_PATHS | _FASTWAM_N4_EXPANSION_RUNTIME_PATHS
+    )
+    forbidden = [path for path in difference_paths if path not in allowed_paths]
+    if forbidden:
+        details = [
+            description
+            for path, description in zip(
+                difference_paths,
+                difference_descriptions,
+                strict=True,
+            )
+            if path in forbidden
+        ]
+        raise ValueError(
+            "FastWAM N=4 capacity resume changed scientific config: "
+            + "; ".join(details[:16])
+        )
+
+    source_actor = _resolved_mapping(checkpoint.get("actor"), name="source actor")
+    target_actor = _resolved_mapping(live.get("actor"), name="target actor")
+    source_env = _resolved_mapping(
+        checkpoint.get("env_train"),
+        name="source train environment",
+    )
+    target_env = _resolved_mapping(
+        live.get("env_train"),
+        name="target train environment",
+    )
+    source_placement = _resolved_mapping(
+        checkpoint.get("component_placement"),
+        name="source component placement",
+    )
+    target_placement = _resolved_mapping(
+        live.get("component_placement"),
+        name="target component placement",
+    )
+    source_environment_count = int(source_env.get("total_num_envs", -1))
+    target_environment_count = int(target_env.get("total_num_envs", -1))
+    source_geometry = (
+        source_environment_count == 4
+        and int(source_actor.get("global_batch_size", -1)) == 28
+        and source_placement.get("actor") == "0-0"
+        and source_placement.get("env") == "1-1"
+        and source_placement.get("rollout") == "1-1"
+        and int(checkpoint.get("world_size", -1)) == 1
+    )
+    target_world_size = 1 if owner == "actor" else 3
+    target_geometry = (
+        target_environment_count >= 12
+        and target_environment_count % 3 == 0
+        and int(target_actor.get("global_batch_size", -1))
+        == 7 * target_environment_count
+        and target_placement.get("actor") == "0-0"
+        and target_placement.get("env") == "1-3"
+        and target_placement.get("rollout") == "1-3"
+        and int(live.get("world_size", -1)) == target_world_size
+    )
+    if not source_geometry or not target_geometry:
+        raise ValueError(
+            "FastWAM capacity resume requires N=4/gbs=28/one-rollout source "
+            "and N>=12/gbs=7*N/three-rollout target geometry."
+        )
+
+    live_model = _resolved_mapping(live.get("model"), name="target model")
+    kv_replay = _resolved_mapping(
+        live_model.get("kv_replay"),
+        name="target K/V replay config",
+    )
+    if kv_replay.get("backend") != "stored":
+        raise ValueError("FastWAM capacity resume requires stored K/V replay.")
+    if kv_replay.get("transport") != "host_staging":
+        raise ValueError("FastWAM capacity resume requires host-staging K/V transport.")
+    for field in (
+        "hot_capacity_bytes_per_rollout_rank",
+        "cold_capacity_bytes_per_rollout_rank",
+        "nvme_capacity_bytes_per_rollout_rank",
+        "hot_min_free_bytes",
+    ):
+        value = kv_replay.get(field)
+        if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+            raise ValueError(f"FastWAM capacity resume requires nonnegative {field}.")
+    prefetch_depth = kv_replay.get("prefetch_depth")
+    if (
+        isinstance(prefetch_depth, bool)
+        or not isinstance(prefetch_depth, int)
+        or prefetch_depth < 1
+    ):
+        raise ValueError("FastWAM capacity resume requires positive prefetch_depth.")
+    weight_syncer = _resolved_mapping(
+        live.get("weight_syncer"),
+        name="target weight syncer",
+    )
+    patch = _resolved_mapping(weight_syncer.get("patch"), name="patch syncer")
+    if patch.get("transport_device") != "cpu":
+        raise ValueError("FastWAM capacity resume requires CPU patch transport.")
+
+    return {
+        "mode": FASTWAM_RESUME_MODE_N4_TO_THREE_ROLLOUT,
+        "source_world_size": 1,
+        "target_world_size": target_world_size,
+        "source_environment_count": source_environment_count,
+        "target_environment_count": target_environment_count,
+    }
+
+
 def validate_fastwam_resume_steps(
     loaded_steps,
     resume_dir: str,
