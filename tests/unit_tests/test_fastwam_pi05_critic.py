@@ -33,9 +33,10 @@ def _load_critic_module():
         "rlinf.models.embodiment.modules.value_head",
         modules_path,
     )
-    modules = importlib.util.module_from_spec(modules_spec)
-    sys.modules[modules_spec.name] = modules
-    modules_spec.loader.exec_module(modules)
+    if modules_spec.name not in sys.modules:
+        modules = importlib.util.module_from_spec(modules_spec)
+        sys.modules[modules_spec.name] = modules
+        modules_spec.loader.exec_module(modules)
 
     critic_path = repo_root / "rlinf/models/embodiment/wam_policy/pi05_critic.py"
     critic_spec = importlib.util.spec_from_file_location(

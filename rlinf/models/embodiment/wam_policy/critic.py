@@ -87,9 +87,7 @@ class FastWAMCurrentFrameFeatureConfig:
             or not isinstance(self.input_dim, int)
             or self.input_dim < 1
         ):
-            raise ValueError(
-                "FastWAM critic `input_dim` must be a positive integer."
-            )
+            raise ValueError("FastWAM critic `input_dim` must be a positive integer.")
         if (
             isinstance(self.layer_index, bool)
             or not isinstance(self.layer_index, int)

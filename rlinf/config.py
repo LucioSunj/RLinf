@@ -875,6 +875,13 @@ def _validate_fastwam_adaptive_cfg(cfg, *, only_eval: bool) -> None:
     if not only_eval and not bool(model_cfg.get("add_value_head", False)):
         raise ValueError("FastWAM adaptive requires its colocated value head.")
 
+    load_for_eval = bool(model_cfg.critic.get("load_for_eval", False))
+    if only_eval:
+        with open_dict(model_cfg):
+            model_cfg.eval_without_critic = not load_for_eval
+        if not load_for_eval:
+            return
+
     critic_kind = CriticKind.parse(
         model_cfg.critic.get("kind", CriticKind.PI0_5_VALUE_AFTER_VLM)
     )
@@ -887,7 +894,6 @@ def _validate_fastwam_adaptive_cfg(cfg, *, only_eval: bool) -> None:
             num_layers=int(video_config.num_layers),
             input_dim=int(video_config.num_heads) * int(video_config.attn_head_dim),
         )
-    load_for_eval = bool(model_cfg.critic.get("load_for_eval", False))
     if critic_kind is CriticKind.PI0_5_VALUE_AFTER_VLM and (
         not only_eval or load_for_eval
     ):
@@ -897,8 +903,6 @@ def _validate_fastwam_adaptive_cfg(cfg, *, only_eval: bool) -> None:
         )
 
     if only_eval:
-        with open_dict(model_cfg):
-            model_cfg.eval_without_critic = not load_for_eval
         return
 
     actor_model = cfg.actor.model
