@@ -218,34 +218,47 @@ def validate_fastwam_eval_checkpoint_contract(
             "FastWAM evaluation checkpoint contract has the wrong parent hash."
         )
     if load_critic:
+        from rlinf.models.embodiment.wam_policy.critic import (
+            CriticKind,
+            critic_parent_checkpoint_sha256,
+        )
+
         live_model = _resolved_mapping(
             live_model_cfg,
             name="FastWAM live evaluation model config",
         )
         live_critic = live_model.get("critic")
-        expected_critic_parent = (
-            str(
-                live_critic.get("backbone_checkpoint_sha256", "")
-                if isinstance(live_critic, Mapping)
-                else ""
-            )
-            .strip()
-            .lower()
+        if not isinstance(live_critic, Mapping):
+            raise ValueError("FastWAM evaluation critic config is missing.")
+        critic_kind = CriticKind.parse(
+            live_critic.get("kind", CriticKind.PI0_5_VALUE_AFTER_VLM)
         )
-        if len(expected_critic_parent) != 64 or any(
-            character not in "0123456789abcdef" for character in expected_critic_parent
+        expected_critic_parent = critic_parent_checkpoint_sha256(live_critic)
+        if critic_kind is CriticKind.PI0_5_VALUE_AFTER_VLM and (
+            expected_critic_parent is None
+            or len(expected_critic_parent) != 64
+            or any(
+                character not in "0123456789abcdef"
+                for character in expected_critic_parent
+            )
         ):
             raise ValueError("Expected pi0.5 critic parent SHA-256 is invalid.")
         if payload.get("critic_parent_checkpoint_sha256") != expected_critic_parent:
-            raise ValueError("pi0.5 evaluation checkpoint parent hash mismatch.")
+            raise ValueError("FastWAM evaluation critic parent mismatch.")
         checkpoint_critic = checkpoint_model.get("critic")
-        if not isinstance(checkpoint_critic, Mapping) or (
-            str(checkpoint_critic.get("backbone_checkpoint_sha256", "")).lower()
-            != expected_critic_parent
-        ):
+        if not isinstance(checkpoint_critic, Mapping):
+            raise ValueError(
+                "FastWAM evaluation checkpoint contract has no critic config."
+            )
+        checkpoint_kind = CriticKind.parse(
+            checkpoint_critic.get("kind", CriticKind.PI0_5_VALUE_AFTER_VLM)
+        )
+        if checkpoint_kind is not critic_kind:
+            raise ValueError("FastWAM evaluation checkpoint critic backend mismatch.")
+        if critic_parent_checkpoint_sha256(checkpoint_critic) != expected_critic_parent:
             raise ValueError(
                 "FastWAM evaluation checkpoint contract has the wrong critic "
-                "parent hash."
+                "parent identity."
             )
     return validate_fastwam_eval_model_contract(
         checkpoint_model,

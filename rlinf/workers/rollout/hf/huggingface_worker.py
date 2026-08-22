@@ -45,6 +45,9 @@ from rlinf.data.embodied_io_struct import (
 from rlinf.hybrid_engines.weight_syncer import WeightSyncer
 from rlinf.models import get_model
 from rlinf.models.embodiment.base_policy import BasePolicy
+from rlinf.models.embodiment.wam_policy.critic import (
+    critic_parent_checkpoint_sha256,
+)
 from rlinf.scheduler import Channel, Cluster, Worker, split_channel_message
 from rlinf.utils.checkpoint_state import (
     FASTWAM_RESUME_AUDIT_SCHEMA,
@@ -229,8 +232,8 @@ class MultiStepRolloutWorker(Worker):
                     expected_parent_checkpoint_sha256=str(
                         self.model_cfg.actor_checkpoint_sha256
                     ),
-                    expected_critic_parent_checkpoint_sha256=str(
-                        self.model_cfg.critic.get("backbone_checkpoint_sha256", "")
+                    expected_critic_parent_checkpoint_sha256=(
+                        critic_parent_checkpoint_sha256(self.model_cfg.critic)
                     ),
                 )
                 if not self.only_eval:
@@ -410,9 +413,9 @@ class MultiStepRolloutWorker(Worker):
             "parent_checkpoint_sha256": str(
                 self.model_cfg.actor_checkpoint_sha256
             ).lower(),
-            "critic_parent_checkpoint_sha256": str(
-                self.model_cfg.critic.backbone_checkpoint_sha256
-            ).lower(),
+            "critic_parent_checkpoint_sha256": critic_parent_checkpoint_sha256(
+                self.model_cfg.critic
+            ),
             "contract": self._fastwam_checkpoint_contract(),
             "policy_runtime": policy_runtime,
             "rng": get_rng_state(),
@@ -476,11 +479,9 @@ class MultiStepRolloutWorker(Worker):
         expected_parent = str(self.model_cfg.actor_checkpoint_sha256).lower()
         if payload.get("parent_checkpoint_sha256") != expected_parent:
             raise ValueError("FastWAM rollout-runtime parent hash mismatch.")
-        expected_critic_parent = str(
-            self.model_cfg.critic.backbone_checkpoint_sha256
-        ).lower()
+        expected_critic_parent = critic_parent_checkpoint_sha256(self.model_cfg.critic)
         if payload.get("critic_parent_checkpoint_sha256") != expected_critic_parent:
-            raise ValueError("FastWAM rollout-runtime pi0.5 parent hash mismatch.")
+            raise ValueError("FastWAM rollout-runtime critic parent mismatch.")
         resume_contract = validate_fastwam_training_checkpoint_contract(
             payload.get("contract"),
             self._fastwam_checkpoint_contract(),
@@ -1118,8 +1119,7 @@ class MultiStepRolloutWorker(Worker):
             return None
         if SupportedModel(self.model_cfg.model_type) is SupportedModel.FASTWAM_ADAPTIVE:
             with torch.no_grad():
-                critic_obs = self.hf_model.runtime.critic_observation(env_obs=final_obs)
-                final_values = self.hf_model.critic.predict_value_batch(critic_obs)
+                final_values = self.hf_model.predict_value_batch(final_obs)
             if final_values.ndim == 1:
                 final_values = final_values[:, None]
             if final_values.ndim != 2 or final_values.shape[1] != 1:
@@ -1151,8 +1151,7 @@ class MultiStepRolloutWorker(Worker):
                 "FastWAM value-only rollout requested for another model."
             )
         with torch.no_grad():
-            critic_obs = self.hf_model.runtime.critic_observation(env_obs=env_obs)
-            values = self.hf_model.critic.predict_value_batch(critic_obs)
+            values = self.hf_model.predict_value_batch(env_obs)
         if values.ndim == 1:
             values = values[:, None]
         if values.ndim != 2 or values.shape[1] != 1:

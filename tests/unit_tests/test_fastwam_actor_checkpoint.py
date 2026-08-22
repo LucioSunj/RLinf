@@ -266,6 +266,38 @@ def test_fastwam_actor_checkpoint_rank_file_round_trip(
     assert '"route_state_sha256"' in audit_output
 
 
+def test_fastwam_actor_checkpoint_uses_null_current_frame_critic_parent(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(worker_module, "get_rng_state", lambda: {})
+    monkeypatch.setattr(worker_module, "set_rng_state", lambda _state: None)
+    monkeypatch.setattr(torch.distributed, "is_initialized", lambda: False)
+    worker = _checkpoint_worker()
+    worker.cfg.actor.model.critic = SimpleNamespace(
+        kind="fastwam_current_frame_value",
+        backbone_checkpoint_sha256=None,
+    )
+    checkpoint_dir = tmp_path / "actor"
+
+    worker.save_checkpoint(str(checkpoint_dir), step=0)
+
+    payload = torch.load(
+        checkpoint_dir / "rank_0.pt",
+        map_location="cpu",
+        weights_only=False,
+    )
+    assert payload["critic_parent_checkpoint_sha256"] is None
+    assert worker.load_checkpoint(str(checkpoint_dir)) == 0
+
+    worker.cfg.actor.model.critic = SimpleNamespace(
+        kind="pi0_5_value_after_vlm",
+        backbone_checkpoint_sha256="b" * 64,
+    )
+    with pytest.raises(ValueError, match="critic checkpoint parent hash mismatch"):
+        worker.load_checkpoint(str(checkpoint_dir))
+
+
 def test_fastwam_actor_step100_capacity_resume_preserves_training_state(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

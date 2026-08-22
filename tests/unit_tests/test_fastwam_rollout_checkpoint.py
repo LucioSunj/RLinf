@@ -131,6 +131,37 @@ def test_rollout_runtime_checkpoint_round_trip(
     assert '"route_state_sha256"' in audit_output
 
 
+def test_rollout_checkpoint_uses_null_current_frame_critic_parent(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(worker_module, "get_rng_state", lambda: {})
+    monkeypatch.setattr(worker_module, "set_rng_state", lambda _state: None)
+    worker = _worker()
+    worker.model_cfg.critic = SimpleNamespace(
+        kind="fastwam_current_frame_value",
+        backbone_checkpoint_sha256=None,
+    )
+    checkpoint_dir = tmp_path / "rollout"
+
+    worker.save_checkpoint(str(checkpoint_dir), step=1)
+
+    payload = torch.load(
+        checkpoint_dir / "rank_0.pt",
+        map_location="cpu",
+        weights_only=False,
+    )
+    assert payload["critic_parent_checkpoint_sha256"] is None
+    assert worker.load_checkpoint(str(checkpoint_dir)) == 1
+
+    worker.model_cfg.critic = SimpleNamespace(
+        kind="pi0_5_value_after_vlm",
+        backbone_checkpoint_sha256="b" * 64,
+    )
+    with pytest.raises(ValueError, match="rollout-runtime critic parent mismatch"):
+        worker.load_checkpoint(str(checkpoint_dir))
+
+
 def test_rollout_step100_capacity_resume_forks_new_rank_rng_and_resets_routes(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

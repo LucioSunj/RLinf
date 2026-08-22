@@ -1,0 +1,19 @@
+defaults:
+  - fastwam_adaptive
+  - _self_
+
+# Opt-in critic that reuses detached current-frame Video-V features from the
+# frozen FastWAM actor. The default fastwam_adaptive preset remains exact Pi05.
+critic:
+  kind: fastwam_current_frame_value
+  load_for_eval: false
+  backbone_checkpoint_sha256: null
+  backbone: null
+  input_dim: 3072
+  hidden_sizes: [1024, 512, 256]
+  activation: relu
+  bias_last: true
+  feature:
+    source: current_frame_video_value
+    layer_index: 14
+    pooling: mean_token

@@ -82,6 +82,9 @@ from rlinf.hybrid_engines.weight_syncer import WeightSyncer
 from rlinf.models import get_model
 from rlinf.models.embodiment.base_policy import ForwardType
 from rlinf.models.embodiment.wam_policy.contracts import WAMRoute
+from rlinf.models.embodiment.wam_policy.critic import (
+    critic_parent_checkpoint_sha256,
+)
 from rlinf.scheduler import Channel, Cluster, CommMapper, Worker
 from rlinf.utils.checkpoint_state import (
     FASTWAM_ACTOR_RESUME_AUDIT_SENTINEL,
@@ -1626,9 +1629,9 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
                     "parent_checkpoint_sha256": str(
                         self.cfg.actor.model.actor_checkpoint_sha256
                     ).lower(),
-                    "critic_parent_checkpoint_sha256": str(
-                        self.cfg.actor.model.critic.backbone_checkpoint_sha256
-                    ).lower(),
+                    "critic_parent_checkpoint_sha256": (
+                        critic_parent_checkpoint_sha256(self.cfg.actor.model.critic)
+                    ),
                     "contract": self._fastwam_checkpoint_contract(),
                     "policy": policy.trainable_state_dict(),
                     "optimizer": self.optimizer.state_dict(),
@@ -1729,15 +1732,15 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
                         payload["bc_bootstrap"],
                         expected_parent_checkpoint_sha256=expected_parent,
                     )
-                expected_critic_parent = str(
-                    self.cfg.actor.model.critic.backbone_checkpoint_sha256
-                ).lower()
+                expected_critic_parent = critic_parent_checkpoint_sha256(
+                    self.cfg.actor.model.critic
+                )
                 if (
                     payload.get("critic_parent_checkpoint_sha256")
                     != expected_critic_parent
                 ):
                     raise ValueError(
-                        "pi0.5 critic checkpoint parent hash mismatch: "
+                        "critic checkpoint parent hash mismatch: "
                         f"expected {expected_critic_parent}, got "
                         f"{payload.get('critic_parent_checkpoint_sha256')}."
                     )

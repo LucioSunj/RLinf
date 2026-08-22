@@ -14,10 +14,11 @@
 
 """Selective FastWAM actor-to-rollout state materialization.
 
-The adaptive policy keeps the pretrained FastWAM and pi0.5 parents frozen. A
-rollout sync therefore needs only trainable Gate/LoRA/value-head parameters and
-persistent buffers. Building a normal FSDP state dict first would clone the
-entire frozen composite model before the patch syncer can filter it.
+The adaptive policy keeps the pretrained FastWAM and optional pi0.5 parent
+frozen. A rollout sync therefore needs only trainable Gate/LoRA/value-head
+parameters and persistent buffers. Building a normal FSDP state dict first
+would clone the entire frozen composite model before the patch syncer can
+filter it.
 
 With ``use_orig_params=True``, classic FSDP preserves the original parameter
 objects but exposes their local one-dimensional shards outside forward/backward

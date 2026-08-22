@@ -17,7 +17,7 @@ import importlib.util
 import sys
 from enum import Enum
 from pathlib import Path
-from types import ModuleType
+from types import ModuleType, SimpleNamespace
 
 import pytest
 import torch
@@ -104,6 +104,12 @@ _runtime_module = sys.modules["fastwam_policy_composite_under_test.libero_runtim
 FastWAMAdaptivePolicy = _policy.FastWAMAdaptivePolicy
 FastWAMAdaptivePolicyConfig = _policy.FastWAMAdaptivePolicyConfig
 FastWAMChunkSample = _policy.FastWAMChunkSample
+FastWAMCurrentFrameValueCritic = sys.modules[
+    "fastwam_policy_composite_under_test.critic"
+].FastWAMCurrentFrameValueCritic
+FastWAMCurrentFrameFeatureConfig = sys.modules[
+    "fastwam_policy_composite_under_test.critic"
+].FastWAMCurrentFrameFeatureConfig
 
 
 def _bank(source, value, batch=2):
@@ -151,6 +157,7 @@ class _Runtime:
         self.grad_enabled_flags = []
         self.action_noise_seeds = []
         self.idm_noise_seeds = []
+        self.critic_feature_calls = 0
 
     def sample_action_batch(
         self,
@@ -185,6 +192,7 @@ class _Runtime:
             denoise_indices=torch.zeros(batch, dtype=torch.long),
             gate_snapshots=_snapshots(routes),
             forward_inputs={"critic_states": env_obs["states"].clone()},
+            critic_features=env_obs["states"][:, :1].detach().float(),
         )
 
     def replay_action_batch(self, *, forward_inputs, route_info):
@@ -199,6 +207,10 @@ class _Runtime:
         if env_obs is not None:
             return {"states": env_obs["states"]}
         return {"states": forward_inputs["critic_states"]}
+
+    def critic_features(self, *, env_obs):
+        self.critic_feature_calls += 1
+        return env_obs["states"][:, :1].detach().float()
 
     def recompute_gate_snapshots(self, *, forward_inputs, route_info):
         del forward_inputs
@@ -269,13 +281,23 @@ def _make_policy(
     eval_timing_cuda_synchronize=False,
     training_rollout_microbatch_size=None,
     formal_training_sampling_seed=None,
+    critic_kind="pi05",
 ):
+    if not with_critic:
+        critic = None
+    elif critic_kind == "fastwam":
+        critic = FastWAMCurrentFrameValueCritic(
+            input_dim=1,
+            hidden_sizes=(2,),
+        )
+    else:
+        critic = _Critic()
     return FastWAMAdaptivePolicy(
         actor=nn.Linear(1, 1),
         runtime=_Runtime(),
         lora_adapter=_LoRA(),
         gate=_Gate(),
-        critic=_Critic() if with_critic else None,
+        critic=critic,
         config=FastWAMAdaptivePolicyConfig(
             gate_epsilon=0.0,
             eval_idm_threshold=0.5,
@@ -672,6 +694,43 @@ def test_libero_critic_observation_canonicalizes_optional_camera_keys():
     assert explicit["extra_view_images"] is extra_view_images
 
 
+def test_libero_current_frame_bootstrap_encodes_only_uncond_conditions():
+    runtime = object.__new__(_runtime_module.LiberoFastWAMRuntime)
+    runtime.critic_feature_config = FastWAMCurrentFrameFeatureConfig(
+        input_dim=2,
+        layer_index=1,
+        pooling="mean_token",
+    )
+    runtime._encode_condition = lambda env_obs: (
+        torch.zeros(2, 3, 4, 4),
+        torch.zeros(2, 5, 2),
+        torch.ones(2, 5, dtype=torch.bool),
+    )
+    regimes = []
+
+    def prepare_condition(**kwargs):
+        regimes.append(kwargs["regime"])
+        sample_index = len(regimes) - 1
+        values = torch.tensor([[[1.0 + sample_index, 2.0], [3.0 + sample_index, 4.0]]])
+        return (
+            SimpleNamespace(
+                video_kv_cache=[{"v": torch.zeros_like(values)}, {"v": values}],
+                current_frame_video_tokens=2,
+            ),
+            None,
+        )
+
+    runtime._prepare_action_condition = prepare_condition
+
+    features = runtime.critic_features(env_obs={"unused": True})
+
+    assert regimes == [PolicyRegime.UNCOND, PolicyRegime.UNCOND]
+    assert torch.equal(
+        features,
+        torch.tensor([[2.0, 3.0], [3.0, 3.0]]),
+    )
+
+
 def test_standalone_eval_runs_and_restores_gate_lora_without_critic():
     source = _make_policy()
     source.set_global_step(3)
@@ -738,7 +797,7 @@ def test_standalone_eval_runs_and_restores_gate_lora_without_critic():
     payload["contract"]["model"]["critic"] = {
         "backbone_checkpoint_sha256": critic_parent_sha256,
     }
-    with pytest.raises(ValueError, match="pi0.5 evaluation checkpoint parent"):
+    with pytest.raises(ValueError, match="evaluation critic parent"):
         _make_policy().load_eval_checkpoint(
             payload,
             expected_parent_checkpoint_sha256=parent_sha256,
@@ -753,6 +812,52 @@ def test_standalone_eval_runs_and_restores_gate_lora_without_critic():
         )
         == 3
     )
+
+
+def test_current_frame_critic_eval_restore_has_no_external_parent():
+    source = _make_policy(critic_kind="fastwam")
+    source.set_global_step(3)
+    parent_sha256 = "a" * 64
+    payload = {
+        "schema": "fastwam-adaptive-rl-checkpoint-v1",
+        "step": 3,
+        "parent_checkpoint_sha256": parent_sha256,
+        "critic_parent_checkpoint_sha256": None,
+        "contract": {
+            "model": {
+                "actor_checkpoint_sha256": parent_sha256,
+                "critic": {
+                    "kind": "fastwam_current_frame_value",
+                    "backbone_checkpoint_sha256": None,
+                },
+            }
+        },
+        "policy": source.trainable_state_dict(),
+    }
+
+    target = _make_policy(critic_kind="fastwam")
+    assert (
+        target.load_eval_checkpoint(
+            payload,
+            expected_parent_checkpoint_sha256=parent_sha256,
+            expected_critic_parent_checkpoint_sha256=None,
+        )
+        == 3
+    )
+    assert target.actor_version == 3
+    for expected, actual in zip(
+        source.critic.value_head.parameters(),
+        target.critic.value_head.parameters(),
+        strict=True,
+    ):
+        torch.testing.assert_close(actual, expected)
+
+    with pytest.raises(ValueError, match="Expected pi0.5 critic parent"):
+        _make_policy().load_eval_checkpoint(
+            payload,
+            expected_parent_checkpoint_sha256=parent_sha256,
+            expected_critic_parent_checkpoint_sha256=None,
+        )
 
 
 def test_policy_update_invalidates_pending_route_and_forces_idm_boundary():
@@ -793,6 +898,55 @@ def test_policy_replay_exposes_separate_gate_and_flow_outputs():
     assert replay["flow_logprobs"].shape == (2, 2, 3)
     assert rollout["prev_values"].shape == (2, 1)
     assert replay["values"].shape == (2, 1)
+
+
+def test_current_frame_critic_reuses_rollout_features_and_bootstrap_is_route_pure():
+    torch.manual_seed(41)
+    policy = _make_policy(critic_kind="fastwam")
+    obs = {
+        "states": torch.tensor([[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]]),
+        "_fastwam_env_ids": torch.tensor([1, 2]),
+        "_fastwam_reset_mask": torch.tensor([True, True]),
+    }
+
+    _, rollout = policy.predict_action_batch(obs, mode="train")
+    assert policy.runtime.critic_feature_calls == 0
+    assert "fastwam_critic_features" in rollout["forward_inputs"]
+    assert "critic_prefix" not in rollout["forward_inputs"]
+    replay = policy.default_forward(
+        rollout["forward_inputs"],
+        route_info=rollout["route_info"],
+        emitted_gate=rollout["emitted_gate"],
+    )
+    torch.testing.assert_close(replay["values"], rollout["prev_values"])
+
+    replay["values"].sum().backward()
+    assert all(
+        parameter.grad is not None
+        for parameter in policy.critic.value_head.parameters()
+    )
+    assert all(parameter.grad is None for parameter in policy.actor.parameters())
+    assert policy.gate.bias.grad is None
+    assert policy.lora_adapter.parameter.grad is None
+
+    route_state = policy.route_tracker.state_dict()
+    bootstrap = policy.predict_value_batch(obs)
+    assert bootstrap.shape == (2, 1)
+    assert policy.runtime.critic_feature_calls == 1
+    assert policy.route_tracker.state_dict() == route_state
+
+    groups = policy.optimizer_parameter_groups(
+        gate_lr=1e-4,
+        lora_lr=2e-4,
+        value_lr=3e-4,
+    )
+    parameter_ids = [id(parameter) for group in groups for parameter in group["params"]]
+    assert [group["name"] for group in groups] == [
+        "gate",
+        "uncond_lora",
+        "value_head",
+    ]
+    assert len(parameter_ids) == len(set(parameter_ids))
 
 
 def test_policy_sparse_handle_replay_preserves_eligible_gate_values():

@@ -36,6 +36,7 @@ from .contracts import (
     GateDecisionRecord,
     GateKVMetadata,
 )
+from .critic import CriticKind, critic_parent_checkpoint_sha256
 from .evaluation import (
     EvaluationRouteSelection,
     EvaluationRoutingConfig,
@@ -61,6 +62,7 @@ class FastWAMChunkSample:
     denoise_indices: torch.Tensor
     gate_snapshots: tuple[GateKVSnapshot, ...]
     forward_inputs: dict[str, torch.Tensor] = field(default_factory=dict)
+    critic_features: torch.Tensor | None = None
     action_execution_trace: ActionExecutionTrace | None = None
 
     def __post_init__(self) -> None:
@@ -75,6 +77,11 @@ class FastWAMChunkSample:
             raise ValueError("Gate snapshots are required after every chunk.")
         if any(snapshot.batch_size != batch_size for snapshot in self.gate_snapshots):
             raise ValueError("Gate snapshot batch must match actions.")
+        if self.critic_features is not None and (
+            self.critic_features.ndim != 2
+            or self.critic_features.shape[0] != batch_size
+        ):
+            raise ValueError("Critic features must have shape [B, D].")
         if (
             self.action_execution_trace is not None
             and self.action_execution_trace.batch_size != batch_size
@@ -109,6 +116,8 @@ class FastWAMPolicyRuntime(Protocol):
         env_obs: dict[str, Any] | None = None,
         forward_inputs: dict[str, torch.Tensor] | None = None,
     ) -> dict[str, Any]: ...
+
+    def critic_features(self, *, env_obs: dict[str, Any]) -> torch.Tensor: ...
 
     def recompute_gate_snapshots(
         self,
@@ -265,9 +274,30 @@ class FastWAMAdaptivePolicy(nn.Module, BasePolicy):
     def _require_critic(self) -> nn.Module:
         if self.critic is None:
             raise RuntimeError(
-                "The pi0.5 critic is intentionally absent from standalone evaluation."
+                "The critic is intentionally absent from standalone evaluation."
             )
         return self.critic
+
+    def _critic_kind(self) -> CriticKind:
+        """Return the configured critic kind, preserving legacy test doubles."""
+
+        critic = self._require_critic()
+        return CriticKind.parse(
+            getattr(critic, "kind", CriticKind.PI0_5_VALUE_AFTER_VLM)
+        )
+
+    def predict_value_batch(self, env_obs: dict[str, Any]) -> torch.Tensor:
+        """Predict bootstrap values through the selected critic backend."""
+
+        critic = self._require_critic()
+        if self._critic_kind() is CriticKind.FASTWAM_CURRENT_FRAME_VALUE:
+            features = self.runtime.critic_features(env_obs=env_obs)
+            values = critic.value_from_features(features)
+        else:
+            critic_obs = self.runtime.critic_observation(env_obs=env_obs)
+            values = critic.predict_value_batch(critic_obs)
+        batch_size = int(env_obs["states"].shape[0])
+        return _column_values(values, batch_size=batch_size)
 
     def _enforce_frozen_actor(self) -> None:
         """Keep only the injected UNCOND LoRA trainable inside FastWAM."""
@@ -892,19 +922,28 @@ class FastWAMAdaptivePolicy(nn.Module, BasePolicy):
         )
 
         if compute_values:
-            critic_obs = self.runtime.critic_observation(env_obs=env_obs)
-            critic_result = self._require_critic().predict_value_batch(
-                critic_obs,
-                return_prefix=True,
-            )
-            if isinstance(critic_result, tuple):
-                values, critic_prefix = critic_result
+            critic = self._require_critic()
+            if self._critic_kind() is CriticKind.FASTWAM_CURRENT_FRAME_VALUE:
+                if sample.critic_features is None:
+                    raise RuntimeError(
+                        "FastWAM current-frame critic rollout returned no features."
+                    )
+                critic_features = sample.critic_features
+                values = critic.value_from_features(critic_features)
             else:
-                values = critic_result
-                critic_prefix = None
+                critic_obs = self.runtime.critic_observation(env_obs=env_obs)
+                critic_result = critic.predict_value_batch(
+                    critic_obs,
+                    return_prefix=True,
+                )
+                if isinstance(critic_result, tuple):
+                    values, critic_features = critic_result
+                else:
+                    values = critic_result
+                    critic_features = None
         else:
             values = torch.zeros(batch_size, device=device, dtype=torch.float32)
-            critic_prefix = None
+            critic_features = None
         values = _column_values(values, batch_size=batch_size)
         forward_inputs = {
             **sample.forward_inputs,
@@ -917,8 +956,9 @@ class FastWAMAdaptivePolicy(nn.Module, BasePolicy):
             # them in forward_inputs would make rollout sharding split [L] by B.
             packed_inputs.pop("gate_kv_layer_indices", None)
             forward_inputs.update(packed_inputs)
-        if critic_prefix is not None:
-            forward_inputs["critic_prefix"] = critic_prefix
+        if critic_features is not None:
+            replay_key = getattr(critic, "replay_feature_key", "critic_prefix")
+            forward_inputs[replay_key] = critic_features
         result = {
             "prev_logprobs": sample.old_flow_logprobs,
             "prev_values": values,
@@ -1048,8 +1088,17 @@ class FastWAMAdaptivePolicy(nn.Module, BasePolicy):
 
         if compute_values:
             critic = self._require_critic()
-            if "critic_prefix" in forward_inputs:
-                values = critic.value_from_prefix(forward_inputs["critic_prefix"])
+            replay_key = getattr(critic, "replay_feature_key", "critic_prefix")
+            if replay_key in forward_inputs:
+                features = forward_inputs[replay_key]
+                if hasattr(critic, "value_from_features"):
+                    values = critic.value_from_features(features)
+                else:
+                    values = critic.value_from_prefix(features)
+            elif self._critic_kind() is CriticKind.FASTWAM_CURRENT_FRAME_VALUE:
+                raise KeyError(
+                    "FastWAM current-frame critic replay is missing stored features."
+                )
             else:
                 critic_obs = self.runtime.critic_observation(
                     forward_inputs=forward_inputs
@@ -1233,28 +1282,39 @@ class FastWAMAdaptivePolicy(nn.Module, BasePolicy):
             )
 
         if self.critic is not None:
-            expected_critic_parent = (
-                str(expected_critic_parent_checkpoint_sha256 or "").strip().lower()
-            )
-            if len(expected_critic_parent) != 64 or any(
-                character not in "0123456789abcdef"
-                for character in expected_critic_parent
+            critic_kind = self._critic_kind()
+            expected_critic_parent = expected_critic_parent_checkpoint_sha256
+            if expected_critic_parent is not None:
+                expected_critic_parent = str(expected_critic_parent).strip().lower()
+            if critic_kind is CriticKind.PI0_5_VALUE_AFTER_VLM and (
+                expected_critic_parent is None
+                or len(expected_critic_parent) != 64
+                or any(
+                    character not in "0123456789abcdef"
+                    for character in expected_critic_parent
+                )
             ):
                 raise ValueError("Expected pi0.5 critic parent SHA-256 is invalid.")
             if payload.get("critic_parent_checkpoint_sha256") != expected_critic_parent:
                 raise ValueError(
-                    "pi0.5 evaluation checkpoint parent hash mismatch: "
+                    "FastWAM evaluation critic parent mismatch: "
                     f"expected {expected_critic_parent}, got "
                     f"{payload.get('critic_parent_checkpoint_sha256')}."
                 )
             contract_critic = contract_model.get("critic")
-            if not isinstance(contract_critic, Mapping) or (
-                str(contract_critic.get("backbone_checkpoint_sha256", "")).lower()
+            if not isinstance(contract_critic, Mapping):
+                raise ValueError(
+                    "FastWAM evaluation checkpoint contract has no critic config."
+                )
+            contract_kind = CriticKind.parse(
+                contract_critic.get("kind", CriticKind.PI0_5_VALUE_AFTER_VLM)
+            )
+            if contract_kind is not critic_kind or (
+                critic_parent_checkpoint_sha256(contract_critic)
                 != expected_critic_parent
             ):
                 raise ValueError(
-                    "FastWAM evaluation checkpoint contract has the wrong critic "
-                    "parent hash."
+                    "FastWAM evaluation checkpoint critic contract mismatch."
                 )
 
         policy_payload = payload.get("policy")

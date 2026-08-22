@@ -22,6 +22,9 @@ from rlinf.hybrid_engines.fsdp.utils import get_fsdp_wrap_policy
 from rlinf.models.embodiment.wam_policy.adaptive_policy import (
     FastWAMAdaptivePolicy,
 )
+from rlinf.models.embodiment.wam_policy.critic import (
+    FastWAMCurrentFrameValueCritic,
+)
 
 
 class RegimeLoRALinear(nn.Linear):
@@ -120,3 +123,28 @@ def test_only_nested_critic_no_split_metadata_is_consumed() -> None:
         recurse=False,
         nonwrapped_numel=0,
     )
+
+
+def test_current_frame_critic_wraps_only_its_value_head() -> None:
+    policy = _policy_shell()
+    policy.critic = FastWAMCurrentFrameValueCritic(
+        input_dim=2,
+        hidden_sizes=(4,),
+    )
+    fsdp_config = OmegaConf.create({"use_orig_params": True})
+
+    wrap_policy = get_fsdp_wrap_policy(
+        module=policy,
+        config=fsdp_config,
+        is_lora=False,
+        model_type="fastwam_adaptive",
+    )
+
+    assert policy._no_split_modules == []
+    assert policy._no_split_names == []
+    assert wrap_policy(
+        module=policy.critic.value_head,
+        recurse=False,
+        nonwrapped_numel=0,
+    )
+    assert not hasattr(policy.critic, "actor")

@@ -61,7 +61,7 @@ def _critic_config():
     )
 
 
-def test_builder_rejects_non_exact_or_pretrained_critic_head() -> None:
+def test_builder_allows_configurable_pi05_head_but_rejects_invalid_contracts() -> None:
     config = _critic_config()
     _builder._validate_exact_pi05_critic_config(config)
 
@@ -71,7 +71,27 @@ def test_builder_rejects_non_exact_or_pretrained_critic_head() -> None:
 
     config = _critic_config()
     config.hidden_sizes = [512, 256]
-    with pytest.raises(ValueError, match="2048 -> 1024"):
+    config.activation = "gelu"
+    config.bias_last = False
+    _builder._validate_exact_pi05_critic_config(config)
+
+    config.input_dim = 1024
+    with pytest.raises(ValueError, match="input width"):
+        _builder._validate_exact_pi05_critic_config(config)
+
+    config = _critic_config()
+    config.input_dim = 2048.5
+    with pytest.raises(TypeError, match="input_dim"):
+        _builder._validate_exact_pi05_critic_config(config)
+
+    config = _critic_config()
+    config.output_dim = 2
+    with pytest.raises(ValueError, match="fixed at 1"):
+        _builder._validate_exact_pi05_critic_config(config)
+
+    config = _critic_config()
+    config.activation = "swiglu"
+    with pytest.raises(ValueError, match="activation"):
         _builder._validate_exact_pi05_critic_config(config)
 
     config = _critic_config()
@@ -265,8 +285,102 @@ def test_libero_adaptive_config_composes_with_confirmed_defaults(monkeypatch) ->
     assert cfg.actor.model.critic.backbone.add_value_head is False
     assert cfg.actor.model.critic.backbone.strict_vlm_checkpoint is True
     assert cfg.actor.model.critic.backbone.openpi.add_value_head is False
+    assert "activation" not in cfg.actor.model.critic
+    assert "bias_last" not in cfg.actor.model.critic
     assert cfg.actor.model.runtime.prompt_template.endswith("{task}")
     _builder._validate_exact_pi05_critic_config(cfg.actor.model.critic)
+
+
+def test_current_frame_critic_config_composes_without_pi05_assets(monkeypatch) -> None:
+    from rlinf.config import _validate_fastwam_adaptive_cfg
+
+    monkeypatch.setenv("EMBODIED_PATH", str(REPO_ROOT / "examples/embodiment"))
+    monkeypatch.setenv("FASTWAM_CHECKPOINT", "/tmp/fastwam.pt")
+    monkeypatch.setenv("FASTWAM_CHECKPOINT_SHA256", "a" * 64)
+    monkeypatch.setenv("FASTWAM_DATASET_STATS", "/tmp/dataset_stats.json")
+    monkeypatch.delenv("PI05_CRITIC_CHECKPOINT", raising=False)
+    monkeypatch.delenv("PI05_CRITIC_CHECKPOINT_SHA256", raising=False)
+
+    with initialize_config_dir(version_base=None, config_dir=str(CONFIG_ROOT)):
+        cfg = compose(
+            config_name=("libero_10_ppo_fastwam_adaptive_current_frame_critic")
+        )
+
+    actor_critic = cfg.actor.model.critic
+    assert OmegaConf.to_container(actor_critic, resolve=True) == OmegaConf.to_container(
+        cfg.rollout.model.critic,
+        resolve=True,
+    )
+    assert actor_critic.kind == "fastwam_current_frame_value"
+    assert actor_critic.backbone is None
+    assert actor_critic.backbone_checkpoint_sha256 is None
+    assert actor_critic.input_dim == 3072
+    assert actor_critic.hidden_sizes == [1024, 512, 256]
+    assert actor_critic.activation == "relu"
+    assert actor_critic.bias_last is True
+    assert actor_critic.feature.layer_index == 14
+    assert actor_critic.feature.pooling == "mean_token"
+    feature = _builder._validate_fastwam_current_frame_critic_config(
+        actor_critic,
+        num_layers=30,
+        input_dim=3072,
+    )
+    assert feature.layer_index == 14
+    _validate_fastwam_adaptive_cfg(cfg, only_eval=False)
+
+    invalid = OmegaConf.create(OmegaConf.to_container(actor_critic, resolve=True))
+    invalid.feature.layer_index = 30
+    with pytest.raises(ValueError, match="outside"):
+        _builder._validate_fastwam_current_frame_critic_config(
+            invalid,
+            num_layers=30,
+            input_dim=3072,
+        )
+
+    invalid = OmegaConf.create(OmegaConf.to_container(actor_critic, resolve=True))
+    invalid.backbone = {"model_path": "/tmp/pi05"}
+    with pytest.raises(ValueError, match="backbone: null"):
+        _builder._validate_fastwam_current_frame_critic_config(
+            invalid,
+            num_layers=30,
+            input_dim=3072,
+        )
+
+    invalid = OmegaConf.create(OmegaConf.to_container(actor_critic, resolve=True))
+    invalid.input_dim = 2048
+    with pytest.raises(ValueError, match="input width"):
+        _builder._validate_fastwam_current_frame_critic_config(
+            invalid,
+            num_layers=30,
+            input_dim=3072,
+        )
+
+    invalid = OmegaConf.create(OmegaConf.to_container(actor_critic, resolve=True))
+    invalid.feature.pooling = "max_token"
+    with pytest.raises(ValueError, match="pooling"):
+        _builder._validate_fastwam_current_frame_critic_config(
+            invalid,
+            num_layers=30,
+            input_dim=3072,
+        )
+
+    invalid = OmegaConf.create(OmegaConf.to_container(actor_critic, resolve=True))
+    invalid.hidden_sizes = [1024, 1.5]
+    with pytest.raises(ValueError, match="positive integers"):
+        _builder._validate_fastwam_current_frame_critic_config(
+            invalid,
+            num_layers=30,
+            input_dim=3072,
+        )
+
+    mismatched = OmegaConf.create(OmegaConf.to_container(cfg, resolve=True))
+    mismatched.rollout.model.critic.feature.pooling = "last_token"
+    with pytest.raises(ValueError, match="replay contracts differ"):
+        _validate_fastwam_adaptive_cfg(mismatched, only_eval=False)
+
+    cfg.actor.model.critic.kind = "custom_target"
+    with pytest.raises(ValueError, match="Unsupported FastWAM critic kind"):
+        _builder._validate_critic_build_config(cfg.actor.model)
 
 
 def test_formal_profile_requires_stage_invariant_internal_contract(

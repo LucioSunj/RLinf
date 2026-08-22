@@ -56,6 +56,10 @@ from rlinf.envs.libero.image_preprocessing import (
 
 from .adaptive_policy import FastWAMChunkSample
 from .contracts import ChunkRouteRecord, WAMRoute
+from .critic import (
+    FastWAMCurrentFrameFeatureConfig,
+    pool_current_frame_video_values,
+)
 from .kv_replay import GateKVReplayBackend
 
 DEFAULT_FASTWAM_PROMPT_TEMPLATE = (
@@ -378,6 +382,7 @@ class LiberoFastWAMRuntime:
         gate_layer_indices: tuple[int, ...] | list[int] | None = None,
         gate_denoise_last_n: int = 1,
         gate_replay_backend: GateKVReplayBackend | str = GateKVReplayBackend.STORED,
+        critic_feature_config: FastWAMCurrentFrameFeatureConfig | None = None,
         camera_height: int = 224,
         camera_width: int = 224,
         camera_concat: str = "horizontal",
@@ -412,6 +417,7 @@ class LiberoFastWAMRuntime:
         )
         self.gate_denoise_last_n = int(gate_denoise_last_n)
         self.gate_replay_backend = GateKVReplayBackend(gate_replay_backend)
+        self.critic_feature_config = critic_feature_config
         self.camera_height = int(camera_height)
         self.camera_width = int(camera_width)
         self.camera_concat = str(camera_concat)
@@ -826,6 +832,7 @@ class LiberoFastWAMRuntime:
             )
         rollouts = []
         idm_initial_latents = []
+        critic_features = []
         for index, route_value in enumerate(routes.tolist()):
             regime = (
                 PolicyRegime.IDM
@@ -848,6 +855,13 @@ class LiberoFastWAMRuntime:
                     else None
                 ),
             )
+            if self.critic_feature_config is not None and mode == "train":
+                critic_features.append(
+                    pool_current_frame_video_values(
+                        condition,
+                        self.critic_feature_config,
+                    )
+                )
             if (
                 collect_replay
                 and self.gate_replay_backend is GateKVReplayBackend.RECOMPUTE
@@ -966,8 +980,36 @@ class LiberoFastWAMRuntime:
             ),
             gate_snapshots=gate_snapshots,
             forward_inputs=replay_inputs,
+            critic_features=(
+                None if not critic_features else torch.cat(critic_features, dim=0)
+            ),
             action_execution_trace=action_execution_trace,
         )
+
+    @torch.no_grad()
+    def critic_features(self, *, env_obs: dict[str, Any]) -> torch.Tensor:
+        """Encode current-frame critic features without action or route updates."""
+
+        if self.critic_feature_config is None:
+            raise RuntimeError(
+                "FastWAM current-frame critic features were not configured."
+            )
+        images, context, context_mask = self._encode_condition(env_obs)
+        features = []
+        for index in range(images.shape[0]):
+            condition, _ = self._prepare_action_condition(
+                image=images[index : index + 1],
+                context=context[index : index + 1],
+                context_mask=context_mask[index : index + 1],
+                regime=PolicyRegime.UNCOND,
+            )
+            features.append(
+                pool_current_frame_video_values(
+                    condition,
+                    self.critic_feature_config,
+                )
+            )
+        return torch.cat(features, dim=0)
 
     def replay_action_batch(
         self,

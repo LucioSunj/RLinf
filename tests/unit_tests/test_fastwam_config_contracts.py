@@ -455,7 +455,7 @@ def test_eval_checkpoint_contract_validates_parent_hashes_before_construction() 
 
     wrong_outer_critic = dict(payload)
     wrong_outer_critic["critic_parent_checkpoint_sha256"] = "c" * 64
-    with pytest.raises(ValueError, match="pi0.5 evaluation checkpoint parent"):
+    with pytest.raises(ValueError, match="evaluation critic parent"):
         MODULE.validate_fastwam_eval_checkpoint_contract(
             wrong_outer_critic,
             live,
@@ -475,10 +475,74 @@ def test_eval_checkpoint_contract_validates_parent_hashes_before_construction() 
             }
         },
     }
-    with pytest.raises(ValueError, match="wrong critic parent hash"):
+    with pytest.raises(ValueError, match="wrong critic parent identity"):
         MODULE.validate_fastwam_eval_checkpoint_contract(
             wrong_contract_critic,
             live,
+            expected_parent_checkpoint_sha256="a" * 64,
+            load_critic=True,
+        )
+
+
+def test_fastwam_critic_eval_checkpoint_has_no_external_parent_and_is_strict() -> None:
+    saved = _eval_model_cfg()
+    saved.critic = {
+        "kind": "fastwam_current_frame_value",
+        "load_for_eval": False,
+        "backbone_checkpoint_sha256": None,
+        "backbone": None,
+        "input_dim": 3072,
+        "hidden_sizes": [1024, 512, 256],
+        "activation": "relu",
+        "bias_last": True,
+        "feature": {
+            "source": "current_frame_video_value",
+            "layer_index": 14,
+            "pooling": "mean_token",
+        },
+    }
+    live = OmegaConf.create(OmegaConf.to_container(saved, resolve=True))
+    live.critic.load_for_eval = True
+    payload = {
+        "schema": "fastwam-adaptive-rl-checkpoint-v1",
+        "parent_checkpoint_sha256": "a" * 64,
+        "critic_parent_checkpoint_sha256": None,
+        "contract": {"model": OmegaConf.to_container(saved, resolve=True)},
+    }
+
+    MODULE.validate_fastwam_eval_checkpoint_contract(
+        payload,
+        live,
+        expected_parent_checkpoint_sha256="a" * 64,
+        load_critic=True,
+    )
+
+    live.critic.feature.pooling = "first_token"
+    with pytest.raises(ValueError, match=r"critic\.feature\.pooling"):
+        MODULE.validate_fastwam_eval_checkpoint_contract(
+            payload,
+            live,
+            expected_parent_checkpoint_sha256="a" * 64,
+            load_critic=True,
+        )
+
+    live = OmegaConf.create(OmegaConf.to_container(saved, resolve=True))
+    live.critic.load_for_eval = True
+    live.critic.hidden_sizes = [512, 256]
+    with pytest.raises(ValueError, match=r"critic\.hidden_sizes"):
+        MODULE.validate_fastwam_eval_checkpoint_contract(
+            payload,
+            live,
+            expected_parent_checkpoint_sha256="a" * 64,
+            load_critic=True,
+        )
+
+    pi05_live = _eval_model_cfg()
+    pi05_live.critic.load_for_eval = True
+    with pytest.raises(ValueError, match="evaluation critic parent"):
+        MODULE.validate_fastwam_eval_checkpoint_contract(
+            payload,
+            pi05_live,
             expected_parent_checkpoint_sha256="a" * 64,
             load_critic=True,
         )

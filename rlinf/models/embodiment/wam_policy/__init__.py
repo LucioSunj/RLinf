@@ -26,6 +26,10 @@ from .contracts import (
     WAMRoute,
     shift_emitted_gate_decisions,
 )
+from .critic import (
+    CriticKind,
+    FastWAMCurrentFrameFeatureConfig,
+)
 from .evaluation import (
     EvaluationRouteSelection,
     EvaluationRoutingConfig,
@@ -157,18 +161,57 @@ def _load_strict_fastwam_parent(actor, checkpoint: str) -> None:
     _validate_fastwam_parent_payload(actor, payload)
 
 
-def _validate_exact_pi05_critic_config(cfg) -> None:
-    """Fail before loading if the critic could restore an existing value head."""
+def _validate_value_head_config(cfg, *, expected_input_dim: int) -> None:
+    """Validate the shared configurable scalar value-head contract."""
 
-    input_dim = int(cfg.get("input_dim", 2048))
-    hidden_sizes = tuple(
-        int(item) for item in cfg.get("hidden_sizes", (1024, 512, 256))
-    )
-    if input_dim != 2048 or hidden_sizes != (1024, 512, 256):
+    if cfg.get("_target_") is not None:
         raise ValueError(
-            "The v0 exact pi0.5 critic requires ValueHead "
-            "2048 -> 1024 -> 512 -> 256 -> 1."
+            "FastWAM critic does not support arbitrary `_target_` classes."
         )
+    input_dim = cfg.get("input_dim", expected_input_dim)
+    if isinstance(input_dim, bool) or not isinstance(input_dim, int):
+        raise TypeError("FastWAM critic `input_dim` must be an integer.")
+    if input_dim != expected_input_dim:
+        raise ValueError(
+            "FastWAM critic input width does not match its feature backend: "
+            f"expected {expected_input_dim}, got {input_dim}."
+        )
+    output_dim = cfg.get("output_dim", 1)
+    if isinstance(output_dim, bool) or not isinstance(output_dim, int):
+        raise TypeError("FastWAM critic `output_dim` must be an integer.")
+    if output_dim != 1:
+        raise ValueError("FastWAM critic `output_dim` is fixed at 1.")
+    hidden_sizes = cfg.get("hidden_sizes", (1024, 512, 256))
+    if hidden_sizes is None or isinstance(hidden_sizes, (str, bytes, Mapping)):
+        raise TypeError("FastWAM critic `hidden_sizes` must be a sequence of integers.")
+    try:
+        hidden_sizes = tuple(hidden_sizes)
+    except TypeError as exc:
+        raise TypeError(
+            "FastWAM critic `hidden_sizes` must be a sequence of integers."
+        ) from exc
+    for hidden_size in hidden_sizes:
+        if (
+            isinstance(hidden_size, bool)
+            or not isinstance(hidden_size, int)
+            or hidden_size < 1
+        ):
+            raise ValueError(
+                "FastWAM critic hidden sizes must contain only positive integers."
+            )
+    activation = str(cfg.get("activation", "relu")).lower()
+    if activation not in {"relu", "gelu", "tanh"}:
+        raise ValueError(
+            "FastWAM critic activation must be one of relu, gelu, or tanh."
+        )
+    if not isinstance(cfg.get("bias_last", True), bool):
+        raise TypeError("FastWAM critic `bias_last` must be a boolean.")
+
+
+def _validate_exact_pi05_critic_config(cfg) -> None:
+    """Fail before loading if the Pi05 critic could restore an existing head."""
+
+    _validate_value_head_config(cfg, expected_input_dim=2048)
     backbone = cfg.backbone
     config_name = str(backbone.openpi.get("config_name", ""))
     if not config_name.startswith("pi05_"):
@@ -186,6 +229,42 @@ def _validate_exact_pi05_critic_config(cfg) -> None:
         raise ValueError(
             "The exact pi0.5 critic requires `strict_vlm_checkpoint: true`."
         )
+
+
+def _validate_fastwam_current_frame_critic_config(
+    cfg,
+    *,
+    num_layers: int,
+    input_dim: int,
+) -> FastWAMCurrentFrameFeatureConfig:
+    """Validate and materialize the actor-feature critic configuration."""
+
+    _validate_value_head_config(cfg, expected_input_dim=input_dim)
+    if cfg.get("backbone") is not None:
+        raise ValueError(
+            "FastWAM current-frame critic must set `backbone: null`; it reuses "
+            "the colocated frozen actor."
+        )
+    if cfg.get("backbone_checkpoint_sha256") not in {None, ""}:
+        raise ValueError(
+            "FastWAM current-frame critic must not configure an external critic "
+            "parent hash."
+        )
+    feature = cfg.get("feature")
+    if feature is None:
+        raise ValueError("FastWAM current-frame critic requires a `feature` mapping.")
+    result = FastWAMCurrentFrameFeatureConfig(
+        input_dim=input_dim,
+        source=str(feature.get("source", "")),
+        layer_index=feature.get("layer_index", -1),
+        pooling=str(feature.get("pooling", "")),
+    )
+    if result.layer_index >= num_layers:
+        raise ValueError(
+            "FastWAM critic feature layer is outside the configured MoT: "
+            f"index={result.layer_index}, layers={num_layers}."
+        )
+    return result
 
 
 def _validate_fastwam_actor_surface(actor) -> None:
@@ -221,12 +300,23 @@ def _validate_flow_sde_config(cfg) -> None:
 
 
 def _validate_critic_build_config(cfg) -> bool:
-    """Return whether this model instance should allocate the pi0.5 critic."""
+    """Return whether this model instance should allocate its configured critic."""
 
     if bool(cfg.get("eval_without_critic", False)):
         return False
-    _validate_exact_pi05_critic_config(cfg.critic)
-    _validate_critic_parent_artifact(cfg.critic)
+    critic_kind = CriticKind.parse(
+        cfg.critic.get("kind", CriticKind.PI0_5_VALUE_AFTER_VLM)
+    )
+    if critic_kind is CriticKind.PI0_5_VALUE_AFTER_VLM:
+        _validate_exact_pi05_critic_config(cfg.critic)
+        _validate_critic_parent_artifact(cfg.critic)
+    else:
+        video_config = cfg.fastwam.video_dit_config
+        _validate_fastwam_current_frame_critic_config(
+            cfg.critic,
+            num_layers=int(video_config.num_layers),
+            input_dim=int(video_config.num_heads) * int(video_config.attn_head_dim),
+        )
     return True
 
 
@@ -250,6 +340,7 @@ def get_model(cfg, torch_dtype):
         FastWAMAdaptivePolicy,
         FastWAMAdaptivePolicyConfig,
     )
+    from .critic import FastWAMCurrentFrameValueCritic
     from .kv_replay import GateKVReplayConfig
     from .pi05_critic import Pi05ValueAfterVLMCritic
 
@@ -301,6 +392,9 @@ def get_model(cfg, torch_dtype):
     replay_config = GateKVReplayConfig(**replay_payload)
     _validate_flow_sde_config(cfg.flow_sde)
     load_critic = _validate_critic_build_config(cfg)
+    critic_kind = CriticKind.parse(
+        cfg.critic.get("kind", CriticKind.PI0_5_VALUE_AFTER_VLM)
+    )
     inference_steps = int(cfg.runtime.get("num_inference_steps", 0))
     if gate_config.denoise_last_n > inference_steps:
         raise ValueError(
@@ -374,15 +468,37 @@ def get_model(cfg, torch_dtype):
     gate = GateTransformer(gate_config).to(dtype=torch_dtype)
 
     critic = None
+    critic_feature_config = None
     if load_critic:
-        from rlinf.models.embodiment.openpi import get_model as get_openpi_model
-
-        critic_backbone = get_openpi_model(cfg.critic.backbone, torch_dtype)
-        critic = Pi05ValueAfterVLMCritic(
-            critic_backbone,
-            input_dim=int(cfg.critic.get("input_dim", 2048)),
-            hidden_sizes=tuple(cfg.critic.get("hidden_sizes", (1024, 512, 256))),
+        hidden_sizes = tuple(
+            int(item) for item in cfg.critic.get("hidden_sizes", (1024, 512, 256))
         )
+        activation = str(cfg.critic.get("activation", "relu"))
+        bias_last = bool(cfg.critic.get("bias_last", True))
+        if critic_kind is CriticKind.PI0_5_VALUE_AFTER_VLM:
+            from rlinf.models.embodiment.openpi import get_model as get_openpi_model
+
+            critic_backbone = get_openpi_model(cfg.critic.backbone, torch_dtype)
+            critic = Pi05ValueAfterVLMCritic(
+                critic_backbone,
+                input_dim=int(cfg.critic.get("input_dim", 2048)),
+                hidden_sizes=hidden_sizes,
+                activation=activation,
+                bias_last=bias_last,
+            )
+        else:
+            actual_feature_dim = int(actor.mot.num_heads) * int(actor.mot.attn_head_dim)
+            critic_feature_config = _validate_fastwam_current_frame_critic_config(
+                cfg.critic,
+                num_layers=int(actor.mot.num_layers),
+                input_dim=actual_feature_dim,
+            )
+            critic = FastWAMCurrentFrameValueCritic(
+                input_dim=actual_feature_dim,
+                hidden_sizes=hidden_sizes,
+                activation=activation,
+                bias_last=bias_last,
+            )
 
     runtime = instantiate(
         cfg.runtime,
@@ -391,6 +507,7 @@ def get_model(cfg, torch_dtype):
         gate_layer_indices=gate_config.layer_taps.resolve(gate_config.num_mot_layers),
         gate_denoise_last_n=gate_config.denoise_last_n,
         gate_replay_backend=replay_config.backend,
+        critic_feature_config=critic_feature_config,
         flow_sde_noise_level=float(cfg.flow_sde.noise_level),
         flow_sde_ignore_last_transition=bool(
             cfg.flow_sde.get("ignore_last_transition", False)

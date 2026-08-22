@@ -65,12 +65,17 @@ class Pi05ValueAfterVLMCritic(nn.Module):
     present in v0 but is frozen and is never called for value prediction.
     """
 
+    kind = "pi0_5_value_after_vlm"
+    replay_feature_key = "critic_prefix"
+
     def __init__(
         self,
         backbone: nn.Module,
         *,
         input_dim: int = 2048,
         hidden_sizes: tuple[int, ...] = (1024, 512, 256),
+        activation: str = "relu",
+        bias_last: bool = True,
     ) -> None:
         """Initialize the frozen backbone and replace any existing value head."""
 
@@ -95,8 +100,8 @@ class Pi05ValueAfterVLMCritic(nn.Module):
             input_dim=input_dim,
             hidden_sizes=hidden_sizes,
             output_dim=1,
-            activation="relu",
-            bias_last=True,
+            activation=activation,
+            bias_last=bias_last,
         )
         backbone.value_head = value_head
         value_head.register_forward_pre_hook(self._match_value_head_input_dtype)
@@ -139,6 +144,20 @@ class Pi05ValueAfterVLMCritic(nn.Module):
         """Predict values from detached pi0.5 prefix features."""
 
         return self.backbone.get_value_from_vlm(prefix_output.detach())
+
+    def value_from_features(self, prefix_output: torch.Tensor) -> torch.Tensor:
+        """Predict values through the common critic replay-feature interface."""
+
+        return self.value_from_prefix(prefix_output)
+
+    def encode_features(self, env_obs: dict[str, Any]) -> torch.Tensor:
+        """Run exact pi0.5 preprocessing and return detached prefix features."""
+
+        _values, prefix_output = self.predict_value_batch(
+            env_obs,
+            return_prefix=True,
+        )
+        return prefix_output
 
     def predict_value_batch(
         self,

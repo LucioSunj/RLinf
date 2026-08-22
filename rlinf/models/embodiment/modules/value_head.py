@@ -21,7 +21,7 @@ class ValueHead(nn.Module):
         input_dim: int,
         hidden_sizes=(512, 128),
         output_dim: int = 1,
-        activation: str = "gelu",  # 'relu' or 'gelu'
+        activation: str = "gelu",  # 'relu', 'gelu', or 'tanh'
         bias_last: bool = False,
     ):
         super().__init__()
@@ -50,6 +50,10 @@ class ValueHead(nn.Module):
         self._init_weights(activation.lower())
 
     def _init_weights(self, nonlinearity="relu"):
+        # PyTorch's Kaiming gain table has no explicit GELU entry.  GELU is
+        # conventionally initialized with unit gain here; ReLU and tanh retain
+        # their existing activation-specific gains.
+        kaiming_nonlinearity = "linear" if nonlinearity == "gelu" else nonlinearity
         for m in self.mlp:
             if isinstance(m, nn.Linear):
                 if m is self.mlp[-1]:
@@ -58,7 +62,9 @@ class ValueHead(nn.Module):
                         nn.init.zeros_(m.bias)
                 else:
                     nn.init.kaiming_normal_(
-                        m.weight, mode="fan_out", nonlinearity=nonlinearity
+                        m.weight,
+                        mode="fan_out",
+                        nonlinearity=kaiming_nonlinearity,
                     )
                     if m.bias is not None:
                         nn.init.zeros_(m.bias)

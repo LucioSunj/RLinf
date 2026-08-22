@@ -26,6 +26,9 @@ from omegaconf import OmegaConf
 import rlinf.workers.actor.fastwam_selective_sync as selective_sync
 import rlinf.workers.actor.fsdp_actor_worker as actor_worker
 from rlinf.config import SupportedModel
+from rlinf.models.embodiment.wam_policy.critic import (
+    FastWAMCurrentFrameValueCritic,
+)
 from rlinf.workers.actor.fastwam_selective_sync import (
     CapturedSyncTensor,
     capture_fastwam_sync_tensors,
@@ -43,6 +46,20 @@ class _SelectiveModule(nn.Module):
         self.register_buffer("ephemeral", torch.tensor([8.0]), persistent=False)
 
 
+class _CurrentFrameCriticSyncModule(nn.Module):
+    def __init__(self) -> None:
+        super().__init__()
+        self.actor = nn.Linear(2, 2)
+        self.actor.requires_grad_(False)
+        self.gate = nn.Linear(2, 1)
+        self.lora_A = nn.Parameter(torch.ones(1, 2))
+        self.lora_B = nn.Parameter(torch.ones(2, 1))
+        self.critic = FastWAMCurrentFrameValueCritic(
+            input_dim=2,
+            hidden_sizes=(4,),
+        )
+
+
 def test_capture_matches_trainable_and_persistent_sync_contract() -> None:
     module = _SelectiveModule()
 
@@ -53,6 +70,18 @@ def test_capture_matches_trainable_and_persistent_sync_contract() -> None:
     assert captured["trainable"].is_parameter
     assert captured["persistent"].tensor is module.persistent
     assert not captured["persistent"].is_parameter
+
+
+def test_current_frame_critic_sync_has_one_value_head_and_no_actor_copy() -> None:
+    module = _CurrentFrameCriticSyncModule()
+
+    captured = capture_fastwam_sync_tensors(module)
+
+    assert len(captured) == len(set(captured))
+    assert not any(name.startswith("actor.") for name in captured)
+    assert not any(name.startswith("critic.actor.") for name in captured)
+    value_names = [name for name in captured if name.startswith("critic.value_head.")]
+    assert len(value_names) == len(list(module.critic.value_head.parameters()))
 
 
 def test_single_rank_materialization_keeps_only_selected_live_storage() -> None:
