@@ -28,7 +28,7 @@ from .contracts import (
 )
 from .critic import (
     CriticKind,
-    FastWAMCurrentFrameFeatureConfig,
+    FastWAMValueTransformerConfig,
 )
 from .evaluation import (
     EvaluationRouteSelection,
@@ -235,11 +235,11 @@ def _validate_fastwam_current_frame_critic_config(
     cfg,
     *,
     num_layers: int,
-    input_dim: int,
-) -> FastWAMCurrentFrameFeatureConfig:
-    """Validate and materialize the actor-feature critic configuration."""
+    source_num_heads: int,
+    source_head_dim: int,
+) -> FastWAMValueTransformerConfig:
+    """Validate and materialize the Gate-style value-transformer config."""
 
-    _validate_value_head_config(cfg, expected_input_dim=input_dim)
     if cfg.get("backbone") is not None:
         raise ValueError(
             "FastWAM current-frame critic must set `backbone: null`; it reuses "
@@ -253,21 +253,73 @@ def _validate_fastwam_current_frame_critic_config(
     feature = cfg.get("feature")
     if feature is None:
         raise ValueError("FastWAM current-frame critic requires a `feature` mapping.")
-    result = FastWAMCurrentFrameFeatureConfig(
-        input_dim=input_dim,
-        source=str(feature.get("source", "")),
-        layer_index=feature.get("layer_index", -1),
-        pooling=str(feature.get("pooling", "")),
-    )
-    if result.layer_index >= num_layers:
+    transformer = cfg.get("transformer")
+    if transformer is None:
         raise ValueError(
-            "FastWAM critic feature layer is outside the configured MoT: "
-            f"index={result.layer_index}, layers={num_layers}."
+            "FastWAM current-frame critic requires a `transformer` mapping."
         )
+    unknown_feature_keys = sorted(
+        set(feature) - {"source_dim", "layer_indices", "sources"}
+    )
+    if unknown_feature_keys:
+        raise ValueError(
+            f"Unknown FastWAM critic feature fields: {unknown_feature_keys}."
+        )
+    unknown_transformer_keys = sorted(
+        set(transformer)
+        - {
+            "hidden_dim",
+            "num_query_tokens",
+            "ffn_multiplier",
+            "share_blocks",
+            "layer_index_embedding",
+            "pooling",
+        }
+    )
+    if unknown_transformer_keys:
+        raise ValueError(
+            f"Unknown FastWAM value-transformer fields: {unknown_transformer_keys}."
+        )
+    expected_source_dim = source_num_heads * source_head_dim
+    source_dim = feature.get("source_dim", expected_source_dim)
+    if isinstance(source_dim, bool) or not isinstance(source_dim, int):
+        raise TypeError("FastWAM critic `feature.source_dim` must be an integer.")
+    if source_dim != expected_source_dim:
+        raise ValueError(
+            "FastWAM critic source width does not match Video/Context K/V: "
+            f"expected {expected_source_dim}, got {source_dim}."
+        )
+    layer_indices = feature.get("layer_indices", (14,))
+    if isinstance(layer_indices, (str, bytes, Mapping)):
+        raise TypeError("FastWAM critic `feature.layer_indices` must be a sequence.")
+    sources = feature.get(
+        "sources",
+        ("current_frame_video", "text_state_context"),
+    )
+    if isinstance(sources, (str, bytes, Mapping)):
+        raise TypeError("FastWAM critic `feature.sources` must be a sequence.")
+    result = FastWAMValueTransformerConfig(
+        num_mot_layers=num_layers,
+        source_num_heads=source_num_heads,
+        source_head_dim=source_head_dim,
+        layer_indices=tuple(layer_indices),
+        sources=tuple(str(source) for source in sources),
+        hidden_dim=transformer.get("hidden_dim", 256),
+        num_query_tokens=transformer.get("num_query_tokens", 4),
+        ffn_multiplier=transformer.get("ffn_multiplier", 4),
+        share_blocks=transformer.get("share_blocks", False),
+        layer_index_embedding=transformer.get("layer_index_embedding", True),
+        pooling=str(transformer.get("pooling", "mean_token")),
+    )
+    _validate_value_head_config(cfg, expected_input_dim=result.hidden_dim)
     return result
 
 
-def _validate_fastwam_actor_surface(actor) -> None:
+def _validate_fastwam_actor_surface(
+    actor,
+    *,
+    require_value_kv: bool = False,
+) -> None:
     required = (
         "action_expert",
         "mot",
@@ -279,6 +331,16 @@ def _validate_fastwam_actor_surface(actor) -> None:
     missing = [name for name in required if not hasattr(actor, name)]
     if missing:
         raise TypeError(f"FastWAM actor is missing required adaptive APIs: {missing}.")
+    if not require_value_kv:
+        return
+    if not hasattr(actor.action_expert, "text_embedding"):
+        raise TypeError(
+            "FastWAM ActionDiT must expose `text_embedding` for critic K/V."
+        )
+    if not hasattr(actor.mot, "read_condition_layer_kv"):
+        raise TypeError(
+            "FastWAM MoT must expose `read_condition_layer_kv` for critic K/V."
+        )
 
 
 def _validate_flow_sde_config(cfg) -> None:
@@ -311,11 +373,12 @@ def _validate_critic_build_config(cfg) -> bool:
         _validate_exact_pi05_critic_config(cfg.critic)
         _validate_critic_parent_artifact(cfg.critic)
     else:
-        video_config = cfg.fastwam.video_dit_config
+        action_config = cfg.fastwam.action_dit_config
         _validate_fastwam_current_frame_critic_config(
             cfg.critic,
-            num_layers=int(video_config.num_layers),
-            input_dim=int(video_config.num_heads) * int(video_config.attn_head_dim),
+            num_layers=int(action_config.num_layers),
+            source_num_heads=int(action_config.num_heads),
+            source_head_dim=int(action_config.attn_head_dim),
         )
     return True
 
@@ -441,7 +504,12 @@ def get_model(cfg, torch_dtype):
         model_dtype=torch_dtype,
         device=init_device,
     )
-    _validate_fastwam_actor_surface(actor)
+    _validate_fastwam_actor_surface(
+        actor,
+        require_value_kv=(
+            load_critic and critic_kind is CriticKind.FASTWAM_CURRENT_FRAME_VALUE
+        ),
+    )
     actual_mot_contract = (
         int(actor.mot.num_layers),
         int(actor.mot.num_heads),
@@ -470,8 +538,11 @@ def get_model(cfg, torch_dtype):
     critic = None
     critic_feature_config = None
     if load_critic:
+        default_hidden_sizes = (
+            (1024, 512, 256) if critic_kind is CriticKind.PI0_5_VALUE_AFTER_VLM else ()
+        )
         hidden_sizes = tuple(
-            int(item) for item in cfg.critic.get("hidden_sizes", (1024, 512, 256))
+            int(item) for item in cfg.critic.get("hidden_sizes", default_hidden_sizes)
         )
         activation = str(cfg.critic.get("activation", "relu"))
         bias_last = bool(cfg.critic.get("bias_last", True))
@@ -487,14 +558,14 @@ def get_model(cfg, torch_dtype):
                 bias_last=bias_last,
             )
         else:
-            actual_feature_dim = int(actor.mot.num_heads) * int(actor.mot.attn_head_dim)
             critic_feature_config = _validate_fastwam_current_frame_critic_config(
                 cfg.critic,
                 num_layers=int(actor.mot.num_layers),
-                input_dim=actual_feature_dim,
+                source_num_heads=int(actor.mot.num_heads),
+                source_head_dim=int(actor.mot.attn_head_dim),
             )
             critic = FastWAMCurrentFrameValueCritic(
-                input_dim=actual_feature_dim,
+                config=critic_feature_config,
                 hidden_sizes=hidden_sizes,
                 activation=activation,
                 bias_last=bias_last,

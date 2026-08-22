@@ -123,6 +123,16 @@ def test_builder_skips_critic_allocation_contract_in_standalone_eval(
 
 def test_builder_actor_surface_fails_before_distributed_launch() -> None:
     complete = SimpleNamespace(
+        action_expert=SimpleNamespace(text_embedding=lambda *_args: None),
+        mot=SimpleNamespace(read_condition_layer_kv=lambda **_kwargs: None),
+        infer_action_scheduler=object(),
+        infer_video_scheduler=object(),
+        vae=object(),
+        load_checkpoint=lambda _path: None,
+    )
+    _builder._validate_fastwam_actor_surface(complete, require_value_kv=True)
+
+    legacy_surface = SimpleNamespace(
         action_expert=object(),
         mot=object(),
         infer_action_scheduler=object(),
@@ -130,7 +140,12 @@ def test_builder_actor_surface_fails_before_distributed_launch() -> None:
         vae=object(),
         load_checkpoint=lambda _path: None,
     )
-    _builder._validate_fastwam_actor_surface(complete)
+    _builder._validate_fastwam_actor_surface(legacy_surface)
+    with pytest.raises(TypeError, match="text_embedding"):
+        _builder._validate_fastwam_actor_surface(
+            legacy_surface,
+            require_value_kv=True,
+        )
 
     with pytest.raises(TypeError, match="infer_video_scheduler"):
         _builder._validate_fastwam_actor_surface(
@@ -314,27 +329,37 @@ def test_current_frame_critic_config_composes_without_pi05_assets(monkeypatch) -
     assert actor_critic.kind == "fastwam_current_frame_value"
     assert actor_critic.backbone is None
     assert actor_critic.backbone_checkpoint_sha256 is None
-    assert actor_critic.input_dim == 3072
-    assert actor_critic.hidden_sizes == [1024, 512, 256]
+    assert actor_critic.input_dim == 256
+    assert actor_critic.hidden_sizes == []
     assert actor_critic.activation == "relu"
     assert actor_critic.bias_last is True
-    assert actor_critic.feature.layer_index == 14
-    assert actor_critic.feature.pooling == "mean_token"
+    assert actor_critic.feature.source_dim == 3072
+    assert actor_critic.feature.layer_indices == [14]
+    assert actor_critic.feature.sources == [
+        "current_frame_video",
+        "text_state_context",
+    ]
+    assert actor_critic.transformer.hidden_dim == 256
+    assert actor_critic.transformer.num_query_tokens == 4
+    assert actor_critic.transformer.pooling == "mean_token"
     feature = _builder._validate_fastwam_current_frame_critic_config(
         actor_critic,
         num_layers=30,
-        input_dim=3072,
+        source_num_heads=24,
+        source_head_dim=128,
     )
-    assert feature.layer_index == 14
+    assert feature.layer_indices == (14,)
+    assert feature.sources == ("current_frame_video", "text_state_context")
     _validate_fastwam_adaptive_cfg(cfg, only_eval=False)
 
     invalid = OmegaConf.create(OmegaConf.to_container(actor_critic, resolve=True))
-    invalid.feature.layer_index = 30
+    invalid.feature.layer_indices = [30]
     with pytest.raises(ValueError, match="outside"):
         _builder._validate_fastwam_current_frame_critic_config(
             invalid,
             num_layers=30,
-            input_dim=3072,
+            source_num_heads=24,
+            source_head_dim=128,
         )
 
     invalid = OmegaConf.create(OmegaConf.to_container(actor_critic, resolve=True))
@@ -343,25 +368,28 @@ def test_current_frame_critic_config_composes_without_pi05_assets(monkeypatch) -
         _builder._validate_fastwam_current_frame_critic_config(
             invalid,
             num_layers=30,
-            input_dim=3072,
+            source_num_heads=24,
+            source_head_dim=128,
         )
 
     invalid = OmegaConf.create(OmegaConf.to_container(actor_critic, resolve=True))
-    invalid.input_dim = 2048
-    with pytest.raises(ValueError, match="input width"):
+    invalid.feature.source_dim = 2048
+    with pytest.raises(ValueError, match="source width"):
         _builder._validate_fastwam_current_frame_critic_config(
             invalid,
             num_layers=30,
-            input_dim=3072,
+            source_num_heads=24,
+            source_head_dim=128,
         )
 
     invalid = OmegaConf.create(OmegaConf.to_container(actor_critic, resolve=True))
-    invalid.feature.pooling = "max_token"
+    invalid.transformer.pooling = "max_token"
     with pytest.raises(ValueError, match="pooling"):
         _builder._validate_fastwam_current_frame_critic_config(
             invalid,
             num_layers=30,
-            input_dim=3072,
+            source_num_heads=24,
+            source_head_dim=128,
         )
 
     invalid = OmegaConf.create(OmegaConf.to_container(actor_critic, resolve=True))
@@ -370,11 +398,12 @@ def test_current_frame_critic_config_composes_without_pi05_assets(monkeypatch) -
         _builder._validate_fastwam_current_frame_critic_config(
             invalid,
             num_layers=30,
-            input_dim=3072,
+            source_num_heads=24,
+            source_head_dim=128,
         )
 
     mismatched = OmegaConf.create(OmegaConf.to_container(cfg, resolve=True))
-    mismatched.rollout.model.critic.feature.pooling = "last_token"
+    mismatched.rollout.model.critic.transformer.pooling = "last_token"
     with pytest.raises(ValueError, match="replay contracts differ"):
         _validate_fastwam_adaptive_cfg(mismatched, only_eval=False)
 

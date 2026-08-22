@@ -28,6 +28,7 @@ import rlinf.workers.actor.fsdp_actor_worker as actor_worker
 from rlinf.config import SupportedModel
 from rlinf.models.embodiment.wam_policy.critic import (
     FastWAMCurrentFrameValueCritic,
+    FastWAMValueTransformerConfig,
 )
 from rlinf.workers.actor.fastwam_selective_sync import (
     CapturedSyncTensor,
@@ -55,7 +56,14 @@ class _CurrentFrameCriticSyncModule(nn.Module):
         self.lora_A = nn.Parameter(torch.ones(1, 2))
         self.lora_B = nn.Parameter(torch.ones(2, 1))
         self.critic = FastWAMCurrentFrameValueCritic(
-            input_dim=2,
+            config=FastWAMValueTransformerConfig(
+                num_mot_layers=1,
+                source_num_heads=1,
+                source_head_dim=2,
+                layer_indices=(0,),
+                hidden_dim=2,
+                num_query_tokens=1,
+            ),
             hidden_sizes=(4,),
         )
 

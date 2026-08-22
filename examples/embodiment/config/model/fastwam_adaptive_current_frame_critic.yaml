@@ -2,18 +2,25 @@ defaults:
   - fastwam_adaptive
   - _self_
 
-# Opt-in critic that reuses detached current-frame Video-V features from the
-# frozen FastWAM actor. The default fastwam_adaptive preset remains exact Pi05.
+# Opt-in Gate-style critic over detached current-frame Video K/V and the
+# prompt+state Context K/V. The default fastwam_adaptive preset remains Pi05.
 critic:
   kind: fastwam_current_frame_value
   load_for_eval: false
   backbone_checkpoint_sha256: null
   backbone: null
-  input_dim: 3072
-  hidden_sizes: [1024, 512, 256]
+  input_dim: 256
+  hidden_sizes: []
   activation: relu
   bias_last: true
   feature:
-    source: current_frame_video_value
-    layer_index: 14
+    source_dim: 3072
+    layer_indices: [14]
+    sources: [current_frame_video, text_state_context]
+  transformer:
+    hidden_dim: 256
+    num_query_tokens: 4
+    ffn_multiplier: 4
+    share_blocks: false
+    layer_index_embedding: true
     pooling: mean_token

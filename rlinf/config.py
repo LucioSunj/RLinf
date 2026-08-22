@@ -888,11 +888,12 @@ def _validate_fastwam_adaptive_cfg(cfg, *, only_eval: bool) -> None:
     if critic_kind is CriticKind.PI0_5_VALUE_AFTER_VLM:
         _validate_exact_pi05_critic_config(model_cfg.critic)
     else:
-        video_config = model_cfg.fastwam.video_dit_config
+        action_config = model_cfg.fastwam.action_dit_config
         _validate_fastwam_current_frame_critic_config(
             model_cfg.critic,
-            num_layers=int(video_config.num_layers),
-            input_dim=int(video_config.num_heads) * int(video_config.attn_head_dim),
+            num_layers=int(action_config.num_layers),
+            source_num_heads=int(action_config.num_heads),
+            source_head_dim=int(action_config.attn_head_dim),
         )
     if critic_kind is CriticKind.PI0_5_VALUE_AFTER_VLM and (
         not only_eval or load_for_eval

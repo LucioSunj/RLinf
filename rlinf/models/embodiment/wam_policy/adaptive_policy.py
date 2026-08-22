@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Composite FastWAM actor, delayed Gate, and pi0.5 critic policy."""
+"""Composite FastWAM actor, delayed Gate, and configurable critic policy."""
 
 from __future__ import annotations
 
@@ -36,7 +36,11 @@ from .contracts import (
     GateDecisionRecord,
     GateKVMetadata,
 )
-from .critic import CriticKind, critic_parent_checkpoint_sha256
+from .critic import (
+    CriticKind,
+    FastWAMValueFeatures,
+    critic_parent_checkpoint_sha256,
+)
 from .evaluation import (
     EvaluationRouteSelection,
     EvaluationRoutingConfig,
@@ -62,7 +66,7 @@ class FastWAMChunkSample:
     denoise_indices: torch.Tensor
     gate_snapshots: tuple[GateKVSnapshot, ...]
     forward_inputs: dict[str, torch.Tensor] = field(default_factory=dict)
-    critic_features: torch.Tensor | None = None
+    critic_features: FastWAMValueFeatures | torch.Tensor | None = None
     action_execution_trace: ActionExecutionTrace | None = None
 
     def __post_init__(self) -> None:
@@ -77,11 +81,15 @@ class FastWAMChunkSample:
             raise ValueError("Gate snapshots are required after every chunk.")
         if any(snapshot.batch_size != batch_size for snapshot in self.gate_snapshots):
             raise ValueError("Gate snapshot batch must match actions.")
-        if self.critic_features is not None and (
-            self.critic_features.ndim != 2
-            or self.critic_features.shape[0] != batch_size
-        ):
-            raise ValueError("Critic features must have shape [B, D].")
+        if self.critic_features is not None:
+            if isinstance(self.critic_features, FastWAMValueFeatures):
+                feature_batch = self.critic_features.batch_size
+            else:
+                if self.critic_features.ndim != 2:
+                    raise ValueError("Tensor critic features must have shape [B, D].")
+                feature_batch = int(self.critic_features.shape[0])
+            if feature_batch != batch_size:
+                raise ValueError("Critic feature batch must match actions.")
         if (
             self.action_execution_trace is not None
             and self.action_execution_trace.batch_size != batch_size
@@ -108,7 +116,7 @@ class FastWAMPolicyRuntime(Protocol):
         forward_inputs: dict[str, torch.Tensor],
         route_info: ChunkRouteRecord,
         compute_base_logprobs: bool = False,
-    ) -> dict[str, torch.Tensor]: ...
+    ) -> dict[str, Any]: ...
 
     def critic_observation(
         self,
@@ -117,7 +125,7 @@ class FastWAMPolicyRuntime(Protocol):
         forward_inputs: dict[str, torch.Tensor] | None = None,
     ) -> dict[str, Any]: ...
 
-    def critic_features(self, *, env_obs: dict[str, Any]) -> torch.Tensor: ...
+    def critic_features(self, *, env_obs: dict[str, Any]) -> Any: ...
 
     def recompute_gate_snapshots(
         self,
@@ -956,7 +964,10 @@ class FastWAMAdaptivePolicy(nn.Module, BasePolicy):
             # them in forward_inputs would make rollout sharding split [L] by B.
             packed_inputs.pop("gate_kv_layer_indices", None)
             forward_inputs.update(packed_inputs)
-        if critic_features is not None:
+        if (
+            critic_features is not None
+            and self._critic_kind() is not CriticKind.FASTWAM_CURRENT_FRAME_VALUE
+        ):
             replay_key = getattr(critic, "replay_feature_key", "critic_prefix")
             forward_inputs[replay_key] = critic_features
         result = {
@@ -1088,22 +1099,26 @@ class FastWAMAdaptivePolicy(nn.Module, BasePolicy):
 
         if compute_values:
             critic = self._require_critic()
-            replay_key = getattr(critic, "replay_feature_key", "critic_prefix")
-            if replay_key in forward_inputs:
-                features = forward_inputs[replay_key]
-                if hasattr(critic, "value_from_features"):
-                    values = critic.value_from_features(features)
-                else:
-                    values = critic.value_from_prefix(features)
-            elif self._critic_kind() is CriticKind.FASTWAM_CURRENT_FRAME_VALUE:
-                raise KeyError(
-                    "FastWAM current-frame critic replay is missing stored features."
-                )
+            critic_kind = self._critic_kind()
+            if critic_kind is CriticKind.FASTWAM_CURRENT_FRAME_VALUE:
+                if "critic_features" not in replay:
+                    raise KeyError(
+                        "FastWAM critic replay returned no reconstructed value K/V."
+                    )
+                values = critic.value_from_features(replay["critic_features"])
             else:
-                critic_obs = self.runtime.critic_observation(
-                    forward_inputs=forward_inputs
-                )
-                values = critic.predict_value_batch(critic_obs)
+                replay_key = getattr(critic, "replay_feature_key", "critic_prefix")
+                if replay_key in forward_inputs:
+                    features = forward_inputs[replay_key]
+                    if hasattr(critic, "value_from_features"):
+                        values = critic.value_from_features(features)
+                    else:
+                        values = critic.value_from_prefix(features)
+                else:
+                    critic_obs = self.runtime.critic_observation(
+                        forward_inputs=forward_inputs
+                    )
+                    values = critic.predict_value_batch(critic_obs)
         else:
             values = torch.zeros(
                 (batch_size, 1),

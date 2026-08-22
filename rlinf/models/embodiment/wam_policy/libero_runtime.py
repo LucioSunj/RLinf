@@ -57,8 +57,9 @@ from rlinf.envs.libero.image_preprocessing import (
 from .adaptive_policy import FastWAMChunkSample
 from .contracts import ChunkRouteRecord, WAMRoute
 from .critic import (
-    FastWAMCurrentFrameFeatureConfig,
-    pool_current_frame_video_values,
+    FastWAMValueFeatures,
+    FastWAMValueTransformerConfig,
+    extract_fastwam_value_features,
 )
 from .kv_replay import GateKVReplayBackend
 
@@ -382,7 +383,7 @@ class LiberoFastWAMRuntime:
         gate_layer_indices: tuple[int, ...] | list[int] | None = None,
         gate_denoise_last_n: int = 1,
         gate_replay_backend: GateKVReplayBackend | str = GateKVReplayBackend.STORED,
-        critic_feature_config: FastWAMCurrentFrameFeatureConfig | None = None,
+        critic_feature_config: FastWAMValueTransformerConfig | None = None,
         camera_height: int = 224,
         camera_width: int = 224,
         camera_concat: str = "horizontal",
@@ -734,6 +735,22 @@ class LiberoFastWAMRuntime:
             replay_initial_latents,
         )
 
+    def _critic_features_from_condition(
+        self,
+        condition: CachedActionCondition,
+    ) -> FastWAMValueFeatures:
+        """Read detached base-regime K/V without an action forward."""
+
+        if self.critic_feature_config is None:
+            raise RuntimeError("FastWAM value-transformer features are not configured.")
+        return extract_fastwam_value_features(
+            condition,
+            mot=self.actor.mot,
+            action_expert=self.actor.action_expert,
+            config=self.critic_feature_config,
+            regime_context=self.lora_adapter.regime_context,
+        )
+
     def _action_schedule(self):
         # Keep schedule arithmetic in FP32. The sampler casts model timesteps
         # and ODE deltas to the action dtype only at their point of use; building
@@ -832,7 +849,7 @@ class LiberoFastWAMRuntime:
             )
         rollouts = []
         idm_initial_latents = []
-        critic_features = []
+        critic_features: list[FastWAMValueFeatures] = []
         for index, route_value in enumerate(routes.tolist()):
             regime = (
                 PolicyRegime.IDM
@@ -856,12 +873,7 @@ class LiberoFastWAMRuntime:
                 ),
             )
             if self.critic_feature_config is not None and mode == "train":
-                critic_features.append(
-                    pool_current_frame_video_values(
-                        condition,
-                        self.critic_feature_config,
-                    )
-                )
+                critic_features.append(self._critic_features_from_condition(condition))
             if (
                 collect_replay
                 and self.gate_replay_backend is GateKVReplayBackend.RECOMPUTE
@@ -981,21 +993,23 @@ class LiberoFastWAMRuntime:
             gate_snapshots=gate_snapshots,
             forward_inputs=replay_inputs,
             critic_features=(
-                None if not critic_features else torch.cat(critic_features, dim=0)
+                None
+                if not critic_features
+                else FastWAMValueFeatures.cat(critic_features)
             ),
             action_execution_trace=action_execution_trace,
         )
 
     @torch.no_grad()
-    def critic_features(self, *, env_obs: dict[str, Any]) -> torch.Tensor:
-        """Encode current-frame critic features without action or route updates."""
+    def critic_features(self, *, env_obs: dict[str, Any]) -> FastWAMValueFeatures:
+        """Encode current-only value K/V without action or route updates."""
 
         if self.critic_feature_config is None:
             raise RuntimeError(
                 "FastWAM current-frame critic features were not configured."
             )
         images, context, context_mask = self._encode_condition(env_obs)
-        features = []
+        features: list[FastWAMValueFeatures] = []
         for index in range(images.shape[0]):
             condition, _ = self._prepare_action_condition(
                 image=images[index : index + 1],
@@ -1003,13 +1017,8 @@ class LiberoFastWAMRuntime:
                 context_mask=context_mask[index : index + 1],
                 regime=PolicyRegime.UNCOND,
             )
-            features.append(
-                pool_current_frame_video_values(
-                    condition,
-                    self.critic_feature_config,
-                )
-            )
-        return torch.cat(features, dim=0)
+            features.append(self._critic_features_from_condition(condition))
+        return FastWAMValueFeatures.cat(features)
 
     def replay_action_batch(
         self,
@@ -1017,7 +1026,7 @@ class LiberoFastWAMRuntime:
         forward_inputs: dict[str, torch.Tensor],
         route_info: ChunkRouteRecord,
         compute_base_logprobs: bool = False,
-    ) -> dict[str, torch.Tensor]:
+    ) -> dict[str, Any]:
         _validate_flow_sde_sampling(
             mode="train",
             routes=route_info.route_used,
@@ -1036,8 +1045,10 @@ class LiberoFastWAMRuntime:
             if compute_base_logprobs
             else None
         )
+        critic_features: list[FastWAMValueFeatures] = []
         for index in range(chains.shape[0]):
-            if int(route_info.route_used[index]) != int(WAMRoute.UNCOND):
+            is_uncond = int(route_info.route_used[index]) == int(WAMRoute.UNCOND)
+            if not is_uncond and self.critic_feature_config is None:
                 continue
             condition, _ = self._prepare_action_condition(
                 image=images[index : index + 1],
@@ -1045,6 +1056,10 @@ class LiberoFastWAMRuntime:
                 context_mask=context_mask[index : index + 1],
                 regime=PolicyRegime.UNCOND,
             )
+            if self.critic_feature_config is not None:
+                critic_features.append(self._critic_features_from_condition(condition))
+            if not is_uncond:
+                continue
             current_replay = replay_action_flow_sde_transition(
                 chains[index : index + 1],
                 indices[index : index + 1],
@@ -1109,6 +1124,8 @@ class LiberoFastWAMRuntime:
                 base_kl,
                 protocol=self.action_protocol,
             )
+        if critic_features:
+            result["critic_features"] = FastWAMValueFeatures.cat(critic_features)
         return result
 
     @torch.no_grad()

@@ -27,6 +27,7 @@ OUTER = Path(__file__).resolve().parents[3]
 sys.path.insert(0, str(OUTER / "FastWAM/src"))
 
 from fastwam.adapters import PolicyRegime  # noqa: E402
+from fastwam.models.wan22.condition_kv import ConditionLayerKV  # noqa: E402
 from fastwam.models.wan22.kv_tap import (  # noqa: E402
     GateKVSnapshot,
     GateLayerKV,
@@ -107,9 +108,12 @@ FastWAMChunkSample = _policy.FastWAMChunkSample
 FastWAMCurrentFrameValueCritic = sys.modules[
     "fastwam_policy_composite_under_test.critic"
 ].FastWAMCurrentFrameValueCritic
-FastWAMCurrentFrameFeatureConfig = sys.modules[
+FastWAMValueFeatures = sys.modules[
     "fastwam_policy_composite_under_test.critic"
-].FastWAMCurrentFrameFeatureConfig
+].FastWAMValueFeatures
+FastWAMValueTransformerConfig = sys.modules[
+    "fastwam_policy_composite_under_test.critic"
+].FastWAMValueTransformerConfig
 
 
 def _bank(source, value, batch=2):
@@ -119,6 +123,45 @@ def _bank(source, value, batch=2):
         key=tensor,
         value=tensor + 1,
         valid_mask=torch.ones(batch, 1, dtype=torch.bool),
+    )
+
+
+def _value_features(states: torch.Tensor) -> FastWAMValueFeatures:
+    values = states[:, None, :2].detach().float()
+    return FastWAMValueFeatures(
+        (
+            ConditionLayerKV(
+                layer_index=0,
+                current_frame_video=KeyValueBank(
+                    source=KVSource.CURRENT_FRAME_VIDEO,
+                    key=values,
+                    value=values + 1,
+                    valid_mask=torch.ones(
+                        values.shape[:2], dtype=torch.bool, device=values.device
+                    ),
+                ),
+                context=KeyValueBank(
+                    source=KVSource.TEXT_STATE_CONTEXT,
+                    key=values + 2,
+                    value=values + 3,
+                    valid_mask=torch.ones(
+                        values.shape[:2], dtype=torch.bool, device=values.device
+                    ),
+                ),
+            ),
+        )
+    )
+
+
+def _value_transformer_config() -> FastWAMValueTransformerConfig:
+    return FastWAMValueTransformerConfig(
+        num_mot_layers=1,
+        source_num_heads=1,
+        source_head_dim=2,
+        layer_indices=(0,),
+        hidden_dim=2,
+        num_query_tokens=1,
+        ffn_multiplier=2,
     )
 
 
@@ -192,7 +235,7 @@ class _Runtime:
             denoise_indices=torch.zeros(batch, dtype=torch.long),
             gate_snapshots=_snapshots(routes),
             forward_inputs={"critic_states": env_obs["states"].clone()},
-            critic_features=env_obs["states"][:, :1].detach().float(),
+            critic_features=_value_features(env_obs["states"]),
         )
 
     def replay_action_batch(self, *, forward_inputs, route_info):
@@ -201,6 +244,7 @@ class _Runtime:
         return {
             "flow_logprobs": torch.zeros(batch, 2, 3, dtype=torch.float32),
             "flow_entropy": torch.ones(batch, 1, dtype=torch.float32),
+            "critic_features": _value_features(forward_inputs["critic_states"]),
         }
 
     def critic_observation(self, *, env_obs=None, forward_inputs=None):
@@ -210,7 +254,7 @@ class _Runtime:
 
     def critic_features(self, *, env_obs):
         self.critic_feature_calls += 1
-        return env_obs["states"][:, :1].detach().float()
+        return _value_features(env_obs["states"])
 
     def recompute_gate_snapshots(self, *, forward_inputs, route_info):
         del forward_inputs
@@ -287,8 +331,8 @@ def _make_policy(
         critic = None
     elif critic_kind == "fastwam":
         critic = FastWAMCurrentFrameValueCritic(
-            input_dim=1,
-            hidden_sizes=(2,),
+            config=_value_transformer_config(),
+            hidden_sizes=(),
         )
     else:
         critic = _Critic()
@@ -694,13 +738,58 @@ def test_libero_critic_observation_canonicalizes_optional_camera_keys():
     assert explicit["extra_view_images"] is extra_view_images
 
 
+def test_libero_condition_context_contains_prompt_and_state_token():
+    class _Actor:
+        def encode_prompt(self, prompts):
+            assert prompts == [
+                "A video recorded from a robot's point of view executing the "
+                "following instruction: move the cup"
+            ]
+            return (
+                torch.tensor([[[1.0, 2.0], [3.0, 4.0]]]),
+                torch.tensor([[True, True]]),
+            )
+
+        def _append_proprio_to_context(
+            self,
+            *,
+            context,
+            context_mask,
+            proprio,
+        ):
+            return (
+                torch.cat((context, proprio[:, None, :]), dim=1),
+                torch.cat(
+                    (
+                        context_mask,
+                        torch.ones(1, 1, dtype=torch.bool),
+                    ),
+                    dim=1,
+                ),
+            )
+
+    runtime = object.__new__(_runtime_module.LiberoFastWAMRuntime)
+    runtime.actor = _Actor()
+    runtime.text_embedding_cache_dir = None
+    runtime.prompt_template = _runtime_module.DEFAULT_FASTWAM_PROMPT_TEMPLATE
+    runtime._model_images = lambda _obs: torch.zeros(1, 3, 4, 4)
+    runtime._normalized_proprio = lambda states: states[:, :2] + 10
+
+    _images, context, context_mask = runtime._encode_condition(
+        {
+            "task_descriptions": ["move the cup"],
+            "states": torch.tensor([[5.0, 6.0, 7.0]]),
+        }
+    )
+
+    assert torch.equal(context[:, :2], torch.tensor([[[1.0, 2.0], [3.0, 4.0]]]))
+    assert torch.equal(context[:, -1], torch.tensor([[15.0, 16.0]]))
+    assert torch.equal(context_mask, torch.tensor([[True, True, True]]))
+
+
 def test_libero_current_frame_bootstrap_encodes_only_uncond_conditions():
     runtime = object.__new__(_runtime_module.LiberoFastWAMRuntime)
-    runtime.critic_feature_config = FastWAMCurrentFrameFeatureConfig(
-        input_dim=2,
-        layer_index=1,
-        pooling="mean_token",
-    )
+    runtime.critic_feature_config = _value_transformer_config()
     runtime._encode_condition = lambda env_obs: (
         torch.zeros(2, 3, 4, 4),
         torch.zeros(2, 5, 2),
@@ -711,24 +800,194 @@ def test_libero_current_frame_bootstrap_encodes_only_uncond_conditions():
     def prepare_condition(**kwargs):
         regimes.append(kwargs["regime"])
         sample_index = len(regimes) - 1
-        values = torch.tensor([[[1.0 + sample_index, 2.0], [3.0 + sample_index, 4.0]]])
         return (
             SimpleNamespace(
-                video_kv_cache=[{"v": torch.zeros_like(values)}, {"v": values}],
-                current_frame_video_tokens=2,
+                sample_index=sample_index,
             ),
             None,
         )
 
     runtime._prepare_action_condition = prepare_condition
+    runtime._critic_features_from_condition = lambda condition: _value_features(
+        torch.tensor([[float(condition.sample_index + 1), 2.0, 3.0]])
+    )
 
     features = runtime.critic_features(env_obs={"unused": True})
 
     assert regimes == [PolicyRegime.UNCOND, PolicyRegime.UNCOND]
     assert torch.equal(
-        features,
-        torch.tensor([[2.0, 3.0], [3.0, 3.0]]),
+        features.layer(0).current_frame_video.key[:, 0],
+        torch.tensor([[1.0, 2.0], [2.0, 2.0]]),
     )
+
+
+def test_libero_rollout_value_reads_each_existing_condition_once(monkeypatch):
+    class _Actor(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.anchor = nn.Parameter(torch.zeros(1))
+            self.action_expert = SimpleNamespace(action_dim=3)
+            self.infer_action_scheduler = SimpleNamespace(num_train_timesteps=1000)
+
+    runtime = object.__new__(_runtime_module.LiberoFastWAMRuntime)
+    runtime.actor = _Actor()
+    runtime.critic_feature_config = _value_transformer_config()
+    runtime.flow_sde_noise_level = 0.5
+    runtime.flow_sde_ignore_last_transition = True
+    runtime.seeded_noise_device = "cpu"
+    runtime.gate_denoise_last_n = 1
+    runtime.gate_replay_backend = _policy.GateKVReplayBackend.STORED
+    runtime.action_protocol = _runtime_module.LiberoActionProtocol(
+        generation_horizon=2,
+        execution_horizon=1,
+        prediction_video_frames=3,
+        reset_wait_steps=0,
+        max_episode_steps=2,
+    )
+    runtime._encode_condition = lambda _obs: (
+        torch.zeros(2, 3, 4, 4),
+        torch.zeros(2, 5, 2),
+        torch.ones(2, 5, dtype=torch.bool),
+    )
+    runtime._action_schedule = lambda: (torch.tensor([1.0]), torch.tensor([-1.0]))
+    prepared_conditions = []
+
+    def prepare_condition(**_kwargs):
+        condition = SimpleNamespace(sample_index=len(prepared_conditions))
+        prepared_conditions.append(condition)
+        return condition, None
+
+    runtime._prepare_action_condition = prepare_condition
+    feature_conditions = []
+
+    def critic_features(condition):
+        feature_conditions.append(condition)
+        return _value_features(
+            torch.tensor([[float(condition.sample_index + 1), 2.0, 3.0]])
+        )
+
+    runtime._critic_features_from_condition = critic_features
+    velocity_conditions = []
+
+    def velocity(condition, **_kwargs):
+        velocity_conditions.append(condition)
+        return condition
+
+    runtime._velocity = velocity
+    runtime._denormalize_action_stages = lambda actions, env_obs: (actions, None)
+
+    def sample_flow(initial_noise, *, velocity_fn, **_kwargs):
+        return SimpleNamespace(
+            actions=torch.zeros_like(initial_noise),
+            old_log_probs=torch.zeros_like(initial_noise),
+            chains=torch.zeros(
+                initial_noise.shape[0],
+                2,
+                *initial_noise.shape[1:],
+            ),
+            denoise_indices=torch.zeros(initial_noise.shape[0], dtype=torch.long),
+            gate_taps=(_snapshots([velocity_fn.sample_index])[0],),
+        )
+
+    monkeypatch.setattr(_runtime_module, "sample_action_flow_sde", sample_flow)
+    sample = runtime.sample_action_batch(
+        env_obs={},
+        routes=torch.tensor([1, 0]),
+        mode="train",
+        actor_version=0,
+    )
+
+    assert len(prepared_conditions) == 2
+    assert feature_conditions == prepared_conditions
+    assert velocity_conditions == prepared_conditions
+    assert sample.critic_features.batch_size == 2
+    assert "fastwam_critic_features" not in sample.forward_inputs
+
+    feature_conditions.clear()
+    eval_sample = runtime.sample_action_batch(
+        env_obs={},
+        routes=torch.tensor([1, 0]),
+        mode="eval",
+        actor_version=0,
+        collect_replay=False,
+    )
+    assert eval_sample.critic_features is None
+    assert feature_conditions == []
+
+
+def test_libero_value_replay_reuses_uncond_condition_and_never_builds_future(
+    monkeypatch,
+):
+    runtime = object.__new__(_runtime_module.LiberoFastWAMRuntime)
+    runtime.critic_feature_config = _value_transformer_config()
+    runtime.flow_sde_noise_level = 0.5
+    runtime.action_protocol = _runtime_module.LiberoActionProtocol(
+        generation_horizon=2,
+        execution_horizon=1,
+        prediction_video_frames=3,
+        reset_wait_steps=0,
+        max_episode_steps=2,
+    )
+    runtime.actor = SimpleNamespace(
+        infer_action_scheduler=SimpleNamespace(num_train_timesteps=1000)
+    )
+    runtime._action_schedule = lambda: (torch.tensor([1.0]), torch.tensor([-1.0]))
+    prepare_regimes = []
+
+    def prepare_condition(**kwargs):
+        prepare_regimes.append(kwargs["regime"])
+        return SimpleNamespace(sample_index=len(prepare_regimes) - 1), None
+
+    runtime._prepare_action_condition = prepare_condition
+    runtime._critic_features_from_condition = lambda condition: _value_features(
+        torch.tensor([[float(condition.sample_index + 1), 2.0, 3.0]])
+    )
+    velocity_conditions = []
+
+    def velocity(condition, **kwargs):
+        velocity_conditions.append((condition, kwargs["regime"]))
+        return object()
+
+    runtime._velocity = velocity
+
+    def replay_transition(chains, _indices, **_kwargs):
+        mean = chains[:, 0]
+        return SimpleNamespace(
+            log_prob=torch.zeros_like(mean),
+            std=torch.ones_like(mean),
+            mean=mean,
+        )
+
+    monkeypatch.setattr(
+        _runtime_module,
+        "replay_action_flow_sde_transition",
+        replay_transition,
+    )
+    route_info = _policy.ChunkRouteRecord(
+        route_used=torch.tensor([1, 0]),
+        route_was_forced=torch.tensor([True, True]),
+        chunk_ids=torch.tensor([0, 0]),
+        episode_ids=torch.tensor([0, 1]),
+        route_source_chunk_ids=torch.tensor([-1, -1]),
+        actor_versions=torch.tensor([0, 0]),
+    )
+    result = runtime.replay_action_batch(
+        forward_inputs={
+            "flow_chains": torch.zeros(2, 2, 2, 3),
+            "denoise_indices": torch.zeros(2, dtype=torch.long),
+            "fastwam_images": torch.zeros(2, 3, 4, 4),
+            "fastwam_context": torch.zeros(2, 5, 2),
+            "fastwam_context_mask": torch.ones(2, 5, dtype=torch.bool),
+        },
+        route_info=route_info,
+    )
+
+    assert prepare_regimes == [PolicyRegime.UNCOND, PolicyRegime.UNCOND]
+    assert len(velocity_conditions) == 1
+    assert velocity_conditions[0][0].sample_index == 1
+    assert velocity_conditions[0][1] is PolicyRegime.UNCOND
+    assert result["critic_features"].batch_size == 2
+    assert result["flow_logprobs"].shape == (2, 1, 3)
 
 
 def test_standalone_eval_runs_and_restores_gate_lora_without_critic():
@@ -911,7 +1170,7 @@ def test_current_frame_critic_reuses_rollout_features_and_bootstrap_is_route_pur
 
     _, rollout = policy.predict_action_batch(obs, mode="train")
     assert policy.runtime.critic_feature_calls == 0
-    assert "fastwam_critic_features" in rollout["forward_inputs"]
+    assert "fastwam_critic_features" not in rollout["forward_inputs"]
     assert "critic_prefix" not in rollout["forward_inputs"]
     replay = policy.default_forward(
         rollout["forward_inputs"],

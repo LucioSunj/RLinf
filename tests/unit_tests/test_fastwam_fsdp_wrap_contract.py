@@ -24,6 +24,7 @@ from rlinf.models.embodiment.wam_policy.adaptive_policy import (
 )
 from rlinf.models.embodiment.wam_policy.critic import (
     FastWAMCurrentFrameValueCritic,
+    FastWAMValueTransformerConfig,
 )
 
 
@@ -128,7 +129,14 @@ def test_only_nested_critic_no_split_metadata_is_consumed() -> None:
 def test_current_frame_critic_wraps_only_its_value_head() -> None:
     policy = _policy_shell()
     policy.critic = FastWAMCurrentFrameValueCritic(
-        input_dim=2,
+        config=FastWAMValueTransformerConfig(
+            num_mot_layers=1,
+            source_num_heads=1,
+            source_head_dim=2,
+            layer_indices=(0,),
+            hidden_dim=2,
+            num_query_tokens=1,
+        ),
         hidden_sizes=(4,),
     )
     fsdp_config = OmegaConf.create({"use_orig_params": True})

@@ -491,13 +491,21 @@ def test_fastwam_critic_eval_checkpoint_has_no_external_parent_and_is_strict() -
         "load_for_eval": False,
         "backbone_checkpoint_sha256": None,
         "backbone": None,
-        "input_dim": 3072,
-        "hidden_sizes": [1024, 512, 256],
+        "input_dim": 256,
+        "hidden_sizes": [],
         "activation": "relu",
         "bias_last": True,
         "feature": {
-            "source": "current_frame_video_value",
-            "layer_index": 14,
+            "source_dim": 3072,
+            "layer_indices": [14],
+            "sources": ["current_frame_video", "text_state_context"],
+        },
+        "transformer": {
+            "hidden_dim": 256,
+            "num_query_tokens": 4,
+            "ffn_multiplier": 4,
+            "share_blocks": False,
+            "layer_index_embedding": True,
             "pooling": "mean_token",
         },
     }
@@ -517,8 +525,8 @@ def test_fastwam_critic_eval_checkpoint_has_no_external_parent_and_is_strict() -
         load_critic=True,
     )
 
-    live.critic.feature.pooling = "first_token"
-    with pytest.raises(ValueError, match=r"critic\.feature\.pooling"):
+    live.critic.transformer.pooling = "first_token"
+    with pytest.raises(ValueError, match=r"critic\.transformer\.pooling"):
         MODULE.validate_fastwam_eval_checkpoint_contract(
             payload,
             live,
