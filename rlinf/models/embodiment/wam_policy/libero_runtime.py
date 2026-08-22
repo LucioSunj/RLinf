@@ -418,7 +418,11 @@ class LiberoFastWAMRuntime:
         )
         self.gate_denoise_last_n = int(gate_denoise_last_n)
         self.gate_replay_backend = GateKVReplayBackend(gate_replay_backend)
-        self.critic_feature_config = critic_feature_config
+        self.critic_feature_config = (
+            None
+            if critic_feature_config is None
+            else FastWAMValueTransformerConfig.materialize(critic_feature_config)
+        )
         self.camera_height = int(camera_height)
         self.camera_width = int(camera_width)
         self.camera_concat = str(camera_concat)

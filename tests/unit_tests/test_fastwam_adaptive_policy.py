@@ -22,6 +22,7 @@ from types import ModuleType, SimpleNamespace
 import pytest
 import torch
 import torch.nn as nn
+from omegaconf import OmegaConf
 
 OUTER = Path(__file__).resolve().parents[3]
 sys.path.insert(0, str(OUTER / "FastWAM/src"))
@@ -163,6 +164,22 @@ def _value_transformer_config() -> FastWAMValueTransformerConfig:
         num_query_tokens=1,
         ffn_multiplier=2,
     )
+
+
+def test_libero_runtime_materializes_hydra_structured_value_config():
+    structured = OmegaConf.structured(_value_transformer_config())
+
+    runtime = _runtime_module.LiberoFastWAMRuntime(
+        actor=nn.Linear(1, 1),
+        lora_adapter=SimpleNamespace(),
+        critic_feature_config=structured,
+    )
+
+    assert isinstance(
+        runtime.critic_feature_config,
+        FastWAMValueTransformerConfig,
+    )
+    assert runtime.critic_feature_config.source_dim == 2
 
 
 def _snapshots(routes):

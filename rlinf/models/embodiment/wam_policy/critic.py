@@ -16,7 +16,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from contextlib import nullcontext
 from dataclasses import dataclass
 from enum import Enum
@@ -94,6 +94,22 @@ class FastWAMValueTransformerConfig:
     share_blocks: bool = False
     layer_index_embedding: bool = True
     pooling: CurrentFramePooling | str = CurrentFramePooling.MEAN_TOKEN
+
+    @classmethod
+    def materialize(
+        cls,
+        value: FastWAMValueTransformerConfig | Mapping[str, Any],
+    ) -> FastWAMValueTransformerConfig:
+        """Restore the native config after a Hydra instantiation boundary."""
+
+        if isinstance(value, cls):
+            return value
+        if not isinstance(value, Mapping):
+            raise TypeError(
+                "FastWAM value-transformer config must be a native config or "
+                f"mapping, got {type(value).__name__}."
+            )
+        return cls(**dict(value))
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "layer_indices", tuple(self.layer_indices))
