@@ -970,6 +970,33 @@ def _validate_fastwam_adaptive_cfg(cfg, *, only_eval: bool) -> None:
 
     if int(cfg.actor.optim.get("critic_warmup_steps", 0)) != 0:
         raise ValueError("FastWAM adaptive does not support critic-only warm-up.")
+    update_resolution_ratio = float(
+        cfg.actor.optim.get("update_resolution_min_half_ulp_ratio", 0.0)
+    )
+    if not math.isfinite(update_resolution_ratio) or update_resolution_ratio < 1.0:
+        raise ValueError(
+            "FastWAM `actor.optim.update_resolution_min_half_ulp_ratio` must "
+            "be finite and at least 1.0."
+        )
+    movement_thresholds = cfg.runner.get(
+        "short_rl_canary_relative_movement_lr_step_multipliers", {}
+    )
+    expected_movement_groups = {"gate", "lora", "value_head"}
+    if set(movement_thresholds) != expected_movement_groups:
+        raise ValueError(
+            "FastWAM short-RL movement multipliers must define exactly Gate, "
+            "LoRA, and value-head groups."
+        )
+    invalid_movement_thresholds = sorted(
+        name
+        for name, value in movement_thresholds.items()
+        if not math.isfinite(float(value)) or float(value) <= 0
+    )
+    if invalid_movement_thresholds:
+        raise ValueError(
+            "FastWAM short-RL movement multipliers must be finite and positive: "
+            + ", ".join(invalid_movement_thresholds)
+        )
     if int(cfg.algorithm.critic_loss.get("warmup_steps", 0)) != 0:
         raise ValueError("FastWAM adaptive value loss must start on the first update.")
     if bool(cfg.actor.get("enable_sft_co_train", False)):

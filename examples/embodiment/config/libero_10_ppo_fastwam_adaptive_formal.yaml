@@ -63,6 +63,13 @@ runner:
   # Diagnostic-only guard. The audited short-RL launcher enables this so a
   # zero-success rollout stops before branch cost, GAE, or any optimizer step.
   short_rl_canary_require_success_signal: false
+  # tau = multiplier * group LR * optimizer steps in this canary segment.
+  # At ten steps these yield 0.01/0.004/0.001: Gate/LoRA reject the historical
+  # BF16 ratios (0.00614/0.00264), while healthy FP32 Value cleared 0.00367.
+  short_rl_canary_relative_movement_lr_step_multipliers:
+    gate: 10.0
+    lora: 40.0
+    value_head: 1.0
 
   # Disabled in the base preset. Formal capacity/pilot launchers enable this
   # fail-closed guard and bind it into the continuation contract.
@@ -173,6 +180,8 @@ actor:
     adam_beta1: 0.9
     adam_beta2: 0.95
     adam_eps: 1.0e-8
+    # First real AdamW step must clear at least one half-ULP in every group.
+    update_resolution_min_half_ulp_ratio: 1.0
     weight_decay: 0.0
     clip_grad: 1.0
     critic_warmup_steps: 0

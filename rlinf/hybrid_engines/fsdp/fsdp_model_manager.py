@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import json
 import os
 import warnings
 from typing import ContextManager, Union
@@ -77,6 +78,7 @@ class FSDPModelManager:
             )
 
         self.optimizer_steps = 0
+        self._fastwam_update_resolution_checked = False
         self.critic_warmup_steps = 0
         if self._cfg.get("optim", {}).get(
             "critic_warmup_steps", None
@@ -432,6 +434,26 @@ class FSDPModelManager:
                 f"[FSDP] Non-finite grad norm {grad_norm} detected. Skipping optimizer step."
             )
         else:
+            if (
+                not self._fastwam_update_resolution_checked
+                and SupportedModel(self._cfg.model.model_type)
+                is SupportedModel.FASTWAM_ADAPTIVE
+            ):
+                from rlinf.models.embodiment.wam_policy.optimizer import (
+                    assert_fastwam_optimizer_update_resolution,
+                )
+
+                resolution = assert_fastwam_optimizer_update_resolution(
+                    self.optimizer,
+                    minimum_half_ulp_ratio=float(
+                        self._cfg.optim.update_resolution_min_half_ulp_ratio
+                    ),
+                )
+                self._fastwam_update_resolution_checked = True
+                self._logger.info(
+                    "[FSDP] FastWAM first-step update resolution: "
+                    f"{json.dumps(resolution, sort_keys=True)}"
+                )
             self.grad_scaler.step(optimizer=self.optimizer)
 
         self.grad_scaler.update()
