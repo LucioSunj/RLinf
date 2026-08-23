@@ -105,6 +105,7 @@ def test_gate_ppo_clips_independently_and_reports_selected_count():
     assert torch.allclose(loss, torch.tensor(-0.85))
     assert metrics["gate/sample_count"].item() == 2
     assert metrics["gate/clip_fraction"].item() == 1.0
+    assert metrics["gate/log_ratio_max_abs"].item() == pytest.approx(abs(math.log(0.5)))
 
 
 def test_dual_ppo_uses_gate_mask_and_uncond_route_mask_separately():
@@ -150,6 +151,9 @@ def test_uncond_flow_ppo_sums_joint_chunk_logprob_before_clipping():
 
     assert loss.item() == pytest.approx(-1.2)
     assert metrics["uncond_flow/ratio"].item() == pytest.approx(1.21)
+    assert metrics["uncond_flow/log_ratio_max_abs"].item() == pytest.approx(
+        math.log(1.21)
+    )
     assert metrics["uncond_flow/sample_count"].item() == 1
 
 
@@ -238,6 +242,8 @@ def test_empty_policy_masks_return_finite_differentiable_zero():
     assert torch.isfinite(flow_loss) and flow_loss.item() == 0.0
     assert gate_metrics["gate/sample_count"].item() == 0.0
     assert flow_metrics["uncond_flow/sample_count"].item() == 0.0
+    assert gate_metrics["gate/log_ratio_max_abs"].item() == 0.0
+    assert flow_metrics["uncond_flow/log_ratio_max_abs"].item() == 0.0
     assert torch.equal(gate_logprobs.grad, torch.zeros_like(gate_logprobs))
     assert torch.equal(flow_logprobs.grad, torch.zeros_like(flow_logprobs))
 
@@ -294,20 +300,44 @@ def test_reported_policy_metrics_are_weighted_by_selected_sample_count():
         "gate/total_loss": [2.0, 6.0],
         "gate/ratio": [1.0, 3.0],
         "gate/ratio_abs": [0.0, 2.0],
+        "gate/log_ratio_max_abs": [0.125, 0.75],
         "gate/approx_kl": [0.0, 4.0],
         "gate/clip_fraction": [0.0, 1.0],
         "gate/entropy": [0.5, 0.25],
+        "uncond_flow/log_ratio_max_abs": [0.25, 0.5],
+        "gate/preupdate_log_ratio_max_abs": [0.0625],
+        "uncond_flow/preupdate_log_ratio_max_abs": [0.125],
+        "base_uncond_kl/max": [0.375],
     }
 
     sums, maxima = dual_ppo.pop_fastwam_weighted_metric_sums(metrics)
     reduced = dual_ppo.finalize_fastwam_weighted_metrics(sums)
 
-    assert maxima == {}
+    assert maxima == {
+        "gate/log_ratio_max_abs": 0.75,
+        "uncond_flow/log_ratio_max_abs": 0.5,
+        "gate/preupdate_log_ratio_max_abs": 0.0625,
+        "uncond_flow/preupdate_log_ratio_max_abs": 0.125,
+        "base_uncond_kl/max": 0.375,
+    }
     assert metrics == {}
     assert reduced["gate/sample_count"] == 4.0
     assert reduced["gate/policy_loss"] == pytest.approx(5.0)
     assert reduced["gate/ratio"] == pytest.approx(2.5)
     assert reduced["gate/clip_fraction"] == pytest.approx(0.75)
+
+
+def test_preupdate_log_ratio_audit_precedes_first_optimizer_step():
+    worker_source = (
+        Path(__file__).resolve().parents[2] / "rlinf/workers/actor/fsdp_actor_worker.py"
+    ).read_text(encoding="utf-8")
+    run_training = worker_source.index("    def run_training(")
+    audit = worker_source.index("if preupdate_log_ratio_audit_pending:", run_training)
+    sentinel = worker_source.index("FASTWAM_PREUPDATE_LOG_RATIO_AUDIT_SENTINEL", audit)
+    optimizer_step = worker_source.index("self.optimizer_step()", sentinel)
+
+    assert audit < sentinel < optimizer_step
+    assert "torch.distributed.ReduceOp.MAX" in worker_source[audit:sentinel]
 
 
 def test_collapse_penalty_uses_differentiable_expected_calls_per_episode():

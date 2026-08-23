@@ -191,13 +191,12 @@ def _zero_ppo_result(
         f"{prefix}/sample_count": metric_zero,
         f"{prefix}/ratio": metric_zero,
         f"{prefix}/ratio_abs": metric_zero,
+        f"{prefix}/log_ratio_max_abs": metric_zero,
         f"{prefix}/approx_kl": metric_zero,
         f"{prefix}/clip_fraction": metric_zero,
         f"{prefix}/entropy": metric_zero,
         f"{prefix}/selected_loss_scale": (
-            metric_zero
-            if selected_loss_scale is None
-            else selected_loss_scale.detach()
+            metric_zero if selected_loss_scale is None else selected_loss_scale.detach()
         ),
     }
 
@@ -224,6 +223,13 @@ _WEIGHTED_METRIC_GROUPS = {
     "base_uncond_kl": ("loss",),
 }
 _WEIGHTED_SUM_SUFFIX = "::weighted_sum"
+_MAX_METRIC_KEYS = (
+    "gate/log_ratio_max_abs",
+    "uncond_flow/log_ratio_max_abs",
+    "gate/preupdate_log_ratio_max_abs",
+    "uncond_flow/preupdate_log_ratio_max_abs",
+    "base_uncond_kl/max",
+)
 
 
 def pop_fastwam_weighted_metric_sums(
@@ -250,9 +256,10 @@ def pop_fastwam_weighted_metric_sums(
             sums[f"{key}{_WEIGHTED_SUM_SUFFIX}"] = sum(
                 value * count for value, count in zip(values, counts)
             )
-    max_values = metrics.pop("base_uncond_kl/max", [])
-    if max_values:
-        maxima["base_uncond_kl/max"] = max(float(value) for value in max_values)
+    for key in _MAX_METRIC_KEYS:
+        max_values = metrics.pop(key, [])
+        if max_values:
+            maxima[key] = max(float(value) for value in max_values)
     return sums, maxima
 
 
@@ -381,6 +388,7 @@ def _compute_masked_clipped_ppo_loss(
         f"{prefix}/sample_count": sample_count,
         f"{prefix}/ratio": ratio.detach().mean(),
         f"{prefix}/ratio_abs": (ratio.detach() - 1.0).abs().mean(),
+        f"{prefix}/log_ratio_max_abs": log_ratio.detach().abs().max(),
         f"{prefix}/approx_kl": approx_kl.detach(),
         f"{prefix}/clip_fraction": clip_fraction.detach(),
         f"{prefix}/entropy": metric_entropy,
@@ -469,9 +477,7 @@ def compute_uncond_flow_ppo_loss(
         logprobs = logprobs.sum(dim=reduction_dims)
         old_logprobs = old_logprobs.sum(dim=reduction_dims)
     if entropy is not None and entropy.ndim > route_used.ndim:
-        entropy = entropy.sum(
-            dim=tuple(range(route_used.ndim, entropy.ndim))
-        )
+        entropy = entropy.sum(dim=tuple(range(route_used.ndim, entropy.ndim)))
     advantages = _squeeze_trailing_singletons(
         advantages,
         target_ndim=route_used.ndim,
@@ -587,9 +593,7 @@ def compute_base_uncond_kl_loss(
     if bool(invalid_route.any().item()):
         raise ValueError("route_used contains a value outside WAMRoute.")
     if kl_values.shape[: route_used.ndim] != route_used.shape:
-        raise ValueError(
-            "Transition KL leading dimensions must match route_used."
-        )
+        raise ValueError("Transition KL leading dimensions must match route_used.")
     reduction_dims = tuple(range(route_used.ndim, kl_values.ndim))
     if reduction_dims:
         kl_values = kl_values.sum(dim=reduction_dims)
@@ -658,7 +662,10 @@ def compute_gate_collapse_penalty(
         raise TypeError("Gate base probabilities must use a floating dtype.")
     if episode_ids.shape != base_idm_probabilities.shape:
         raise ValueError("episode_ids must match Gate base probabilities.")
-    if valid_mask.shape != base_idm_probabilities.shape or valid_mask.dtype != torch.bool:
+    if (
+        valid_mask.shape != base_idm_probabilities.shape
+        or valid_mask.dtype != torch.bool
+    ):
         raise ValueError("valid_mask must be bool and match Gate base probabilities.")
     probabilities = base_idm_probabilities.float()
     if bool(((probabilities < 0) | (probabilities > 1)).any().item()):
@@ -677,11 +684,11 @@ def compute_gate_collapse_penalty(
     groups = (
         [torch.ones_like(selected_episodes, dtype=torch.bool)]
         if scope == "microbatch"
-        else [selected_episodes == episode for episode in torch.unique(selected_episodes)]
+        else [
+            selected_episodes == episode for episode in torch.unique(selected_episodes)
+        ]
     )
-    idm_calls = torch.stack(
-        [selected_probabilities[group].sum() for group in groups]
-    )
+    idm_calls = torch.stack([selected_probabilities[group].sum() for group in groups])
     uncond_calls = torch.stack(
         [(1.0 - selected_probabilities[group]).sum() for group in groups]
     )

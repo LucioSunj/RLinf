@@ -30,6 +30,61 @@ _REQUIRED_TRAINABLE_DTYPE = torch.float32
 _FASTWAM_GROUP_NAMES = ("gate", "uncond_lora", "value_head")
 
 
+def fastwam_optimizer_gradient_norms(
+    optimizer: torch.optim.Optimizer,
+) -> dict[str, float]:
+    """Measure global post-clip gradient norms for each adaptive family."""
+
+    indexed_groups: dict[str, Mapping[str, Any]] = {}
+    for group in optimizer.param_groups:
+        name = str(group.get("name", ""))
+        if name in indexed_groups:
+            raise RuntimeError(
+                f"FastWAM optimizer has duplicate parameter group {name!r}."
+            )
+        indexed_groups[name] = group
+    if set(indexed_groups) != set(_FASTWAM_GROUP_NAMES):
+        raise RuntimeError(
+            "FastWAM gradient-norm groups differ from Gate, UNCOND LoRA, "
+            f"and value head: {sorted(indexed_groups)}."
+        )
+
+    parameters_by_group = [
+        list(indexed_groups[name]["params"]) for name in _FASTWAM_GROUP_NAMES
+    ]
+    if any(not parameters for parameters in parameters_by_group):
+        raise RuntimeError("FastWAM gradient-norm group is empty.")
+    devices = {
+        parameter.device
+        for parameters in parameters_by_group
+        for parameter in parameters
+    }
+    if len(devices) != 1:
+        raise RuntimeError(
+            "FastWAM gradient-norm parameters must share one device, got "
+            f"{sorted(map(str, devices))}."
+        )
+    squared_norms = torch.zeros(
+        len(_FASTWAM_GROUP_NAMES),
+        dtype=torch.float64,
+        device=next(iter(devices)),
+    )
+    with torch.no_grad():
+        for index, parameters in enumerate(parameters_by_group):
+            for parameter in parameters:
+                gradient = parameter.grad
+                if gradient is None:
+                    continue
+                values = (
+                    gradient.coalesce().values() if gradient.is_sparse else gradient
+                )
+                squared_norms[index].add_(
+                    values.detach().float().square().sum(dtype=torch.float64)
+                )
+    norms = squared_norms.sqrt().cpu().tolist()
+    return {name: float(norm) for name, norm in zip(_FASTWAM_GROUP_NAMES, norms)}
+
+
 def _optimizer_step_value(value: Any) -> int:
     if torch.is_tensor(value):
         return int(value.item())

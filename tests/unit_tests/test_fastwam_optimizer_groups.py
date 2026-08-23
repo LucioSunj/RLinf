@@ -29,6 +29,7 @@ partition_fastwam_trainable_parameters = _MODULE.partition_fastwam_trainable_par
 assert_fastwam_optimizer_update_resolution = (
     _MODULE.assert_fastwam_optimizer_update_resolution
 )
+fastwam_optimizer_gradient_norms = _MODULE.fastwam_optimizer_gradient_norms
 
 
 def _parameter(dtype: torch.dtype = torch.float32) -> torch.nn.Parameter:
@@ -152,3 +153,20 @@ def test_update_resolution_counts_zero_updates_in_group_median() -> None:
             optimizer,
             minimum_half_ulp_ratio=1.0,
         )
+
+
+def test_optimizer_gradient_norms_report_each_adaptive_family() -> None:
+    optimizer = _adamw_with_named_groups(torch.float32)
+    optimizer.param_groups[0]["params"][0].grad = torch.tensor(
+        [3.0, 4.0, 0.0, 0.0, 0.0]
+    )
+    optimizer.param_groups[1]["params"][0].grad = torch.tensor(
+        [0.0, 0.0, 5.0, 12.0, 0.0]
+    )
+    optimizer.param_groups[2]["params"][0].grad = None
+
+    assert fastwam_optimizer_gradient_norms(optimizer) == {
+        "gate": 5.0,
+        "uncond_lora": 13.0,
+        "value_head": 0.0,
+    }

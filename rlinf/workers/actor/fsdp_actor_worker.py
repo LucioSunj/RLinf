@@ -147,6 +147,7 @@ from rlinf.workers.rollout.utils import RankMapper
 
 _FASTWAM_BC_BOOTSTRAP_SCHEMA = "fastwam-uncond-bc-bootstrap-v1"
 FASTWAM_ACCELERATION_SEMANTICS_AUDIT_SENTINEL = "FASTWAM_ACCELERATION_SEMANTICS_AUDIT"
+FASTWAM_PREUPDATE_LOG_RATIO_AUDIT_SENTINEL = "FASTWAM_PREUPDATE_LOG_RATIO_AUDIT"
 _FASTWAM_BC_BOOTSTRAP_KEYS = {
     "schema",
     "bc_step",
@@ -2484,11 +2485,20 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
                     "FastWAM adaptive optimizer groups changed unexpectedly: "
                     f"{sorted(lr_by_name)}"
                 )
+            gradient_norms = dict(self._fastwam_last_gradient_norms)
+            if set(gradient_norms) != expected:
+                raise RuntimeError(
+                    "FastWAM adaptive gradient-norm groups changed unexpectedly: "
+                    f"{sorted(gradient_norms)}"
+                )
             data.update(
                 {
                     "gate/lr": lr_by_name["gate"],
                     "uncond_flow/lora_lr": lr_by_name["uncond_lora"],
                     "critic/lr": lr_by_name["value_head"],
+                    "gate/grad_norm": gradient_norms["gate"],
+                    "uncond_lora/grad_norm": gradient_norms["uncond_lora"],
+                    "value_head/grad_norm": gradient_norms["value_head"],
                 }
             )
             return data
@@ -3000,6 +3010,10 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
             f"{rollout_size} is not divisible by {batch_size_per_rank}"
         )
         metrics = {}
+        preupdate_log_ratio_audit_pending = (
+            SupportedModel(self.cfg.actor.model.model_type)
+            is SupportedModel.FASTWAM_ADAPTIVE
+        )
         for _ in range(update_epoch):
             rollout_dataloader_iter = split_dict_to_chunk(
                 self.rollout_batch,
@@ -3022,6 +3036,7 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
                     train_global_batch_size // self.cfg.actor.micro_batch_size,
                 )
                 selected_loss_scales = None
+                counts = None
                 if (
                     SupportedModel(self.cfg.actor.model.model_type)
                     is SupportedModel.FASTWAM_ADAPTIVE
@@ -3098,6 +3113,72 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
                     # avoid gpu memory leak
                     train_micro_batch[idx] = None
                     del batch
+
+                if preupdate_log_ratio_audit_pending:
+                    if counts is None:
+                        raise RuntimeError(
+                            "FastWAM pre-update log-ratio audit lacks branch counts."
+                        )
+                    prefixes = ("gate", "uncond_flow")
+                    local_maxima = []
+                    for prefix in prefixes:
+                        values = metrics.get(f"{prefix}/log_ratio_max_abs", [])
+                        if not values:
+                            raise RuntimeError(
+                                "FastWAM pre-update log-ratio audit lacks "
+                                f"{prefix} metrics."
+                            )
+                        local_maxima.append(
+                            torch.stack(
+                                [
+                                    torch.as_tensor(
+                                        value,
+                                        dtype=torch.float32,
+                                        device=self.device,
+                                    ).detach()
+                                    for value in values
+                                ]
+                            ).max()
+                        )
+                    preupdate_maxima = torch.stack(local_maxima)
+                    torch.distributed.all_reduce(
+                        preupdate_maxima,
+                        op=torch.distributed.ReduceOp.MAX,
+                    )
+                    gate_samples = int(counts[0].item())
+                    flow_samples = int(counts[1].item())
+                    gate_max = float(preupdate_maxima[0].item())
+                    flow_max = float(preupdate_maxima[1].item())
+                    audit = {
+                        "schema": "fastwam-preupdate-log-ratio-audit-v1",
+                        "actor_rank": int(self._rank),
+                        "actor_version": int(self.version),
+                        "optimizer_steps_before": int(self.optimizer_steps),
+                        "gate": {
+                            "sample_count": gate_samples,
+                            "max_abs_log_ratio": gate_max,
+                        },
+                        "uncond_flow": {
+                            "sample_count": flow_samples,
+                            "max_abs_log_ratio": flow_max,
+                        },
+                    }
+                    if self._rank == 0:
+                        print(
+                            f"{FASTWAM_PREUPDATE_LOG_RATIO_AUDIT_SENTINEL} "
+                            + json.dumps(audit, sort_keys=True),
+                            flush=True,
+                        )
+                    append_to_dict(
+                        metrics,
+                        {
+                            "gate/preupdate_log_ratio_max_abs": gate_max,
+                            "gate/preupdate_sample_count": float(gate_samples),
+                            "uncond_flow/preupdate_log_ratio_max_abs": flow_max,
+                            "uncond_flow/preupdate_sample_count": float(flow_samples),
+                        },
+                    )
+                    preupdate_log_ratio_audit_pending = False
 
                 self.torch_platform.empty_cache()
 

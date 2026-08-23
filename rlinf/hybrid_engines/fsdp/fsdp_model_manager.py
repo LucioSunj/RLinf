@@ -79,6 +79,7 @@ class FSDPModelManager:
 
         self.optimizer_steps = 0
         self._fastwam_update_resolution_checked = False
+        self._fastwam_last_gradient_norms: dict[str, float] = {}
         self.critic_warmup_steps = 0
         if self._cfg.get("optim", {}).get(
             "critic_warmup_steps", None
@@ -428,6 +429,17 @@ class FSDPModelManager:
         grad_norm = self._strategy.clip_grad_norm_(
             model=self.model,
         )
+        if (
+            SupportedModel(self._cfg.model.model_type)
+            is SupportedModel.FASTWAM_ADAPTIVE
+        ):
+            from rlinf.models.embodiment.wam_policy.optimizer import (
+                fastwam_optimizer_gradient_norms,
+            )
+
+            self._fastwam_last_gradient_norms = fastwam_optimizer_gradient_norms(
+                self.optimizer
+            )
 
         if not torch.isfinite(torch.as_tensor(grad_norm)):
             self._logger.warning(
