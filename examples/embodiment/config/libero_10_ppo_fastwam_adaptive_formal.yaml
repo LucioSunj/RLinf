@@ -201,8 +201,13 @@ actor:
     ignore_frozen_parameters: true
     gradient_checkpointing: false
     mixed_precision:
-      param_dtype: ${actor.model.precision}
-      reduce_dtype: ${actor.model.precision}
+      # FSDP manages only the trainable FP32 masters here (frozen parents sit in
+      # ignored_states), so a BF16 parameter dtype would undo the FP32 master
+      # fix inside the training forward and desynchronise the actor from the
+      # unwrapped FP32 rollout. FP32 reduction also preserves small gradients
+      # with multiple actor ranks. See docs/BF16_PARAMETER_UPDATE_LOSS.md.
+      param_dtype: fp32
+      reduce_dtype: fp32
       buffer_dtype: ${actor.model.precision}
 
 reward:

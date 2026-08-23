@@ -1213,6 +1213,30 @@ def _validate_fastwam_adaptive_cfg(cfg, *, only_eval: bool) -> None:
             "ignore_frozen_parameters: true so frozen parent weights are not "
             "flattened into trainable handles."
         )
+    mixed_precision = cfg.actor.fsdp_config.get("mixed_precision", {})
+    precision_fields = {
+        name: mixed_precision.get(name, None)
+        for name in ("param_dtype", "reduce_dtype")
+    }
+    try:
+        fp32_fields = {
+            name: torch_dtype_from_precision(value)
+            for name, value in precision_fields.items()
+        }
+    except ValueError as error:
+        raise ValueError(
+            "FastWAM adaptive requires FSDP mixed-precision `param_dtype` and "
+            "`reduce_dtype` to resolve to torch.float32 for rollout/actor parity; "
+            f"got {precision_fields}."
+        ) from error
+    if any(dtype is not torch.float32 for dtype in fp32_fields.values()):
+        resolved = {name: str(dtype) for name, dtype in fp32_fields.items()}
+        raise ValueError(
+            "FastWAM adaptive requires FSDP mixed-precision `param_dtype` and "
+            "`reduce_dtype` to resolve to torch.float32. FP32 parameter compute "
+            "preserves rollout/actor parity for the Gate and value head, and FP32 "
+            f"gradient reduction preserves small multi-rank updates; got {resolved}."
+        )
     if str(cfg.actor.fsdp_config.get("sharding_strategy", "")).lower() != "no_shard":
         raise ValueError("FastWAM adaptive v0 checkpointing requires FSDP `no_shard`.")
     if bool(cfg.actor.fsdp_config.get("save_full_model_weights", False)):

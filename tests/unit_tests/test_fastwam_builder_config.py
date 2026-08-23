@@ -272,6 +272,9 @@ def test_libero_adaptive_config_composes_with_confirmed_defaults(monkeypatch) ->
     assert cfg.actor.model.add_value_head is True
     assert cfg.actor.fsdp_config.use_orig_params is True
     assert cfg.actor.fsdp_config.ignore_frozen_parameters is True
+    assert cfg.actor.fsdp_config.mixed_precision.param_dtype == "fp32"
+    assert cfg.actor.fsdp_config.mixed_precision.reduce_dtype == "fp32"
+    assert cfg.actor.fsdp_config.mixed_precision.buffer_dtype == "bf16"
     assert cfg.weight_syncer.patch.init_sync.enabled is True
     assert cfg.actor.model.gate.layer_taps.mode == "all"
     assert cfg.actor.model.gate.denoise_last_n == 1
@@ -351,6 +354,17 @@ def test_current_frame_critic_config_composes_without_pi05_assets(monkeypatch) -
     assert feature.layer_indices == (14,)
     assert feature.sources == ("current_frame_video", "text_state_context")
     _validate_fastwam_adaptive_cfg(cfg, only_eval=False)
+
+    for dtype_field in ("param_dtype", "reduce_dtype"):
+        invalid = OmegaConf.create(OmegaConf.to_container(cfg, resolve=True))
+        invalid.actor.fsdp_config.mixed_precision[dtype_field] = "bf16"
+        with pytest.raises(ValueError, match="rollout/actor parity"):
+            _validate_fastwam_adaptive_cfg(invalid, only_eval=False)
+
+    invalid = OmegaConf.create(OmegaConf.to_container(cfg, resolve=True))
+    invalid.actor.fsdp_config.mixed_precision.param_dtype = "unsupported"
+    with pytest.raises(ValueError, match="rollout/actor parity"):
+        _validate_fastwam_adaptive_cfg(invalid, only_eval=False)
 
     invalid = OmegaConf.create(OmegaConf.to_container(actor_critic, resolve=True))
     invalid.feature.layer_indices = [30]
