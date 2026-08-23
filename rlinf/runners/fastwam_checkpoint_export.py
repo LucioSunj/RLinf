@@ -76,7 +76,7 @@ def validate_initial_checkpoint_export_config(
     *,
     actor_world_size: int,
 ) -> Path:
-    """Validate the fixed E4 bootstrap checkpoint profile."""
+    """Validate the production bootstrap checkpoint profile."""
 
     output_value = OmegaConf.select(
         cfg,
@@ -102,31 +102,11 @@ def validate_initial_checkpoint_export_config(
         )
     )
     if num_layers != 30:
-        raise ValueError("E4 step-zero export requires exactly 30 MoT layers.")
+        raise ValueError("Step-zero export requires exactly 30 MoT layers.")
     if bool(OmegaConf.select(cfg, "actor.model.gate.share_blocks", default=True)):
-        raise ValueError("E4 step-zero export requires independent Gate blocks.")
+        raise ValueError("Step-zero export requires independent Gate blocks.")
     if int(OmegaConf.select(cfg, "actor.model.gate.denoise_last_n", default=-1)) != 1:
-        raise ValueError("E4 step-zero export requires gate.denoise_last_n=1.")
-    if (
-        str(OmegaConf.select(cfg, "actor.model.gate.layer_taps.mode", default=""))
-        != "all"
-    ):
-        raise ValueError("E4 step-zero export requires the native all-layer Gate.")
-    if (
-        OmegaConf.select(
-            cfg,
-            "actor.model.gate.layer_taps.last_n",
-            default=None,
-        )
-        is not None
-        or OmegaConf.select(
-            cfg,
-            "actor.model.gate.layer_taps.indices",
-            default=None,
-        )
-        is not None
-    ):
-        raise ValueError("E4 all-layer export forbids layer subset arguments.")
+        raise ValueError("Step-zero export requires gate.denoise_last_n=1.")
     _resolve_uncond_lora_bootstrap(cfg)
     return Path(str(output_value)).expanduser().resolve()
 

@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Focused tests for native all-layer step-zero checkpoint export."""
+"""Focused tests for native step-zero checkpoint export."""
 
 import hashlib
 from pathlib import Path
@@ -116,7 +116,6 @@ def test_initial_checkpoint_export_rejects_nonempty_output(
     [
         ("runner.resume_dir", "/resume", "resume_dir"),
         ("actor.model.model_type", "openvla", "fastwam_adaptive"),
-        ("actor.model.gate.layer_taps.mode", "indices", "all-layer"),
         ("actor.model.gate.share_blocks", True, "independent"),
         ("actor.model.gate.denoise_last_n", 2, "denoise_last_n"),
         ("actor.model.fastwam.action_dit_config.num_layers", 29, "30"),
@@ -141,6 +140,21 @@ def test_initial_checkpoint_export_requires_one_actor_rank(tmp_path: Path) -> No
             _cfg(tmp_path / "checkpoint"),
             actor_world_size=2,
         )
+
+
+def test_initial_checkpoint_export_accepts_validated_gate_layer_subset(
+    tmp_path: Path,
+) -> None:
+    cfg = _cfg(tmp_path / "checkpoint")
+    cfg.actor.model.gate.layer_taps.mode = "indices"
+    cfg.actor.model.gate.layer_taps.indices = [14, 15, 16, 17, 18, 19]
+
+    output_dir = validate_initial_checkpoint_export_config(
+        cfg,
+        actor_world_size=1,
+    )
+
+    assert output_dir == (tmp_path / "checkpoint").resolve()
 
 
 def test_export_explicit_bc_sidecar_loads_before_single_step_zero_save(

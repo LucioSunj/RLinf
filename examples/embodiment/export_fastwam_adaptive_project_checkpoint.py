@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Export a native all-layer FastWAM adaptive project checkpoint at step zero."""
+"""Export a native FastWAM adaptive project checkpoint at step zero."""
 
 import json
 
