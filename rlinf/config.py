@@ -1237,6 +1237,17 @@ def _validate_fastwam_adaptive_cfg(cfg, *, only_eval: bool) -> None:
             "preserves rollout/actor parity for the Gate and value head, and FP32 "
             f"gradient reduction preserves small multi-rank updates; got {resolved}."
         )
+    if bool(mixed_precision.get("cast_root_forward_inputs", True)):
+        raise ValueError(
+            "FastWAM adaptive requires FSDP mixed-precision "
+            "`cast_root_forward_inputs: false`. The root instance would "
+            "otherwise coerce every floating-point forward input to "
+            "`param_dtype`, so an FP32 parameter dtype would feed FP32 "
+            "activations into the frozen BF16 parents that "
+            "`ignore_frozen_parameters` deliberately leaves outside FSDP. "
+            "Stored replay inputs must also reach the actor at the rollout's "
+            "own dtype for parity."
+        )
     if str(cfg.actor.fsdp_config.get("sharding_strategy", "")).lower() != "no_shard":
         raise ValueError("FastWAM adaptive v0 checkpointing requires FSDP `no_shard`.")
     if bool(cfg.actor.fsdp_config.get("save_full_model_weights", False)):

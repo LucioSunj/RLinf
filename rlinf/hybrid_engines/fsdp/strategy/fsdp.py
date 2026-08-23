@@ -49,9 +49,7 @@ def _frozen_parameters_to_ignore(
     if not bool(fsdp_config.get("ignore_frozen_parameters", False)):
         return None
     if not bool(fsdp_config.get("use_orig_params", False)):
-        raise ValueError(
-            "FSDP ignore_frozen_parameters requires use_orig_params=True."
-        )
+        raise ValueError("FSDP ignore_frozen_parameters requires use_orig_params=True.")
 
     frozen = tuple(
         parameter for parameter in model.parameters() if not parameter.requires_grad
@@ -68,6 +66,28 @@ def _frozen_parameters_to_ignore(
             "FSDP ignore_frozen_parameters=True found no trainable parameters."
         )
     return frozen
+
+
+def mixed_precision_from_config(mixed_precision_config) -> MixedPrecision:
+    """Build FSDP1 mixed precision, including the root forward-input cast.
+
+    ``param_dtype`` decides two separate things: the dtype of the managed
+    parameters during forward, and the dtype the root instance coerces every
+    floating-point forward input to. A model that keeps frozen parents outside
+    FSDP through ``ignored_states`` needs the first without the second, because
+    the root cast would otherwise hand those frozen low-precision submodules
+    activations in the trainable dtype. Keep the upstream default unless a
+    config opts out.
+    """
+
+    return MixedPrecision(
+        param_dtype=torch_dtype_from_precision(mixed_precision_config.param_dtype),
+        reduce_dtype=torch_dtype_from_precision(mixed_precision_config.reduce_dtype),
+        buffer_dtype=torch_dtype_from_precision(mixed_precision_config.buffer_dtype),
+        cast_root_forward_inputs=bool(
+            mixed_precision_config.get("cast_root_forward_inputs", True)
+        ),
+    )
 
 
 class FSDPStrategy(FSDPStrategyBase):
@@ -173,14 +193,8 @@ class FSDPStrategy(FSDPStrategyBase):
         Returns:
             - FSDP: The wrapped FSDP model.
         """
-        mixed_precision_config = self.cfg.fsdp_config.mixed_precision
-        param_dtype = torch_dtype_from_precision(mixed_precision_config.param_dtype)
-        reduce_dtype = torch_dtype_from_precision(mixed_precision_config.reduce_dtype)
-        buffer_dtype = torch_dtype_from_precision(mixed_precision_config.buffer_dtype)
-        mixed_precision = MixedPrecision(
-            param_dtype=param_dtype,
-            reduce_dtype=reduce_dtype,
-            buffer_dtype=buffer_dtype,
+        mixed_precision = mixed_precision_from_config(
+            self.cfg.fsdp_config.mixed_precision
         )
 
         sharding_strategy = get_sharding_strategy(

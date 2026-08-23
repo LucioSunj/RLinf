@@ -22,6 +22,11 @@ mixed_precision:            # mixed precision settings for fsdp/fsdp2
   param_dtype: null
   reduce_dtype: null
   buffer_dtype: null
+  # FSDP1 only. If true, the root FSDP instance casts every floating-point
+  # forward input to `param_dtype`. Set false when frozen submodules are kept
+  # outside FSDP at a different dtype, or when forward inputs must reach the
+  # model at the dtype they were produced in.
+  cast_root_forward_inputs: true
 
 amp_autocast:                       # Do not enable `amp_autocast` with FSDP `mixed_precision` enabled, using both will result in conflict.
   enabled: False                    # if True, automatic mixed precision (AMP) will be used in FSDP/FSDP2 training.

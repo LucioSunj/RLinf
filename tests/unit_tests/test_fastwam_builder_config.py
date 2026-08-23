@@ -275,6 +275,10 @@ def test_libero_adaptive_config_composes_with_confirmed_defaults(monkeypatch) ->
     assert cfg.actor.fsdp_config.mixed_precision.param_dtype == "fp32"
     assert cfg.actor.fsdp_config.mixed_precision.reduce_dtype == "fp32"
     assert cfg.actor.fsdp_config.mixed_precision.buffer_dtype == "bf16"
+    # An FP32 param_dtype would otherwise make the root FSDP instance hand the
+    # frozen BF16 parents FP32 activations; see the VAE conv3d failure in
+    # docs/BF16_PARAMETER_UPDATE_LOSS.md.
+    assert cfg.actor.fsdp_config.mixed_precision.cast_root_forward_inputs is False
     assert cfg.weight_syncer.patch.init_sync.enabled is True
     assert cfg.actor.model.gate.layer_taps.mode == "all"
     assert cfg.actor.model.gate.denoise_last_n == 1
@@ -364,6 +368,16 @@ def test_current_frame_critic_config_composes_without_pi05_assets(monkeypatch) -
     invalid = OmegaConf.create(OmegaConf.to_container(cfg, resolve=True))
     invalid.actor.fsdp_config.mixed_precision.param_dtype = "unsupported"
     with pytest.raises(ValueError, match="rollout/actor parity"):
+        _validate_fastwam_adaptive_cfg(invalid, only_eval=False)
+
+    invalid = OmegaConf.create(OmegaConf.to_container(cfg, resolve=True))
+    invalid.actor.fsdp_config.mixed_precision.cast_root_forward_inputs = True
+    with pytest.raises(ValueError, match="cast_root_forward_inputs"):
+        _validate_fastwam_adaptive_cfg(invalid, only_eval=False)
+
+    invalid = OmegaConf.create(OmegaConf.to_container(cfg, resolve=True))
+    del invalid.actor.fsdp_config.mixed_precision.cast_root_forward_inputs
+    with pytest.raises(ValueError, match="cast_root_forward_inputs"):
         _validate_fastwam_adaptive_cfg(invalid, only_eval=False)
 
     invalid = OmegaConf.create(OmegaConf.to_container(actor_critic, resolve=True))

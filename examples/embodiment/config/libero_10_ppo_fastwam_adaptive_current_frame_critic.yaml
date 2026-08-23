@@ -196,6 +196,12 @@ actor:
       param_dtype: fp32
       reduce_dtype: fp32
       buffer_dtype: ${actor.model.precision}
+      # The root FSDP instance otherwise coerces every floating-point forward
+      # input to param_dtype. The frozen FastWAM parents stay BF16 outside FSDP,
+      # so an FP32 root cast feeds FP32 activations into the BF16 VAE and DiT.
+      # Stored replay inputs already carry the rollout's dtype and must reach
+      # the actor unchanged for rollout/actor parity.
+      cast_root_forward_inputs: false
 
 reward:
   use_reward_model: false
