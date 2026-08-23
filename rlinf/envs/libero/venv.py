@@ -21,6 +21,12 @@ import gym
 import numpy as np
 
 from rlinf.envs.libero.action_contract import inspect_libero_action_contract
+from rlinf.envs.libero.causal_snapshot import (
+    capture_worker_causal_state,
+    observe_worker_causal_task_state,
+    restore_worker_causal_state,
+    restore_worker_simulator_only_for_audit,
+)
 from rlinf.envs.libero.utils import get_libero_type
 from rlinf.envs.venv import (
     BaseVectorEnv,
@@ -154,6 +160,16 @@ def _worker(
             elif cmd == "set_init_state":
                 obs = env.set_init_state(data)
                 p.send(obs)
+            elif cmd == "capture_causal_state":
+                p.send(capture_worker_causal_state(env))
+            elif cmd == "observe_causal_task_state":
+                p.send(observe_worker_causal_task_state(env))
+            elif cmd == "restore_causal_state":
+                restore_worker_causal_state(env, data)
+                p.send(None)
+            elif cmd == "restore_causal_simulator_only_for_audit":
+                restore_worker_simulator_only_for_audit(env, data)
+                p.send(None)
             elif cmd == "reconfigure":
                 env.close()
                 seed = data.pop("seed")
@@ -197,6 +213,30 @@ class ReconfigureSubprocEnvWorker(SubprocEnvWorker):
         self.parent_remote.send(["reconfigure", env_fn_param])
         return self.parent_remote.recv()
 
+    def capture_causal_state(self):
+        """Capture worker-owned state for a same-state intervention fork."""
+
+        self.parent_remote.send(["capture_causal_state", None])
+        return self.parent_remote.recv()
+
+    def observe_causal_task_state(self):
+        """Read native BDDL predicates and task-object contacts."""
+
+        self.parent_remote.send(["observe_causal_task_state", None])
+        return self.parent_remote.recv()
+
+    def restore_causal_state(self, state):
+        """Restore worker-owned state before executing another branch."""
+
+        self.parent_remote.send(["restore_causal_state", state])
+        return self.parent_remote.recv()
+
+    def restore_causal_simulator_only_for_audit(self, state):
+        """Restore only MuJoCo state for the Stage-C negative control."""
+
+        self.parent_remote.send(["restore_causal_simulator_only_for_audit", state])
+        return self.parent_remote.recv()
+
 
 class ReconfigureSubprocEnv(SubprocVectorEnv):
     def __init__(self, env_fns: list[Callable[[], gym.Env]], **kwargs: Any) -> None:
@@ -213,3 +253,45 @@ class ReconfigureSubprocEnv(SubprocVectorEnv):
 
         for j, i in enumerate(id):
             self.workers[i].reconfigure_env_fn(env_fns[j])
+
+    def capture_causal_states(self, id=None):
+        """Capture exact worker state for the selected ready environments."""
+
+        self._assert_is_not_closed()
+        ids = self._wrap_id(id)
+        if self.is_async:
+            self._assert_id(ids)
+        return [self.workers[index].capture_causal_state() for index in ids]
+
+    def observe_causal_task_states(self, id=None):
+        """Read native task signals from selected ready environments."""
+
+        self._assert_is_not_closed()
+        ids = self._wrap_id(id)
+        if self.is_async:
+            self._assert_id(ids)
+        return [self.workers[index].observe_causal_task_state() for index in ids]
+
+    def restore_causal_states(self, states, id=None):
+        """Restore worker states in the same order as selected environments."""
+
+        self._assert_is_not_closed()
+        ids = self._wrap_id(id)
+        if self.is_async:
+            self._assert_id(ids)
+        if len(states) != len(ids):
+            raise ValueError("Causal worker-state count must match environment IDs.")
+        for index, state in zip(ids, states):
+            self.workers[index].restore_causal_state(state)
+
+    def restore_causal_simulators_only_for_audit(self, states, id=None):
+        """Run the incomplete-restore negative control on selected environments."""
+
+        self._assert_is_not_closed()
+        ids = self._wrap_id(id)
+        if self.is_async:
+            self._assert_id(ids)
+        if len(states) != len(ids):
+            raise ValueError("Causal worker-state count must match environment IDs.")
+        for index, state in zip(ids, states):
+            self.workers[index].restore_causal_simulator_only_for_audit(state)

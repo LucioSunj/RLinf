@@ -12,6 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from __future__ import annotations
+
 import copy
 import glob
 import hashlib
@@ -19,12 +21,18 @@ import importlib
 import os
 import sys
 from dataclasses import replace
-from typing import Optional, Union
+from typing import TYPE_CHECKING, Optional, Union
 
 import gym
 import numpy as np
 import torch
 from omegaconf.omegaconf import OmegaConf
+
+if TYPE_CHECKING:
+    from fastwam.causal_prediction import (
+        CausalSamplingMetadataV2,
+        CausalStateIdentityV2,
+    )
 
 from rlinf.envs.action_contract import (
     SUBMITTED_LIBERO_ACTION_STAGE,
@@ -34,6 +42,12 @@ from rlinf.envs.libero.action_contract import (
     LiberoActionContract,
     inspect_libero_action_contract,
     merge_libero_action_contracts,
+)
+from rlinf.envs.libero.causal_snapshot import (
+    CausalSnapshotV1,
+    CausalSnapshotV2,
+    capture_process_rng_state,
+    restore_process_rng_state,
 )
 from rlinf.envs.libero.egl import instantiate_with_isolated_egl
 from rlinf.envs.libero.reward_utils import mask_rewards_after_first_done
@@ -218,6 +232,160 @@ class LiberoEnv(gym.Env):
             logger.info(f"Evaluation Mode: LIBERO-PLUS | Suffix: {suffix}")
         else:
             logger.info("Evaluation Mode: Standard LIBERO")
+
+    def capture_causal_snapshot(
+        self,
+        *,
+        snapshot_id: str,
+        recent_history=(),
+        policy_runtime_state=None,
+        source_policy: str,
+        previous_mode: str | None,
+        chunk_index: int,
+        remaining_budget: float,
+    ) -> CausalSnapshotV1:
+        """Capture a complete single-environment same-state fork point."""
+
+        if self.num_envs != 1:
+            raise RuntimeError(
+                "CausalSnapshotV1 requires num_envs=1 so restoring a branch cannot "
+                "mutate unrelated vector slots."
+            )
+        if self.current_raw_obs is None or len(self.current_raw_obs) != 1:
+            raise RuntimeError("LIBERO must be reset before capturing a snapshot.")
+        wrapper_state = {
+            "task_ids": self.task_ids.copy(),
+            "trial_ids": self.trial_ids.copy(),
+            "reset_state_ids": self.reset_state_ids.copy(),
+            "prev_step_reward": self.prev_step_reward.copy(),
+            "success_once": self.success_once.copy(),
+            "fail_once": self.fail_once.copy(),
+            "returns": self.returns.copy(),
+            "success_episode_len": self.success_episode_len.copy(),
+            "elapsed_steps": self._elapsed_steps.copy(),
+            "task_success_stats": copy.deepcopy(self._task_success_stats),
+            "eval_seen_trials": copy.deepcopy(self._eval_seen_trials),
+            "generator": copy.deepcopy(self._generator.bit_generator.state),
+            "generator_ordered": copy.deepcopy(
+                self._generator_ordered.bit_generator.state
+            ),
+            "start_idx": int(self.start_idx),
+            "formal_runner_step": int(self.formal_runner_step),
+            "is_start": bool(self._is_start),
+        }
+        worker_state = self.env.capture_causal_states(id=[0])[0]
+        return CausalSnapshotV1(
+            snapshot_id=snapshot_id,
+            worker_state=worker_state,
+            wrapper_state=wrapper_state,
+            current_raw_observation=copy.deepcopy(self.current_raw_obs[0]),
+            recent_history=tuple(copy.deepcopy(tuple(recent_history))),
+            policy_runtime_state=copy.deepcopy(policy_runtime_state or {}),
+            driver_rng_state=capture_process_rng_state(),
+            source_policy=str(source_policy),
+            previous_mode=None if previous_mode is None else str(previous_mode),
+            chunk_index=int(chunk_index),
+            remaining_budget=float(remaining_budget),
+        )
+
+    def observe_causal_task_state(self):
+        """Return native goal predicates and task-object contact for batch one."""
+
+        if self.num_envs != 1:
+            raise RuntimeError("Causal task observation requires num_envs=1.")
+        return self.env.observe_causal_task_states(id=[0])[0]
+
+    def restore_causal_snapshot(self, snapshot: CausalSnapshotV1 | CausalSnapshotV2):
+        """Restore a fork point and return its exact stored policy observation."""
+
+        if isinstance(snapshot, CausalSnapshotV2):
+            snapshot = snapshot.runtime_snapshot
+        if not isinstance(snapshot, CausalSnapshotV1):
+            raise TypeError("`snapshot` must be CausalSnapshotV1 or CausalSnapshotV2.")
+        if self.num_envs != 1:
+            raise RuntimeError("CausalSnapshotV1 restore requires num_envs=1.")
+        self.env.restore_causal_states([snapshot.worker_state], id=[0])
+        state = snapshot.wrapper_state
+        for name, target_name in (
+            ("task_ids", "task_ids"),
+            ("trial_ids", "trial_ids"),
+            ("reset_state_ids", "reset_state_ids"),
+            ("prev_step_reward", "prev_step_reward"),
+            ("success_once", "success_once"),
+            ("fail_once", "fail_once"),
+            ("returns", "returns"),
+            ("success_episode_len", "success_episode_len"),
+            ("elapsed_steps", "_elapsed_steps"),
+        ):
+            setattr(self, target_name, np.asarray(state[name]).copy())
+        self._task_success_stats = copy.deepcopy(state["task_success_stats"])
+        self._eval_seen_trials = copy.deepcopy(state["eval_seen_trials"])
+        self._generator.bit_generator.state = copy.deepcopy(state["generator"])
+        self._generator_ordered.bit_generator.state = copy.deepcopy(
+            state["generator_ordered"]
+        )
+        self.start_idx = int(state["start_idx"])
+        self.formal_runner_step = int(state["formal_runner_step"])
+        self._is_start = bool(state["is_start"])
+        self.current_raw_obs = [copy.deepcopy(snapshot.current_raw_observation)]
+        restore_process_rng_state(snapshot.driver_rng_state)
+        return self._wrap_obs(self.current_raw_obs)
+
+    def restore_causal_simulator_only_for_audit(
+        self,
+        snapshot: CausalSnapshotV1 | CausalSnapshotV2,
+    ):
+        """Restore only MuJoCo state for the Stage-C negative control."""
+
+        if isinstance(snapshot, CausalSnapshotV2):
+            snapshot = snapshot.runtime_snapshot
+        if not isinstance(snapshot, CausalSnapshotV1):
+            raise TypeError("`snapshot` must be CausalSnapshotV1 or CausalSnapshotV2.")
+        if self.num_envs != 1:
+            raise RuntimeError("MuJoCo-only audit restore requires num_envs=1.")
+        self.env.restore_causal_simulators_only_for_audit(
+            [snapshot.worker_state],
+            id=[0],
+        )
+
+    def capture_causal_snapshot_v2(
+        self,
+        *,
+        identity: CausalStateIdentityV2,
+        sampling: CausalSamplingMetadataV2,
+        recent_history=(),
+        policy_runtime_state=None,
+        source_route: str,
+        previous_mode: str | None,
+        remaining_budget: float,
+        predicate_before: tuple[bool, ...],
+        source_trace_summary,
+        parent_checkpoint_identity: str,
+        statistics_identity: str,
+    ) -> CausalSnapshotV2:
+        """Capture the exact runtime state plus v2 scientific provenance."""
+
+        runtime_snapshot = self.capture_causal_snapshot(
+            snapshot_id=identity.snapshot_id,
+            recent_history=recent_history,
+            policy_runtime_state=policy_runtime_state,
+            source_policy=sampling.source_policy,
+            previous_mode=previous_mode,
+            chunk_index=identity.chunk_index,
+            remaining_budget=remaining_budget,
+        )
+        return CausalSnapshotV2(
+            runtime_snapshot=runtime_snapshot,
+            identity=identity,
+            sampling=sampling,
+            source_route=str(source_route),
+            previous_mode=previous_mode,
+            remaining_budget=float(remaining_budget),
+            predicate_before=tuple(bool(value) for value in predicate_before),
+            source_trace_summary=copy.deepcopy(source_trace_summary),
+            parent_checkpoint_identity=str(parent_checkpoint_identity),
+            statistics_identity=str(statistics_identity),
+        )
 
     def _init_env(self):
         env_fns = self.get_env_fns()
