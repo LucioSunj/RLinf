@@ -20,6 +20,8 @@ from pathlib import Path
 import pytest
 import torch
 
+from rlinf.algorithms.losses import compute_ppo_critic_loss
+
 
 def _load_module(name: str, relative_path: str):
     repo_root = Path(__file__).resolve().parents[2]
@@ -41,6 +43,18 @@ dual_ppo = _load_module(
     "rlinf/algorithms/fastwam_dual_ppo.py",
 )
 WAMRoute = contracts.WAMRoute
+
+
+def test_shared_critic_clip_metric_counts_unclipped_value_deltas():
+    _loss, metrics = compute_ppo_critic_loss(
+        values=torch.tensor([0.0, 0.1, 0.3, -0.4]),
+        returns=torch.zeros(4),
+        prev_values=torch.zeros(4),
+        value_clip=0.2,
+        huber_delta=1.0,
+    )
+
+    assert metrics["critic/value_clip_ratio"].item() == pytest.approx(0.5)
 
 
 def test_epsilon_mixture_bernoulli_probability_and_logprob_are_exact():
@@ -307,9 +321,7 @@ def test_collapse_penalty_uses_differentiable_expected_calls_per_episode():
     )
     penalty.backward()
 
-    expected = (
-        math.exp(-0.5) + math.exp(-1.5) + math.exp(-1.0) + math.exp(0.0)
-    ) / 2
+    expected = (math.exp(-0.5) + math.exp(-1.5) + math.exp(-1.0) + math.exp(0.0)) / 2
     assert penalty.item() == pytest.approx(expected)
     assert metrics["collapse/group_count"].item() == 2
     assert probabilities.grad is not None

@@ -360,7 +360,7 @@ def compute_ppo_critic_loss(
     value_loss = torch.max(value_loss_original, value_loss_clipped)
     value_loss = loss_agg_func(value_loss, loss_mask, loss_mask_ratio)
 
-    value_clip_indicator = (value_pred_clipped - prev_values).abs() > value_clip
+    value_clip_indicator = (values - prev_values).abs() > value_clip
     value_clip_ratio = value_clip_indicator.float().mean()
 
     explained_variance_stats = compute_critic_explained_variance_stats(
