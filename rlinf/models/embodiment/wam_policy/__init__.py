@@ -386,6 +386,7 @@ def _validate_critic_build_config(cfg) -> bool:
 def get_model(cfg, torch_dtype):
     """Build the composite policy from explicit FastWAM/OpenPi sub-configs."""
 
+    import torch
     from fastwam.adapters import (
         RegimeLoRAConfig,
         inject_action_dit_lora,
@@ -533,7 +534,12 @@ def get_model(cfg, torch_dtype):
         actor.action_expert,
         lora_config,
     )
-    gate = GateTransformer(gate_config).to(dtype=torch_dtype)
+    # The Gate is trainable, so it stays in FP32 rather than adopting the frozen
+    # model dtype. A BF16 Gate discards every Adam update below half a BF16 ULP,
+    # which is where this Gate's updates land; see
+    # `docs/BF16_PARAMETER_UPDATE_LOSS.md`. `DirectKVAttention` already casts the
+    # stored K/V banks to the query dtype, so the read-only tap still works.
+    gate = GateTransformer(gate_config).to(dtype=torch.float32)
 
     critic = None
     critic_feature_config = None

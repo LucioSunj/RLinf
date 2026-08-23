@@ -16,8 +16,8 @@ partition_fastwam_trainable_parameters = (
 )
 
 
-def _parameter() -> torch.nn.Parameter:
-    return torch.nn.Parameter(torch.zeros(1))
+def _parameter(dtype: torch.dtype = torch.float32) -> torch.nn.Parameter:
+    return torch.nn.Parameter(torch.zeros(1, dtype=dtype))
 
 
 def test_partition_fastwam_trainable_parameters_is_disjoint() -> None:
@@ -63,3 +63,28 @@ def test_partition_fastwam_trainable_parameters_requires_all_groups() -> None:
                 ("critic.value_head.weight", _parameter()),
             ]
         )
+
+
+def test_partition_fastwam_trainable_parameters_rejects_reduced_precision() -> None:
+    """A BF16 trainable silently discards sub-ULP optimizer steps."""
+
+    with pytest.raises(RuntimeError, match="master weights"):
+        partition_fastwam_trainable_parameters(
+            [
+                ("gate.output.weight", _parameter(dtype=torch.bfloat16)),
+                ("actor.action_expert.q.lora_A", _parameter()),
+                ("critic.value_head.weight", _parameter()),
+            ]
+        )
+
+
+def test_partition_fastwam_trainable_parameters_accepts_fp32_groups() -> None:
+    groups = partition_fastwam_trainable_parameters(
+        [
+            ("gate.output.weight", _parameter()),
+            ("actor.action_expert.q.lora_A", _parameter()),
+            ("critic.value_head.weight", _parameter()),
+        ]
+    )
+
+    assert sorted(groups) == ["gate", "uncond_lora", "value_head"]

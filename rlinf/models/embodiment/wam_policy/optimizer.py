@@ -4,7 +4,13 @@ from __future__ import annotations
 
 from collections.abc import Iterable
 
+import torch
 import torch.nn as nn
+
+# Optimizer updates for these groups are far smaller than a BF16
+# unit-in-last-place, so a reduced-precision parameter would silently discard
+# every step. See `docs/BF16_PARAMETER_UPDATE_LOSS.md`.
+_REQUIRED_TRAINABLE_DTYPE = torch.float32
 
 
 def partition_fastwam_trainable_parameters(
@@ -38,5 +44,21 @@ def partition_fastwam_trainable_parameters(
     if missing:
         raise RuntimeError(
             f"FastWAM adaptive optimizer is missing parameter groups: {missing}"
+        )
+    reduced_precision = sorted(
+        {
+            f"{group}:{parameter.dtype}"
+            for group, parameters in groups.items()
+            for parameter in parameters
+            if parameter.dtype is not _REQUIRED_TRAINABLE_DTYPE
+        }
+    )
+    if reduced_precision:
+        raise RuntimeError(
+            "FastWAM adaptive trainable parameters must be "
+            f"{_REQUIRED_TRAINABLE_DTYPE} master weights; an optimizer step "
+            "smaller than half the stored dtype's unit-in-last-place is "
+            "discarded by round-to-nearest and the parameter never moves. "
+            f"Offending groups: {reduced_precision}"
         )
     return groups

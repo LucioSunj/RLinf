@@ -991,7 +991,12 @@ class FastWAMAdaptivePolicy(nn.Module, BasePolicy):
         **_kwargs,
     ) -> dict[str, torch.Tensor]:
         gate_device = next(self.gate.parameters()).device
-        gate_dtype = next(self.gate.parameters()).dtype
+        # Materialize Gate K/V in the declared storage dtype, not in the Gate's
+        # parameter dtype. The Gate holds FP32 master weights, but upcasting
+        # every layer's K/V to FP32 here would double replay memory and break
+        # the declared per-sample and tier byte limits. `DirectKVAttention`
+        # casts each layer's bank to the query dtype transiently instead.
+        gate_dtype = self.config.kv_replay.torch_dtype
         batch_size = int(route_info.route_used.shape[0])
         if self.config.kv_replay.backend is GateKVReplayBackend.STORED:
             from .tiered_kv_store import GATE_KV_BATCH_INDICES
