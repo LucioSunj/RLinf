@@ -877,7 +877,23 @@ class LiberoFastWAMRuntime:
                 ),
             )
             if self.critic_feature_config is not None and mode == "train":
-                critic_features.append(self._critic_features_from_condition(condition))
+                # Rollout, actor replay, and GAE bootstrap must use one critic
+                # construction. Future content is causally sealed from the
+                # current prefix under `first_frame_causal`, but full-shape and
+                # compact prefills still differ numerically under production
+                # kernels. Match replay/bootstrap's compact UNCOND shape.
+                if regime is PolicyRegime.UNCOND:
+                    critic_condition = condition
+                else:
+                    critic_condition, _ = self._prepare_action_condition(
+                        image=images[index : index + 1],
+                        context=context[index : index + 1],
+                        context_mask=context_mask[index : index + 1],
+                        regime=PolicyRegime.UNCOND,
+                    )
+                critic_features.append(
+                    self._critic_features_from_condition(critic_condition)
+                )
             if (
                 collect_replay
                 and self.gate_replay_backend is GateKVReplayBackend.RECOMPUTE

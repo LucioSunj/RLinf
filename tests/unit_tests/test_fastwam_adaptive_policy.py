@@ -838,7 +838,9 @@ def test_libero_current_frame_bootstrap_encodes_only_uncond_conditions():
     )
 
 
-def test_libero_rollout_value_reads_each_existing_condition_once(monkeypatch):
+def test_libero_rollout_value_uses_compact_uncond_condition_for_every_route(
+    monkeypatch,
+):
     class _Actor(nn.Module):
         def __init__(self):
             super().__init__()
@@ -868,10 +870,12 @@ def test_libero_rollout_value_reads_each_existing_condition_once(monkeypatch):
     )
     runtime._action_schedule = lambda: (torch.tensor([1.0]), torch.tensor([-1.0]))
     prepared_conditions = []
+    prepared_regimes = []
 
-    def prepare_condition(**_kwargs):
+    def prepare_condition(**kwargs):
         condition = SimpleNamespace(sample_index=len(prepared_conditions))
         prepared_conditions.append(condition)
+        prepared_regimes.append(kwargs["regime"])
         return condition, None
 
     runtime._prepare_action_condition = prepare_condition
@@ -914,13 +918,20 @@ def test_libero_rollout_value_reads_each_existing_condition_once(monkeypatch):
         actor_version=0,
     )
 
-    assert len(prepared_conditions) == 2
-    assert feature_conditions == prepared_conditions
-    assert velocity_conditions == prepared_conditions
+    assert prepared_regimes == [
+        PolicyRegime.IDM,
+        PolicyRegime.UNCOND,
+        PolicyRegime.UNCOND,
+    ]
+    assert feature_conditions == prepared_conditions[1:]
+    assert velocity_conditions == [prepared_conditions[0], prepared_conditions[2]]
     assert sample.critic_features.batch_size == 2
     assert "fastwam_critic_features" not in sample.forward_inputs
 
+    prepared_conditions.clear()
+    prepared_regimes.clear()
     feature_conditions.clear()
+    velocity_conditions.clear()
     eval_sample = runtime.sample_action_batch(
         env_obs={},
         routes=torch.tensor([1, 0]),
@@ -930,6 +941,8 @@ def test_libero_rollout_value_reads_each_existing_condition_once(monkeypatch):
     )
     assert eval_sample.critic_features is None
     assert feature_conditions == []
+    assert prepared_regimes == [PolicyRegime.IDM, PolicyRegime.UNCOND]
+    assert velocity_conditions == prepared_conditions
 
 
 def test_libero_value_replay_reuses_uncond_condition_and_never_builds_future(

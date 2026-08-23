@@ -20,8 +20,14 @@ import torch
 import torch.nn as nn
 from fastwam.adapters import PolicyRegime
 from fastwam.models.wan22.condition_kv import ConditionLayerKV
-from fastwam.models.wan22.kv_tap import KeyValueBank, KVSource
+from fastwam.models.wan22.kv_tap import (
+    GateKVSnapshot,
+    GateLayerKV,
+    KeyValueBank,
+    KVSource,
+)
 
+from rlinf.models.embodiment.wam_policy import libero_runtime as _runtime_module
 from rlinf.models.embodiment.wam_policy.critic import (
     CriticKind,
     FastWAMCurrentFrameValueCritic,
@@ -99,6 +105,167 @@ def _features(
             for index in layer_indices
         )
     )
+
+
+def test_idm_rollout_replay_and_bootstrap_use_identical_critic_construction(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Require three-path parity measured at max-abs 0.0 in this synthetic case."""
+
+    class _Actor(nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.anchor = nn.Parameter(torch.zeros(1))
+            self.action_expert = SimpleNamespace(action_dim=3)
+            self.infer_action_scheduler = SimpleNamespace(num_train_timesteps=1000)
+
+    runtime = object.__new__(_runtime_module.LiberoFastWAMRuntime)
+    runtime.actor = _Actor()
+    runtime.critic_feature_config = _config()
+    runtime.flow_sde_noise_level = 0.5
+    runtime.flow_sde_ignore_last_transition = True
+    runtime.seeded_noise_device = "cpu"
+    runtime.gate_denoise_last_n = 1
+    runtime.gate_replay_backend = _runtime_module.GateKVReplayBackend.STORED
+    runtime.action_protocol = _runtime_module.LiberoActionProtocol(
+        generation_horizon=2,
+        execution_horizon=1,
+        prediction_video_frames=3,
+        reset_wait_steps=0,
+        max_episode_steps=2,
+    )
+    images = torch.zeros(1, 3, 4, 4)
+    context = torch.zeros(1, 5, 2)
+    context_mask = torch.ones(1, 5, dtype=torch.bool)
+    fixed_observation = {"sample_id": torch.tensor([17])}
+
+    def encode_condition(env_obs):
+        assert env_obs is fixed_observation
+        return images, context, context_mask
+
+    runtime._encode_condition = encode_condition
+    runtime._action_schedule = lambda: (
+        torch.tensor([1.0]),
+        torch.tensor([-1.0]),
+    )
+
+    def prepare_condition(**kwargs):
+        regime = kwargs["regime"]
+        marker = 1.0 if regime is PolicyRegime.UNCOND else 9.0
+        return SimpleNamespace(regime=regime, marker=marker), None
+
+    runtime._prepare_action_condition = prepare_condition
+
+    def critic_features(condition):
+        video = torch.full((1, 2, 4), condition.marker)
+        text_state = torch.full((1, 3, 4), condition.marker + 0.5)
+        return FastWAMValueFeatures(
+            (
+                ConditionLayerKV(
+                    layer_index=1,
+                    current_frame_video=_bank(
+                        KVSource.CURRENT_FRAME_VIDEO,
+                        video,
+                    ),
+                    context=_bank(
+                        KVSource.TEXT_STATE_CONTEXT,
+                        text_state,
+                    ),
+                ),
+            )
+        )
+
+    runtime._critic_features_from_condition = critic_features
+    runtime._velocity = lambda condition, **_kwargs: condition
+    runtime._denormalize_action_stages = lambda actions, env_obs: (actions, None)
+
+    def sample_flow(initial_noise, *, velocity_fn, **_kwargs):
+        gate_value = torch.zeros(1, 1, 4)
+        snapshot = GateKVSnapshot(
+            (
+                GateLayerKV(
+                    layer_index=0,
+                    denoise_timestep=torch.zeros(1),
+                    current_mode=(velocity_fn.regime,),
+                    current_frame_video=_bank(
+                        KVSource.CURRENT_FRAME_VIDEO,
+                        gate_value,
+                    ),
+                    action=_bank(KVSource.ACTION, gate_value),
+                    context=_bank(KVSource.TEXT_STATE_CONTEXT, gate_value),
+                    actor_version=7,
+                ),
+            )
+        )
+        return SimpleNamespace(
+            actions=torch.zeros_like(initial_noise),
+            old_log_probs=torch.zeros_like(initial_noise),
+            chains=torch.zeros(1, 2, *initial_noise.shape[1:]),
+            denoise_indices=torch.zeros(1, dtype=torch.long),
+            gate_taps=(snapshot,),
+        )
+
+    monkeypatch.setattr(_runtime_module, "sample_action_flow_sde", sample_flow)
+    route = int(_runtime_module.WAMRoute.IDM)
+    rollout = runtime.sample_action_batch(
+        env_obs=fixed_observation,
+        routes=torch.tensor([route]),
+        mode="train",
+        actor_version=7,
+        collect_replay=False,
+    )
+    route_info = _runtime_module.ChunkRouteRecord(
+        route_used=torch.tensor([route]),
+        route_was_forced=torch.tensor([True]),
+        chunk_ids=torch.tensor([0]),
+        episode_ids=torch.tensor([17]),
+        route_source_chunk_ids=torch.tensor([-1]),
+        actor_versions=torch.tensor([7]),
+    )
+    replay = runtime.replay_action_batch(
+        forward_inputs={
+            "flow_chains": rollout.flow_chains,
+            "denoise_indices": rollout.denoise_indices,
+            "fastwam_images": images,
+            "fastwam_context": context,
+            "fastwam_context_mask": context_mask,
+        },
+        route_info=route_info,
+    )
+    bootstrap = runtime.critic_features(env_obs=fixed_observation)
+
+    def max_abs_diff(
+        left: FastWAMValueFeatures,
+        right: FastWAMValueFeatures,
+    ) -> float:
+        assert left.layer_indices == right.layer_indices
+        differences = []
+        for layer_index in left.layer_indices:
+            left_layer = left.layer(layer_index)
+            right_layer = right.layer(layer_index)
+            for source_name in ("current_frame_video", "context"):
+                left_bank = getattr(left_layer, source_name)
+                right_bank = getattr(right_layer, source_name)
+                assert torch.equal(left_bank.valid_mask, right_bank.valid_mask)
+                differences.extend(
+                    (left_bank.key - right_bank.key).abs().reshape(-1).tolist()
+                )
+                differences.extend(
+                    (left_bank.value - right_bank.value).abs().reshape(-1).tolist()
+                )
+        return max(differences, default=0.0)
+
+    rollout_replay_max_abs = max_abs_diff(
+        rollout.critic_features,
+        replay["critic_features"],
+    )
+    rollout_bootstrap_max_abs = max_abs_diff(
+        rollout.critic_features,
+        bootstrap,
+    )
+    parity_atol = 0.0
+    assert rollout_replay_max_abs <= parity_atol
+    assert rollout_bootstrap_max_abs <= parity_atol
 
 
 def test_value_feature_batching_preserves_sources_masks_and_detaches() -> None:
