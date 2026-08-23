@@ -575,3 +575,94 @@ class ActionExecutionTrace:
         if not isinstance(other, ActionExecutionTrace):
             return NotImplemented
         return self.stages == other.stages
+
+
+def action_stage_contract_violations(
+    statistics: ActionStageStatistics,
+    *,
+    dimension_names: Sequence[str],
+    low: Sequence[float],
+    high: Sequence[float],
+    active_mask: Sequence[bool] | torch.Tensor | None = None,
+) -> list[dict[str, Any]]:
+    """Return exact live-contract violations for active batch rows."""
+
+    if len(dimension_names) != statistics.action_dim:
+        raise ValueError("Action dimension names do not match stage statistics.")
+    low_tensor = torch.as_tensor(low, dtype=torch.float32)
+    high_tensor = torch.as_tensor(high, dtype=torch.float32)
+    if low_tensor.shape != (statistics.action_dim,) or high_tensor.shape != (
+        statistics.action_dim,
+    ):
+        raise ValueError("Action contract bounds do not match stage statistics.")
+    invalid = (
+        (statistics.finite_count != statistics.total_value_count)
+        | (statistics.below_low_count > 0)
+        | (statistics.above_high_count > 0)
+    )
+    if active_mask is not None:
+        mask = torch.as_tensor(
+            active_mask,
+            dtype=torch.bool,
+            device=invalid.device,
+        )
+        if mask.shape != (statistics.batch_size,):
+            raise ValueError("Action active mask must have shape [B].")
+        invalid &= mask.reshape(-1, 1)
+    violations = []
+    for batch_index, dimension_index in invalid.nonzero(as_tuple=False).tolist():
+        finite_count = int(statistics.finite_count[batch_index, dimension_index])
+        violations.append(
+            {
+                "environment_index": int(batch_index),
+                "dimension_index": int(dimension_index),
+                "dimension_name": str(dimension_names[dimension_index]),
+                "minimum": (
+                    float(statistics.minimum[batch_index, dimension_index])
+                    if finite_count
+                    else None
+                ),
+                "maximum": (
+                    float(statistics.maximum[batch_index, dimension_index])
+                    if finite_count
+                    else None
+                ),
+                "low": float(low_tensor[dimension_index]),
+                "high": float(high_tensor[dimension_index]),
+                "finite_count": finite_count,
+                "total_value_count": int(
+                    statistics.total_value_count[batch_index, dimension_index]
+                ),
+                "below_low_count": int(
+                    statistics.below_low_count[batch_index, dimension_index]
+                ),
+                "above_high_count": int(
+                    statistics.above_high_count[batch_index, dimension_index]
+                ),
+            }
+        )
+    return violations
+
+
+def validate_action_stage_contract(
+    statistics: ActionStageStatistics,
+    *,
+    dimension_names: Sequence[str],
+    low: Sequence[float],
+    high: Sequence[float],
+    active_mask: Sequence[bool] | torch.Tensor | None = None,
+) -> None:
+    """Reject active Action values outside the exact live contract."""
+
+    violations = action_stage_contract_violations(
+        statistics,
+        dimension_names=dimension_names,
+        low=low,
+        high=high,
+        active_mask=active_mask,
+    )
+    if violations:
+        raise ValueError(
+            "Refusing to submit Action values outside the exact live LIBERO "
+            f"contract: {violations}. No clamp was applied."
+        )

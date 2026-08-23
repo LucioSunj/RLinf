@@ -243,6 +243,31 @@ def test_traced_chunk_ignores_invalid_values_in_inactive_slots() -> None:
     assert submitted.finite_count[1].eq(0).all()
 
 
+def test_contract_violation_abort_resets_without_submitting_an_action() -> None:
+    env = _libero_env()
+    env.is_eval = True
+    env.auto_reset = True
+    resets = []
+
+    def handle_auto_reset(_self, dones, final_obs, infos):
+        resets.append(np.asarray(dones, dtype=bool).copy())
+        reset_obs = {
+            "states": torch.tensor([[10.0], [11.0], [12.0]]),
+            "task_descriptions": ["next"] * 3,
+        }
+        return reset_obs, {"final_observation": final_obs, "final_info": infos}, dones
+
+    env._handle_eval_auto_reset = MethodType(handle_auto_reset, env)
+
+    obs, infos, count_mask = env.abort_eval_episodes(np.asarray([False, True, False]))
+
+    assert env.env.calls == []
+    assert [item.tolist() for item in resets] == [[False, True, False]]
+    assert obs["states"][:, 0].tolist() == [10.0, 11.0, 12.0]
+    assert infos["fastwam_contract_violation"].tolist() == [False, True, False]
+    assert np.asarray(count_mask).tolist() == [False, True, False]
+
+
 @pytest.mark.parametrize(
     "bad_mask",
     (

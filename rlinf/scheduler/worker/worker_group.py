@@ -266,6 +266,17 @@ class WorkerGroup(Generic[WorkerClsType]):
                 ),
                 "NODE_GROUP_LABEL": placement.node_group_label,
             }
+            if (
+                str(
+                    Cluster.get_sys_env_var(
+                        ClusterEnvVar.PATH_ENV_MERGE_MODE,
+                        "append",
+                    )
+                ).lower()
+                == "override"
+                and "PYTHONPATH" in os.environ
+            ):
+                env_vars["PYTHONPATH"] = os.environ["PYTHONPATH"]
             env_vars.update(
                 AcceleratorUtil.get_accelerator_env_var(
                     accelerator_type, placement.visible_accelerators
