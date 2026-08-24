@@ -383,9 +383,20 @@ class _TrainingActionTraceEnv:
         self.action_contract = contract
         self.submitted = None
 
-    def chunk_step_with_action_trace(self, actions, contract):
+    def chunk_step_with_action_trace(
+        self,
+        actions,
+        contract,
+        *,
+        contract_failure_mask=None,
+    ):
         assert contract is self.action_contract
         self.submitted = torch.as_tensor(actions).clone()
+        self.contract_failure_mask = (
+            torch.zeros(int(actions.shape[0]), dtype=torch.bool)
+            if contract_failure_mask is None
+            else torch.as_tensor(contract_failure_mask, dtype=torch.bool).clone()
+        )
         submitted = ActionStageStatistics.from_values(
             stage=SUBMITTED_LIBERO_ACTION_STAGE,
             values=actions,
@@ -394,10 +405,21 @@ class _TrainingActionTraceEnv:
             gripper_dimension_index=contract.gripper_dimension_index,
             action_contract_sha256=contract.canonical_sha256,
         )
+        row_mask = (~self.contract_failure_mask).reshape(-1, 1)
+        submitted = replace(
+            submitted,
+            minimum=submitted.minimum.masked_fill(~row_mask, 0.0),
+            maximum=submitted.maximum.masked_fill(~row_mask, 0.0),
+            finite_count=submitted.finite_count.masked_fill(~row_mask, 0),
+            below_low_count=submitted.below_low_count.masked_fill(~row_mask, 0),
+            above_high_count=submitted.above_high_count.masked_fill(~row_mask, 0),
+            total_value_count=submitted.total_value_count.masked_fill(~row_mask, 0),
+        )
         batch, horizon = actions.shape[:2]
         observations = [{"state": torch.zeros(batch, 1)}]
         rewards = torch.zeros(batch, horizon)
         terminations = torch.zeros(batch, horizon, dtype=torch.bool)
+        terminations[self.contract_failure_mask, -1] = True
         truncations = torch.zeros_like(terminations)
         return (observations, rewards, terminations, truncations, [{}]), submitted
 
@@ -604,6 +626,94 @@ def test_guarded_env_step_reports_route_and_first_action_violation_stage(
     assert '"flow_sde_denoise_index": 9' in message
     assert '"task_id": 3' in message
     assert '"reset_state_id": 174' in message
+    assert "FASTWAM_TRAINING_ACTION_FAILURE" in capsys.readouterr().out
+
+
+def test_guarded_env_step_turns_rejected_slot_into_unbootstrapped_failure(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    contract = _contract()
+    environment = _TrainingActionTraceEnv(contract)
+    environment.task_ids = np.asarray([2, 9])
+    environment.trial_ids = np.asarray([1, 0])
+    environment.reset_state_ids = np.asarray([101, 450])
+    worker = object.__new__(EnvWorker)
+    worker._rank = 2
+    worker.cfg = OmegaConf.create(
+        {
+            "runner": {
+                "fastwam_training_guard": {
+                    "enabled": True,
+                    "action_contract_violation_outcome": "fail_episode",
+                }
+            },
+            "env": {
+                "train": {
+                    "env_type": "libero",
+                    "auto_reset": False,
+                    "ignore_terminations": False,
+                }
+            },
+        }
+    )
+    worker.model_cfg = OmegaConf.create(
+        {"model_type": "fastwam_adaptive", "num_action_chunks": 10, "action_dim": 7}
+    )
+    worker.env_list = [environment]
+    worker.use_external_reward_model = False
+    actions = torch.zeros(2, 10, 7)
+    actions[1, :, 0] = 1.125
+    model_trace = _three_stage_model_trace(actions, contract)
+    route = ChunkRouteRecord(
+        route_used=torch.tensor([WAMRoute.IDM, WAMRoute.IDM]),
+        route_was_forced=torch.tensor([False, False]),
+        chunk_ids=torch.tensor([5, 27]),
+        episode_ids=torch.tensor([8, 12]),
+        route_source_chunk_ids=torch.tensor([4, 26]),
+        actor_versions=torch.tensor([4, 4]),
+    )
+    monkeypatch.setattr(
+        "rlinf.workers.env.env_worker.prepare_actions",
+        lambda *, raw_chunk_actions, **_: raw_chunk_actions,
+    )
+    monkeypatch.setattr(
+        "rlinf.workers.env.env_worker.get_env_attr",
+        lambda owner, name: getattr(owner, name),
+    )
+
+    env_output, _, payload = inspect.unwrap(EnvWorker.env_interact_step)(
+        worker,
+        actions,
+        0,
+        action_execution_trace=model_trace,
+        route_info=route,
+        flow_sde_denoise_indices=torch.tensor([-1, -1]),
+    )
+
+    assert environment.contract_failure_mask.tolist() == [False, True]
+    assert env_output.rewards.eq(0).all()
+    assert env_output.terminations[1, -1]
+    assert not env_output.truncations[1].any()
+    bootstrapped = inspect.unwrap(EnvWorker.compute_bootstrap_rewards)(
+        worker,
+        env_output,
+        torch.ones(2, 1),
+        None,
+    )
+    assert bootstrapped.eq(0).all()
+    assert payload["submitted_action_mask_by_environment"] == [True, False]
+    assert isinstance(payload["submitted_action_sha256_by_environment"][0], str)
+    assert payload["submitted_action_sha256_by_environment"][1] is None
+    failure = payload["contract_failure_audit"]
+    assert failure["outcome"] == "fail_episode"
+    assert failure["contract_failure_environment_indices"] == [1]
+    assert failure["zero_environment_reward"] is True
+    assert failure["true_termination"] is True
+    assert failure["bootstrap_allowed"] is False
+    assert failure["no_silent_clamp"] is True
+    trace = payload["action_execution_trace"]
+    assert all(stage.total_value_count[1].eq(0).all() for stage in trace.stages)
     assert "FASTWAM_TRAINING_ACTION_FAILURE" in capsys.readouterr().out
 
 

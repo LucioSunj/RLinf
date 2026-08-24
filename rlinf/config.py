@@ -1184,6 +1184,34 @@ def _validate_fastwam_adaptive_cfg(cfg, *, only_eval: bool) -> None:
             raise ValueError(
                 "FastWAM configured IDM cost must appear in the counterfactual grid."
             )
+    gate_parameter_audit_interval = training_guard.get(
+        "gate_parameter_audit_interval_updates", 1
+    )
+    if (
+        isinstance(gate_parameter_audit_interval, bool)
+        or not isinstance(gate_parameter_audit_interval, int)
+        or gate_parameter_audit_interval < 1
+    ):
+        raise ValueError(
+            "FastWAM Gate parameter audit interval must be a positive integer."
+        )
+    action_contract_violation_outcome = str(
+        training_guard.get("action_contract_violation_outcome", "error")
+    ).lower()
+    if action_contract_violation_outcome not in {"error", "fail_episode"}:
+        raise ValueError(
+            "FastWAM Action contract violation outcome must be `error` or "
+            "`fail_episode`."
+        )
+    if action_contract_violation_outcome == "fail_episode":
+        if not bool(training_guard.get("enabled", False)):
+            raise ValueError(
+                "FastWAM fail-episode Action handling requires the scientific guard."
+            )
+        if str(cfg.env.train.env_type) != "libero":
+            raise ValueError(
+                "FastWAM fail-episode Action handling requires LIBERO training."
+            )
     kv_backend = str(actor_model.kv_replay.get("backend", "stored")).lower()
     weight_sync_interval = int(cfg.runner.get("weight_sync_interval", 1))
     validate_fastwam_kv_weight_sync(kv_backend, weight_sync_interval)

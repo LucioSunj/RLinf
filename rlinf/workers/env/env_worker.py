@@ -77,7 +77,7 @@ from rlinf.workers.env.history_manager import HistoryManager
 FASTWAM_TRAINING_ACTION_AUDIT_SENTINEL = "FASTWAM_TRAINING_ACTION_AUDIT"
 FASTWAM_TRAINING_ACTION_AUDIT_SCHEMA = "fastwam-training-action-audit-v1"
 FASTWAM_TRAINING_ACTION_FAILURE_SENTINEL = "FASTWAM_TRAINING_ACTION_FAILURE"
-FASTWAM_TRAINING_ACTION_FAILURE_SCHEMA = "fastwam-training-action-failure-v1"
+FASTWAM_TRAINING_ACTION_FAILURE_SCHEMA = "fastwam-training-action-failure-v2"
 
 
 def _batch_metadata_value(value: Any, index: int) -> int | None:
@@ -121,6 +121,47 @@ def _route_metadata_for_batch_index(
         "route_source_chunk_id": int(flattened["route_source_chunk_ids"][index].item()),
         "actor_version": int(flattened["actor_versions"][index].item()),
     }
+
+
+def _fastwam_action_contract_failure_mask(
+    statistics: ActionStageStatistics,
+) -> torch.Tensor:
+    """Return batch slots whose prepared Actions cannot be submitted."""
+
+    invalid_dimensions = (
+        (statistics.finite_count != statistics.total_value_count)
+        | (statistics.below_low_count > 0)
+        | (statistics.above_high_count > 0)
+    )
+    return invalid_dimensions.any(dim=1).to(dtype=torch.bool)
+
+
+def _mask_fastwam_action_trace_for_submission(
+    trace: ActionExecutionTrace,
+    submitted_mask: torch.Tensor,
+) -> ActionExecutionTrace:
+    """Exclude rejected slots from the audit of actually submitted Actions."""
+
+    mask = torch.as_tensor(submitted_mask, dtype=torch.bool).reshape(-1)
+    if int(mask.numel()) != trace.batch_size:
+        raise ValueError("FastWAM Action submission mask has the wrong batch size.")
+    stages = []
+    for statistics in trace.stages:
+        row_mask = mask.to(device=statistics.minimum.device).reshape(-1, 1)
+        stages.append(
+            replace(
+                statistics,
+                minimum=statistics.minimum.masked_fill(~row_mask, 0.0),
+                maximum=statistics.maximum.masked_fill(~row_mask, 0.0),
+                finite_count=statistics.finite_count.masked_fill(~row_mask, 0),
+                below_low_count=statistics.below_low_count.masked_fill(~row_mask, 0),
+                above_high_count=statistics.above_high_count.masked_fill(~row_mask, 0),
+                total_value_count=statistics.total_value_count.masked_fill(
+                    ~row_mask, 0
+                ),
+            )
+        )
+    return ActionExecutionTrace(stages=tuple(stages))
 
 
 def build_fastwam_episode_identity_sha256(
@@ -188,11 +229,22 @@ def build_fastwam_action_failure_audit(
     denoise_indices: Any,
     worker_rank: int,
     pipeline_stage_id: int,
+    failure_mask: torch.Tensor | None = None,
+    outcome: str = "error",
 ) -> dict[str, Any]:
     """Build compact first-violation provenance for a rejected Action chunk."""
 
+    if outcome not in {"error", "fail_episode"}:
+        raise ValueError("Unsupported FastWAM Action contract failure outcome.")
+    if failure_mask is None:
+        failure_mask = _fastwam_action_contract_failure_mask(trace.stages[-1])
+    failure_mask = torch.as_tensor(failure_mask, dtype=torch.bool).reshape(-1)
+    if int(failure_mask.numel()) != trace.batch_size:
+        raise ValueError("FastWAM Action failure mask has the wrong batch size.")
     violations = []
     for batch_index in range(trace.batch_size):
+        if not bool(failure_mask[batch_index].item()):
+            continue
         for dimension_index in range(trace.stages[0].action_dim):
             first_stage = None
             stage_record = None
@@ -250,6 +302,13 @@ def build_fastwam_action_failure_audit(
         "pipeline_stage_id": int(pipeline_stage_id),
         "stage_order": list(trace.stage_names),
         "action_contract_sha256": contract.canonical_sha256,
+        "contract_failure_environment_indices": failure_mask.nonzero(as_tuple=False)
+        .reshape(-1)
+        .tolist(),
+        "outcome": outcome,
+        "zero_environment_reward": outcome == "fail_episode",
+        "true_termination": outcome == "fail_episode",
+        "bootstrap_allowed": False if outcome == "fail_episode" else None,
         "violations": violations,
         "no_silent_clamp": True,
     }
@@ -824,14 +883,16 @@ class EnvWorker(Worker):
                 action_execution_trace,
                 ActionExecutionTrace(stages=(prepared_statistics,)),
             )
-            try:
-                chunk_result, submitted_statistics = self.env_list[
-                    stage_id
-                ].chunk_step_with_action_trace(exec_actions, action_contract)
-            except ValueError as error:
-                if "Refusing to submit Action values outside" not in str(error):
-                    raise
-                environment = self.env_list[stage_id]
+            failure_mask = _fastwam_action_contract_failure_mask(prepared_statistics)
+            submission_mask = ~failure_mask
+            failure_audit = None
+            violation_outcome = str(
+                self.cfg.runner.get("fastwam_training_guard", {}).get(
+                    "action_contract_violation_outcome", "error"
+                )
+            ).lower()
+            environment = self.env_list[stage_id]
+            if bool(failure_mask.any().item()) and violation_outcome == "fail_episode":
                 failure_audit = build_fastwam_action_failure_audit(
                     trace=pre_submission_trace,
                     contract=action_contract,
@@ -842,21 +903,64 @@ class EnvWorker(Worker):
                     denoise_indices=flow_sde_denoise_indices,
                     worker_rank=int(getattr(self, "_rank", 0)),
                     pipeline_stage_id=stage_id,
+                    failure_mask=failure_mask,
+                    outcome=violation_outcome,
                 )
                 print(
                     f"{FASTWAM_TRAINING_ACTION_FAILURE_SENTINEL} "
                     + json.dumps(failure_audit, sort_keys=True),
                     flush=True,
                 )
-                raise ValueError(
-                    f"{error} FastWAM failure provenance: "
-                    + json.dumps(failure_audit, sort_keys=True)
-                ) from error
-            environment_trace = ActionExecutionTrace(
-                stages=(prepared_statistics, submitted_statistics)
+                chunk_result, submitted_statistics = (
+                    environment.chunk_step_with_action_trace(
+                        exec_actions,
+                        action_contract,
+                        contract_failure_mask=failure_mask,
+                    )
+                )
+            else:
+                try:
+                    chunk_result, submitted_statistics = (
+                        environment.chunk_step_with_action_trace(
+                            exec_actions, action_contract
+                        )
+                    )
+                except ValueError as error:
+                    if "Refusing to submit Action values outside" not in str(error):
+                        raise
+                    failure_audit = build_fastwam_action_failure_audit(
+                        trace=pre_submission_trace,
+                        contract=action_contract,
+                        route=route_info,
+                        task_ids=get_env_attr(environment, "task_ids"),
+                        trial_ids=get_env_attr(environment, "trial_ids"),
+                        reset_state_ids=get_env_attr(environment, "reset_state_ids"),
+                        denoise_indices=flow_sde_denoise_indices,
+                        worker_rank=int(getattr(self, "_rank", 0)),
+                        pipeline_stage_id=stage_id,
+                        failure_mask=failure_mask,
+                        outcome="error",
+                    )
+                    print(
+                        f"{FASTWAM_TRAINING_ACTION_FAILURE_SENTINEL} "
+                        + json.dumps(failure_audit, sort_keys=True),
+                        flush=True,
+                    )
+                    raise ValueError(
+                        f"{error} FastWAM failure provenance: "
+                        + json.dumps(failure_audit, sort_keys=True)
+                    ) from error
+            audited_pre_submission_trace = (
+                _mask_fastwam_action_trace_for_submission(
+                    pre_submission_trace,
+                    submission_mask,
+                )
+                if bool(failure_mask.any().item())
+                else pre_submission_trace
             )
             combined_action_trace = ActionExecutionTrace.combine(
-                action_execution_trace, environment_trace
+                audited_pre_submission_trace,
+                ActionExecutionTrace(stages=(submitted_statistics,)),
             )
         else:
             chunk_result = self.env_list[stage_id].chunk_step(chunk_actions)
@@ -925,9 +1029,23 @@ class EnvWorker(Worker):
             "truncations": chunk_truncations,
             "infos_list": infos_list,
             "action_execution_trace": combined_action_trace,
+            "contract_failure_audit": (
+                failure_audit
+                if training_action_audit
+                and failure_audit is not None
+                and failure_audit.get("outcome") == "fail_episode"
+                else None
+            ),
+            "submitted_action_mask_by_environment": (
+                submission_mask.tolist() if training_action_audit else None
+            ),
             "submitted_action_sha256_by_environment": (
                 [
-                    checkpoint_state_sha256(exec_actions[index])
+                    (
+                        checkpoint_state_sha256(exec_actions[index])
+                        if bool(submission_mask[index].item())
+                        else None
+                    )
                     for index in range(int(exec_actions.shape[0]))
                 ]
                 if training_action_audit
@@ -1628,7 +1746,13 @@ class EnvWorker(Worker):
         training_action_episode_identity_streams: list[list[tuple[str, ...]]] = [
             [] for _ in range(self.stage_num)
         ]
-        training_submitted_action_streams: list[list[list[str]]] = [
+        training_submitted_action_streams: list[list[list[str | None]]] = [
+            [] for _ in range(self.stage_num)
+        ]
+        training_submitted_action_masks: list[list[list[bool]]] = [
+            [] for _ in range(self.stage_num)
+        ]
+        training_action_failure_audits: list[list[dict[str, Any]]] = [
             [] for _ in range(self.stage_num)
         ]
         training_flow_sde_denoise_indices: list[list[torch.Tensor]] = [
@@ -1777,11 +1901,25 @@ class EnvWorker(Worker):
                     submitted_action_hashes = chunk_step_payload.pop(
                         "submitted_action_sha256_by_environment", None
                     )
+                    submitted_action_mask = chunk_step_payload.pop(
+                        "submitted_action_mask_by_environment", None
+                    )
+                    contract_failure_audit = chunk_step_payload.pop(
+                        "contract_failure_audit", None
+                    )
                     if action_trace is not None:
                         training_action_traces[stage_id].append(action_trace)
                     if submitted_action_hashes is not None:
                         training_submitted_action_streams[stage_id].append(
                             submitted_action_hashes
+                        )
+                    if submitted_action_mask is not None:
+                        training_submitted_action_masks[stage_id].append(
+                            submitted_action_mask
+                        )
+                    if contract_failure_audit is not None:
+                        training_action_failure_audits[stage_id].append(
+                            contract_failure_audit
                         )
                     stage_rollout = self.rollout_results[stage_id]
                     if isinstance(stage_rollout, EmbodiedLerobotRolloutResult):
@@ -1937,16 +2075,25 @@ class EnvWorker(Worker):
                     )
                 identity_streams = training_action_episode_identity_streams[stage_id]
                 submitted_streams = training_submitted_action_streams[stage_id]
+                submitted_masks = training_submitted_action_masks[stage_id]
                 if len(identity_streams) != len(traces) or len(
                     submitted_streams
                 ) != len(traces):
                     raise RuntimeError(
                         "FastWAM training Action stream/trace counts disagree."
                     )
+                if len(submitted_masks) != len(traces):
+                    raise RuntimeError(
+                        "FastWAM training Action submission-mask/trace counts disagree."
+                    )
                 environment_count = len(identity_streams[0])
                 if any(
                     len(stream) != environment_count
-                    for stream in (*identity_streams, *submitted_streams)
+                    for stream in (
+                        *identity_streams,
+                        *submitted_streams,
+                        *submitted_masks,
+                    )
                 ):
                     raise RuntimeError(
                         "FastWAM training Action stream environment counts differ."
@@ -1956,6 +2103,15 @@ class EnvWorker(Worker):
                     raise RuntimeError(
                         "FastWAM denoise-index stream/trace counts disagree."
                     )
+                action_failure_audits = training_action_failure_audits[stage_id]
+                failure_event_count = sum(
+                    any(not submitted for submitted in mask) for mask in submitted_masks
+                )
+                if len(action_failure_audits) != failure_event_count:
+                    raise RuntimeError(
+                        "FastWAM Action failure audits do not reconcile with "
+                        "submission masks."
+                    )
                 global_environment_offset = stage_id * self.train_num_envs_per_stage
                 payload = {
                     "schema": FASTWAM_TRAINING_ACTION_AUDIT_SCHEMA,
@@ -1963,6 +2119,32 @@ class EnvWorker(Worker):
                     "pipeline_stage_id": int(stage_id),
                     "stage_order": list(merged_trace.stage_names),
                     "action_contract": contract.to_artifact(),
+                    "contract_violation_outcome": str(
+                        self.cfg.runner.fastwam_training_guard.get(
+                            "action_contract_violation_outcome", "error"
+                        )
+                    ).lower(),
+                    "contract_failure_event_count": failure_event_count,
+                    "contract_failure_environment_count": sum(
+                        sum(not submitted for submitted in mask)
+                        for mask in submitted_masks
+                    ),
+                    "submission_counts_by_global_environment": [
+                        {
+                            "global_environment_index": (
+                                global_environment_offset + environment_index
+                            ),
+                            "submitted_chunk_count": sum(
+                                bool(mask[environment_index])
+                                for mask in submitted_masks
+                            ),
+                            "rejected_chunk_count": sum(
+                                not bool(mask[environment_index])
+                                for mask in submitted_masks
+                            ),
+                        }
+                        for environment_index in range(environment_count)
+                    ],
                     "episode_identity_observation_count": len(identity_hashes),
                     "first_episode_identity_sha256": identity_hashes[0],
                     "episode_identity_sequence_sha256": checkpoint_state_sha256(

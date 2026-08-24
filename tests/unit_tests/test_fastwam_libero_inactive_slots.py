@@ -243,6 +243,74 @@ def test_traced_chunk_ignores_invalid_values_in_inactive_slots() -> None:
     assert submitted.finite_count[1].eq(0).all()
 
 
+def test_contract_failure_slot_is_not_stepped_and_becomes_true_termination() -> None:
+    env = _libero_env()
+    reset_masks = []
+
+    def _contract_failure_reset(_self, dones, observations, infos):
+        reset_masks.append(np.asarray(dones, dtype=bool).copy())
+        return observations, infos
+
+    env._handle_contract_failure_reset = MethodType(_contract_failure_reset, env)
+    actions = np.zeros((3, 2, 7), dtype=np.float32)
+    actions[1, :, 0] = 1.125
+
+    result, submitted = env.chunk_step_with_action_trace(
+        actions,
+        _contract(),
+        contract_failure_mask=torch.tensor([False, True, False]),
+    )
+
+    _observations, rewards, terminations, truncations, _infos = result
+    assert [indices for _actions, indices in env.env.calls] == [(0, 2), (0, 2)]
+    assert rewards[1].eq(0).all()
+    assert terminations[1].tolist() == [False, True]
+    assert not truncations[1].any()
+    assert reset_masks and reset_masks[-1].tolist() == [False, True, False]
+    assert submitted.total_value_count[1].eq(0).all()
+    assert submitted.finite_count[1].eq(0).all()
+    assert submitted.above_high_count[1].eq(0).all()
+
+
+def test_contract_failure_reset_changes_only_rejected_slot_identity() -> None:
+    env = object.__new__(LiberoEnv)
+    env.num_envs = 3
+    env.is_eval = False
+    env.use_fixed_reset_state_ids = True
+    env.stage_invariant_fixed_reset_ids = False
+    env.cfg = OmegaConf.create({"use_ordered_reset_state_ids": False})
+    env.reset_state_ids = np.asarray([10, 20, 30])
+    reset_calls = []
+    env._get_random_reset_state_ids = MethodType(
+        lambda _self, count: np.asarray([99] * count),
+        env,
+    )
+
+    def _reset(_self, env_idx=None, reset_state_ids=None):
+        reset_calls.append(
+            (np.asarray(env_idx).copy(), np.asarray(reset_state_ids).copy())
+        )
+        return {"states": torch.zeros(3, 1)}, {}
+
+    env.reset = MethodType(_reset, env)
+    final_obs = {"states": torch.ones(3, 1)}
+    final_info = {"episode": {"success_once": torch.zeros(3, dtype=torch.bool)}}
+
+    _obs, infos = env._handle_contract_failure_reset(
+        np.asarray([False, True, False]),
+        final_obs,
+        final_info,
+    )
+
+    assert env.reset_state_ids.tolist() == [10, 99, 30]
+    assert len(reset_calls) == 1
+    assert reset_calls[0][0].tolist() == [1]
+    assert reset_calls[0][1].tolist() == [99]
+    assert infos["final_observation"] is not final_obs
+    assert infos["final_info"] is not final_info
+    assert infos["_final_info"].tolist() == [False, True, False]
+
+
 @pytest.mark.parametrize(
     "bad_mask",
     (

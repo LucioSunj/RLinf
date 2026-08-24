@@ -1096,6 +1096,27 @@ class LiberoEnv(gym.Env):
         return mask.astype(bool, copy=True)
 
     @staticmethod
+    def _normalize_contract_failure_mask(contract_failure_mask, *, batch_size):
+        """Validate slots rejected before Action submission."""
+
+        if contract_failure_mask is None:
+            return np.zeros(int(batch_size), dtype=bool)
+        if isinstance(contract_failure_mask, torch.Tensor):
+            if contract_failure_mask.dtype != torch.bool:
+                raise TypeError("LIBERO contract failure mask must have boolean dtype.")
+            mask = contract_failure_mask.detach().cpu().numpy()
+        else:
+            mask = np.asarray(contract_failure_mask)
+            if mask.dtype != np.bool_:
+                raise TypeError("LIBERO contract failure mask must have boolean dtype.")
+        if mask.shape != (int(batch_size),):
+            raise ValueError(
+                "LIBERO contract failure mask must have shape "
+                f"[{int(batch_size)}], got {tuple(mask.shape)}."
+            )
+        return mask.astype(bool, copy=True)
+
+    @staticmethod
     def _mask_action_statistics(
         statistics: ActionStageStatistics,
         active_mask: np.ndarray,
@@ -1261,8 +1282,15 @@ class LiberoEnv(gym.Env):
         chunk_actions,
         action_contract: LiberoActionContract,
         active_mask=None,
+        *,
+        contract_failure_mask=None,
     ):
-        """Execute a chunk while reducing only actually submitted Actions."""
+        """Execute a chunk while reducing only actually submitted Actions.
+
+        Contract-failure slots are never passed to the underlying environment.
+        They become zero-reward true terminations and are reset independently,
+        so value bootstrapping is disabled while the other vector slots run.
+        """
 
         if not isinstance(action_contract, LiberoActionContract):
             raise TypeError("LIBERO chunk tracing requires a typed Action contract.")
@@ -1272,12 +1300,17 @@ class LiberoEnv(gym.Env):
             active_mask,
             batch_size=self.num_envs,
         )
+        normalized_failure_mask = self._normalize_contract_failure_mask(
+            contract_failure_mask,
+            batch_size=self.num_envs,
+        )
         records: list[ActionStageStatistics] = []
         self._action_submission_capture = (action_contract, records)
         try:
             result = self.chunk_step(
                 chunk_actions,
                 active_mask=normalized_mask,
+                contract_failure_mask=normalized_failure_mask,
             )
         finally:
             self._action_submission_capture = None
@@ -1289,7 +1322,13 @@ class LiberoEnv(gym.Env):
             )
         return result, ActionStageStatistics.merge_time(records)
 
-    def chunk_step(self, chunk_actions, active_mask=None):
+    def chunk_step(
+        self,
+        chunk_actions,
+        active_mask=None,
+        *,
+        contract_failure_mask=None,
+    ):
         # chunk_actions: [num_envs, chunk_step, action_dim]
         if (
             len(chunk_actions.shape) != 3
@@ -1305,6 +1344,18 @@ class LiberoEnv(gym.Env):
             active_mask,
             batch_size=self.num_envs,
         )
+        contract_failure_mask = self._normalize_contract_failure_mask(
+            contract_failure_mask,
+            batch_size=self.num_envs,
+        )
+        if bool((contract_failure_mask & ~active_mask).any()):
+            raise ValueError("LIBERO contract failures must be active slots.")
+        if contract_failure_mask.any():
+            if self._action_submission_capture is None:
+                raise RuntimeError(
+                    "LIBERO contract-failure termination requires Action tracing."
+                )
+        execution_mask = active_mask & ~contract_failure_mask
         obs_list = []
         infos_list = []
 
@@ -1317,7 +1368,7 @@ class LiberoEnv(gym.Env):
             extracted_obs, step_reward, terminations, truncations, infos = self.step(
                 actions,
                 auto_reset=False,
-                active_mask=active_mask,
+                active_mask=execution_mask,
             )
             obs_list.append(extracted_obs)
             infos_list.append(infos)
@@ -1329,6 +1380,13 @@ class LiberoEnv(gym.Env):
         chunk_rewards = torch.stack(chunk_rewards, dim=1)
         raw_chunk_terminations = torch.stack(raw_chunk_terminations, dim=1)
         raw_chunk_truncations = torch.stack(raw_chunk_truncations, dim=1)
+        rejected = torch.as_tensor(
+            contract_failure_mask,
+            dtype=torch.bool,
+            device=raw_chunk_terminations.device,
+        )
+        if rejected.any():
+            raw_chunk_terminations[rejected, -1] = True
         raw_chunk_dones = torch.logical_or(
             raw_chunk_terminations,
             raw_chunk_truncations,
@@ -1347,6 +1405,10 @@ class LiberoEnv(gym.Env):
         if past_dones.any() and self.auto_reset:
             obs_list[-1], infos_list[-1], eval_count_mask = self._handle_auto_reset(
                 past_dones.cpu().numpy(), obs_list[-1], infos_list[-1]
+            )
+        elif rejected.any():
+            obs_list[-1], infos_list[-1] = self._handle_contract_failure_reset(
+                rejected.cpu().numpy(), obs_list[-1], infos_list[-1]
             )
 
         if self.auto_reset or self.ignore_terminations:
@@ -1391,6 +1453,35 @@ class LiberoEnv(gym.Env):
             return self._handle_eval_auto_reset(dones, _final_obs, infos)
         obs, infos = self._handle_train_auto_reset(dones, _final_obs, infos)
         return obs, infos, None
+
+    def _handle_contract_failure_reset(self, failures, _final_obs, infos):
+        """Reset only pre-submission failure slots in non-auto-reset training."""
+
+        if getattr(self, "is_eval", False):
+            raise RuntimeError("Contract-failure episode outcomes are training-only.")
+        final_obs = copy.deepcopy(_final_obs)
+        env_idx = np.arange(0, self.num_envs)[failures]
+        final_info = copy.deepcopy(infos)
+        if self.use_fixed_reset_state_ids:
+            if self.stage_invariant_fixed_reset_ids:
+                reset_state_ids = self._get_stage_invariant_reset_state_ids()[env_idx]
+            elif self.cfg.use_ordered_reset_state_ids:
+                reset_state_ids = self._get_ordered_reset_state_ids(len(env_idx))
+            else:
+                reset_state_ids = self._get_random_reset_state_ids(len(env_idx))
+            self.reset_state_ids[env_idx] = reset_state_ids
+            obs, reset_infos = self.reset(
+                env_idx=env_idx,
+                reset_state_ids=reset_state_ids,
+            )
+        else:
+            obs, reset_infos = self.reset(env_idx=env_idx, reset_state_ids=None)
+        reset_infos["final_observation"] = final_obs
+        reset_infos["final_info"] = final_info
+        reset_infos["_final_info"] = np.asarray(failures, dtype=bool)
+        reset_infos["_final_observation"] = failures
+        reset_infos["_elapsed_steps"] = failures
+        return obs, reset_infos
 
     def _handle_eval_auto_reset(self, dones, _final_obs, infos):
         final_obs = copy.deepcopy(_final_obs)

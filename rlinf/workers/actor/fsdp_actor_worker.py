@@ -1444,6 +1444,20 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
         return state
 
     @staticmethod
+    def _fastwam_gate_parameter_audit_due(
+        *,
+        actor_version: int,
+        interval_updates: int,
+    ) -> bool:
+        """Return whether the completed runner update is an audit boundary."""
+
+        if actor_version < 0:
+            raise ValueError("FastWAM actor version must be non-negative.")
+        if interval_updates < 1:
+            raise ValueError("FastWAM Gate parameter audit interval must be positive.")
+        return (int(actor_version) + 1) % int(interval_updates) == 0
+
+    @staticmethod
     def _summarize_fastwam_gate_update(
         *,
         before: dict[str, torch.Tensor],
@@ -2940,15 +2954,26 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
 
         gate_update_before = None
         gate_optimizer_steps_before = None
-        if SupportedModel(
-            self.cfg.actor.model.model_type
-        ) is SupportedModel.FASTWAM_ADAPTIVE and bool(
-            self.cfg.runner.get("fastwam_training_guard", {})
-            .get("cost_audit", {})
-            .get("enabled", False)
+        gate_parameter_audit_interval = None
+        training_guard = self.cfg.runner.get("fastwam_training_guard", {})
+        cost_audit_enabled = bool(
+            training_guard.get("cost_audit", {}).get("enabled", False)
+        )
+        configured_gate_parameter_audit_interval = int(
+            training_guard.get("gate_parameter_audit_interval_updates", 1)
+        )
+        if (
+            SupportedModel(self.cfg.actor.model.model_type)
+            is SupportedModel.FASTWAM_ADAPTIVE
+            and cost_audit_enabled
+            and self._fastwam_gate_parameter_audit_due(
+                actor_version=int(self.version),
+                interval_updates=configured_gate_parameter_audit_interval,
+            )
         ):
             gate_update_before = self._capture_fastwam_gate_parameters()
             gate_optimizer_steps_before = int(self.optimizer_steps)
+            gate_parameter_audit_interval = configured_gate_parameter_audit_interval
 
         if self.cfg.algorithm.loss_type == "opd":
             target_steps = int(self.rollout_batch["advantages"].shape[0])
@@ -3196,9 +3221,16 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
                 optimizer_steps_before=int(gate_optimizer_steps_before),
                 optimizer_steps_after=int(self.optimizer_steps),
             )
+            gate_update_artifact = gate_update_audit.to_artifact()
+            gate_update_artifact.update(
+                {
+                    "runner_update": int(self.version) + 1,
+                    "interval_updates": int(gate_parameter_audit_interval),
+                }
+            )
             print(
                 f"{FASTWAM_GATE_UPDATE_AUDIT_SENTINEL} "
-                + json.dumps(gate_update_audit.to_artifact(), sort_keys=True),
+                + json.dumps(gate_update_artifact, sort_keys=True),
                 flush=True,
             )
             append_to_dict(

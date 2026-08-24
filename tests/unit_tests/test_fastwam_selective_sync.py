@@ -68,6 +68,21 @@ class _CurrentFrameCriticSyncModule(nn.Module):
         )
 
 
+def test_gate_parameter_cpu_snapshot_audit_uses_runner_update_interval() -> None:
+    due = EmbodiedFSDPActor._fastwam_gate_parameter_audit_due
+
+    observed = [
+        version + 1
+        for version in range(25)
+        if due(actor_version=version, interval_updates=10)
+    ]
+
+    assert observed == [10, 20]
+    assert due(actor_version=0, interval_updates=1)
+    with pytest.raises(ValueError, match="interval"):
+        due(actor_version=0, interval_updates=0)
+
+
 def test_capture_matches_trainable_and_persistent_sync_contract() -> None:
     module = _SelectiveModule()
 

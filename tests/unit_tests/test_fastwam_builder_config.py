@@ -279,6 +279,10 @@ def test_libero_adaptive_config_composes_with_confirmed_defaults(monkeypatch) ->
     # frozen BF16 parents FP32 activations; see the VAE conv3d failure in
     # docs/BF16_PARAMETER_UPDATE_LOSS.md.
     assert cfg.actor.fsdp_config.mixed_precision.cast_root_forward_inputs is False
+    assert (
+        cfg.runner.fastwam_training_guard.action_contract_violation_outcome == "error"
+    )
+    assert cfg.runner.fastwam_training_guard.gate_parameter_audit_interval_updates == 1
     assert cfg.weight_syncer.patch.init_sync.enabled is True
     assert cfg.actor.model.gate.layer_taps.mode == "all"
     assert cfg.actor.model.gate.denoise_last_n == 1
@@ -379,6 +383,26 @@ def test_current_frame_critic_config_composes_without_pi05_assets(monkeypatch) -
     del invalid.actor.fsdp_config.mixed_precision.cast_root_forward_inputs
     with pytest.raises(ValueError, match="cast_root_forward_inputs"):
         _validate_fastwam_adaptive_cfg(invalid, only_eval=False)
+
+    invalid = OmegaConf.create(OmegaConf.to_container(cfg, resolve=True))
+    invalid.runner.fastwam_training_guard.gate_parameter_audit_interval_updates = 0
+    with pytest.raises(ValueError, match="audit interval"):
+        _validate_fastwam_adaptive_cfg(invalid, only_eval=False)
+
+    invalid = OmegaConf.create(OmegaConf.to_container(cfg, resolve=True))
+    invalid.runner.fastwam_training_guard.action_contract_violation_outcome = "clamp"
+    with pytest.raises(ValueError, match="violation outcome"):
+        _validate_fastwam_adaptive_cfg(invalid, only_eval=False)
+
+    fail_episode = OmegaConf.create(OmegaConf.to_container(cfg, resolve=True))
+    fail_episode.runner.fastwam_training_guard.enabled = True
+    fail_episode.runner.fastwam_training_guard.action_contract_violation_outcome = (
+        "fail_episode"
+    )
+    fail_episode.runner.fastwam_training_guard.gate_parameter_audit_interval_updates = (
+        10
+    )
+    _validate_fastwam_adaptive_cfg(fail_episode, only_eval=False)
 
     invalid = OmegaConf.create(OmegaConf.to_container(actor_critic, resolve=True))
     invalid.feature.layer_indices = [30]
