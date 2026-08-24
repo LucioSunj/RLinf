@@ -174,6 +174,13 @@ class FastWAMTrainingGuard:
             raise ValueError("break_even_patience must be positive.")
         if self.window_size < 1:
             raise ValueError("window_size must be positive.")
+        if (
+            self.break_even_guard_enabled
+            and self.break_even_patience > self.window_size + 1
+        ):
+            raise ValueError(
+                "FastWAM break-even patience exceeds the retained route-history window."
+            )
         finite = {
             "eligible_idm_fraction_min": self.eligible_idm_fraction_min,
             "eligible_idm_fraction_max": self.eligible_idm_fraction_max,
@@ -262,6 +269,8 @@ class FastWAMTrainingGuard:
         self._pending_uncond_sample_count = uncond_count
         break_even = None
         configured_idm_cost = None
+        break_even_route_window: list[float] = []
+        break_even_route_monotonic_decline = False
         if self.break_even_guard_enabled:
             missing_cost = [
                 index
@@ -313,14 +322,35 @@ class FastWAMTrainingGuard:
             )
             if below_cost:
                 self._consecutive_break_even_below_cost += 1
+                previous_count = min(
+                    self._consecutive_break_even_below_cost - 1,
+                    self.break_even_patience - 1,
+                )
+                previous_fractions = (
+                    self._history["eligible_idm_fraction"][-previous_count:]
+                    if previous_count
+                    else []
+                )
+                break_even_route_window = [*previous_fractions, idm_fraction]
+                break_even_route_monotonic_decline = len(
+                    break_even_route_window
+                ) == self.break_even_patience and all(
+                    break_even_route_window[index] < break_even_route_window[index - 1]
+                    for index in range(1, len(break_even_route_window))
+                )
             else:
                 self._consecutive_break_even_below_cost = 0
-            if self._consecutive_break_even_below_cost >= self.break_even_patience:
+            if (
+                self._consecutive_break_even_below_cost >= self.break_even_patience
+                and break_even_route_monotonic_decline
+            ):
                 rendered = "undefined" if break_even is None else str(break_even)
                 raise RuntimeError(
                     "FastWAM break-even IDM cost stayed below the configured cost "
-                    f"for {self._consecutive_break_even_below_cost} consecutive "
-                    f"rollouts: {rendered} < {configured_idm_cost}."
+                    "while the eligible IDM fraction declined monotonically for "
+                    f"{self.break_even_patience} rollouts: {rendered} < "
+                    f"{configured_idm_cost}; route window "
+                    f"{break_even_route_window}."
                 )
         if self._consecutive_zero_success_batches >= self.zero_success_patience:
             if self.zero_success_patience == 1:
@@ -348,6 +378,8 @@ class FastWAMTrainingGuard:
             "consecutive_break_even_below_cost": (
                 self._consecutive_break_even_below_cost
             ),
+            "break_even_route_window": break_even_route_window,
+            "break_even_route_monotonic_decline": (break_even_route_monotonic_decline),
         }
 
     def observe_training(

@@ -83,6 +83,7 @@ def _training_metrics(
     gate_kl: float = 0.02,
     gate_clip: float = 0.2,
     gate_entropy: float = 0.5,
+    gate_samples: float = 100.0,
     uncond_samples: float = 8.0,
 ):
     return [
@@ -95,7 +96,7 @@ def _training_metrics(
             "gate/clip_fraction": gate_clip,
             "gate/entropy": gate_entropy,
             "gate/ratio": 1.0,
-            "gate/sample_count": 100.0,
+            "gate/sample_count": gate_samples,
             "uncond_flow/approx_kl": 0.001,
             "uncond_flow/clip_fraction": 0.0,
             "uncond_flow/entropy": 14.0,
@@ -168,6 +169,15 @@ def test_guard_rejects_inverted_eligible_idm_fraction_bounds() -> None:
         FastWAMTrainingGuard(invalid)
 
 
+def test_break_even_guard_rejects_insufficient_route_history() -> None:
+    invalid = _config(cost_audit=True)
+    invalid.break_even_patience = 4
+    invalid.window_size = 2
+
+    with pytest.raises(ValueError, match="route-history window"):
+        FastWAMTrainingGuard(invalid)
+
+
 def test_v9_counterfactual_replay_triggers_break_even_guard_at_update_7() -> None:
     fixture = json.loads(
         (FIXTURE_ROOT / "fastwam_v9_counterfactual_break_even.json").read_text(
@@ -190,15 +200,30 @@ def test_v9_counterfactual_replay_triggers_break_even_guard_at_update_7() -> Non
     guard = FastWAMTrainingGuard(_config(cost_audit=True))
     trigger_version = None
     for record, audit in zip(records, audits, strict=True):
-        rollout = _rollout_metrics(successes=1)
+        idm_count = int(record["zero"]["idm_count"])
+        uncond_count = int(record["zero"]["uncond_count"])
+        eligible_count = idm_count + uncond_count
+        rollout = _rollout_metrics(
+            successes=1,
+            idm_fraction=idm_count / eligible_count,
+        )
+        rollout[0]["fastwam/eligible_gate_decision_count"] = float(eligible_count)
+        rollout[0]["fastwam/eligible_idm_decision_count"] = float(idm_count)
+        rollout[0]["fastwam/valid_uncond_chunk_count"] = float(uncond_count)
         rollout[0].update(audit.to_metrics())
         try:
             guard.observe_rollout(rollout)
         except RuntimeError as error:
             assert "break-even IDM cost" in str(error)
+            assert "declined monotonically" in str(error)
             trigger_version = record["actor_version"]
             break
-        guard.observe_training(_training_metrics())
+        guard.observe_training(
+            _training_metrics(
+                gate_samples=float(eligible_count),
+                uncond_samples=float(uncond_count),
+            )
+        )
         if record["actor_version"] == 6:
             state = guard.state_dict()
             resumed = FastWAMTrainingGuard(_config(cost_audit=True))
@@ -206,6 +231,39 @@ def test_v9_counterfactual_replay_triggers_break_even_guard_at_update_7() -> Non
             guard = resumed
 
     assert trigger_version == 7
+
+
+def test_v10_stable_route_does_not_trip_break_even_guard() -> None:
+    guard = FastWAMTrainingGuard(_config(cost_audit=True))
+    v10_updates_21_to_23 = (
+        (512, 464, 48),
+        (383, 347, 36),
+        (424, 386, 38),
+    )
+
+    for eligible_count, idm_count, uncond_count in v10_updates_21_to_23:
+        rollout = _rollout_metrics(
+            successes=1,
+            idm_fraction=idm_count / eligible_count,
+        )
+        rollout[0]["fastwam/eligible_gate_decision_count"] = float(eligible_count)
+        rollout[0]["fastwam/eligible_idm_decision_count"] = float(idm_count)
+        rollout[0]["fastwam/valid_uncond_chunk_count"] = float(uncond_count)
+        rollout[0]["fastwam/counterfactual/break_even_idm_cost"] = None
+        rollout[0]["fastwam/counterfactual/configured_idm_cost"] = 0.01
+        result = guard.observe_rollout(rollout)
+        guard.observe_training(
+            _training_metrics(
+                gate_samples=float(eligible_count),
+                uncond_samples=float(uncond_count),
+            )
+        )
+
+    assert result["consecutive_break_even_below_cost"] == 3
+    assert result["break_even_route_window"] == pytest.approx(
+        [464 / 512, 347 / 383, 386 / 424]
+    )
+    assert result["break_even_route_monotonic_decline"] is False
 
 
 def test_counterfactual_cost_audit_appends_full_jsonl_tables(tmp_path: Path) -> None:
