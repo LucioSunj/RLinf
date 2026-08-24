@@ -220,12 +220,45 @@ class FastWAMCounterfactualCostAudit:
     eligible_uncond_decision_count: int
     entries: tuple[FastWAMCounterfactualCostEntry, ...]
 
+    @staticmethod
+    def _unnormalized_destination_gap(
+        entry: FastWAMCounterfactualCostEntry,
+    ) -> float:
+        idm = entry.unnormalized_idm_gate_advantage
+        uncond = entry.unnormalized_uncond_gate_advantage
+        if idm.finite_count < 1 or uncond.finite_count < 1:
+            raise ValueError(
+                "Counterfactual break-even requires finite IDM and UNCOND samples."
+            )
+        return idm.total / idm.finite_count - uncond.total / uncond.finite_count
+
+    @property
+    def break_even_idm_cost(self) -> float | None:
+        """Return the interpolated cost where the unnormalized route gap is zero."""
+
+        if len(self.entries) < 2:
+            return None
+        lower = min(self.entries, key=lambda entry: entry.idm_cost)
+        upper = max(self.entries, key=lambda entry: entry.idm_cost)
+        cost_span = upper.idm_cost - lower.idm_cost
+        if not math.isclose(lower.idm_cost, 0.0, rel_tol=0.0, abs_tol=1.0e-12):
+            raise ValueError("Counterfactual break-even requires a zero-cost entry.")
+        if cost_span <= 0.0:
+            return None
+        gap_at_zero = self._unnormalized_destination_gap(lower)
+        slope = (self._unnormalized_destination_gap(upper) - gap_at_zero) / cost_span
+        if gap_at_zero <= 0.0 or slope >= 0.0:
+            return None
+        break_even = gap_at_zero / -slope
+        return break_even if math.isfinite(break_even) else None
+
     def to_artifact(self) -> dict[str, object]:
         """Return compact counterfactual evidence."""
 
         return {
             "schema": FASTWAM_COUNTERFACTUAL_COST_AUDIT_SCHEMA,
             "configured_idm_cost": self.configured_idm_cost,
+            "break_even_idm_cost": self.break_even_idm_cost,
             "configured_alignment_max_abs_error": (
                 self.configured_alignment_max_abs_error
             ),
@@ -257,6 +290,9 @@ class FastWAMCounterfactualCostAudit:
                 self.configured_alignment_max_abs_error
             ),
         }
+        break_even = self.break_even_idm_cost
+        if break_even is not None:
+            metrics["fastwam/counterfactual/break_even_idm_cost"] = break_even
         configured = next(
             (
                 entry

@@ -19,11 +19,15 @@ from __future__ import annotations
 import hashlib
 import json
 import math
+import os
 import statistics
 from collections.abc import Mapping, Sequence
+from pathlib import Path
 from typing import Any
 
-FASTWAM_TRAINING_GUARD_STATE_SCHEMA = "fastwam-training-guard-state-v1"
+FASTWAM_TRAINING_GUARD_STATE_SCHEMA = "fastwam-training-guard-state-v2"
+FASTWAM_BREAK_EVEN_METRIC = "fastwam/counterfactual/break_even_idm_cost"
+FASTWAM_CONFIGURED_COST_METRIC = "fastwam/counterfactual/configured_idm_cost"
 
 
 def _plain_mapping(value: Any) -> dict[str, Any]:
@@ -51,6 +55,28 @@ def _finite_float(value: Any, *, name: str) -> float:
     if not math.isfinite(result):
         raise ValueError(f"{name} is non-finite.")
     return result
+
+
+def append_fastwam_counterfactual_cost_audit_jsonl(
+    path: str | Path,
+    *,
+    runner_step: int,
+    artifact: Mapping[str, Any],
+) -> None:
+    """Append one full counterfactual-cost table to a run-scoped JSONL file."""
+
+    if runner_step < 0:
+        raise ValueError("Counterfactual audit runner_step must be non-negative.")
+    payload = {"runner_step": int(runner_step), **dict(artifact)}
+    if payload.get("schema") != "fastwam-counterfactual-cost-audit-v1":
+        raise ValueError("Counterfactual audit schema mismatch.")
+    destination = Path(path)
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    encoded = json.dumps(payload, sort_keys=True, allow_nan=False)
+    with destination.open("a", encoding="utf-8") as handle:
+        handle.write(encoded + "\n")
+        handle.flush()
+        os.fsync(handle.fileno())
 
 
 class FastWAMTrainingGuard:
@@ -95,6 +121,11 @@ class FastWAMTrainingGuard:
         raw = _plain_mapping(config)
         self.enabled = bool(raw.get("enabled", False))
         self.zero_success_patience = int(raw.get("zero_success_patience", 1))
+        self.break_even_patience = int(raw.get("break_even_patience", 3))
+        cost_audit = _plain_mapping(raw.get("cost_audit", None))
+        self.break_even_guard_enabled = self.enabled and bool(
+            cost_audit.get("enabled", False)
+        )
         self.window_size = int(raw.get("window_size", 3))
         self.eligible_idm_fraction_min = float(
             raw.get("eligible_idm_fraction_min", 0.05)
@@ -111,6 +142,8 @@ class FastWAMTrainingGuard:
         self._config = {
             "enabled": self.enabled,
             "zero_success_patience": self.zero_success_patience,
+            "break_even_patience": self.break_even_patience,
+            "break_even_guard_enabled": self.break_even_guard_enabled,
             "window_size": self.window_size,
             "eligible_idm_fraction_min": self.eligible_idm_fraction_min,
             "eligible_idm_fraction_max": self.eligible_idm_fraction_max,
@@ -122,6 +155,7 @@ class FastWAMTrainingGuard:
         }
         self._config_sha256 = _canonical_sha256(self._config)
         self._consecutive_zero_success_batches = 0
+        self._consecutive_break_even_below_cost = 0
         self._observed_runner_steps = 0
         self._pending_idm_fraction: float | None = None
         self._pending_gate_sample_count: int | None = None
@@ -136,6 +170,8 @@ class FastWAMTrainingGuard:
     def _validate_config(self) -> None:
         if self.zero_success_patience < 1:
             raise ValueError("zero_success_patience must be positive.")
+        if self.break_even_patience < 1:
+            raise ValueError("break_even_patience must be positive.")
         if self.window_size < 1:
             raise ValueError("window_size must be positive.")
         finite = {
@@ -149,10 +185,11 @@ class FastWAMTrainingGuard:
         }
         if any(not math.isfinite(value) for value in finite.values()):
             raise ValueError("FastWAM training guard thresholds must be finite.")
-        if (
-            not 0.0
+        if not (
+            0.0
             <= self.eligible_idm_fraction_min
-            < (self.eligible_idm_fraction_max <= 1.0)
+            < self.eligible_idm_fraction_max
+            <= 1.0
         ):
             raise ValueError("Eligible IDM fraction bounds must lie inside [0, 1].")
         if self.gate_entropy_min < 0.0:
@@ -223,6 +260,68 @@ class FastWAMTrainingGuard:
         self._pending_idm_fraction = idm_fraction
         self._pending_gate_sample_count = eligible_count
         self._pending_uncond_sample_count = uncond_count
+        break_even = None
+        configured_idm_cost = None
+        if self.break_even_guard_enabled:
+            missing_cost = [
+                index
+                for index, worker_metrics in enumerate(metrics_list)
+                if FASTWAM_CONFIGURED_COST_METRIC not in worker_metrics
+            ]
+            if missing_cost:
+                raise ValueError(
+                    "FastWAM break-even guard is missing configured-cost metrics "
+                    f"from workers {missing_cost}."
+                )
+            configured_costs = [
+                _finite_float(
+                    worker_metrics[FASTWAM_CONFIGURED_COST_METRIC],
+                    name="FastWAM configured IDM cost",
+                )
+                for worker_metrics in metrics_list
+            ]
+            configured_idm_cost = configured_costs[0]
+            if configured_idm_cost < 0.0 or any(
+                not math.isclose(
+                    value,
+                    configured_idm_cost,
+                    rel_tol=0.0,
+                    abs_tol=1.0e-12,
+                )
+                for value in configured_costs[1:]
+            ):
+                raise ValueError(
+                    "FastWAM configured IDM costs are invalid or disagree across "
+                    "actor workers."
+                )
+            break_even_values: list[float] = []
+            break_even_defined = True
+            for worker_metrics in metrics_list:
+                value = worker_metrics.get(FASTWAM_BREAK_EVEN_METRIC)
+                if value is None:
+                    break_even_defined = False
+                    continue
+                break_even_values.append(
+                    _finite_float(value, name="FastWAM break-even IDM cost")
+                )
+            if break_even_defined and break_even_values:
+                break_even = min(break_even_values)
+                if break_even < 0.0:
+                    raise ValueError("FastWAM break-even IDM cost is negative.")
+            below_cost = configured_idm_cost > 0.0 and (
+                break_even is None or break_even < configured_idm_cost
+            )
+            if below_cost:
+                self._consecutive_break_even_below_cost += 1
+            else:
+                self._consecutive_break_even_below_cost = 0
+            if self._consecutive_break_even_below_cost >= self.break_even_patience:
+                rendered = "undefined" if break_even is None else str(break_even)
+                raise RuntimeError(
+                    "FastWAM break-even IDM cost stayed below the configured cost "
+                    f"for {self._consecutive_break_even_below_cost} consecutive "
+                    f"rollouts: {rendered} < {configured_idm_cost}."
+                )
         if self._consecutive_zero_success_batches >= self.zero_success_patience:
             if self.zero_success_patience == 1:
                 raise RuntimeError(
@@ -243,6 +342,11 @@ class FastWAMTrainingGuard:
             "valid_uncond_chunk_count": uncond_count,
             "consecutive_zero_success_batches": (
                 self._consecutive_zero_success_batches
+            ),
+            "break_even_idm_cost": break_even,
+            "configured_idm_cost": configured_idm_cost,
+            "consecutive_break_even_below_cost": (
+                self._consecutive_break_even_below_cost
             ),
         }
 
@@ -336,6 +440,9 @@ class FastWAMTrainingGuard:
             "consecutive_zero_success_batches": (
                 self._consecutive_zero_success_batches
             ),
+            "consecutive_break_even_below_cost": (
+                self._consecutive_break_even_below_cost
+            ),
         }
 
     def state_dict(self) -> dict[str, Any]:
@@ -346,6 +453,9 @@ class FastWAMTrainingGuard:
             "config_sha256": self._config_sha256,
             "consecutive_zero_success_batches": (
                 self._consecutive_zero_success_batches
+            ),
+            "consecutive_break_even_below_cost": (
+                self._consecutive_break_even_below_cost
             ),
             "observed_runner_steps": self._observed_runner_steps,
             "pending_idm_fraction": self._pending_idm_fraction,
@@ -362,8 +472,14 @@ class FastWAMTrainingGuard:
         if state.get("config_sha256") != self._config_sha256:
             raise ValueError("FastWAM training guard config hash mismatch.")
         streak = int(state.get("consecutive_zero_success_batches", -1))
+        break_even_streak = int(state.get("consecutive_break_even_below_cost", -1))
         observed = int(state.get("observed_runner_steps", -1))
-        if streak < 0 or observed < 0:
+        if (
+            streak < 0
+            or break_even_streak < 0
+            or break_even_streak >= self.break_even_patience
+            or observed < 0
+        ):
             raise ValueError("FastWAM training guard counters are invalid.")
         history = state.get("history")
         if not isinstance(history, Mapping) or set(history) != set(self._history):
@@ -397,6 +513,7 @@ class FastWAMTrainingGuard:
             if pending_gate < 1 or pending_uncond < 0:
                 raise ValueError("Pending FastWAM route sample counts are invalid.")
         self._consecutive_zero_success_batches = streak
+        self._consecutive_break_even_below_cost = break_even_streak
         self._observed_runner_steps = observed
         self._pending_idm_fraction = pending
         self._pending_gate_sample_count = pending_gate

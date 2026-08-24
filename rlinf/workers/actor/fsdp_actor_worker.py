@@ -20,6 +20,7 @@ import time
 from collections import deque
 from concurrent.futures import Future, ThreadPoolExecutor
 from functools import partial
+from pathlib import Path
 from typing import Any, Optional
 
 import numpy as np
@@ -84,6 +85,9 @@ from rlinf.models.embodiment.base_policy import ForwardType
 from rlinf.models.embodiment.wam_policy.contracts import WAMRoute
 from rlinf.models.embodiment.wam_policy.critic import (
     critic_parent_checkpoint_sha256,
+)
+from rlinf.runners.fastwam_training_guard import (
+    append_fastwam_counterfactual_cost_audit_jsonl,
 )
 from rlinf.scheduler import Channel, Cluster, CommMapper, Worker
 from rlinf.utils.checkpoint_state import (
@@ -2182,13 +2186,23 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
                     rollout_epoch=int(self.cfg.env.train.rollout_epoch),
                     carry_pending_across_epochs=bool(self.cfg.env.train.auto_reset),
                 )
+                counterfactual_artifact = counterfactual_cost_audit.to_artifact()
                 print(
                     f"{FASTWAM_COUNTERFACTUAL_COST_AUDIT_SENTINEL} "
-                    + json.dumps(
-                        counterfactual_cost_audit.to_artifact(), sort_keys=True
-                    ),
+                    + json.dumps(counterfactual_artifact, sort_keys=True),
                     flush=True,
                 )
+                if self._rank == 0:
+                    audit_path = (
+                        Path(str(self.cfg.runner.logger.log_path))
+                        / str(self.cfg.runner.logger.experiment_name)
+                        / "audits/counterfactual_cost_audit.jsonl"
+                    )
+                    append_fastwam_counterfactual_cost_audit_jsonl(
+                        audit_path,
+                        runner_step=int(self.version),
+                        artifact=counterfactual_artifact,
+                    )
             if audit_enabled:
                 kv_cfg = self.cfg.actor.model.kv_replay
                 rollout_state_audit = summarize_fastwam_rollout_state(

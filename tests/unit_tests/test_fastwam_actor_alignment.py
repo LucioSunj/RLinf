@@ -397,6 +397,9 @@ def test_counterfactual_cost_audit_is_read_only_and_lowers_idm_advantage():
         for entry in artifact["entries"][1:]
     )
     metrics = audit.to_metrics()
+    assert audit.break_even_idm_cost is None
+    assert artifact["break_even_idm_cost"] is None
+    assert "fastwam/counterfactual/break_even_idm_cost" not in metrics
     assert metrics["fastwam/counterfactual/configured_idm_cost"] == 0.025
     assert metrics["fastwam/counterfactual/alignment_max_abs_error"] == 0.0
     assert metrics["fastwam/counterfactual/gate_advantage_normalized/count"] == 4.0

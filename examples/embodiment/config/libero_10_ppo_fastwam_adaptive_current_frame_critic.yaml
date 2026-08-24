@@ -65,6 +65,7 @@ runner:
     action_contract_violation_outcome: error
     gate_parameter_audit_interval_updates: 1
     zero_success_patience: 1
+    break_even_patience: 3
     window_size: 3
     eligible_idm_fraction_min: 0.05
     eligible_idm_fraction_max: 0.95

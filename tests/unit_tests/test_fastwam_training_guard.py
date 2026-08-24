@@ -16,19 +16,32 @@
 
 from __future__ import annotations
 
+import json
 import math
+from pathlib import Path
 
 import pytest
 from omegaconf import OmegaConf
 
-from rlinf.runners.fastwam_training_guard import FastWAMTrainingGuard
+from rlinf.algorithms.advantages import (
+    FastWAMCounterfactualCostAudit,
+    FastWAMCounterfactualCostEntry,
+    FastWAMScalarAudit,
+)
+from rlinf.runners.fastwam_training_guard import (
+    FastWAMTrainingGuard,
+    append_fastwam_counterfactual_cost_audit_jsonl,
+)
+
+FIXTURE_ROOT = Path(__file__).resolve().parents[1] / "fixtures"
 
 
-def _config(*, patience: int = 3):
+def _config(*, patience: int = 3, cost_audit: bool = False):
     return OmegaConf.create(
         {
             "enabled": True,
             "zero_success_patience": patience,
+            "break_even_patience": 3,
             "window_size": 3,
             "eligible_idm_fraction_min": 0.05,
             "eligible_idm_fraction_max": 0.95,
@@ -37,6 +50,7 @@ def _config(*, patience: int = 3):
             "gate_kl_single_max": 0.1,
             "gate_clip_median_max": 0.6,
             "gate_clip_single_max": 0.8,
+            "cost_audit": {"enabled": cost_audit},
         }
     )
 
@@ -91,11 +105,129 @@ def _training_metrics(
     ]
 
 
+def _scalar(total: float, count: int) -> FastWAMScalarAudit:
+    return FastWAMScalarAudit(
+        count=count,
+        finite_count=count,
+        nonfinite_count=0,
+        minimum=None,
+        maximum=None,
+        total=total,
+    )
+
+
+def _counterfactual_audit_from_v9_record(
+    record: dict[str, object],
+) -> FastWAMCounterfactualCostAudit:
+    placeholder = _scalar(0.0, 1)
+    entries = []
+    for key, idm_cost in (("zero", 0.0), ("max", record["max"]["idm_cost"])):
+        values = record[key]
+        entries.append(
+            FastWAMCounterfactualCostEntry(
+                idm_cost=float(idm_cost),
+                expected_cost_sum=0.0,
+                unnormalized_gate_advantage=placeholder,
+                normalized_gate_advantage=placeholder,
+                unnormalized_idm_gate_advantage=_scalar(
+                    float(values["idm_sum"]), int(values["idm_count"])
+                ),
+                normalized_idm_gate_advantage=placeholder,
+                unnormalized_uncond_gate_advantage=_scalar(
+                    float(values["uncond_sum"]), int(values["uncond_count"])
+                ),
+                normalized_uncond_gate_advantage=placeholder,
+                unnormalized_idm_delta_from_zero=placeholder,
+                normalized_idm_delta_from_zero=placeholder,
+            )
+        )
+    zero = record["zero"]
+    return FastWAMCounterfactualCostAudit(
+        configured_idm_cost=float(record["configured_idm_cost"]),
+        configured_alignment_max_abs_error=0.0,
+        eligible_gate_decision_count=int(zero["idm_count"]) + int(zero["uncond_count"]),
+        eligible_idm_decision_count=int(zero["idm_count"]),
+        eligible_uncond_decision_count=int(zero["uncond_count"]),
+        entries=tuple(entries),
+    )
+
+
 def test_positive_cost_guard_stops_first_zero_success_batch() -> None:
     guard = FastWAMTrainingGuard(_config(patience=1))
 
     with pytest.raises(RuntimeError, match="zero sparse-success"):
         guard.observe_rollout(_rollout_metrics(successes=0))
+
+
+def test_guard_rejects_inverted_eligible_idm_fraction_bounds() -> None:
+    invalid = _config()
+    invalid.eligible_idm_fraction_min = 0.9
+    invalid.eligible_idm_fraction_max = 0.5
+
+    with pytest.raises(ValueError, match="fraction bounds"):
+        FastWAMTrainingGuard(invalid)
+
+
+def test_v9_counterfactual_replay_triggers_break_even_guard_at_update_7() -> None:
+    fixture = json.loads(
+        (FIXTURE_ROOT / "fastwam_v9_counterfactual_break_even.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    records = fixture["records"]
+    assert len(records) == 21
+    assert [record["actor_version"] for record in records] == list(range(21))
+    audits = [_counterfactual_audit_from_v9_record(record) for record in records]
+    break_evens = [audit.break_even_idm_cost for audit in audits]
+    assert break_evens[0] == pytest.approx(0.022167795441826472)
+    assert break_evens[1] == pytest.approx(0.04514449758500185)
+    assert break_evens[3] is None
+    assert break_evens[5] == pytest.approx(0.02461735974379635)
+    assert break_evens[6] == pytest.approx(0.013035805397631172)
+    assert break_evens[7] == pytest.approx(0.005439436564658173)
+    assert break_evens[20] == pytest.approx(0.0037622571305554143)
+
+    guard = FastWAMTrainingGuard(_config(cost_audit=True))
+    trigger_version = None
+    for record, audit in zip(records, audits, strict=True):
+        rollout = _rollout_metrics(successes=1)
+        rollout[0].update(audit.to_metrics())
+        try:
+            guard.observe_rollout(rollout)
+        except RuntimeError as error:
+            assert "break-even IDM cost" in str(error)
+            trigger_version = record["actor_version"]
+            break
+        guard.observe_training(_training_metrics())
+        if record["actor_version"] == 6:
+            state = guard.state_dict()
+            resumed = FastWAMTrainingGuard(_config(cost_audit=True))
+            resumed.load_state_dict(state)
+            guard = resumed
+
+    assert trigger_version == 7
+
+
+def test_counterfactual_cost_audit_appends_full_jsonl_tables(tmp_path: Path) -> None:
+    path = tmp_path / "run/audits/counterfactual_cost_audit.jsonl"
+    artifact = {
+        "schema": "fastwam-counterfactual-cost-audit-v1",
+        "configured_idm_cost": 0.01,
+        "break_even_idm_cost": 0.0275,
+        "entries": [{"idm_cost": 0.0}, {"idm_cost": 0.1}],
+    }
+
+    append_fastwam_counterfactual_cost_audit_jsonl(
+        path, runner_step=0, artifact=artifact
+    )
+    append_fastwam_counterfactual_cost_audit_jsonl(
+        path, runner_step=1, artifact=artifact
+    )
+
+    rows = [json.loads(line) for line in path.read_text().splitlines()]
+    assert [row["runner_step"] for row in rows] == [0, 1]
+    assert all(row["entries"] == artifact["entries"] for row in rows)
+    assert all(row["break_even_idm_cost"] == 0.0275 for row in rows)
 
 
 def test_zero_cost_guard_state_round_trip_preserves_patience() -> None:
