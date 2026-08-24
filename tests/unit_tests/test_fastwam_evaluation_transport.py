@@ -25,6 +25,15 @@ from rlinf.data.embodied_io_struct import (
     EvaluationRolloutControl,
     RolloutResult,
 )
+from rlinf.envs.action_contract import (
+    DENORMALIZED_ACTION_STAGE,
+    GRIPPER_CONVERTED_ACTION_STAGE,
+    NORMALIZED_ACTION_STAGE,
+    PREPARED_LIBERO_ACTION_STAGE,
+    ActionExecutionTrace,
+    ActionStageStatistics,
+)
+from rlinf.envs.libero.action_contract import LiberoActionContract
 from rlinf.models.embodiment.wam_policy.contracts import (
     ChunkRouteRecord,
     GateDecisionRecord,
@@ -38,6 +47,7 @@ from rlinf.runners.fastwam_libero_eval_collector import EvaluationArtifactShard
 from rlinf.workers.env import env_worker as env_worker_module
 from rlinf.workers.env.env_worker import (
     EnvWorker,
+    FastWAMEvaluationActionContractViolation,
     _mark_terminal_gate_unused,
     _merge_evaluation_rollout_results,
 )
@@ -45,6 +55,51 @@ from rlinf.workers.rollout.hf.huggingface_worker import (
     MultiStepRolloutWorker,
     _build_evaluation_rollout_result,
 )
+
+
+def test_eval_collector_runtime_identity_is_not_hydra_instantiated(
+    monkeypatch,
+) -> None:
+    worker = object.__new__(EnvWorker)
+    worker._group_name = "EnvGroup"
+    worker._world_size = 1
+    worker._rank = 0
+    worker.only_eval = True
+    worker.broadcast = lambda *_args, **_kwargs: None
+    worker.update_env_cfg = lambda: None
+    worker.model_cfg = OmegaConf.create(
+        {
+            "eval_routing_mode": "learned_threshold",
+            "eval_idm_threshold": 0.5,
+            "eval_random_idm_probability": None,
+            "eval_routing_seed": 0,
+            "runtime": {
+                "_target_": "unit.RuntimeThatRequiresLiveModelObjects",
+            },
+        }
+    )
+    worker.cfg = OmegaConf.create(
+        {
+            "runner": {
+                "evaluation_collector": {
+                    "_target_": "unit.EvaluationCollector",
+                }
+            },
+            "env": {"eval": {"task_suite": "libero_10"}},
+        }
+    )
+
+    def _capture_instantiate(_config, **kwargs):
+        assert kwargs["_recursive_"] is False
+        assert (
+            kwargs["evaluation_runtime_identity"]["model"]["runtime"]["_target_"]
+            == "unit.RuntimeThatRequiresLiveModelObjects"
+        )
+        raise RuntimeError("collector instantiation captured")
+
+    monkeypatch.setattr(env_worker_module, "instantiate", _capture_instantiate)
+    with pytest.raises(RuntimeError, match="collector instantiation captured"):
+        worker.init_worker()
 
 
 def _records(
@@ -84,6 +139,56 @@ def _records(
         counterfactual_next_route=(probability >= 0.5).to(torch.long),
     )
     return route, emitted, selection
+
+
+def _action_contract() -> LiberoActionContract:
+    return LiberoActionContract(
+        low=(-1.0,) * 7,
+        high=(1.0,) * 7,
+        dimension_names=(
+            "delta_x",
+            "delta_y",
+            "delta_z",
+            "delta_axis_angle_x",
+            "delta_axis_angle_y",
+            "delta_axis_angle_z",
+            "gripper",
+        ),
+        gripper_dimension_index=6,
+        outer_environment_classes=("unit.OffScreenRenderEnv",),
+        underlying_environment_classes=("unit.LiberoTask",),
+        robot_class="unit.SingleArm",
+        robot_model="OnTheGroundPanda",
+        controller_class="unit.OperationalSpaceController",
+        controller_name="OSC_POSE",
+        controller_input_low=(-1.0,) * 6,
+        controller_input_high=(1.0,) * 6,
+        controller_output_low=(-0.05,) * 6,
+        controller_output_high=(0.05,) * 6,
+        gripper_class="unit.PandaGripper",
+        gripper_dof=1,
+        gripper_speed=0.01,
+        control_frequency_hz=20,
+        environment_horizon=1000,
+        dependency_versions=(("robosuite_version", "1.4.0"),),
+    )
+
+
+def _trace(stages: tuple[str, ...], values: torch.Tensor) -> ActionExecutionTrace:
+    contract = _action_contract()
+    return ActionExecutionTrace(
+        stages=tuple(
+            ActionStageStatistics.from_values(
+                stage=stage,
+                values=values,
+                low=contract.low,
+                high=contract.high,
+                gripper_dimension_index=contract.gripper_dimension_index,
+                action_contract_sha256=contract.canonical_sha256,
+            )
+            for stage in stages
+        )
+    )
 
 
 def test_compact_eval_result_keeps_only_actions_and_typed_route_metadata() -> None:
@@ -314,6 +419,224 @@ def test_env_evaluate_step_propagates_outcomes_into_next_reset_mask(
     assert torch.equal(env_output.truncations, worker.eval_env_list[0].truncations)
     assert torch.equal(env_output.rewards, worker.eval_env_list[0].rewards)
     assert next_input["fastwam_reset_mask"].tolist() == [False, True]
+
+
+def test_env_evaluate_step_rejects_entire_invalid_chunk_before_env_step(
+    monkeypatch,
+) -> None:
+    class RejectingEnv:
+        action_contract = _action_contract()
+
+        def __init__(self) -> None:
+            self.chunk_step_calls = 0
+
+        def chunk_step_with_action_trace(self, *_args, **_kwargs):
+            self.chunk_step_calls += 1
+            raise AssertionError("invalid Action reached the environment")
+
+    worker = object.__new__(EnvWorker)
+    worker.cfg = OmegaConf.create(
+        {"env": {"eval": {"env_type": "libero", "auto_reset": True}}}
+    )
+    worker.model_cfg = OmegaConf.create(
+        {
+            "model_type": "fastwam_adaptive",
+            "num_action_chunks": 2,
+            "action_dim": 7,
+        }
+    )
+    env = RejectingEnv()
+    worker.eval_env_list = [env]
+    worker.evaluation_collector = object()
+    monkeypatch.setattr(
+        env_worker_module,
+        "prepare_actions",
+        lambda raw_chunk_actions, **_kwargs: raw_chunk_actions,
+    )
+    actions = np.zeros((1, 2, 7), dtype=np.float32)
+    actions[0, 1, 0] = 7.207030773162842
+
+    with pytest.raises(FastWAMEvaluationActionContractViolation) as caught:
+        worker.env_evaluate_step(actions, stage_id=0, active_mask=(True,))
+
+    assert env.chunk_step_calls == 0
+    assert caught.value.rejected_mask == (True,)
+    assert caught.value.prepared_actions[0, 1, 0] == pytest.approx(7.207030773162842)
+
+
+def test_contract_violation_records_route_before_abort_and_resets_episode() -> None:
+    events = []
+
+    class Collector:
+        continues_after_contract_violation = True
+
+        def record_contract_violation(self, **kwargs) -> None:
+            events.append(("record", kwargs))
+
+    class AbortEnv:
+        action_contract = _action_contract()
+        task_ids = [884]
+        trial_ids = [0]
+        reset_state_ids = [44200]
+
+        def abort_eval_episodes(self, active_mask):
+            events.append(("abort", tuple(active_mask)))
+            obs = {
+                "states": torch.zeros(1, 3),
+                "task_descriptions": ["next"],
+            }
+            infos = {
+                "final_observation": obs,
+                "final_info": {"episode": {"success_once": torch.tensor([False])}},
+                "_final_observation": np.asarray([True]),
+            }
+            return obs, infos, np.asarray([True])
+
+    worker = object.__new__(EnvWorker)
+    worker.evaluation_collector = Collector()
+    worker.eval_num_envs_per_stage = 1
+    worker.eval_env_list = [AbortEnv()]
+    worker.model_cfg = OmegaConf.create({"num_action_chunks": 2})
+    worker._rank = 0
+    values = torch.zeros(1, 2, 7)
+    model_trace = _trace(
+        (
+            NORMALIZED_ACTION_STAGE,
+            DENORMALIZED_ACTION_STAGE,
+            GRIPPER_CONVERTED_ACTION_STAGE,
+        ),
+        values,
+    )
+    prepared_values = values.clone()
+    prepared_values[0, 1, 0] = 7.207030773162842
+    prepared = _trace(
+        (PREPARED_LIBERO_ACTION_STAGE,),
+        prepared_values,
+    ).stages[0]
+    route, emitted, selection = _records(
+        routes=(1,),
+        forced=(True,),
+        chunk_ids=(0,),
+        episode_ids=(0,),
+        source_chunk_ids=(-1,),
+    )
+    result = RolloutResult(
+        actions=prepared_values,
+        route_info=route,
+        emitted_gate=emitted,
+        evaluation_selection=selection,
+        action_execution_trace=model_trace,
+    )
+    error = FastWAMEvaluationActionContractViolation(
+        "rejected",
+        prepared_actions=prepared_values.numpy(),
+        prepared_statistics=prepared,
+        action_contract=_action_contract(),
+        rejected_mask=(True,),
+    )
+    snapshot = type("Snapshot", (), {"active_mask": (True,)})()
+
+    env_output, env_info, aligned = worker._record_evaluation_action_contract_violation(
+        error=error,
+        stage_id=0,
+        snapshot=snapshot,
+        rollout_result=result,
+        policy_latency_seconds=0.1,
+        environment_started_at=env_worker_module.time.perf_counter(),
+    )
+
+    assert [event[0] for event in events] == ["record", "abort"]
+    recorded = events[0][1]
+    violation = recorded["failure_audit"]["violations"][0]
+    assert violation["task_id"] == 884
+    assert violation["reset_state_id"] == 44200
+    assert violation["route_metadata"]["route"] == "IDM"
+    assert violation["route_metadata"]["chunk_id"] == 0
+    assert violation["first_invalid_primitive_index"] == 1
+    assert violation["first_invalid_prepared_value"] == pytest.approx(7.207030773162842)
+    assert aligned.emitted_gate.valid.tolist() == [False]
+    assert env_output.dones.tolist() == [True]
+    assert env_output.truncations[:, -1].tolist() == [True]
+    assert env_info["success_once"].tolist() == [False]
+
+
+def test_contract_violation_raise_mode_preserves_original_error_and_audit(
+    capsys,
+) -> None:
+    events = []
+
+    class Collector:
+        continues_after_contract_violation = False
+
+        def record_contract_violation(self, **kwargs) -> None:
+            events.append(("record", kwargs))
+
+    class AbortEnv:
+        action_contract = _action_contract()
+        task_ids = [884]
+        trial_ids = [0]
+        reset_state_ids = [44200]
+
+        def abort_eval_episodes(self, _active_mask):
+            raise AssertionError("raise mode must not advance the environment")
+
+    worker = object.__new__(EnvWorker)
+    worker.evaluation_collector = Collector()
+    worker.eval_num_envs_per_stage = 1
+    worker.eval_env_list = [AbortEnv()]
+    worker.model_cfg = OmegaConf.create({"num_action_chunks": 2})
+    worker._rank = 0
+    values = torch.zeros(1, 2, 7)
+    model_trace = _trace(
+        (
+            NORMALIZED_ACTION_STAGE,
+            DENORMALIZED_ACTION_STAGE,
+            GRIPPER_CONVERTED_ACTION_STAGE,
+        ),
+        values,
+    )
+    prepared_values = values.clone()
+    prepared_values[0, 1, 0] = 7.207030773162842
+    prepared = _trace((PREPARED_LIBERO_ACTION_STAGE,), prepared_values).stages[0]
+    route, emitted, selection = _records(
+        routes=(1,),
+        forced=(True,),
+        chunk_ids=(0,),
+        episode_ids=(0,),
+        source_chunk_ids=(-1,),
+    )
+    result = RolloutResult(
+        actions=prepared_values,
+        route_info=route,
+        emitted_gate=emitted,
+        evaluation_selection=selection,
+        action_execution_trace=model_trace,
+    )
+    error = FastWAMEvaluationActionContractViolation(
+        "original exact-contract rejection",
+        prepared_actions=prepared_values.numpy(),
+        prepared_statistics=prepared,
+        action_contract=_action_contract(),
+        rejected_mask=(True,),
+    )
+    snapshot = type("Snapshot", (), {"active_mask": (True,)})()
+
+    with pytest.raises(
+        FastWAMEvaluationActionContractViolation,
+        match="original exact-contract rejection",
+    ) as caught:
+        worker._record_evaluation_action_contract_violation(
+            error=error,
+            stage_id=0,
+            snapshot=snapshot,
+            rollout_result=result,
+            policy_latency_seconds=0.1,
+            environment_started_at=env_worker_module.time.perf_counter(),
+        )
+
+    assert caught.value is error
+    assert [event[0] for event in events] == ["record"]
+    assert "FASTWAM_EVALUATION_ACTION_FAILURE" in capsys.readouterr().out
 
 
 def _emit_uncond(

@@ -37,6 +37,7 @@ if TYPE_CHECKING:
 from rlinf.envs.action_contract import (
     SUBMITTED_LIBERO_ACTION_STAGE,
     ActionStageStatistics,
+    validate_action_stage_contract,
 )
 from rlinf.envs.libero.action_contract import (
     LiberoActionContract,
@@ -1144,49 +1145,11 @@ class LiberoEnv(gym.Env):
         contract: LiberoActionContract,
     ) -> None:
         """Reject invalid active-slot Actions before the underlying env step."""
-
-        invalid = (
-            (statistics.finite_count != statistics.total_value_count)
-            | (statistics.below_low_count > 0)
-            | (statistics.above_high_count > 0)
-        )
-        if not bool(invalid.any()):
-            return
-        violations = []
-        for batch_index, dimension_index in invalid.nonzero(as_tuple=False).tolist():
-            finite_count = int(statistics.finite_count[batch_index, dimension_index])
-            violations.append(
-                {
-                    "environment_index": int(batch_index),
-                    "dimension_index": int(dimension_index),
-                    "dimension_name": contract.dimension_names[dimension_index],
-                    "minimum": (
-                        float(statistics.minimum[batch_index, dimension_index])
-                        if finite_count
-                        else None
-                    ),
-                    "maximum": (
-                        float(statistics.maximum[batch_index, dimension_index])
-                        if finite_count
-                        else None
-                    ),
-                    "low": float(contract.low[dimension_index]),
-                    "high": float(contract.high[dimension_index]),
-                    "finite_count": finite_count,
-                    "total_value_count": int(
-                        statistics.total_value_count[batch_index, dimension_index]
-                    ),
-                    "below_low_count": int(
-                        statistics.below_low_count[batch_index, dimension_index]
-                    ),
-                    "above_high_count": int(
-                        statistics.above_high_count[batch_index, dimension_index]
-                    ),
-                }
-            )
-        raise ValueError(
-            "Refusing to submit Action values outside the exact live LIBERO "
-            f"contract: {violations}. No clamp was applied."
+        validate_action_stage_contract(
+            statistics,
+            dimension_names=contract.dimension_names,
+            low=contract.low,
+            high=contract.high,
         )
 
     def step(self, actions=None, auto_reset=True, active_mask=None):
@@ -1482,6 +1445,33 @@ class LiberoEnv(gym.Env):
         reset_infos["_final_observation"] = failures
         reset_infos["_elapsed_steps"] = failures
         return obs, reset_infos
+
+    def abort_eval_episodes(self, active_mask):
+        """Fail and reset selected eval episodes without submitting an Action."""
+
+        if not self.is_eval or not self.auto_reset:
+            raise RuntimeError(
+                "Action-contract episode abort requires auto-reset evaluation."
+            )
+        mask = self._normalize_active_mask(active_mask, batch_size=self.num_envs)
+        if not mask.any():
+            raise ValueError("Action-contract episode abort selected no environment.")
+        if self.current_raw_obs is None:
+            raise RuntimeError("Cannot abort an evaluation episode before reset.")
+        final_obs = self._wrap_obs(self.current_raw_obs)
+        infos: dict = {}
+        self._record_metrics(
+            np.zeros(self.num_envs, dtype=np.float32),
+            np.zeros(self.num_envs, dtype=bool),
+            infos,
+        )
+        obs, reset_infos, count_mask = self._handle_eval_auto_reset(
+            mask,
+            final_obs,
+            infos,
+        )
+        reset_infos["fastwam_contract_violation"] = np.asarray(mask, dtype=bool)
+        return obs, reset_infos, count_mask
 
     def _handle_eval_auto_reset(self, dones, _final_obs, infos):
         final_obs = copy.deepcopy(_final_obs)
