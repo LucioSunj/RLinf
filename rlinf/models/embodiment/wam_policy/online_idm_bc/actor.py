@@ -24,11 +24,18 @@ import torch
 from hydra.utils import get_class
 
 from rlinf.models.embodiment.wam_policy.adaptive_policy import FastWAMAdaptivePolicy
+from rlinf.models.embodiment.wam_policy.contracts import WAMRoute
 from rlinf.scheduler import Worker
+from rlinf.utils.nested_dict_process import put_tensor_device
+from rlinf.utils.utils import get_rng_state, set_rng_state
 from rlinf.workers.actor.fastwam_selective_sync import prepare_fastwam_sync_tensors
 from rlinf.workers.actor.fsdp_actor_worker import EmbodiedFSDPActor
 
-from .config import ONLINE_IDM_BC_FLOW_VALID, OnlineIDMBCConfig
+from .config import (
+    ONLINE_IDM_BC_FLOW_VALID,
+    ONLINE_IDM_BC_TEACHER_PRESENT,
+    OnlineIDMBCConfig,
+)
 from .policy import OnlineIDMBCFastWAMPolicy
 
 _ONLINE_BC_OUTPUT_KEYS = {
@@ -208,6 +215,87 @@ def audit_online_idm_bc_gradient_ownership(
     }
 
 
+def audit_online_idm_bc_backward_gradient_ownership(
+    *,
+    optimizer: torch.optim.Optimizer,
+    policy: OnlineIDMBCFastWAMPolicy,
+) -> dict[str, float]:
+    """Audit one completed BC-only backward through FSDP optimizer groups."""
+
+    groups = {str(group.get("name", "")): group for group in optimizer.param_groups}
+    expected_groups = {"gate", "uncond_lora", "value_head"}
+    if set(groups) != expected_groups:
+        raise RuntimeError(
+            "Online IDM BC gradient audit requires the existing Gate, UNCOND LoRA, "
+            "and value-head optimizer groups."
+        )
+    group_parameters = {name: tuple(group["params"]) for name, group in groups.items()}
+    lora_parameters = tuple(policy.lora_adapter.lora_parameters())
+    gate_parameters = tuple(
+        parameter for parameter in policy.gate.parameters() if parameter.requires_grad
+    )
+    critic_parameters = (
+        ()
+        if policy.critic is None
+        else tuple(
+            parameter
+            for parameter in policy.critic.parameters()
+            if parameter.requires_grad
+        )
+    )
+    expected_parameter_ids = {
+        "uncond_lora": {id(parameter) for parameter in lora_parameters},
+        "gate": {id(parameter) for parameter in gate_parameters},
+        "value_head": {id(parameter) for parameter in critic_parameters},
+    }
+    for name, parameters in group_parameters.items():
+        if {id(parameter) for parameter in parameters} != expected_parameter_ids[name]:
+            raise RuntimeError(
+                f"Online IDM BC optimizer ownership differs for group {name!r}."
+            )
+
+    lora_ids = expected_parameter_ids["uncond_lora"]
+    for parameter in policy.actor.parameters():
+        if id(parameter) in lora_ids:
+            continue
+        if parameter.requires_grad:
+            raise RuntimeError(
+                "Online IDM BC found trainable frozen/base actor parameters."
+            )
+        if parameter.grad is not None:
+            raise RuntimeError("Online IDM BC wrote a frozen/base actor gradient.")
+
+    nonzero_counts: dict[str, int] = {}
+    for name, parameters in group_parameters.items():
+        nonzero = 0
+        for parameter in parameters:
+            gradient = parameter.grad
+            if gradient is None:
+                continue
+            if not bool(torch.isfinite(gradient).all().item()):
+                raise FloatingPointError(
+                    f"Online IDM BC produced a non-finite {name} gradient."
+                )
+            nonzero += int(bool((gradient != 0).any().item()))
+        nonzero_counts[name] = nonzero
+    if nonzero_counts["uncond_lora"] == 0:
+        raise RuntimeError("Online IDM BC produced no nonzero LoRA gradient.")
+    if nonzero_counts["gate"] or nonzero_counts["value_head"]:
+        raise RuntimeError("Online IDM BC gradient escaped into Gate or critic state.")
+    return {
+        "online_idm_bc/gradient_audit_pass": 1.0,
+        "online_idm_bc/gradient_audit_lora_parameter_count": float(
+            len(group_parameters["uncond_lora"])
+        ),
+        "online_idm_bc/gradient_audit_lora_nonzero_count": float(
+            nonzero_counts["uncond_lora"]
+        ),
+        "online_idm_bc/gradient_audit_gate_nonzero_count": 0.0,
+        "online_idm_bc/gradient_audit_critic_nonzero_count": 0.0,
+        "online_idm_bc/gradient_audit_base_trainable_count": 0.0,
+    }
+
+
 class OnlineIDMBCFSDPActor(EmbodiedFSDPActor):
     """Select the online policy and add its BC numerator to the actor loss."""
 
@@ -218,6 +306,8 @@ class OnlineIDMBCFSDPActor(EmbodiedFSDPActor):
         if not self.online_idm_bc_config.enabled:
             raise ValueError("Online IDM BC actor requires `enabled: true`.")
         self._online_idm_bc_gradient_audit_complete = False
+        self._online_idm_bc_audit_micro_batch: dict[str, Any] | None = None
+        self._online_idm_bc_audit_metrics: dict[str, float] | None = None
         super().__init__(cfg)
 
     def model_provider_func(self) -> OnlineIDMBCFastWAMPolicy:
@@ -266,6 +356,18 @@ class OnlineIDMBCFSDPActor(EmbodiedFSDPActor):
         forward_inputs[ONLINE_IDM_BC_FLOW_VALID] = micro_batch["flow_valid_mask"]
         online_batch: dict[str, Any] = dict(micro_batch)
         online_batch["forward_inputs"] = forward_inputs
+        if (
+            not self._online_idm_bc_gradient_audit_complete
+            and self._online_idm_bc_audit_micro_batch is None
+        ):
+            routes = online_batch["route_info"].route_used.reshape(-1)
+            flow_valid = online_batch["flow_valid_mask"].bool().reshape(-1)
+            teacher_present = (
+                forward_inputs[ONLINE_IDM_BC_TEACHER_PRESENT].bool().reshape(-1)
+            )
+            selected = flow_valid & (routes == int(WAMRoute.UNCOND)) & teacher_present
+            if bool(selected.any().item()):
+                self._online_idm_bc_audit_micro_batch = online_batch
         super().train_micro_batch(
             online_batch,
             metrics,
@@ -296,20 +398,88 @@ class OnlineIDMBCFSDPActor(EmbodiedFSDPActor):
             metric_scale_numerator=float(self.gradient_accumulation * self._world_size),
             flow_metric_loss=float(metrics.get("uncond_flow/total_loss", 0.0)),
         )
-        if (
-            not self._online_idm_bc_gradient_audit_complete
-            and float(output_dict["online_idm_bc_selected_count"].item()) > 0.0
-        ):
-            online_metrics.update(
-                audit_online_idm_bc_gradient_ownership(
-                    bc_loss=(
-                        float(self.online_idm_bc_config.loss_weight)
-                        * output_dict["online_idm_bc_loss_sum"].float()
-                    ),
-                    policy=self._fastwam_policy_module(),
-                )
-            )
-            self._online_idm_bc_gradient_audit_complete = True
         metrics.update(online_metrics)
         metrics["fastwam/total_loss"] = float(total_loss.detach().item())
         return total_loss, metrics
+
+    def _run_online_idm_bc_gradient_audit(self) -> dict[str, float]:
+        """Run one side-effect-free BC-only backward after the real update."""
+
+        pending = self._online_idm_bc_audit_micro_batch
+        if pending is None:
+            raise RuntimeError("Online IDM BC gradient audit has no eligible batch.")
+        micro_batch = put_tensor_device(pending, self.device)
+        forward_inputs = dict(micro_batch["forward_inputs"])
+        emitted_gate = micro_batch["emitted_gate"]
+        if "gate_kv_denoise_timesteps" in forward_inputs:
+            if emitted_gate.kv_metadata is None:
+                raise ValueError("Stored Gate K/V replay requires K/V metadata.")
+            forward_inputs["gate_kv_layer_indices"] = torch.tensor(
+                emitted_gate.kv_metadata.layer_indices,
+                dtype=torch.long,
+                device=self.device,
+            )
+
+        rng_state = get_rng_state()
+        self.optimizer.zero_grad()
+        try:
+            with self.amp_context:
+                output_dict = self.model(
+                    forward_inputs=forward_inputs,
+                    compute_logprobs=True,
+                    compute_entropy=True,
+                    compute_values=self.cfg.algorithm.adv_type == "gae",
+                    use_cache=False,
+                    route_info=micro_batch["route_info"],
+                    emitted_gate=emitted_gate,
+                    compute_base_logprobs=False,
+                )
+            if float(output_dict["online_idm_bc_selected_count"].item()) <= 0.0:
+                raise RuntimeError(
+                    "Online IDM BC audit batch lost its eligible UNCOND sample."
+                )
+            bc_loss = (
+                float(self.online_idm_bc_config.loss_weight)
+                * output_dict["online_idm_bc_loss_sum"].float()
+            )
+            bc_loss.backward()
+            restored_handles = (
+                self._restore_fastwam_fsdp_parameter_views_after_backward()
+            )
+            metrics = audit_online_idm_bc_backward_gradient_ownership(
+                optimizer=self.optimizer,
+                policy=self._fastwam_policy_module(),
+            )
+            metrics["online_idm_bc/gradient_audit_fsdp_view_restore_handles"] = float(
+                restored_handles
+            )
+            self._online_idm_bc_gradient_audit_complete = True
+            return metrics
+        finally:
+            self.optimizer.zero_grad()
+            set_rng_state(rng_state)
+            self._online_idm_bc_audit_micro_batch = None
+
+    def optimizer_step(self) -> tuple[float, list[float]]:
+        """Preserve the real step, then run the one-shot isolated BC audit."""
+
+        result = super().optimizer_step()
+        if (
+            not self._online_idm_bc_gradient_audit_complete
+            and self._online_idm_bc_audit_micro_batch is not None
+        ):
+            self._online_idm_bc_audit_metrics = self._run_online_idm_bc_gradient_audit()
+        return result
+
+    def _optimizer_metrics(
+        self,
+        grad_norm: float,
+        lr_list: list[float],
+    ) -> dict[str, float]:
+        """Attach one-shot BC ownership evidence to normal optimizer metrics."""
+
+        metrics = super()._optimizer_metrics(grad_norm, lr_list)
+        if self._online_idm_bc_audit_metrics is not None:
+            metrics.update(self._online_idm_bc_audit_metrics)
+            self._online_idm_bc_audit_metrics = None
+        return metrics

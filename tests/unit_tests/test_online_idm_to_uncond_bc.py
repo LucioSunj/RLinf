@@ -16,15 +16,19 @@
 
 from __future__ import annotations
 
+import os
 from copy import deepcopy
 from pathlib import Path
 from types import MethodType, SimpleNamespace
 
 import pytest
 import torch
+import torch.distributed as dist
 from hydra import compose, initialize_config_dir
 from omegaconf import OmegaConf
 from torch import nn
+from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
+from torch.distributed.fsdp import ShardingStrategy
 
 from rlinf.models.embodiment.wam_policy.adaptive_policy import (
     FastWAMAdaptivePolicy,
@@ -35,6 +39,7 @@ from rlinf.models.embodiment.wam_policy.contracts import ChunkRouteRecord, WAMRo
 from rlinf.models.embodiment.wam_policy.libero_runtime import LiberoFastWAMRuntime
 from rlinf.models.embodiment.wam_policy.online_idm_bc.actor import (
     assemble_online_idm_bc_loss,
+    audit_online_idm_bc_backward_gradient_ownership,
     audit_online_idm_bc_gradient_ownership,
 )
 from rlinf.models.embodiment.wam_policy.online_idm_bc.config import (
@@ -74,6 +79,43 @@ class _TinyLoRAAdapter:
 
     def lora_parameters(self):
         return iter((self.actor.lora,))
+
+
+class _FSDPAuditActor(nn.Module):
+    def __init__(self) -> None:
+        super().__init__()
+        self.base = nn.Linear(4, 4, bias=False).requires_grad_(False)
+        self.lora_a = nn.Linear(4, 2, bias=False)
+        self.lora_b = nn.Linear(2, 4, bias=False)
+        nn.init.zeros_(self.lora_b.weight)
+
+
+class _FSDPAuditAdapter:
+    def __init__(self, actor: _FSDPAuditActor) -> None:
+        self.actor = actor
+
+    def lora_parameters(self):
+        return iter(
+            (
+                self.actor.lora_a.weight,
+                self.actor.lora_b.weight,
+            )
+        )
+
+
+class _FSDPAuditPolicy(nn.Module):
+    def __init__(self) -> None:
+        super().__init__()
+        self.actor = _FSDPAuditActor()
+        self.lora_adapter = _FSDPAuditAdapter(self.actor)
+        self.gate = nn.Linear(4, 1, bias=False)
+        self.critic = nn.Linear(4, 1, bias=False)
+
+    def forward(self, inputs: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        frozen = self.actor.base(inputs)
+        bc_output = frozen + self.actor.lora_b(self.actor.lora_a(inputs))
+        escaped_output = self.gate(inputs) + self.critic(inputs)
+        return bc_output, escaped_output
 
 
 class _FlowScheduler:
@@ -408,3 +450,98 @@ def test_policy_rewrap_preserves_state_and_bc_gradient_ownership() -> None:
             bc_loss=escaped_loss,
             policy=wrapped,
         )
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is unavailable")
+def test_gradient_audit_reads_completed_fsdp_backward_optimizer_groups() -> None:
+    """Audit FSDP gradients after backward instead of its disconnected originals."""
+
+    owns_process_group = not dist.is_initialized()
+    if owns_process_group:
+        os.environ.setdefault("MASTER_ADDR", "127.0.0.1")
+        os.environ.setdefault("MASTER_PORT", "29584")
+        dist.init_process_group("nccl", rank=0, world_size=1)
+        torch.cuda.set_device(0)
+    try:
+        policy = _FSDPAuditPolicy().cuda()
+        wrapped = FSDP(
+            module=policy,
+            sharding_strategy=ShardingStrategy.NO_SHARD,
+            use_orig_params=True,
+            device_id=torch.cuda.current_device(),
+            ignored_states=tuple(
+                parameter
+                for parameter in policy.parameters()
+                if not parameter.requires_grad
+            ),
+        )
+        lora_parameters = tuple(policy.lora_adapter.lora_parameters())
+        optimizer = torch.optim.AdamW(
+            [
+                {
+                    "name": "gate",
+                    "params": list(policy.gate.parameters()),
+                },
+                {
+                    "name": "uncond_lora",
+                    "params": list(lora_parameters),
+                },
+                {
+                    "name": "value_head",
+                    "params": list(policy.critic.parameters()),
+                },
+            ],
+            lr=1.0e-4,
+        )
+        bc_output, _ = wrapped(torch.randn(3, 4, device="cuda"))
+        bc_loss = bc_output.square().mean()
+        bc_loss.backward()
+        metrics = audit_online_idm_bc_backward_gradient_ownership(
+            optimizer=optimizer,
+            policy=policy,
+        )
+        assert metrics["online_idm_bc/gradient_audit_pass"] == 1.0
+        assert metrics["online_idm_bc/gradient_audit_lora_nonzero_count"] == 1.0
+        assert lora_parameters[0].grad is not None
+        assert lora_parameters[1].grad is not None
+        assert torch.count_nonzero(lora_parameters[1].grad).item() > 0
+
+        escaped_policy = _FSDPAuditPolicy().cuda()
+        escaped_wrapped = FSDP(
+            module=escaped_policy,
+            sharding_strategy=ShardingStrategy.NO_SHARD,
+            use_orig_params=True,
+            device_id=torch.cuda.current_device(),
+            ignored_states=tuple(
+                parameter
+                for parameter in escaped_policy.parameters()
+                if not parameter.requires_grad
+            ),
+        )
+        escaped_bc, escaped_other = escaped_wrapped(torch.randn(3, 4, device="cuda"))
+        escaped_optimizer = torch.optim.AdamW(
+            [
+                {
+                    "name": "gate",
+                    "params": list(escaped_policy.gate.parameters()),
+                },
+                {
+                    "name": "uncond_lora",
+                    "params": list(escaped_policy.lora_adapter.lora_parameters()),
+                },
+                {
+                    "name": "value_head",
+                    "params": list(escaped_policy.critic.parameters()),
+                },
+            ],
+            lr=1.0e-4,
+        )
+        (escaped_bc.square().mean() + escaped_other.square().mean()).backward()
+        with pytest.raises(RuntimeError, match="escaped"):
+            audit_online_idm_bc_backward_gradient_ownership(
+                optimizer=escaped_optimizer,
+                policy=escaped_policy,
+            )
+    finally:
+        if owns_process_group:
+            dist.destroy_process_group()
