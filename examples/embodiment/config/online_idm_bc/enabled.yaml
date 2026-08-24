@@ -1,0 +1,22 @@
+# @package _global_
+
+algorithm:
+  uncond_idm_bc:
+    enabled: true
+    loss_weight: 0.2
+
+online_idm_bc_implementation:
+  actor_target: rlinf.models.embodiment.wam_policy.online_idm_bc.actor.OnlineIDMBCFSDPActor
+  policy_target: rlinf.models.embodiment.wam_policy.online_idm_bc.policy.OnlineIDMBCFastWAMPolicy
+
+actor:
+  model:
+    formal_training_sampling_seed: ${actor.seed}
+    runtime:
+      _target_: rlinf.models.embodiment.wam_policy.online_idm_bc.runtime.OnlineIDMTeacherLiberoRuntime
+
+rollout:
+  model:
+    formal_training_sampling_seed: ${actor.seed}
+    runtime:
+      _target_: rlinf.models.embodiment.wam_policy.online_idm_bc.runtime.OnlineIDMTeacherLiberoRuntime
