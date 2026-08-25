@@ -42,6 +42,9 @@ runner:
     # Preserve the preregistered protocol unless an explicit diagnostic run
     # requests the official evaluator's fixed-per-episode reseeding.
     noise_seed_mode: stateless_per_chunk
+    contract_violation_outcome: raise
+    resume: false
+    policy_checkpoint_sha256: null
 
 env:
   group_name: EnvGroup

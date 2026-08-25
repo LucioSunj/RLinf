@@ -20,12 +20,14 @@ import hashlib
 import json
 import math
 import os
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
 import numpy as np
 import torch
+from omegaconf import OmegaConf
 
 from rlinf.data.embodied_io_struct import (
     EnvOutput,
@@ -45,7 +47,10 @@ LEDGER_SCHEMA_V2 = "fastwam-libero-eval-ledger-v2"
 LEDGER_SCHEMAS = {LEDGER_SCHEMA_V1, LEDGER_SCHEMA_V2}
 CHUNK_SCHEMA = "fastwam-libero-eval-chunk-v2"
 EPISODE_SCHEMA = "fastwam-libero-eval-episode-v1"
+COMPLETED_EPISODE_SCHEMA = "fastwam-libero-eval-completed-episode-v1"
+PROGRESS_SCHEMA = "fastwam-libero-eval-progress-v1"
 NOISE_SEED_MODES = {"stateless_per_chunk", "fixed_per_episode"}
+CONTRACT_VIOLATION_OUTCOMES = {"raise", "fail_episode"}
 _IDENTITY_FIELDS_V1 = (
     "task_suite",
     "task_id",
@@ -93,6 +98,14 @@ def _sha256_file(path: Path) -> str:
         for chunk in iter(lambda: handle.read(1024 * 1024), b""):
             digest.update(chunk)
     return digest.hexdigest()
+
+
+def _valid_sha256(value: str | None) -> bool:
+    return (
+        isinstance(value, str)
+        and len(value) == 64
+        and all(character in "0123456789abcdef" for character in value)
+    )
 
 
 def _load_ledger(path: Path) -> dict[str, Any]:
@@ -255,6 +268,10 @@ class FastWAMLiberoEvalCollector:
         routing_seed: int,
         fixed_idm_cost: float,
         noise_seed_mode: str = "stateless_per_chunk",
+        contract_violation_outcome: str = "raise",
+        resume: bool = False,
+        policy_checkpoint_sha256: str | None = None,
+        evaluation_runtime_identity: Mapping[str, Any] | None = None,
     ) -> None:
         self.output_dir = Path(output_dir).expanduser().resolve()
         self.output_dir.mkdir(parents=True, exist_ok=True)
@@ -272,12 +289,52 @@ class FastWAMLiberoEvalCollector:
         self.routing_seed = int(routing_seed)
         self.fixed_idm_cost = float(fixed_idm_cost)
         self.noise_seed_mode = str(noise_seed_mode)
+        self.contract_violation_outcome = str(contract_violation_outcome)
+        self.resume = bool(resume)
+        self.policy_checkpoint_sha256 = (
+            None if policy_checkpoint_sha256 is None else str(policy_checkpoint_sha256)
+        )
+        if evaluation_runtime_identity is None:
+            self.evaluation_runtime_identity = None
+        elif not isinstance(evaluation_runtime_identity, Mapping):
+            raise TypeError("Evaluation runtime identity must be a mapping.")
+        else:
+            # Canonical JSON round-tripping validates nested values and removes
+            # OmegaConf container subclasses before persistence/comparison.
+            identity_container = OmegaConf.to_container(
+                OmegaConf.create(evaluation_runtime_identity),
+                resolve=True,
+                enum_to_str=True,
+            )
+            self.evaluation_runtime_identity = json.loads(
+                _canonical_bytes(identity_container)
+            )
         if self.noise_seed_mode not in NOISE_SEED_MODES:
             raise ValueError(
                 f"Unsupported FastWAM evaluation noise seed mode {noise_seed_mode!r}."
             )
         if not math.isfinite(self.fixed_idm_cost) or self.fixed_idm_cost < 0:
             raise ValueError("fixed_idm_cost must be finite and non-negative.")
+        if self.contract_violation_outcome not in CONTRACT_VIOLATION_OUTCOMES:
+            raise ValueError(
+                "contract_violation_outcome must be 'raise' or 'fail_episode'."
+            )
+        if self.policy_checkpoint_sha256 is not None and not _valid_sha256(
+            self.policy_checkpoint_sha256
+        ):
+            raise ValueError("policy_checkpoint_sha256 must be a lowercase SHA256.")
+        if self.resume and self.policy_checkpoint_sha256 is None:
+            raise ValueError("Resumable evaluation requires policy_checkpoint_sha256.")
+        if self.resume and self.evaluation_runtime_identity is None:
+            raise ValueError(
+                "Resumable evaluation requires evaluation_runtime_identity."
+            )
+        if self.resume and self.routing_mode is EvaluationRoutingMode.MATCHED_RANDOM:
+            raise ValueError(
+                "Resuming matched_random evaluation is not supported because a "
+                "fresh rollout worker restarts its route episode ids and would "
+                "therefore change the preregistered random draws."
+            )
         self._entries_by_reset = {
             int(entry["reset_state_id"]): entry for entry in self.ledger["entries"]
         }
@@ -286,6 +343,174 @@ class FastWAMLiberoEvalCollector:
         self._episodes: list[dict[str, Any]] = []
         self._action_contracts: dict[str, LiberoActionContract] = {}
         self._executable_action_contract_sha256: str | None = None
+        self._chunk_path = self.output_dir / f"chunks.rank-{self.rank}.jsonl"
+        self._episode_path = self.output_dir / f"episodes.rank-{self.rank}.jsonl"
+        self._progress_path = self.output_dir / f"progress.rank-{self.rank}.json"
+        self._completion_dir = self.output_dir / f"completed.rank-{self.rank}"
+        self._live_contract_dir = self.output_dir / f"contracts.rank-{self.rank}"
+        self._ledger_order = {
+            str(entry["episode_identity"]): index
+            for index, entry in enumerate(self.ledger["entries"])
+        }
+        self._progress_identity = self._build_progress_identity()
+        self._initialize_progress()
+
+    @property
+    def continues_after_contract_violation(self) -> bool:
+        """Return whether rejected Actions are recorded as failed episodes."""
+
+        return self.contract_violation_outcome == "fail_episode"
+
+    @property
+    def pending_reset_state_ids(self) -> tuple[int, ...]:
+        """Return ledger reset identities not restored as completed episodes."""
+
+        completed = {str(item["episode_identity"]) for item in self._episodes}
+        return tuple(
+            int(entry["reset_state_id"])
+            for entry in self.ledger["entries"]
+            if str(entry["episode_identity"]) not in completed
+        )
+
+    def _build_progress_identity(self) -> dict[str, Any]:
+        return {
+            "run_id": self.run_id,
+            "rank": self.rank,
+            "ledger_sha256": _sha256_file(self.ledger_path),
+            "policy_checkpoint_sha256": self.policy_checkpoint_sha256,
+            "evaluation_runtime_identity": self.evaluation_runtime_identity,
+            "routing_mode": self.routing_mode.value,
+            "idm_threshold": self.idm_threshold,
+            "random_idm_probability": self.random_idm_probability,
+            "routing_seed": self.routing_seed,
+            "fixed_idm_cost": self.fixed_idm_cost,
+            "noise_seed_mode": self.noise_seed_mode,
+            "contract_violation_outcome": self.contract_violation_outcome,
+        }
+
+    def _initialize_progress(self) -> None:
+        if self.resume:
+            if not self._progress_path.is_file():
+                raise FileNotFoundError(
+                    "Evaluation resume requested without a progress manifest: "
+                    f"{self._progress_path}."
+                )
+            payload = json.loads(self._progress_path.read_text(encoding="utf-8"))
+            if payload.get("schema") != PROGRESS_SCHEMA:
+                raise ValueError("Unsupported evaluation progress schema.")
+            persisted_identity = payload.get("identity")
+            if persisted_identity != self._progress_identity:
+                persisted_mapping = (
+                    persisted_identity if isinstance(persisted_identity, dict) else {}
+                )
+                mismatched_fields = sorted(
+                    key
+                    for key in set(persisted_mapping) | set(self._progress_identity)
+                    if persisted_mapping.get(key) != self._progress_identity.get(key)
+                )
+                raise ValueError(
+                    "Evaluation resume identity differs from the persisted run; "
+                    f"mismatched fields: {mismatched_fields}."
+                )
+            self._restore_completion_units()
+            self._restore_live_action_contracts()
+            return
+
+        existing_outputs = [
+            path for path in (self._chunk_path, self._episode_path) if path.exists()
+        ]
+        existing_outputs.extend(
+            self.output_dir.glob(f"action_contract.rank-{self.rank}*")
+        )
+        if (
+            self._progress_path.exists()
+            or self._completion_dir.exists()
+            or existing_outputs
+        ):
+            raise FileExistsError(
+                "Evaluation output already contains resumable progress; use a new "
+                "output directory or set resume=true with matching provenance."
+            )
+        self._completion_dir.mkdir(parents=False)
+        self._live_contract_dir.mkdir(parents=False)
+        self._write_json_atomic(
+            self._progress_path,
+            {"schema": PROGRESS_SCHEMA, "identity": self._progress_identity},
+        )
+
+    def _restore_completion_units(self) -> None:
+        if not self._completion_dir.is_dir():
+            raise FileNotFoundError(
+                "Evaluation progress is missing its completed-episode directory."
+            )
+        units: list[tuple[int, dict[str, Any], list[dict[str, Any]]]] = []
+        seen_identities: set[str] = set()
+        seen_record_ids: set[str] = set()
+        for path in sorted(self._completion_dir.glob("*.json")):
+            payload = json.loads(path.read_text(encoding="utf-8"))
+            if payload.get("schema") != COMPLETED_EPISODE_SCHEMA:
+                raise ValueError(f"Unsupported completion unit schema in {path}.")
+            if payload.get("progress_identity_sha256") != _sha256_payload(
+                self._progress_identity
+            ):
+                raise ValueError(f"Completion unit provenance mismatch in {path}.")
+            episode = payload.get("episode")
+            chunks = payload.get("chunks")
+            if (
+                not isinstance(episode, dict)
+                or not isinstance(chunks, list)
+                or not chunks
+            ):
+                raise ValueError(f"Completion unit is incomplete in {path}.")
+            identity = str(episode.get("episode_identity", ""))
+            ledger_index = self._ledger_order.get(identity)
+            if ledger_index is None or identity in seen_identities:
+                raise ValueError(
+                    f"Completion unit episode identity is invalid in {path}."
+                )
+            if (
+                episode.get("run_id") != self.run_id
+                or int(episode.get("rank", -1)) != self.rank
+            ):
+                raise ValueError(f"Completion unit run identity mismatch in {path}.")
+            record_ids = [str(chunk.get("record_id", "")) for chunk in chunks]
+            if record_ids != episode.get("chunk_record_ids"):
+                raise ValueError(f"Completion unit chunk list mismatch in {path}.")
+            if any(
+                chunk.get("run_id") != self.run_id
+                or int(chunk.get("rank", -1)) != self.rank
+                or chunk.get("episode_identity") != identity
+                for chunk in chunks
+            ):
+                raise ValueError(f"Completion unit chunk identity mismatch in {path}.")
+            if any(record_id in seen_record_ids for record_id in record_ids):
+                raise ValueError(f"Duplicate chunk record identity in {path}.")
+            _canonical_bytes(payload)
+            seen_identities.add(identity)
+            seen_record_ids.update(record_ids)
+            units.append((ledger_index, episode, chunks))
+
+        for _index, episode, chunks in sorted(units):
+            self._episodes.append(episode)
+            self._chunks.extend(chunks)
+
+    def _restore_live_action_contracts(self) -> None:
+        if not self._live_contract_dir.is_dir():
+            raise FileNotFoundError(
+                "Evaluation progress is missing its live-contract directory."
+            )
+        for path in sorted(self._live_contract_dir.glob("*.json")):
+            contract = LiberoActionContract.from_artifact(
+                json.loads(path.read_text(encoding="utf-8"))
+            )
+            self._action_contracts[contract.canonical_sha256] = contract
+            executable_sha256 = contract.executable_spec_sha256
+            if self._executable_action_contract_sha256 is None:
+                self._executable_action_contract_sha256 = executable_sha256
+            elif self._executable_action_contract_sha256 != executable_sha256:
+                raise ValueError(
+                    "Persisted LIBERO executable Action contracts disagree."
+                )
 
     def snapshot_before_step(
         self,
@@ -307,6 +532,9 @@ class FastWAMLiberoEvalCollector:
             raise ValueError(
                 "Live LIBERO executable Action contract changed within one run."
             )
+        if action_contract.canonical_sha256 not in self._action_contracts:
+            self._action_contracts[action_contract.canonical_sha256] = action_contract
+            self._persist_live_action_contract(action_contract)
         task_ids = _int_list(get_env_attr(env, "task_ids"), name="task_ids")
         trial_ids = _int_list(get_env_attr(env, "trial_ids"), name="trial_ids")
         reset_ids = _int_list(
@@ -321,6 +549,9 @@ class FastWAMLiberoEvalCollector:
             )
 
         slots = []
+        completed_identities = {
+            str(episode["episode_identity"]) for episode in self._episodes
+        }
         for local_index, (env_id, task_id, trial_id, reset_id) in enumerate(
             zip(environment_ids, task_ids, trial_ids, reset_ids)
         ):
@@ -345,6 +576,11 @@ class FastWAMLiberoEvalCollector:
                         f"actual=({task_id}, {trial_id}, {reset_id}), "
                         f"ledger=({entry['task_id']}, {entry['trial_id']}, "
                         f"{entry['reset_state_id']})."
+                    )
+                if str(entry["episode_identity"]) in completed_identities:
+                    raise ValueError(
+                        "Evaluation environment replayed an episode already restored "
+                        "from durable progress."
                     )
                 state = _EpisodeState(
                     entry=entry,
@@ -371,6 +607,17 @@ class FastWAMLiberoEvalCollector:
             slots=tuple(slots),
             action_contract=action_contract,
         )
+
+    def _persist_live_action_contract(self, contract: LiberoActionContract) -> None:
+        path = self._live_contract_dir / f"{contract.canonical_sha256}.json"
+        if path.exists():
+            restored = LiberoActionContract.from_artifact(
+                json.loads(path.read_text(encoding="utf-8"))
+            )
+            if restored != contract:
+                raise ValueError("Persisted live Action contract changed in place.")
+            return
+        self._write_json_atomic(path, contract.to_artifact())
 
     def augment_rollout_input(
         self,
@@ -613,6 +860,7 @@ class FastWAMLiberoEvalCollector:
                 "actor_version": actor_version,
                 "gate_idm_probability": probability,
                 "gate_epsilon": float(emitted.epsilon[index]),
+                "gate_temperature": float(emitted.temperature[index]),
                 "counterfactual_next_route": _route_name(
                     int(selection.counterfactual_next_route[index])
                 ),
@@ -627,6 +875,8 @@ class FastWAMLiberoEvalCollector:
                 "primitive_steps_executed": int(
                     entry.get("execution_horizon", entry.get("action_horizon", -1))
                 ),
+                "action_submission_status": "submitted",
+                "action_contract_violation": None,
                 "reward": reward,
                 "success_observed": success,
                 "terminal": terminal,
@@ -655,6 +905,177 @@ class FastWAMLiberoEvalCollector:
             self._chunks.append(record)
             if terminal:
                 self._finish_episode(state, success=success, truncated=truncated)
+        self._sync_live_jsonl()
+
+    def record_contract_violation(
+        self,
+        *,
+        snapshot: EvaluationIdentityBatch,
+        rollout_result: RolloutResult,
+        action_trace: ActionExecutionTrace,
+        failure_audit: dict[str, Any],
+        rejected_mask: tuple[bool, ...],
+        policy_latency_seconds: float | None,
+        environment_latency_seconds: float,
+    ) -> None:
+        """Persist rejected Action chunks as explicit failed episodes."""
+
+        if rejected_mask != snapshot.active_mask:
+            raise ValueError(
+                "Contract-violation continuation currently requires every active "
+                "evaluation slot to be rejected together."
+            )
+        route = rollout_result.route_info
+        emitted = rollout_result.emitted_gate
+        selection = rollout_result.evaluation_selection
+        if route is None or emitted is None or selection is None:
+            raise ValueError(
+                "Contract-violation records require all typed route metadata."
+            )
+        batch_size = len(snapshot.slots)
+        if action_trace.batch_size != batch_size:
+            raise ValueError("Rejected Action trace batch size is inconsistent.")
+        if action_trace.stage_names != FASTWAM_LIBERO_ACTION_STAGES[:-1]:
+            raise ValueError(
+                "Rejected Action trace must stop immediately before env submission."
+            )
+        if (
+            action_trace.action_contract_sha256
+            != snapshot.action_contract.canonical_sha256
+        ):
+            raise ValueError("Rejected Action trace uses a different live contract.")
+        if route.shape != torch.Size([batch_size]) or emitted.shape != route.shape:
+            raise ValueError("Rejected Action route metadata has the wrong shape.")
+        if selection.effective_next_route.shape != route.shape:
+            raise ValueError("Rejected Action selection has the wrong shape.")
+        if not math.isfinite(float(environment_latency_seconds)):
+            raise ValueError("Environment latency must be finite.")
+        if policy_latency_seconds is not None and not math.isfinite(
+            float(policy_latency_seconds)
+        ):
+            raise ValueError("Policy latency must be finite when recorded.")
+        audit_violations = failure_audit.get("violations")
+        if not isinstance(audit_violations, list) or not audit_violations:
+            raise ValueError("Rejected Action audit contains no violations.")
+        _canonical_bytes(failure_audit)
+
+        for index, slot in enumerate(snapshot.slots):
+            if slot.entry is None:
+                continue
+            state = self._states[(slot.stage_id, slot.local_env_index)]
+            chunk_id = int(route.chunk_ids[index])
+            if chunk_id != len(state.chunks) or chunk_id != slot.chunk_id:
+                raise ValueError("Collector and rejected policy chunk diverged.")
+            route_episode_id = int(route.episode_ids[index])
+            actor_version = int(route.actor_versions[index])
+            if state.route_episode_id is None:
+                state.route_episode_id = route_episode_id
+                state.actor_version = actor_version
+            elif (
+                route_episode_id != state.route_episode_id
+                or actor_version != state.actor_version
+            ):
+                raise ValueError(
+                    "Episode id or actor version changed within a rejected episode."
+                )
+            if bool(emitted.valid[index]):
+                raise ValueError(
+                    "Rejected terminal chunks must discard their emitted Gate decision."
+                )
+            probability = float(emitted.base_probability[index])
+            if not math.isfinite(probability):
+                raise ValueError("Gate probability must be finite.")
+            random_draw = (
+                None
+                if selection.random_draws is None
+                else float(selection.random_draws[index])
+            )
+            entry = state.entry
+            identity = str(entry["episode_identity"])
+            per_environment_audit = {
+                **failure_audit,
+                "violations": [
+                    violation
+                    for violation in audit_violations
+                    if int(violation["environment_index"]) == index
+                ],
+            }
+            if not per_environment_audit["violations"]:
+                raise ValueError(
+                    "Rejected evaluation slot has no matching audit violation."
+                )
+            final_stage = action_trace.stages[-1]
+            action_min = float(final_stage.minimum[index].min().item())
+            action_max = float(final_stage.maximum[index].max().item())
+            record = {
+                "schema": CHUNK_SCHEMA,
+                "run_id": self.run_id,
+                "rank": self.rank,
+                "env_id": slot.env_id,
+                "episode_id": route_episode_id,
+                "episode_identity": identity,
+                "task_suite": entry["task_suite"],
+                "task_id": int(entry["task_id"]),
+                "trial_id": int(entry["trial_id"]),
+                "reset_state_id": int(entry["reset_state_id"]),
+                "record_id": f"{identity}:{chunk_id}",
+                "chunk_id": chunk_id,
+                "route": _route_name(int(route.route_used[index])),
+                "route_was_forced": bool(route.route_was_forced[index]),
+                "route_source_chunk_id": int(route.route_source_chunk_ids[index]),
+                "actor_version": actor_version,
+                "gate_idm_probability": probability,
+                "gate_epsilon": float(emitted.epsilon[index]),
+                "gate_temperature": float(emitted.temperature[index]),
+                "counterfactual_next_route": _route_name(
+                    int(selection.counterfactual_next_route[index])
+                ),
+                "effective_next_route": _route_name(
+                    int(selection.effective_next_route[index])
+                ),
+                "routing_mode": selection.mode.value,
+                "random_draw": random_draw,
+                "emitted_decision_consumed": False,
+                "emitted_decision_discarded": True,
+                "eligible_decision": False,
+                "primitive_steps_executed": 0,
+                "action_submission_status": "rejected",
+                "action_contract_violation": per_environment_audit,
+                "reward": 0.0,
+                "success_observed": False,
+                "terminal": True,
+                "termination_type": "contract_violation",
+                "policy_latency_seconds": (
+                    None
+                    if policy_latency_seconds is None
+                    else float(policy_latency_seconds)
+                ),
+                "gate_latency_seconds": (
+                    None
+                    if rollout_result.gate_latency_seconds is None
+                    else float(rollout_result.gate_latency_seconds[index])
+                ),
+                "gate_h2d_seconds": (
+                    0.0
+                    if rollout_result.gate_h2d_seconds is None
+                    else float(rollout_result.gate_h2d_seconds[index])
+                ),
+                "environment_latency_seconds": float(environment_latency_seconds),
+                "action_min": action_min,
+                "action_max": action_max,
+                "action_contract_sha256": (snapshot.action_contract.canonical_sha256),
+                "action_trace": action_trace.record_for_batch_index(index),
+            }
+            _canonical_bytes(record)
+            state.chunks.append(record)
+            self._chunks.append(record)
+            self._finish_episode(
+                state,
+                success=False,
+                truncated=False,
+                termination_type="contract_violation",
+            )
+        self._sync_live_jsonl()
 
     def _finish_episode(
         self,
@@ -662,10 +1083,23 @@ class FastWAMLiberoEvalCollector:
         *,
         success: bool,
         truncated: bool,
+        termination_type: str | None = None,
     ) -> None:
         chunks = state.chunks
         if not chunks or not chunks[-1]["terminal"]:
             raise ValueError("Cannot finalize an episode without a terminal chunk.")
+        expected_termination = (
+            "success"
+            if success
+            else "truncation"
+            if truncated
+            else "contract_violation"
+        )
+        termination_type = (
+            expected_termination if termination_type is None else str(termination_type)
+        )
+        if termination_type != expected_termination:
+            raise ValueError("Episode outcome and termination type disagree.")
         executed = len(chunks)
         idm_total = sum(chunk["route"] == "idm" for chunk in chunks)
         forced_initial = sum(
@@ -710,15 +1144,56 @@ class FastWAMLiberoEvalCollector:
             "environment_latency_seconds": float(
                 sum(chunk["environment_latency_seconds"] for chunk in chunks)
             ),
-            "termination_type": "success" if success else "truncation",
+            "termination_type": termination_type,
+            "contract_violation_count": int(termination_type == "contract_violation"),
             "terminal": True,
             "chunk_record_ids": [chunk["record_id"] for chunk in chunks],
         }
-        if not success and not truncated:
-            raise ValueError("Terminal episode must be success or truncation.")
         _canonical_bytes(episode)
+        self._persist_completed_episode(episode=episode, chunks=chunks)
         self._episodes.append(episode)
         state.completed = True
+
+    def _persist_completed_episode(
+        self,
+        *,
+        episode: dict[str, Any],
+        chunks: list[dict[str, Any]],
+    ) -> None:
+        """Atomically persist one complete episode as the resumable unit."""
+
+        identity = str(episode["episode_identity"])
+        ledger_index = self._ledger_order[identity]
+        path = self._completion_dir / f"{ledger_index:08d}.{identity}.json"
+        if path.exists():
+            raise FileExistsError(
+                f"Completed evaluation episode already exists: {identity}."
+            )
+        payload = {
+            "schema": COMPLETED_EPISODE_SCHEMA,
+            "progress_identity_sha256": _sha256_payload(self._progress_identity),
+            "episode": episode,
+            "chunks": list(chunks),
+        }
+        _canonical_bytes(payload)
+        self._write_json_atomic(path, payload)
+
+    def _sync_live_jsonl(self) -> None:
+        """Atomically expose all records collected so far after every chunk."""
+
+        chunks = sorted(
+            self._chunks,
+            key=lambda record: (
+                self._ledger_order[str(record["episode_identity"])],
+                int(record["chunk_id"]),
+            ),
+        )
+        episodes = sorted(
+            self._episodes,
+            key=lambda record: self._ledger_order[str(record["episode_identity"])],
+        )
+        self._write_jsonl_atomic(self._chunk_path, chunks)
+        self._write_jsonl_atomic(self._episode_path, episodes)
 
     @staticmethod
     def _write_jsonl_atomic(path: Path, records: list[dict[str, Any]]) -> None:
@@ -793,8 +1268,8 @@ class FastWAMLiberoEvalCollector:
             self._episodes,
             key=lambda item: ledger_order[item["episode_identity"]],
         )
-        chunk_path = self.output_dir / f"chunks.rank-{self.rank}.jsonl"
-        episode_path = self.output_dir / f"episodes.rank-{self.rank}.jsonl"
+        chunk_path = self._chunk_path
+        episode_path = self._episode_path
         contract_items = sorted(self._action_contracts.items())
         action_contract_payloads = [
             contract.to_artifact() for _, contract in contract_items

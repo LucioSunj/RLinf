@@ -15,6 +15,7 @@
 import asyncio
 import gc
 import json
+import math
 import time
 from collections import defaultdict
 from dataclasses import asdict, replace
@@ -40,9 +41,12 @@ from rlinf.data.embodied_io_struct import (
 )
 from rlinf.envs import get_env_cls
 from rlinf.envs.action_contract import (
+    FASTWAM_LIBERO_ACTION_STAGES,
     PREPARED_LIBERO_ACTION_STAGE,
     ActionExecutionTrace,
     ActionStageStatistics,
+    action_stage_contract_violations,
+    validate_action_stage_contract,
 )
 from rlinf.envs.action_utils import prepare_actions
 from rlinf.envs.libero.action_contract import LiberoActionContract
@@ -78,6 +82,27 @@ FASTWAM_TRAINING_ACTION_AUDIT_SENTINEL = "FASTWAM_TRAINING_ACTION_AUDIT"
 FASTWAM_TRAINING_ACTION_AUDIT_SCHEMA = "fastwam-training-action-audit-v1"
 FASTWAM_TRAINING_ACTION_FAILURE_SENTINEL = "FASTWAM_TRAINING_ACTION_FAILURE"
 FASTWAM_TRAINING_ACTION_FAILURE_SCHEMA = "fastwam-training-action-failure-v2"
+FASTWAM_EVALUATION_ACTION_FAILURE_SENTINEL = "FASTWAM_EVALUATION_ACTION_FAILURE"
+FASTWAM_EVALUATION_ACTION_FAILURE_SCHEMA = "fastwam-evaluation-action-failure-v1"
+
+
+class FastWAMEvaluationActionContractViolation(ValueError):
+    """Pre-submission Action rejection with compact prepared-stage evidence."""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        prepared_actions: np.ndarray,
+        prepared_statistics: ActionStageStatistics,
+        action_contract: LiberoActionContract,
+        rejected_mask: tuple[bool, ...],
+    ) -> None:
+        super().__init__(message)
+        self.prepared_actions = np.asarray(prepared_actions)
+        self.prepared_statistics = prepared_statistics
+        self.action_contract = action_contract
+        self.rejected_mask = tuple(bool(item) for item in rejected_mask)
 
 
 def _batch_metadata_value(value: Any, index: int) -> int | None:
@@ -231,6 +256,9 @@ def build_fastwam_action_failure_audit(
     pipeline_stage_id: int,
     failure_mask: torch.Tensor | None = None,
     outcome: str = "error",
+    failure_schema: str = FASTWAM_TRAINING_ACTION_FAILURE_SCHEMA,
+    prepared_actions: Any | None = None,
+    require_uncond_denoise_index: bool = True,
 ) -> dict[str, Any]:
     """Build compact first-violation provenance for a rejected Action chunk."""
 
@@ -242,10 +270,28 @@ def build_fastwam_action_failure_audit(
     if int(failure_mask.numel()) != trace.batch_size:
         raise ValueError("FastWAM Action failure mask has the wrong batch size.")
     violations = []
+    submitted = trace.stages[-1]
+    prepared_tensor = (
+        None if prepared_actions is None else torch.as_tensor(prepared_actions)
+    )
+    if prepared_tensor is not None and (
+        prepared_tensor.ndim != 3
+        or int(prepared_tensor.shape[0]) != trace.batch_size
+        or int(prepared_tensor.shape[-1]) != trace.stages[0].action_dim
+    ):
+        raise ValueError("Prepared failure Actions must have shape [B, T, D].")
     for batch_index in range(trace.batch_size):
         if not bool(failure_mask[batch_index].item()):
             continue
         for dimension_index in range(trace.stages[0].action_dim):
+            submitted_invalid = (
+                int(submitted.finite_count[batch_index, dimension_index])
+                != int(submitted.total_value_count[batch_index, dimension_index])
+                or int(submitted.below_low_count[batch_index, dimension_index]) > 0
+                or int(submitted.above_high_count[batch_index, dimension_index]) > 0
+            )
+            if not submitted_invalid:
+                continue
             first_stage = None
             stage_record = None
             for statistics in trace.stages:
@@ -270,48 +316,69 @@ def build_fastwam_action_failure_audit(
                 route_metadata is not None
                 and route_metadata["route"] == WAMRoute.UNCOND.name
                 and denoise_index is None
+                and require_uncond_denoise_index
             ):
                 raise ValueError(
                     "Rejected UNCOND Action is missing its Flow-SDE denoise index."
                 )
-            violations.append(
-                {
-                    "environment_index": batch_index,
-                    "dimension_index": dimension_index,
-                    "dimension_name": contract.dimension_names[dimension_index],
-                    "first_out_of_live_bounds_stage": first_stage,
-                    "statistics": stage_record,
-                    "low": float(contract.low[dimension_index]),
-                    "high": float(contract.high[dimension_index]),
-                    "task_id": _batch_metadata_value(task_ids, batch_index),
-                    "trial_id": _batch_metadata_value(trial_ids, batch_index),
-                    "reset_state_id": _batch_metadata_value(
-                        reset_state_ids, batch_index
+            violation = {
+                "environment_index": batch_index,
+                "dimension_index": dimension_index,
+                "dimension_name": contract.dimension_names[dimension_index],
+                "first_out_of_live_bounds_stage": first_stage,
+                "statistics": stage_record,
+                "low": float(contract.low[dimension_index]),
+                "high": float(contract.high[dimension_index]),
+                "task_id": _batch_metadata_value(task_ids, batch_index),
+                "trial_id": _batch_metadata_value(trial_ids, batch_index),
+                "reset_state_id": _batch_metadata_value(reset_state_ids, batch_index),
+                "route_metadata": route_metadata,
+                "flow_sde_denoise_index": denoise_index,
+            }
+            if prepared_tensor is not None:
+                values = prepared_tensor[batch_index, :, dimension_index].float()
+                low = float(contract.low[dimension_index])
+                high = float(contract.high[dimension_index])
+                invalid = (~torch.isfinite(values)) | (values < low) | (values > high)
+                invalid_indices = invalid.nonzero(as_tuple=False).reshape(-1)
+                if invalid_indices.numel() < 1:
+                    raise ValueError(
+                        "Rejected Action dimension has no invalid prepared primitive."
+                    )
+                primitive_index = int(invalid_indices[0].item())
+                value = float(values[primitive_index].item())
+                violation.update(
+                    first_invalid_primitive_index=primitive_index,
+                    first_invalid_prepared_value=(
+                        value if math.isfinite(value) else None
                     ),
-                    "route_metadata": route_metadata,
-                    "flow_sde_denoise_index": denoise_index,
-                }
-            )
+                )
+            violations.append(violation)
     if not violations:
         raise ValueError(
             "Rejected submitted Action has no matching pre-submission violation."
         )
-    return {
-        "schema": FASTWAM_TRAINING_ACTION_FAILURE_SCHEMA,
+    audit = {
+        "schema": str(failure_schema),
         "worker_rank": int(worker_rank),
         "pipeline_stage_id": int(pipeline_stage_id),
         "stage_order": list(trace.stage_names),
         "action_contract_sha256": contract.canonical_sha256,
-        "contract_failure_environment_indices": failure_mask.nonzero(as_tuple=False)
-        .reshape(-1)
-        .tolist(),
-        "outcome": outcome,
-        "zero_environment_reward": outcome == "fail_episode",
-        "true_termination": outcome == "fail_episode",
-        "bootstrap_allowed": False if outcome == "fail_episode" else None,
         "violations": violations,
+        "action_submission_status": "rejected_before_env_step",
         "no_silent_clamp": True,
     }
+    if failure_schema == FASTWAM_TRAINING_ACTION_FAILURE_SCHEMA:
+        audit.update(
+            contract_failure_environment_indices=(
+                failure_mask.nonzero(as_tuple=False).reshape(-1).tolist()
+            ),
+            outcome=outcome,
+            zero_environment_reward=outcome == "fail_episode",
+            true_termination=outcome == "fail_episode",
+            bootstrap_allowed=False if outcome == "fail_episode" else None,
+        )
+    return audit
 
 
 def summarize_fastwam_flow_sde_denoise_indices(
@@ -589,6 +656,7 @@ class EnvWorker(Worker):
                 )
             self.evaluation_collector = instantiate(
                 collector_cfg,
+                _recursive_=False,
                 rank=self._rank,
                 routing_mode=self.model_cfg.eval_routing_mode,
                 idm_threshold=self.model_cfg.eval_idm_threshold,
@@ -596,11 +664,51 @@ class EnvWorker(Worker):
                     "eval_random_idm_probability", None
                 ),
                 routing_seed=self.model_cfg.eval_routing_seed,
+                evaluation_runtime_identity={
+                    "model": OmegaConf.to_container(
+                        self.model_cfg,
+                        resolve=True,
+                        enum_to_str=True,
+                    ),
+                    "environment": OmegaConf.to_container(
+                        self.cfg.env.eval,
+                        resolve=True,
+                        enum_to_str=True,
+                    ),
+                },
             )
             if self.eval_rollout_epoch != 1:
                 raise ValueError(
                     "Frozen-ledger evaluation requires exactly one rollout epoch."
                 )
+            if (
+                self.evaluation_collector.continues_after_contract_violation
+                and self.eval_num_envs_per_stage != 1
+            ):
+                raise ValueError(
+                    "contract_violation_outcome=fail_episode requires exactly one "
+                    "evaluation environment per stage."
+                )
+            if self.evaluation_collector.resume:
+                configured_reset_ids = tuple(
+                    int(item)
+                    for item in self.cfg.env.eval.get("ordered_reset_state_ids", ())
+                )
+                ledger_reset_ids = tuple(
+                    int(entry["reset_state_id"])
+                    for entry in self.evaluation_collector.ledger["entries"]
+                )
+                if configured_reset_ids != ledger_reset_ids:
+                    raise ValueError(
+                        "Resume config ordered reset IDs differ from its ledger."
+                    )
+                pending_reset_ids = self.evaluation_collector.pending_reset_state_ids
+                if not pending_reset_ids:
+                    raise RuntimeError(
+                        "Evaluation progress is already complete; finalize or reuse "
+                        "its existing artifacts instead of resuming."
+                    )
+                self.cfg.env.eval.ordered_reset_state_ids = list(pending_reset_ids)
 
         if self.enable_train:
             train_env_cls = get_env_cls(self.cfg.env.train.env_type, self.cfg.env.train)
@@ -1090,6 +1198,38 @@ class EnvWorker(Worker):
                 gripper_dimension_index=(action_contract.gripper_dimension_index),
                 action_contract_sha256=(action_contract.canonical_sha256),
             )
+            violations = action_stage_contract_violations(
+                prepared_statistics,
+                dimension_names=action_contract.dimension_names,
+                low=action_contract.low,
+                high=action_contract.high,
+                active_mask=active_mask,
+            )
+            if violations:
+                rejected_indices = {
+                    int(violation["environment_index"]) for violation in violations
+                }
+                rejected_mask = tuple(
+                    index in rejected_indices
+                    for index in range(prepared_statistics.batch_size)
+                )
+                try:
+                    validate_action_stage_contract(
+                        prepared_statistics,
+                        dimension_names=action_contract.dimension_names,
+                        low=action_contract.low,
+                        high=action_contract.high,
+                        active_mask=active_mask,
+                    )
+                except ValueError as error:
+                    raise FastWAMEvaluationActionContractViolation(
+                        str(error),
+                        prepared_actions=chunk_actions,
+                        prepared_statistics=prepared_statistics,
+                        action_contract=action_contract,
+                        rejected_mask=rejected_mask,
+                    ) from error
+                raise AssertionError("Action violation validation did not raise.")
             chunk_result, submitted_statistics = eval_env.chunk_step_with_action_trace(
                 chunk_actions,
                 action_contract,
@@ -1171,6 +1311,100 @@ class EnvWorker(Worker):
             action_execution_trace=action_execution_trace,
         )
         return env_output, env_info
+
+    def _record_evaluation_action_contract_violation(
+        self,
+        *,
+        error: FastWAMEvaluationActionContractViolation,
+        stage_id: int,
+        snapshot,
+        rollout_result: RolloutResult,
+        policy_latency_seconds: float | None,
+        environment_started_at: float,
+    ) -> tuple[EnvOutput, dict[str, Any], RolloutResult]:
+        """Persist one rejected eval chunk, then reset to the next ledger entry."""
+
+        collector = self.evaluation_collector
+        if collector is None:
+            raise error
+        if self.eval_num_envs_per_stage != 1:
+            raise RuntimeError(
+                "Contract-violation continuation currently requires one evaluation "
+                "environment per stage."
+            ) from error
+        if rollout_result.action_execution_trace is None:
+            raise ValueError(
+                "Rejected FastWAM evaluation Action is missing its model trace."
+            ) from error
+        eval_env = self.eval_env_list[stage_id]
+        combined_trace = ActionExecutionTrace.combine(
+            rollout_result.action_execution_trace,
+            ActionExecutionTrace(stages=(error.prepared_statistics,)),
+        )
+        if combined_trace.stage_names != FASTWAM_LIBERO_ACTION_STAGES[:-1]:
+            raise ValueError(
+                "Rejected FastWAM evaluation Action has an invalid stage order."
+            ) from error
+        audit = build_fastwam_action_failure_audit(
+            trace=combined_trace,
+            contract=error.action_contract,
+            route=rollout_result.route_info,
+            task_ids=get_env_attr(eval_env, "task_ids"),
+            trial_ids=get_env_attr(eval_env, "trial_ids"),
+            reset_state_ids=get_env_attr(eval_env, "reset_state_ids"),
+            denoise_indices=rollout_result.forward_inputs.get("denoise_indices"),
+            worker_rank=int(getattr(self, "_rank", 0)),
+            pipeline_stage_id=stage_id,
+            failure_schema=FASTWAM_EVALUATION_ACTION_FAILURE_SCHEMA,
+            prepared_actions=error.prepared_actions,
+            require_uncond_denoise_index=False,
+        )
+        rejected = torch.as_tensor(error.rejected_mask, dtype=torch.bool)
+        rollout_result = _mark_terminal_gate_unused(rollout_result, rejected)
+        collector.record_contract_violation(
+            snapshot=snapshot,
+            rollout_result=rollout_result,
+            action_trace=combined_trace,
+            failure_audit=audit,
+            rejected_mask=error.rejected_mask,
+            policy_latency_seconds=policy_latency_seconds,
+            environment_latency_seconds=(time.perf_counter() - environment_started_at),
+        )
+        print(
+            f"{FASTWAM_EVALUATION_ACTION_FAILURE_SENTINEL} "
+            + json.dumps(audit, sort_keys=True),
+            flush=True,
+        )
+        if not collector.continues_after_contract_violation:
+            raise error
+
+        obs, infos, count_mask = eval_env.abort_eval_episodes(error.rejected_mask)
+        if not bool(np.asarray(count_mask, dtype=bool).all()):
+            raise RuntimeError("Rejected ledger episode was not counted exactly once.")
+        batch_size = len(error.rejected_mask)
+        horizon = int(self.model_cfg.num_action_chunks)
+        terminations = torch.zeros((batch_size, horizon), dtype=torch.bool)
+        truncations = torch.zeros_like(terminations)
+        truncations[rejected, -1] = True
+        rewards = torch.zeros((batch_size, horizon), dtype=torch.float32)
+        env_info: dict[str, Any] = {}
+        final_info = infos.get("final_info")
+        if isinstance(final_info, dict) and "episode" in final_info:
+            for key, value in final_info["episode"].items():
+                env_info[key] = torch.as_tensor(value)[rejected].cpu()
+        env_output = EnvOutput(
+            obs=obs,
+            final_obs=infos.get("final_observation"),
+            dones=rejected,
+            terminations=terminations,
+            truncations=truncations,
+            rewards=rewards,
+            env_infos=infos,
+            action_execution_trace=ActionExecutionTrace(
+                stages=(error.prepared_statistics,)
+            ),
+        )
+        return env_output, env_info, rollout_result
 
     def _build_chunk_final_obs(self, obs_list, infos_list):
         """Build per-env terminal observations for a whole chunk.
@@ -2334,24 +2568,48 @@ class EnvWorker(Worker):
                             "identity snapshot."
                         )
                     environment_started_at = time.perf_counter()
-                    if snapshot is None:
-                        env_output, env_info = self.env_evaluate_step(
-                            raw_chunk_actions, stage_id
+                    contract_violation_recorded = False
+                    try:
+                        if snapshot is None:
+                            env_output, env_info = self.env_evaluate_step(
+                                raw_chunk_actions, stage_id
+                            )
+                        else:
+                            env_output, env_info = self.env_evaluate_step(
+                                raw_chunk_actions,
+                                stage_id,
+                                active_mask=snapshot.active_mask,
+                            )
+                    except FastWAMEvaluationActionContractViolation as error:
+                        if snapshot is None or not isinstance(
+                            rollout_results, RolloutResult
+                        ):
+                            raise
+                        env_output, env_info, rollout_results = (
+                            self._record_evaluation_action_contract_violation(
+                                error=error,
+                                stage_id=stage_id,
+                                snapshot=snapshot,
+                                rollout_result=rollout_results,
+                                policy_latency_seconds=policy_latency_seconds,
+                                environment_started_at=environment_started_at,
+                            )
                         )
-                    else:
-                        env_output, env_info = self.env_evaluate_step(
-                            raw_chunk_actions,
-                            stage_id,
-                            active_mask=snapshot.active_mask,
-                        )
+                        contract_violation_recorded = True
                     environment_latency_seconds = (
                         time.perf_counter() - environment_started_at
                     )
-                    if isinstance(rollout_results, RolloutResult):
+                    if (
+                        isinstance(rollout_results, RolloutResult)
+                        and not contract_violation_recorded
+                    ):
                         rollout_results = _mark_terminal_gate_unused(
                             rollout_results, env_output.dones
                         )
-                    if self.evaluation_collector is not None:
+                    if (
+                        self.evaluation_collector is not None
+                        and not contract_violation_recorded
+                    ):
                         if not isinstance(rollout_results, RolloutResult):
                             raise TypeError(
                                 "FastWAM evaluation collector requires typed "

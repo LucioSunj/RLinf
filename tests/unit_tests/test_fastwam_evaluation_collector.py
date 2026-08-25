@@ -21,6 +21,8 @@ from pathlib import Path
 
 import pytest
 import torch
+from hydra.utils import instantiate
+from omegaconf import OmegaConf
 
 from rlinf.data.embodied_io_struct import EnvOutput, RolloutResult
 from rlinf.envs.action_contract import (
@@ -31,6 +33,8 @@ from rlinf.envs.action_contract import (
     SUBMITTED_LIBERO_ACTION_STAGE,
     ActionExecutionTrace,
     ActionStageStatistics,
+    action_stage_contract_violations,
+    validate_action_stage_contract,
 )
 from rlinf.envs.libero.action_contract import LiberoActionContract
 from rlinf.models.embodiment.wam_policy.contracts import (
@@ -227,6 +231,12 @@ def _collector(
     tmp_path: Path,
     *,
     noise_seed_mode: str = "stateless_per_chunk",
+    resume: bool = False,
+    contract_violation_outcome: str = "raise",
+    routing_mode: str = "forced_uncond",
+    random_idm_probability: float | None = None,
+    policy_checkpoint_sha256: str = "a" * 64,
+    evaluation_runtime_identity: dict | None = None,
 ) -> FastWAMLiberoEvalCollector:
     tmp_path.mkdir(parents=True, exist_ok=True)
     ledger_path = tmp_path / "ledger.json"
@@ -237,13 +247,59 @@ def _collector(
         ledger_path=str(ledger_path),
         run_id="collector-unit",
         rank=0,
-        routing_mode="forced_uncond",
+        routing_mode=routing_mode,
         idm_threshold=0.5,
-        random_idm_probability=None,
+        random_idm_probability=random_idm_probability,
         routing_seed=0,
         fixed_idm_cost=0.01,
         noise_seed_mode=noise_seed_mode,
+        contract_violation_outcome=contract_violation_outcome,
+        resume=resume,
+        policy_checkpoint_sha256=policy_checkpoint_sha256,
+        evaluation_runtime_identity=(
+            {"text_conditioning": "cache-a"}
+            if evaluation_runtime_identity is None
+            else evaluation_runtime_identity
+        ),
     )
+
+
+def test_nonrecursive_hydra_identity_is_canonicalized_as_audit_data(tmp_path) -> None:
+    ledger_path = tmp_path / "ledger.json"
+    _ledger(ledger_path)
+    config = OmegaConf.create(
+        {
+            "_target_": (
+                "rlinf.runners.fastwam_libero_eval_collector.FastWAMLiberoEvalCollector"
+            ),
+            "output_dir": str(tmp_path),
+            "ledger_path": str(ledger_path),
+            "run_id": "hydra-identity-unit",
+            "fixed_idm_cost": 0.01,
+        }
+    )
+    runtime_identity = {
+        "model": {
+            "runtime": {
+                "_target_": "unit.RuntimeThatRequiresLiveModelObjects",
+                "text_embedding_cache_dir": "/tmp/cache",
+            }
+        },
+        "environment": {"task_suite": "libero_10"},
+    }
+
+    collector = instantiate(
+        config,
+        _recursive_=False,
+        rank=0,
+        routing_mode="learned_threshold",
+        idm_threshold=0.5,
+        random_idm_probability=None,
+        routing_seed=0,
+        evaluation_runtime_identity=runtime_identity,
+    )
+
+    assert collector.evaluation_runtime_identity == runtime_identity
 
 
 def test_collector_records_aligned_chunks_episode_and_atomic_shards(tmp_path) -> None:
@@ -269,6 +325,13 @@ def test_collector_records_aligned_chunks_episode_and_atomic_shards(tmp_path) ->
         environment_latency_seconds=0.02,
     )
     assert collector.is_complete is False
+    live_chunks = (tmp_path / "chunks.rank-0.jsonl").read_text().splitlines()
+    assert len(live_chunks) == 1
+    assert json.loads(live_chunks[0])["chunk_id"] == 0
+    assert (tmp_path / "episodes.rank-0.jsonl").read_text() == ""
+    assert not (tmp_path / "chunks.rank-0.jsonl.tmp").exists()
+    assert not (tmp_path / "episodes.rank-0.jsonl.tmp").exists()
+    assert not list((tmp_path / "completed.rank-0").glob("*.json"))
 
     second_snapshot = collector.snapshot_before_step(0, env, env_ids)
     second_input = collector.augment_rollout_input(
@@ -288,6 +351,14 @@ def test_collector_records_aligned_chunks_episode_and_atomic_shards(tmp_path) ->
         environment_latency_seconds=0.03,
     )
     assert collector.is_complete is True
+    completion_paths = list((tmp_path / "completed.rank-0").glob("*.json"))
+    assert len(completion_paths) == 1
+    completion = json.loads(completion_paths[0].read_text(encoding="utf-8"))
+    assert len(completion["chunks"]) == 2
+    assert (
+        completion["episode"]["episode_identity"]
+        == (first_snapshot.slots[0].entry["episode_identity"])
+    )
     shard = collector.finalize()
 
     assert first_input["obs"]["_fastwam_action_noise_seeds"].shape == (1,)
@@ -312,6 +383,7 @@ def test_collector_records_aligned_chunks_episode_and_atomic_shards(tmp_path) ->
     assert chunks[0]["route"] == "idm"
     assert chunks[0]["route_was_forced"] is True
     assert chunks[0]["emitted_decision_consumed"] is True
+    assert chunks[0]["gate_temperature"] == 1.0
     assert chunks[1]["route"] == "uncond"
     assert chunks[1]["emitted_decision_discarded"] is True
     assert chunks[1]["terminal"] is True
@@ -716,3 +788,280 @@ def test_collector_rejects_malformed_ledger_v2_protocol(tmp_path) -> None:
 
     with pytest.raises(ValueError, match="inconsistent"):
         _load_ledger(path)
+
+
+def test_action_contract_accepts_exact_bounds_and_rejects_bf16_next_value() -> None:
+    contract = _action_contract()
+    exact = torch.tensor([[[-1.0] * 7, [1.0] * 7]], dtype=torch.float32)
+    exact_statistics = ActionStageStatistics.from_values(
+        stage=PREPARED_LIBERO_ACTION_STAGE,
+        values=exact,
+        low=contract.low,
+        high=contract.high,
+        gripper_dimension_index=contract.gripper_dimension_index,
+        action_contract_sha256=contract.canonical_sha256,
+    )
+    validate_action_stage_contract(
+        exact_statistics,
+        dimension_names=contract.dimension_names,
+        low=contract.low,
+        high=contract.high,
+    )
+
+    normalized = torch.tensor([1.0625, 1.0703125], dtype=torch.bfloat16)
+    denormalized = normalized.float() * 0.9375
+    assert denormalized.tolist() == [0.99609375, 1.00341796875]
+    values = torch.zeros(1, 2, 7)
+    values[0, :, 2] = denormalized
+    statistics = ActionStageStatistics.from_values(
+        stage=PREPARED_LIBERO_ACTION_STAGE,
+        values=values,
+        low=contract.low,
+        high=contract.high,
+        gripper_dimension_index=contract.gripper_dimension_index,
+        action_contract_sha256=contract.canonical_sha256,
+    )
+    violations = action_stage_contract_violations(
+        statistics,
+        dimension_names=contract.dimension_names,
+        low=contract.low,
+        high=contract.high,
+    )
+    assert violations == [
+        {
+            "environment_index": 0,
+            "dimension_index": 2,
+            "dimension_name": "delta_z",
+            "minimum": 0.99609375,
+            "maximum": 1.00341796875,
+            "low": -1.0,
+            "high": 1.0,
+            "finite_count": 2,
+            "total_value_count": 2,
+            "below_low_count": 0,
+            "above_high_count": 1,
+        }
+    ]
+
+
+@pytest.mark.parametrize(
+    "contract_violation_outcome",
+    ("fail_episode", "raise"),
+)
+def test_collector_persists_task884_contract_violation_without_submission(
+    tmp_path,
+    contract_violation_outcome,
+) -> None:
+    collector = _collector(
+        tmp_path,
+        contract_violation_outcome=contract_violation_outcome,
+    )
+    env = _IdentityEnv()
+    snapshot = collector.snapshot_before_step(0, env, torch.tensor([1 << 50]))
+    rollout = _rollout(
+        chunk_id=0,
+        route_used=1,
+        forced=True,
+        source_chunk_id=-1,
+        terminal=True,
+    )
+    prepared_values = torch.zeros(1, 2, 7)
+    prepared_values[0, 0, 0] = 7.207030773162842
+    prepared = ActionStageStatistics.from_values(
+        stage=PREPARED_LIBERO_ACTION_STAGE,
+        values=prepared_values,
+        low=env.action_contract.low,
+        high=env.action_contract.high,
+        gripper_dimension_index=env.action_contract.gripper_dimension_index,
+        action_contract_sha256=env.action_contract.canonical_sha256,
+    )
+    trace = ActionExecutionTrace.combine(
+        rollout.action_execution_trace,
+        ActionExecutionTrace(stages=(prepared,)),
+    )
+    audit = {
+        "schema": "fastwam-evaluation-action-failure-v1",
+        "worker_rank": 0,
+        "pipeline_stage_id": 0,
+        "stage_order": list(trace.stage_names),
+        "action_contract_sha256": env.action_contract.canonical_sha256,
+        "violations": [
+            {
+                "environment_index": 0,
+                "dimension_index": 0,
+                "dimension_name": "delta_x",
+                "first_out_of_live_bounds_stage": PREPARED_LIBERO_ACTION_STAGE,
+                "first_invalid_primitive_index": 0,
+                "first_invalid_prepared_value": 7.207030773162842,
+            }
+        ],
+        "action_submission_status": "rejected_before_env_step",
+        "no_silent_clamp": True,
+    }
+
+    def record_violation() -> None:
+        collector.record_contract_violation(
+            snapshot=snapshot,
+            rollout_result=rollout,
+            action_trace=trace,
+            failure_audit=audit,
+            rejected_mask=(True,),
+            policy_latency_seconds=0.1,
+            environment_latency_seconds=0.01,
+        )
+
+    record_violation()
+
+    shard = collector.finalize()
+    assert shard.episode_record_count == 1
+    chunk = json.loads((tmp_path / "chunks.rank-0.jsonl").read_text().splitlines()[0])
+    episode = json.loads(
+        (tmp_path / "episodes.rank-0.jsonl").read_text().splitlines()[0]
+    )
+    assert chunk["action_submission_status"] == "rejected"
+    assert chunk["primitive_steps_executed"] == 0
+    assert chunk["route"] == "idm"
+    assert chunk["action_max"] == pytest.approx(7.207030773162842)
+    assert chunk["action_contract_violation"]["no_silent_clamp"] is True
+    assert episode["success"] is False
+    assert episode["termination_type"] == "contract_violation"
+    assert episode["contract_violation_count"] == 1
+
+
+def test_collector_resume_restores_completed_episode_without_duplicates(
+    tmp_path,
+) -> None:
+    entries = []
+    for episode_index in range(2):
+        identity_fields = {
+            "task_suite": "libero_10",
+            "task_id": 0,
+            "trial_id": episode_index,
+            "reset_state_id": episode_index,
+            "environment_seed": 7,
+            "action_noise_seed": 101 + episode_index,
+            "idm_video_noise_seed": 202 + episode_index,
+            "max_primitive_steps": 32,
+            "action_horizon": 16,
+        }
+        entries.append(
+            {
+                "episode_index": episode_index,
+                **identity_fields,
+                "episode_identity": _canonical_sha(identity_fields),
+            }
+        )
+    ledger_path = tmp_path / "ledger.json"
+    ledger_path.write_text(
+        json.dumps(
+            {
+                "schema": "fastwam-libero-eval-ledger-v1",
+                "kind": "preflight",
+                "task_suite": "libero_10",
+                "entries": entries,
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    def make_collector(*, resume: bool) -> FastWAMLiberoEvalCollector:
+        return FastWAMLiberoEvalCollector(
+            output_dir=str(tmp_path),
+            ledger_path=str(ledger_path),
+            run_id="resume-unit",
+            rank=0,
+            routing_mode="forced_uncond",
+            idm_threshold=0.5,
+            random_idm_probability=None,
+            routing_seed=0,
+            fixed_idm_cost=0.01,
+            resume=resume,
+            policy_checkpoint_sha256="b" * 64,
+            evaluation_runtime_identity={"text_conditioning": "cache-a"},
+        )
+
+    first = make_collector(resume=False)
+    env = _IdentityEnv()
+    snapshot = first.snapshot_before_step(0, env, torch.tensor([1 << 50]))
+    first.record_chunk(
+        snapshot=snapshot,
+        rollout_result=_rollout(
+            chunk_id=0,
+            route_used=1,
+            forced=True,
+            source_chunk_id=-1,
+            terminal=True,
+        ),
+        env_output=_outcome(terminal=True),
+        environment_latency_seconds=0.02,
+    )
+    unit_path = next((tmp_path / "completed.rank-0").glob("*.json"))
+    first_unit = unit_path.read_bytes()
+
+    resumed = make_collector(resume=True)
+    assert resumed.pending_reset_state_ids == (1,)
+    assert resumed.is_complete is False
+    env.trial_ids = [1]
+    env.reset_state_ids = [1]
+    snapshot = resumed.snapshot_before_step(0, env, torch.tensor([1 << 50]))
+    resumed.record_chunk(
+        snapshot=snapshot,
+        rollout_result=_rollout(
+            chunk_id=0,
+            route_used=1,
+            forced=True,
+            source_chunk_id=-1,
+            terminal=True,
+        ),
+        env_output=_outcome(terminal=True),
+        environment_latency_seconds=0.02,
+    )
+    resumed.finalize()
+
+    assert unit_path.read_bytes() == first_unit
+    episodes = [
+        json.loads(line)
+        for line in (tmp_path / "episodes.rank-0.jsonl").read_text().splitlines()
+    ]
+    chunks = [
+        json.loads(line)
+        for line in (tmp_path / "chunks.rank-0.jsonl").read_text().splitlines()
+    ]
+    assert [item["episode_identity"] for item in episodes] == [
+        item["episode_identity"] for item in entries
+    ]
+    assert len({item["record_id"] for item in chunks}) == 2
+
+
+def test_collector_refuses_matched_random_resume_with_restarted_route_ids(
+    tmp_path,
+) -> None:
+    _collector(
+        tmp_path,
+        routing_mode="matched_random",
+        random_idm_probability=0.25,
+        policy_checkpoint_sha256="c" * 64,
+    )
+
+    with pytest.raises(ValueError, match="restarts its route episode ids"):
+        _collector(
+            tmp_path,
+            routing_mode="matched_random",
+            random_idm_probability=0.25,
+            resume=True,
+            policy_checkpoint_sha256="c" * 64,
+        )
+
+
+def test_collector_resume_refuses_changed_runtime_identity(tmp_path) -> None:
+    _collector(
+        tmp_path,
+        evaluation_runtime_identity={"text_conditioning": "online-batch-one"},
+    )
+
+    with pytest.raises(ValueError, match="evaluation_runtime_identity"):
+        _collector(
+            tmp_path,
+            resume=True,
+            evaluation_runtime_identity={"text_conditioning": "cached-batch-four"},
+        )

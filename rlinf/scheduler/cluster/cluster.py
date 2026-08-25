@@ -30,12 +30,11 @@ from omegaconf import DictConfig
 from packaging import version as vs
 from ray._private import ray_logging
 from ray.actor import ActorHandle
-from ray.util.state import list_actors
 
 from ..hardware.accelerators.accelerator import ProfileConfig
 from .config import ClusterConfig
 from .node import NodeGroupInfo, NodeInfo, NodeProbe
-from .utils import DistributedRayLogCollector, without_http_proxies
+from .utils import DistributedRayLogCollector
 
 ray_version = version("ray")
 assert vs.parse(ray_version) >= vs.parse("2.47.0"), (
@@ -45,14 +44,6 @@ assert vs.parse(ray_version) >= vs.parse("2.47.0"), (
 if TYPE_CHECKING:
     from ..manager import Manager
     from ..worker import Worker
-
-
-def _list_current_cluster_actors(*, filters: list[tuple[str, str, Any]]) -> list[Any]:
-    """List actors through the GCS address of this initialized Ray cluster."""
-    address = ray.get_runtime_context().gcs_address
-    if not address:
-        raise RuntimeError("The current Ray runtime has no GCS address.")
-    return list_actors(address=address, filters=filters)
 
 
 class ClusterEnvVar(str, Enum):
@@ -185,6 +176,7 @@ class Cluster:
             return
         self._setup_logger()
         self._distributed_log_collector: Optional[DistributedRayLogCollector] = None
+        self._owned_actor_handles: list[ActorHandle] = []
         self._ray_code_sync_fragment: Optional[dict[str, Any]] = None
         self._runtime_code_sync_strip_roots: tuple[str, ...] = ()
         if num_nodes is not None or cluster_cfg is not None:
@@ -260,7 +252,7 @@ class Cluster:
             ),
             runtime_env,
         )
-        return (
+        actor = (
             ray.remote(manager_cls)
             .options(
                 name=manager_cls.MANAGER_NAME,
@@ -272,6 +264,20 @@ class Cluster:
             )
             .remote(*args)
         )
+        self._owned_actor_handles.append(actor)
+        return actor
+
+    def _kill_owned_actors(self) -> tuple[str, ...]:
+        """Kill only actors created by this driver without using Ray State API."""
+        failures = []
+        if ray.is_initialized():
+            for actor in reversed(self._owned_actor_handles):
+                try:
+                    ray.kill(actor, no_restart=True)
+                except Exception as error:  # noqa BLE001 - cleanup must continue
+                    failures.append(f"{type(error).__name__}: {error}")
+        self._owned_actor_handles.clear()
+        return tuple(failures)
 
     def _init_and_launch_managers(
         self,
@@ -425,6 +431,7 @@ class Cluster:
                     Tracer, manager_node, runtime_env, tracer_cfg.get("output_file")
                 )
         except ValueError:
+            self._kill_owned_actors()
             raise Cluster.NamespaceConflictError
 
         def signal_handler(sig, frame):
@@ -434,16 +441,12 @@ class Cluster:
             if self._distributed_log_collector is not None:
                 self._distributed_log_collector.stop()
 
-            with without_http_proxies():
-                alive_actors = _list_current_cluster_actors(
-                    filters=[
-                        ("STATE", "=", "ALIVE"),
-                        ("RAY_NAMESPACE", "=", Cluster.NAMESPACE),
-                    ]
+            cleanup_failures = self._kill_owned_actors()
+            for cleanup_failure in cleanup_failures:
+                self._logger.warning(
+                    "Ray actor cleanup failed after the primary worker failure: %s",
+                    cleanup_failure,
                 )
-            for actor_state in alive_actors:
-                actor = ray.get_actor(actor_state.name)
-                ray.kill(actor, no_restart=True)
 
             if ray.is_initialized():
                 # Mimic ray's sleep before shutdown to ensure log messages are flushed
@@ -796,6 +799,7 @@ class Cluster:
             options["max_concurrency"] = max_concurrency
 
         actor = remote_cls.options(**options).remote(*cls_args, **cls_kwargs)
+        self._owned_actor_handles.append(actor)
         if self._distributed_log_collector is not None and not disable_distributed_log:
             self._distributed_log_collector.register_worker(
                 worker_name=worker_name,

@@ -56,28 +56,29 @@ def path_merge_test_env_var() -> str:
     return "LD_LIBRARY_PATH"
 
 
-def test_actor_listing_is_scoped_to_current_ray_cluster(monkeypatch):
-    captured = {}
-    expected = [SimpleNamespace(name="actor")]
+def test_actor_cleanup_uses_only_driver_owned_handles_without_state_api(monkeypatch):
+    cluster = object.__new__(Cluster)
+    first = SimpleNamespace(name="first")
+    failed = SimpleNamespace(name="failed")
+    last = SimpleNamespace(name="last")
+    cluster._owned_actor_handles = [first, failed, last]
+    killed = []
 
-    monkeypatch.setattr(
-        cluster_module.ray,
-        "get_runtime_context",
-        lambda: SimpleNamespace(gcs_address="192.0.2.1:12345"),
-    )
+    monkeypatch.setattr(cluster_module.ray, "is_initialized", lambda: True)
 
-    def fake_list_actors(*, address, filters):
-        captured.update(address=address, filters=filters)
-        return expected
+    def fake_kill(actor, *, no_restart):
+        assert no_restart is True
+        killed.append(actor.name)
+        if actor is failed:
+            raise RuntimeError("already dead")
 
-    monkeypatch.setattr(cluster_module, "list_actors", fake_list_actors)
-    filters = [("STATE", "=", "ALIVE")]
+    monkeypatch.setattr(cluster_module.ray, "kill", fake_kill)
 
-    assert cluster_module._list_current_cluster_actors(filters=filters) == expected
-    assert captured == {
-        "address": "192.0.2.1:12345",
-        "filters": filters,
-    }
+    failures = cluster._kill_owned_actors()
+
+    assert killed == ["last", "failed", "first"]
+    assert failures == ("RuntimeError: already dead",)
+    assert cluster._owned_actor_handles == []
 
 
 def test_cluster_config_parses_node_group_hardware():
