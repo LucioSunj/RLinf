@@ -61,6 +61,12 @@ class FastWAMScalarAudit:
     minimum: float | None
     maximum: float | None
     total: float
+    sum_of_squares: float = 0.0
+    p10: float | None = None
+    p25: float | None = None
+    p50: float | None = None
+    p75: float | None = None
+    p90: float | None = None
 
     def to_artifact(self) -> dict[str, object]:
         """Return a JSON-safe aggregate."""
@@ -72,6 +78,14 @@ class FastWAMScalarAudit:
             "minimum": self.minimum,
             "maximum": self.maximum,
             "sum": self.total,
+            "sum_of_squares": self.sum_of_squares,
+            "quantiles": {
+                "p10": self.p10,
+                "p25": self.p25,
+                "p50": self.p50,
+                "p75": self.p75,
+                "p90": self.p90,
+            },
         }
 
     def to_metrics(self, *, prefix: str) -> dict[str, float]:
@@ -82,6 +96,7 @@ class FastWAMScalarAudit:
             f"{prefix}/finite_count": float(self.finite_count),
             f"{prefix}/nonfinite_count": float(self.nonfinite_count),
             f"{prefix}/sum": self.total,
+            f"{prefix}/sum_of_squares": self.sum_of_squares,
         }
         if self.finite_count:
             metrics[f"{prefix}/mean"] = self.total / self.finite_count
@@ -89,6 +104,10 @@ class FastWAMScalarAudit:
             metrics[f"{prefix}/min"] = self.minimum
         if self.maximum is not None:
             metrics[f"{prefix}/max"] = self.maximum
+        for name in ("p10", "p25", "p50", "p75", "p90"):
+            value = getattr(self, name)
+            if value is not None:
+                metrics[f"{prefix}/{name}"] = value
         return metrics
 
 
@@ -482,6 +501,11 @@ class FastWAMRolloutStateAudit:
     base_probability_min: float
     base_probability_max: float
     base_probability_mean: float
+    base_probability_p10: float
+    base_probability_p50: float
+    base_probability_p90: float
+    base_probability_bimodality_score: float
+    base_probability_outside_0p2_0p8_fraction: float
     behavior_probability_min: float
     behavior_probability_max: float
     behavior_probability_mean: float
@@ -527,6 +551,13 @@ class FastWAMRolloutStateAudit:
                 "minimum": self.base_probability_min,
                 "maximum": self.base_probability_max,
                 "mean": self.base_probability_mean,
+                "p10": self.base_probability_p10,
+                "p50": self.base_probability_p50,
+                "p90": self.base_probability_p90,
+                "bimodality_score": self.base_probability_bimodality_score,
+                "outside_0p2_0p8_fraction": (
+                    self.base_probability_outside_0p2_0p8_fraction
+                ),
             },
             "behavior_probability": {
                 "count": probability_count,
@@ -588,6 +619,15 @@ class FastWAMRolloutStateAudit:
             "fastwam/gate/base_idm_probability_min": self.base_probability_min,
             "fastwam/gate/base_idm_probability_max": self.base_probability_max,
             "fastwam/gate/base_idm_probability_mean": self.base_probability_mean,
+            "fastwam/gate/base_idm_probability_p10": self.base_probability_p10,
+            "fastwam/gate/base_idm_probability_p50": self.base_probability_p50,
+            "fastwam/gate/base_idm_probability_p90": self.base_probability_p90,
+            "fastwam/gate/base_idm_probability_bimodality_score": (
+                self.base_probability_bimodality_score
+            ),
+            "fastwam/gate/base_idm_probability_outside_0p2_0p8_fraction": (
+                self.base_probability_outside_0p2_0p8_fraction
+            ),
             "fastwam/gate/behavior_idm_probability_min": (
                 self.behavior_probability_min
             ),
@@ -729,6 +769,18 @@ def _summarize_selected_scalars(
     finite_values = selected[finite].to(torch.float64)
     count = int(selected.numel())
     finite_count = int(finite.sum().item())
+    quantiles = (
+        torch.quantile(
+            finite_values,
+            torch.tensor(
+                [0.10, 0.25, 0.50, 0.75, 0.90],
+                dtype=torch.float64,
+                device=finite_values.device,
+            ),
+        )
+        if finite_count
+        else None
+    )
     return FastWAMScalarAudit(
         count=count,
         finite_count=finite_count,
@@ -736,6 +788,14 @@ def _summarize_selected_scalars(
         minimum=(float(finite_values.min().item()) if finite_count else None),
         maximum=(float(finite_values.max().item()) if finite_count else None),
         total=(float(finite_values.sum().item()) if finite_count else 0.0),
+        sum_of_squares=(
+            float(finite_values.square().sum().item()) if finite_count else 0.0
+        ),
+        p10=(float(quantiles[0].item()) if quantiles is not None else None),
+        p25=(float(quantiles[1].item()) if quantiles is not None else None),
+        p50=(float(quantiles[2].item()) if quantiles is not None else None),
+        p75=(float(quantiles[3].item()) if quantiles is not None else None),
+        p90=(float(quantiles[4].item()) if quantiles is not None else None),
     )
 
 
@@ -978,15 +1038,46 @@ def summarize_fastwam_rollout_state(
             "FastWAM recompute metadata must report zero stored K/V bytes."
         )
 
-    def probability_summary(value: torch.Tensor) -> tuple[float, float, float]:
+    def probability_summary(value: torch.Tensor) -> dict[str, float]:
         selected = value[eligible_gate_mask].to(torch.float64)
         if not bool(torch.isfinite(selected).all().item()):
             raise ValueError("Eligible Gate probability contains non-finite values.")
-        return (
-            float(selected.min().item()),
-            float(selected.max().item()),
-            float(selected.mean().item()),
+        quantiles = torch.quantile(
+            selected,
+            torch.tensor(
+                [0.10, 0.50, 0.90],
+                dtype=torch.float64,
+                device=selected.device,
+            ),
         )
+        centered = selected - selected.mean()
+        second_moment = centered.square().mean()
+        if float(second_moment.item()) == 0.0:
+            bimodality_score = 0.0
+        else:
+            third_moment = centered.pow(3).mean()
+            fourth_moment = centered.pow(4).mean()
+            skewness = third_moment / second_moment.pow(1.5)
+            kurtosis = fourth_moment / second_moment.square()
+            pearson_coefficient = (skewness.square() + 1.0) / kurtosis
+            bimodality_score = float(
+                (pearson_coefficient * (quantiles[2] - quantiles[0])).item()
+            )
+        return {
+            "minimum": float(selected.min().item()),
+            "maximum": float(selected.max().item()),
+            "mean": float(selected.mean().item()),
+            "p10": float(quantiles[0].item()),
+            "p50": float(quantiles[1].item()),
+            "p90": float(quantiles[2].item()),
+            # Pearson's coefficient alone is scale invariant and can call two
+            # nearby peaks strongly bimodal. Weighting it by the interdecile
+            # range makes the score reflect materially separated routing modes.
+            "bimodality_score": bimodality_score,
+            "outside_0p2_0p8_fraction": float(
+                ((selected < 0.2) | (selected > 0.8)).to(torch.float64).mean().item()
+            ),
+        }
 
     def byte_summary(values: torch.Tensor) -> tuple[int, int, int, int]:
         sample_count = int(values.numel())
@@ -995,10 +1086,8 @@ def summarize_fastwam_rollout_state(
         maximum = int(values.max().item()) if sample_count else 0
         return sample_count, nonzero_count, total_bytes, maximum
 
-    base_min, base_max, base_mean = probability_summary(emitted.base_probability)
-    behavior_min, behavior_max, behavior_mean = probability_summary(
-        emitted.behavior_probability
-    )
+    base_summary = probability_summary(emitted.base_probability)
+    behavior_summary = probability_summary(emitted.behavior_probability)
     all_count, all_nonzero, all_total, all_max = byte_summary(emitted_bytes)
     eligible_byte_count, eligible_nonzero, eligible_total, eligible_max = byte_summary(
         eligible_bytes
@@ -1037,12 +1126,19 @@ def summarize_fastwam_rollout_state(
                 "emitted_source_chunk_ids": emitted.source_chunk_ids,
             }
         ),
-        base_probability_min=base_min,
-        base_probability_max=base_max,
-        base_probability_mean=base_mean,
-        behavior_probability_min=behavior_min,
-        behavior_probability_max=behavior_max,
-        behavior_probability_mean=behavior_mean,
+        base_probability_min=base_summary["minimum"],
+        base_probability_max=base_summary["maximum"],
+        base_probability_mean=base_summary["mean"],
+        base_probability_p10=base_summary["p10"],
+        base_probability_p50=base_summary["p50"],
+        base_probability_p90=base_summary["p90"],
+        base_probability_bimodality_score=base_summary["bimodality_score"],
+        base_probability_outside_0p2_0p8_fraction=base_summary[
+            "outside_0p2_0p8_fraction"
+        ],
+        behavior_probability_min=behavior_summary["minimum"],
+        behavior_probability_max=behavior_summary["maximum"],
+        behavior_probability_mean=behavior_summary["mean"],
         kv_replay_backend=backend,
         kv_storage_dtype=metadata.storage_dtype,
         kv_layer_indices=metadata.layer_indices,

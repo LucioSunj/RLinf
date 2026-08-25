@@ -19,6 +19,7 @@ import types
 from dataclasses import replace
 from pathlib import Path
 
+import numpy as np
 import pytest
 import torch
 
@@ -396,6 +397,9 @@ def test_counterfactual_cost_audit_is_read_only_and_lowers_idm_advantage():
         entry["idm_destination_delta_from_zero"]["unnormalized"]["sum"] < 0.0
         for entry in artifact["entries"][1:]
     )
+    scalar_summary = artifact["entries"][0]["gate_advantage"]["unnormalized"]
+    assert scalar_summary["sum_of_squares"] >= 0.0
+    assert list(scalar_summary["quantiles"]) == ["p10", "p25", "p50", "p75", "p90"]
     metrics = audit.to_metrics()
     assert audit.break_even_idm_cost is None
     assert artifact["break_even_idm_cost"] is None
@@ -499,6 +503,11 @@ def test_rollout_state_audit_records_route_probabilities_and_stored_kv_bytes():
         "minimum": pytest.approx(0.375),
         "maximum": pytest.approx(0.375),
         "mean": pytest.approx(0.375),
+        "p10": pytest.approx(0.375),
+        "p50": pytest.approx(0.375),
+        "p90": pytest.approx(0.375),
+        "bimodality_score": 0.0,
+        "outside_0p2_0p8_fraction": 0.0,
     }
     assert artifact["behavior_probability"] == {
         "count": 8,
@@ -528,10 +537,68 @@ def test_rollout_state_audit_records_route_probabilities_and_stored_kv_bytes():
     assert metrics["fastwam/route/eligible_idm_fraction"] == 0.0
     assert metrics["fastwam/route/forced_fraction"] == pytest.approx(1 / 3)
     assert metrics["fastwam/gate/base_idm_probability_mean"] == pytest.approx(0.375)
+    assert metrics["fastwam/gate/base_idm_probability_p10"] == pytest.approx(0.375)
+    assert metrics["fastwam/gate/base_idm_probability_p50"] == pytest.approx(0.375)
+    assert metrics["fastwam/gate/base_idm_probability_p90"] == pytest.approx(0.375)
+    assert metrics["fastwam/gate/base_idm_probability_bimodality_score"] == 0.0
     assert metrics["fastwam/gate/behavior_idm_probability_mean"] == pytest.approx(0.4)
     assert metrics["fastwam/kv/eligible_total_bytes"] == 512.0
     assert metrics["fastwam/eligible_idm_fraction"] == 0.0
     json.dumps(artifact, sort_keys=True)
+
+
+def test_scalar_audit_records_sum_of_squares_and_numpy_quantiles() -> None:
+    values = torch.tensor([1.0, 2.0, float("nan"), 4.0])
+
+    artifact = advantages._summarize_selected_scalars(values).to_artifact()
+    finite = np.asarray([1.0, 2.0, 4.0])
+
+    assert artifact["count"] == 4
+    assert artifact["finite_count"] == 3
+    assert artifact["sum"] == 7.0
+    assert artifact["sum_of_squares"] == 21.0
+    for name, probability in (
+        ("p10", 0.10),
+        ("p25", 0.25),
+        ("p50", 0.50),
+        ("p75", 0.75),
+        ("p90", 0.90),
+    ):
+        assert artifact["quantiles"][name] == pytest.approx(
+            np.quantile(finite, probability)
+        )
+
+
+def test_gate_bimodality_score_separates_broad_modes_from_narrow_values() -> None:
+    route, emitted, _ = _alignment_records()
+    eligible = torch.ones_like(emitted.valid)
+
+    def score(values: list[float]) -> float:
+        probabilities = torch.tensor(values).reshape(emitted.shape)
+        audit = advantages.summarize_fastwam_rollout_state(
+            route=route,
+            emitted=replace(
+                emitted,
+                base_probability=probabilities,
+                behavior_probability=probabilities,
+            ),
+            eligible_gate_mask=eligible,
+            valid_mask=None,
+            kv_replay_backend="stored",
+            max_bytes_per_sample=256,
+        )
+        return audit.base_probability_bimodality_score
+
+    narrow_unimodal = score(
+        [0.45, 0.46, 0.47, 0.48, 0.49, 0.50, 0.51, 0.52, 0.53, 0.54, 0.55, 0.56]
+    )
+    broad_bimodal = score(
+        [0.08, 0.09, 0.10, 0.11, 0.12, 0.13, 0.87, 0.88, 0.89, 0.90, 0.91, 0.92]
+    )
+
+    assert narrow_unimodal < 0.1
+    assert broad_bimodal > 0.5
+    assert broad_bimodal > 5 * narrow_unimodal
 
 
 @pytest.mark.parametrize("missing_metadata", [True, False])

@@ -268,11 +268,39 @@ def test_v10_stable_route_does_not_trip_break_even_guard() -> None:
 
 def test_counterfactual_cost_audit_appends_full_jsonl_tables(tmp_path: Path) -> None:
     path = tmp_path / "run/audits/counterfactual_cost_audit.jsonl"
+    scalar = {
+        "count": 2,
+        "finite_count": 2,
+        "nonfinite_count": 0,
+        "minimum": -1.0,
+        "maximum": 1.0,
+        "sum": 0.0,
+        "sum_of_squares": 2.0,
+        "quantiles": {
+            "p10": -0.8,
+            "p25": -0.5,
+            "p50": 0.0,
+            "p75": 0.5,
+            "p90": 0.8,
+        },
+    }
+    groups = {
+        name: {"unnormalized": scalar, "normalized": scalar}
+        for name in (
+            "gate_advantage",
+            "idm_destination_gate_advantage",
+            "uncond_destination_gate_advantage",
+            "idm_destination_delta_from_zero",
+        )
+    }
     artifact = {
         "schema": "fastwam-counterfactual-cost-audit-v1",
         "configured_idm_cost": 0.01,
         "break_even_idm_cost": 0.0275,
-        "entries": [{"idm_cost": 0.0}, {"idm_cost": 0.1}],
+        "entries": [
+            {"idm_cost": 0.0, **groups},
+            {"idm_cost": 0.1, **groups},
+        ],
     }
 
     append_fastwam_counterfactual_cost_audit_jsonl(
@@ -286,6 +314,27 @@ def test_counterfactual_cost_audit_appends_full_jsonl_tables(tmp_path: Path) -> 
     assert [row["runner_step"] for row in rows] == [0, 1]
     assert all(row["entries"] == artifact["entries"] for row in rows)
     assert all(row["break_even_idm_cost"] == 0.0275 for row in rows)
+
+
+def test_counterfactual_cost_audit_jsonl_requires_variance_fields(
+    tmp_path: Path,
+) -> None:
+    artifact = {
+        "schema": "fastwam-counterfactual-cost-audit-v1",
+        "entries": [
+            {
+                "gate_advantage": {
+                    "unnormalized": {},
+                    "normalized": {},
+                }
+            }
+        ],
+    }
+
+    with pytest.raises(ValueError, match="sum_of_squares"):
+        append_fastwam_counterfactual_cost_audit_jsonl(
+            tmp_path / "audit.jsonl", runner_step=0, artifact=artifact
+        )
 
 
 def test_zero_cost_guard_state_round_trip_preserves_patience() -> None:

@@ -70,6 +70,40 @@ def append_fastwam_counterfactual_cost_audit_jsonl(
     payload = {"runner_step": int(runner_step), **dict(artifact)}
     if payload.get("schema") != "fastwam-counterfactual-cost-audit-v1":
         raise ValueError("Counterfactual audit schema mismatch.")
+    entries = payload.get("entries")
+    if not isinstance(entries, list) or not entries:
+        raise ValueError("Counterfactual audit entries must be a non-empty list.")
+    for entry in entries:
+        if not isinstance(entry, Mapping):
+            raise TypeError("Counterfactual audit entries must be mappings.")
+        for group in (
+            "gate_advantage",
+            "idm_destination_gate_advantage",
+            "uncond_destination_gate_advantage",
+            "idm_destination_delta_from_zero",
+        ):
+            grouped = entry.get(group)
+            if not isinstance(grouped, Mapping):
+                raise ValueError(f"Counterfactual audit {group} group is missing.")
+            for normalization in ("unnormalized", "normalized"):
+                summary = grouped.get(normalization)
+                if not isinstance(summary, Mapping):
+                    raise ValueError(
+                        f"Counterfactual audit {group}/{normalization} is missing."
+                    )
+                if "sum_of_squares" not in summary:
+                    raise ValueError(
+                        f"Counterfactual audit {group}/{normalization} "
+                        "sum_of_squares is missing."
+                    )
+                quantiles = summary.get("quantiles")
+                if not isinstance(quantiles, Mapping) or any(
+                    key not in quantiles for key in ("p10", "p25", "p50", "p75", "p90")
+                ):
+                    raise ValueError(
+                        f"Counterfactual audit {group}/{normalization} "
+                        "quantiles are missing."
+                    )
     destination = Path(path)
     destination.parent.mkdir(parents=True, exist_ok=True)
     encoded = json.dumps(payload, sort_keys=True, allow_nan=False)
