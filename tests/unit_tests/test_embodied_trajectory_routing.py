@@ -54,21 +54,16 @@ def test_gate_kv_episode_contributions_do_not_merge_environment_columns():
     assert contributions == [
         {
             "trajectory_column": 0,
-            "episode_id": 0,
-            "emitted_chunk_count": 2,
-            "sampled_kv_count": 1,
+            "initial_episode_id": 0,
+            "observed_episode_id_count": 2,
+            "emitted_chunk_count": 3,
+            "sampled_kv_count": 2,
             "sampled_eligible_gate_count": 1,
         },
         {
-            "trajectory_column": 0,
-            "episode_id": 1,
-            "emitted_chunk_count": 1,
-            "sampled_kv_count": 1,
-            "sampled_eligible_gate_count": 0,
-        },
-        {
             "trajectory_column": 1,
-            "episode_id": 0,
+            "initial_episode_id": 0,
+            "observed_episode_id_count": 1,
             "emitted_chunk_count": 3,
             "sampled_kv_count": 3,
             "sampled_eligible_gate_count": 2,

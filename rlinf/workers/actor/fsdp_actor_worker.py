@@ -185,7 +185,7 @@ def summarize_fastwam_gate_kv_episode_contributions(
     gate_valid_mask: torch.Tensor,
     gate_kv_sample_mask: torch.Tensor,
 ) -> list[dict[str, int]]:
-    """Count sampled K/V and usable Gate rows for each trajectory episode."""
+    """Count sampled K/V and usable Gate rows for each rollout trajectory."""
 
     if episode_ids.ndim != 2:
         raise ValueError("Gate K/V episode telemetry requires [time, batch] tensors.")
@@ -199,20 +199,20 @@ def summarize_fastwam_gate_kv_episode_contributions(
     contributions = []
     for trajectory_column in range(int(episode_ids.shape[1])):
         column_episodes = episode_ids[:, trajectory_column]
-        for episode_id in torch.unique(column_episodes).tolist():
-            episode_mask = torch.zeros_like(sampled)
-            episode_mask[:, trajectory_column] = column_episodes == int(episode_id)
-            contributions.append(
-                {
-                    "trajectory_column": trajectory_column,
-                    "episode_id": int(episode_id),
-                    "emitted_chunk_count": int(episode_mask.sum().item()),
-                    "sampled_kv_count": int((episode_mask & sampled).sum().item()),
-                    "sampled_eligible_gate_count": int(
-                        (episode_mask & sampled & gate_valid).sum().item()
-                    ),
-                }
-            )
+        contributions.append(
+            {
+                "trajectory_column": trajectory_column,
+                "initial_episode_id": int(column_episodes[0].item()),
+                "observed_episode_id_count": int(torch.unique(column_episodes).numel()),
+                "emitted_chunk_count": int(episode_ids.shape[0]),
+                "sampled_kv_count": int(sampled[:, trajectory_column].sum().item()),
+                "sampled_eligible_gate_count": int(
+                    (sampled[:, trajectory_column] & gate_valid[:, trajectory_column])
+                    .sum()
+                    .item()
+                ),
+            }
+        )
     return contributions
 
 
