@@ -76,6 +76,17 @@ def test_gate_kv_episode_contributions_do_not_merge_environment_columns():
     ]
 
 
+def test_gate_gradient_cosine_uses_all_parameter_tensors() -> None:
+    cosine, reference_norm, estimate_norm = EmbodiedFSDPActor._fastwam_gradient_cosine(
+        (torch.tensor([1.0, 0.0]), torch.tensor([0.0])),
+        (torch.tensor([1.0, 1.0]), torch.tensor([0.0])),
+    )
+
+    assert reference_norm == pytest.approx(1.0)
+    assert estimate_norm == pytest.approx(2.0**0.5)
+    assert cosine == pytest.approx(2.0**-0.5)
+
+
 class _AsyncValue:
     def __init__(self, value):
         self.value = value
