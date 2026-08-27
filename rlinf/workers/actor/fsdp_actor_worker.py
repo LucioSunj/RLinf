@@ -3295,10 +3295,9 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
         ).reshape(-1)
         eligible_indices = effective_mask.nonzero(as_tuple=False).reshape(-1).cpu()
         full_count = int(eligible_indices.numel())
-        if any(sample_size > full_count for sample_size in sample_sizes):
+        if full_count < 1:
             raise ValueError(
-                "Gate gradient diagnostic sample size exceeds the effective full count: "
-                f"{sample_sizes} vs {full_count}."
+                "Gate gradient diagnostic requires at least one effective Gate sample."
             )
         rng_state = get_rng_state()
         optimizer_steps_before = int(self.optimizer_steps)
@@ -3318,39 +3317,53 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
             metrics["gate_gradient_curve/full_effective_count"] = float(full_count)
             metrics["gate_gradient_curve/full_gradient_norm"] = full_norm
             for sample_size_index, sample_size in enumerate(sample_sizes):
+                effective_count = min(sample_size, full_count)
+                reused_full_gradient = effective_count == full_count
                 repeat_results = []
                 for repeat in range(repeats):
                     seed = base_seed + sample_size_index * repeats + repeat
-                    generator = torch.Generator(device="cpu")
-                    generator.manual_seed(seed)
-                    selected = eligible_indices[
-                        torch.randperm(full_count, generator=generator)[:sample_size]
-                    ]
-                    estimate, metadata = (
-                        self._compute_fastwam_gate_gradient_for_indices(selected)
-                    )
-                    cosine, _, estimate_norm = self._fastwam_gradient_cosine(
-                        full_gradient, estimate
-                    )
-                    if metadata["non_gate_nonzero_parameter_count"] != 0:
-                        raise RuntimeError(
-                            "Subsampled Gate diagnostic gradient reached a "
-                            "non-Gate parameter."
+                    if reused_full_gradient:
+                        cosine = 1.0
+                        estimate_norm = full_norm
+                        metadata = full_metadata
+                    else:
+                        generator = torch.Generator(device="cpu")
+                        generator.manual_seed(seed)
+                        selected = eligible_indices[
+                            torch.randperm(full_count, generator=generator)[
+                                :effective_count
+                            ]
+                        ]
+                        estimate, metadata = (
+                            self._compute_fastwam_gate_gradient_for_indices(selected)
                         )
+                        cosine, _, estimate_norm = self._fastwam_gradient_cosine(
+                            full_gradient, estimate
+                        )
+                        if metadata["non_gate_nonzero_parameter_count"] != 0:
+                            raise RuntimeError(
+                                "Subsampled Gate diagnostic gradient reached a "
+                                "non-Gate parameter."
+                            )
+                        del estimate
                     repeat_results.append(
                         {
                             "seed": seed,
-                            "effective_count": sample_size,
+                            "requested_effective_count": sample_size,
+                            "effective_count": effective_count,
+                            "capped_to_full": sample_size > full_count,
+                            "reused_full_gradient": reused_full_gradient,
                             "cosine": cosine,
                             "gradient_norm": estimate_norm,
                             **metadata,
                         }
                     )
-                    del estimate
                 cosines = [result["cosine"] for result in repeat_results]
                 summary = {
                     "requested_effective_count": sample_size,
-                    "effective_count": sample_size,
+                    "effective_count": effective_count,
+                    "capped_to_full": sample_size > full_count,
+                    "reused_full_gradient": reused_full_gradient,
                     "cosine_mean": float(sum(cosines) / len(cosines)),
                     "cosine_min": float(min(cosines)),
                     "cosine_max": float(max(cosines)),
@@ -3361,6 +3374,8 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
                 metrics[f"{prefix}/cosine_mean"] = summary["cosine_mean"]
                 metrics[f"{prefix}/cosine_min"] = summary["cosine_min"]
                 metrics[f"{prefix}/cosine_max"] = summary["cosine_max"]
+                metrics[f"{prefix}/effective_count"] = float(effective_count)
+                metrics[f"{prefix}/requested_effective_count"] = float(sample_size)
             del full_gradient
         finally:
             self.optimizer.zero_grad()

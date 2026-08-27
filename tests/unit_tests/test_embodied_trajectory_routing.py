@@ -14,6 +14,7 @@
 
 import asyncio
 import inspect
+import json
 from types import SimpleNamespace
 
 import pytest
@@ -80,6 +81,63 @@ def test_gate_gradient_cosine_uses_all_parameter_tensors() -> None:
     assert reference_norm == pytest.approx(1.0)
     assert estimate_norm == pytest.approx(2.0**0.5)
     assert cosine == pytest.approx(2.0**-0.5)
+
+
+def test_gate_gradient_curve_caps_requested_count_to_effective_full_count(
+    monkeypatch,
+    capsys,
+) -> None:
+    class _Optimizer:
+        def zero_grad(self):
+            pass
+
+    compute_calls = []
+
+    def compute(indices):
+        indices = indices.clone()
+        compute_calls.append(indices)
+        return (torch.tensor([float(indices.numel()), 1.0]),), {
+            "selected_count": int(indices.numel()),
+            "non_gate_nonzero_parameter_count": 0,
+            "fsdp_view_restore_handles": 0,
+        }
+
+    worker = SimpleNamespace(
+        rollout_batch={
+            "gate_valid_mask": torch.tensor([True, True, True]),
+            "gate_kv_sample_mask": torch.tensor([True, True, True]),
+        },
+        optimizer=_Optimizer(),
+        optimizer_steps=7,
+        version=3,
+        _compute_fastwam_gate_gradient_for_indices=compute,
+        _fastwam_gradient_cosine=EmbodiedFSDPActor._fastwam_gradient_cosine,
+    )
+    monkeypatch.setattr(actor_worker_module, "get_rng_state", lambda: {"cpu": "same"})
+    monkeypatch.setattr(actor_worker_module, "set_rng_state", lambda _: None)
+    monkeypatch.setattr(
+        actor_worker_module,
+        "checkpoint_state_sha256",
+        lambda _: "same",
+    )
+
+    metrics = EmbodiedFSDPActor._run_fastwam_gate_gradient_diagnostic(
+        worker,
+        ((2, 5), 2, 11),
+    )
+
+    assert [int(indices.numel()) for indices in compute_calls] == [3, 2, 2]
+    assert metrics["gate_gradient_curve/n_5/requested_effective_count"] == 5.0
+    assert metrics["gate_gradient_curve/n_5/effective_count"] == 3.0
+    line = capsys.readouterr().out.strip()
+    marker = actor_worker_module.FASTWAM_GATE_GRADIENT_CURVE_AUDIT_SENTINEL
+    audit = json.loads(line.split(f"{marker} ", 1)[1])
+    capped = audit["sample_sizes"][1]
+    assert capped["requested_effective_count"] == 5
+    assert capped["effective_count"] == 3
+    assert capped["capped_to_full"] is True
+    assert capped["reused_full_gradient"] is True
+    assert [repeat["effective_count"] for repeat in capped["repeats"]] == [3, 3]
 
 
 class _AsyncValue:
