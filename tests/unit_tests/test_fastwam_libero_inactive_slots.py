@@ -23,6 +23,7 @@ from omegaconf import OmegaConf
 
 from rlinf.envs.libero.action_contract import LiberoActionContract
 from rlinf.envs.libero.libero_env import LiberoEnv
+from rlinf.workers.env.env_worker import summarize_fastwam_training_episode_outcomes
 
 
 class _SubsetVectorEnv:
@@ -109,6 +110,40 @@ def _contract() -> LiberoActionContract:
         environment_horizon=1000,
         dependency_versions=(("robosuite_version", "1.4.0"),),
     )
+
+
+def test_training_episode_outcomes_preserve_first_success_and_executed_steps():
+    records = summarize_fastwam_training_episode_outcomes(
+        success_once=np.array([True, False, True]),
+        success_episode_len=np.array([237, 0, 411]),
+        executed_steps=np.array([700, 700, 700]),
+        rollout_epoch=4,
+        global_environment_offset=6,
+    )
+
+    assert records == [
+        {
+            "rollout_epoch": 4,
+            "global_environment_index": 6,
+            "executed_steps": 700,
+            "success": True,
+            "first_success_step": 237,
+        },
+        {
+            "rollout_epoch": 4,
+            "global_environment_index": 7,
+            "executed_steps": 700,
+            "success": False,
+            "first_success_step": None,
+        },
+        {
+            "rollout_epoch": 4,
+            "global_environment_index": 8,
+            "executed_steps": 700,
+            "success": True,
+            "first_success_step": 411,
+        },
+    ]
 
 
 def _formal_reset_env(*, num_envs: int, global_offset: int) -> LiberoEnv:

@@ -86,6 +86,47 @@ FASTWAM_EVALUATION_ACTION_FAILURE_SENTINEL = "FASTWAM_EVALUATION_ACTION_FAILURE"
 FASTWAM_EVALUATION_ACTION_FAILURE_SCHEMA = "fastwam-evaluation-action-failure-v1"
 
 
+def summarize_fastwam_training_episode_outcomes(
+    *,
+    success_once: Any,
+    success_episode_len: Any,
+    executed_steps: Any,
+    rollout_epoch: int,
+    global_environment_offset: int,
+) -> list[dict[str, Any]]:
+    """Return exact per-episode termination telemetry without changing the env."""
+
+    successes = np.asarray(success_once, dtype=bool).reshape(-1)
+    first_success_steps = np.asarray(success_episode_len, dtype=np.int64).reshape(-1)
+    final_steps = np.asarray(executed_steps, dtype=np.int64).reshape(-1)
+    if not (successes.shape == first_success_steps.shape == final_steps.shape):
+        raise ValueError("FastWAM training episode outcome arrays disagree in shape.")
+    if rollout_epoch < 0 or global_environment_offset < 0:
+        raise ValueError(
+            "FastWAM training episode outcome indices must be non-negative."
+        )
+    invalid_success = successes & (
+        (first_success_steps < 1) | (first_success_steps > final_steps)
+    )
+    if bool(invalid_success.any()):
+        raise ValueError("A successful episode has an invalid first-success step.")
+    if bool(((~successes) & (first_success_steps != 0)).any()):
+        raise ValueError("An unsuccessful episode has a nonzero first-success step.")
+
+    return [
+        {
+            "rollout_epoch": int(rollout_epoch),
+            "global_environment_index": int(global_environment_offset + index),
+            "executed_steps": int(final_steps[index]),
+            "success": bool(successes[index]),
+            "first_success_step": (
+                int(first_success_steps[index]) if successes[index] else None
+            ),
+        }
+        for index in range(int(successes.size))
+    ]
+
+
 class FastWAMEvaluationActionContractViolation(ValueError):
     """Pre-submission Action rejection with compact prepared-stage evidence."""
 
@@ -1969,6 +2010,9 @@ class EnvWorker(Worker):
         self.rollout_results = self._prepare_rollout_results(
             getattr(self, "rollout_results", None)
         )
+        training_action_audit = bool(
+            self.cfg.runner.get("fastwam_training_guard", {}).get("enabled", False)
+        )
         env_metrics = defaultdict(list)
         rlt_pending_obs: list[dict[str, Any] | None] = [None] * self.stage_num
         training_action_traces: list[list[ActionExecutionTrace]] = [
@@ -1990,6 +2034,9 @@ class EnvWorker(Worker):
             [] for _ in range(self.stage_num)
         ]
         training_flow_sde_denoise_indices: list[list[torch.Tensor]] = [
+            [] for _ in range(self.stage_num)
+        ]
+        training_episode_outcomes: list[list[dict[str, Any]]] = [
             [] for _ in range(self.stage_num)
         ]
 
@@ -2271,6 +2318,22 @@ class EnvWorker(Worker):
                     getattr(self, "rollout_results", None)
                 )
 
+            if training_action_audit:
+                for stage_id, environment in enumerate(self.env_list):
+                    training_episode_outcomes[stage_id].extend(
+                        summarize_fastwam_training_episode_outcomes(
+                            success_once=get_env_attr(environment, "success_once"),
+                            success_episode_len=get_env_attr(
+                                environment, "success_episode_len"
+                            ),
+                            executed_steps=get_env_attr(environment, "elapsed_steps"),
+                            rollout_epoch=epoch,
+                            global_environment_offset=(
+                                stage_id * self.train_num_envs_per_stage
+                            ),
+                        )
+                    )
+
             self.store_last_obs_and_intervened_info(env_outputs)
             self.finish_rollout()
 
@@ -2287,9 +2350,6 @@ class EnvWorker(Worker):
                         stage_id=stage_id,
                     )
 
-        training_action_audit = bool(
-            self.cfg.runner.get("fastwam_training_guard", {}).get("enabled", False)
-        )
         if training_action_audit:
             for stage_id, traces in enumerate(training_action_traces):
                 if not traces:
@@ -2347,6 +2407,18 @@ class EnvWorker(Worker):
                         "submission masks."
                     )
                 global_environment_offset = stage_id * self.train_num_envs_per_stage
+                episode_outcomes = training_episode_outcomes[stage_id]
+                successful_first_steps = [
+                    int(record["first_success_step"])
+                    for record in episode_outcomes
+                    if record["success"]
+                ]
+                executed_step_distribution: dict[str, int] = {}
+                for record in episode_outcomes:
+                    key = str(int(record["executed_steps"]))
+                    executed_step_distribution[key] = (
+                        executed_step_distribution.get(key, 0) + 1
+                    )
                 payload = {
                     "schema": FASTWAM_TRAINING_ACTION_AUDIT_SCHEMA,
                     "worker_rank": int(self._rank),
@@ -2363,6 +2435,18 @@ class EnvWorker(Worker):
                         sum(not submitted for submitted in mask)
                         for mask in submitted_masks
                     ),
+                    "episode_outcomes": {
+                        "episode_count": len(episode_outcomes),
+                        "successful_episode_count": len(successful_first_steps),
+                        "executed_step_distribution": executed_step_distribution,
+                        "successful_first_termination_steps": successful_first_steps,
+                        "successful_mean_first_termination_step": (
+                            sum(successful_first_steps) / len(successful_first_steps)
+                            if successful_first_steps
+                            else None
+                        ),
+                        "records": episode_outcomes,
+                    },
                     "submission_counts_by_global_environment": [
                         {
                             "global_environment_index": (

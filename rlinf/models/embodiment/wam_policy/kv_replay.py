@@ -52,6 +52,8 @@ class GateKVReplayConfig:
     pin_memory: bool = True
     deduplicate_static_banks: bool = True
     max_bytes_per_sample: int | None = None
+    gate_kv_sample_budget: int | None = None
+    gate_kv_sample_seed: int = 0
     hot_capacity_bytes_per_rollout_rank: int = 25 * 1024**3 // 2
     cold_capacity_bytes_per_rollout_rank: int = 24 * 1024**3
     nvme_capacity_bytes_per_rollout_rank: int = 0
@@ -70,6 +72,20 @@ class GateKVReplayConfig:
         object.__setattr__(self, "backend", backend)
         if self.max_bytes_per_sample is not None and self.max_bytes_per_sample <= 0:
             raise ValueError("`max_bytes_per_sample` must be positive when set.")
+        if self.gate_kv_sample_budget is not None and (
+            isinstance(self.gate_kv_sample_budget, bool)
+            or not isinstance(self.gate_kv_sample_budget, int)
+            or self.gate_kv_sample_budget < 1
+        ):
+            raise ValueError(
+                "`gate_kv_sample_budget` must be a positive integer or null."
+            )
+        if (
+            isinstance(self.gate_kv_sample_seed, bool)
+            or not isinstance(self.gate_kv_sample_seed, int)
+            or self.gate_kv_sample_seed < 0
+        ):
+            raise ValueError("`gate_kv_sample_seed` must be a non-negative integer.")
         for name in (
             "hot_capacity_bytes_per_rollout_rank",
             "cold_capacity_bytes_per_rollout_rank",

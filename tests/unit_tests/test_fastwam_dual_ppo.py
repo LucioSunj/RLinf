@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import importlib.util
+import itertools
 import math
 import sys
 from pathlib import Path
@@ -215,6 +216,43 @@ def test_selected_loss_scale_handles_an_empty_local_microbatch():
 
     assert accumulated.item() == pytest.approx(-1.0)
     assert torch.equal(logprobs.grad, torch.tensor([0.0, -1.0]))
+
+
+def test_fixed_budget_gate_gradient_is_unbiased_over_uniform_subsets():
+    advantages = torch.tensor([0.5, -1.0, 2.0, 1.5, -0.25, 3.0])
+    eligible = torch.tensor([True, True, False, True, False, True])
+    full_logits = torch.linspace(-0.3, 0.2, 6, requires_grad=True)
+    full_loss, _ = dual_ppo.compute_gate_ppo_loss(
+        logprobs=full_logits,
+        old_logprobs=torch.zeros(6),
+        advantages=advantages,
+        valid_mask=eligible,
+        clip_ratio_low=10.0,
+        clip_ratio_high=10.0,
+        selected_loss_scale=1.0 / float(eligible.sum()),
+    )
+    full_gradient = torch.autograd.grad(full_loss, full_logits)[0]
+
+    subset_gradients = []
+    sample_size = 2
+    inclusion_probability = sample_size / 6.0
+    for selected_indices in itertools.combinations(range(6), sample_size):
+        logits = full_logits.detach().clone().requires_grad_(True)
+        sampled = torch.zeros(6, dtype=torch.bool)
+        sampled[list(selected_indices)] = True
+        sampled_loss, _ = dual_ppo.compute_gate_ppo_loss(
+            logprobs=logits,
+            old_logprobs=torch.zeros(6),
+            advantages=advantages,
+            valid_mask=eligible & sampled,
+            clip_ratio_low=10.0,
+            clip_ratio_high=10.0,
+            selected_loss_scale=(1.0 / (float(eligible.sum()) * inclusion_probability)),
+        )
+        subset_gradients.append(torch.autograd.grad(sampled_loss, logits)[0])
+
+    mean_sampled_gradient = torch.stack(subset_gradients).mean(dim=0)
+    torch.testing.assert_close(mean_sampled_gradient, full_gradient)
 
 
 def test_empty_policy_masks_return_finite_differentiable_zero():

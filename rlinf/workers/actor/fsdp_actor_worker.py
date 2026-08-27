@@ -152,6 +152,7 @@ from rlinf.workers.rollout.utils import RankMapper
 _FASTWAM_BC_BOOTSTRAP_SCHEMA = "fastwam-uncond-bc-bootstrap-v1"
 FASTWAM_ACCELERATION_SEMANTICS_AUDIT_SENTINEL = "FASTWAM_ACCELERATION_SEMANTICS_AUDIT"
 FASTWAM_PREUPDATE_LOG_RATIO_AUDIT_SENTINEL = "FASTWAM_PREUPDATE_LOG_RATIO_AUDIT"
+FASTWAM_GATE_KV_SAMPLE_AUDIT_SENTINEL = "FASTWAM_GATE_KV_SAMPLE_AUDIT"
 _FASTWAM_BC_BOOTSTRAP_KEYS = {
     "schema",
     "bc_step",
@@ -159,6 +160,58 @@ _FASTWAM_BC_BOOTSTRAP_KEYS = {
     "sidecar_sha256",
     "parent_checkpoint_sha256",
 }
+
+
+def fastwam_effective_gate_kv_mask(
+    gate_valid_mask: torch.Tensor,
+    gate_kv_sample_mask: torch.Tensor | None,
+) -> torch.Tensor:
+    """Restrict only Gate replay while leaving every non-Gate mask untouched."""
+
+    gate_valid = gate_valid_mask.bool()
+    if gate_kv_sample_mask is None:
+        return gate_valid
+    sampled = gate_kv_sample_mask.bool()
+    if sampled.shape != gate_valid.shape:
+        raise ValueError("Gate-valid and Gate K/V sample masks must have equal shape.")
+    return gate_valid & sampled
+
+
+def summarize_fastwam_gate_kv_episode_contributions(
+    *,
+    episode_ids: torch.Tensor,
+    gate_valid_mask: torch.Tensor,
+    gate_kv_sample_mask: torch.Tensor,
+) -> list[dict[str, int]]:
+    """Count sampled K/V and usable Gate rows for each trajectory episode."""
+
+    if episode_ids.ndim != 2:
+        raise ValueError("Gate K/V episode telemetry requires [time, batch] tensors.")
+    if (
+        gate_valid_mask.shape != episode_ids.shape
+        or gate_kv_sample_mask.shape != episode_ids.shape
+    ):
+        raise ValueError("Gate K/V episode telemetry tensors must have equal shape.")
+    gate_valid = gate_valid_mask.bool()
+    sampled = gate_kv_sample_mask.bool()
+    contributions = []
+    for trajectory_column in range(int(episode_ids.shape[1])):
+        column_episodes = episode_ids[:, trajectory_column]
+        for episode_id in torch.unique(column_episodes).tolist():
+            episode_mask = torch.zeros_like(sampled)
+            episode_mask[:, trajectory_column] = column_episodes == int(episode_id)
+            contributions.append(
+                {
+                    "trajectory_column": trajectory_column,
+                    "episode_id": int(episode_id),
+                    "emitted_chunk_count": int(episode_mask.sum().item()),
+                    "sampled_kv_count": int((episode_mask & sampled).sum().item()),
+                    "sampled_eligible_gate_count": int(
+                        (episode_mask & sampled & gate_valid).sum().item()
+                    ),
+                }
+            )
+    return contributions
 
 
 def _fastwam_sha256_file(path: str) -> str:
@@ -2707,16 +2760,16 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
             raise ValueError(
                 "Gate-valid mask and K/V payload references must have equal shape."
             )
+        references = metadata.payload_reference_ids
+        sample_mask = references >= 0
+        self.rollout_batch["gate_kv_sample_mask"] = sample_mask
         all_handles = tuple(
-            int(value)
-            for value in metadata.payload_reference_ids.detach().cpu().reshape(-1)
+            int(value) for value in references[sample_mask].detach().cpu().reshape(-1)
         )
+        effective_gate_valid = fastwam_effective_gate_kv_mask(gate_valid, sample_mask)
         eligible_handles = tuple(
             int(value)
-            for value in metadata.payload_reference_ids[gate_valid.bool()]
-            .detach()
-            .cpu()
-            .reshape(-1)
+            for value in references[effective_gate_valid].detach().cpu().reshape(-1)
         )
         if len(set(all_handles)) != len(all_handles):
             raise ValueError(
@@ -2731,6 +2784,61 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
             handle: int(update_epoch) for handle in eligible_handles
         }
         self._fastwam_kv_all_handles = all_handles
+        emitted_count = int(references.numel())
+        sampled_count = int(sample_mask.sum().item())
+        configured_budget = self.cfg.actor.model.kv_replay.get(
+            "gate_kv_sample_budget", None
+        )
+        expected_sampled_count = (
+            emitted_count
+            if configured_budget is None
+            else min(int(configured_budget), emitted_count)
+        )
+        if sampled_count != expected_sampled_count:
+            raise RuntimeError(
+                "Global Gate K/V sample count disagrees with its budget: "
+                f"{sampled_count} != {expected_sampled_count}."
+            )
+        self._fastwam_gate_kv_sample_probability = (
+            sampled_count / emitted_count if emitted_count else 1.0
+        )
+        contributions = summarize_fastwam_gate_kv_episode_contributions(
+            episode_ids=self.rollout_batch["emitted_gate"].episode_ids,
+            gate_valid_mask=gate_valid,
+            gate_kv_sample_mask=sample_mask,
+        )
+        sample_audit = {
+            "schema": "fastwam-gate-kv-sample-audit-v1",
+            "actor_version": int(self.version),
+            "configured_budget": configured_budget,
+            "configured_seed": int(
+                self.cfg.actor.model.kv_replay.get("gate_kv_sample_seed", 0)
+            ),
+            "emitted_candidate_count": emitted_count,
+            "sampled_kv_count": sampled_count,
+            "actual_sample_rate": self._fastwam_gate_kv_sample_probability,
+            "full_eligible_gate_count": int(gate_valid.bool().sum().item()),
+            "sampled_eligible_gate_count": int(effective_gate_valid.sum().item()),
+            "episode_contributions": contributions,
+        }
+        print(
+            f"{FASTWAM_GATE_KV_SAMPLE_AUDIT_SENTINEL} "
+            + json.dumps(sample_audit, sort_keys=True),
+            flush=True,
+        )
+        self._fastwam_gate_kv_sampling_metrics = {
+            "kv_cache/sampled_kv_samples": float(sampled_count),
+            "kv_cache/emitted_kv_candidates": float(emitted_count),
+            "kv_cache/actual_sample_rate": float(
+                self._fastwam_gate_kv_sample_probability
+            ),
+            "kv_cache/full_eligible_gate_samples": float(
+                gate_valid.bool().sum().item()
+            ),
+            "kv_cache/sampled_eligible_gate_samples": float(
+                effective_gate_valid.sum().item()
+            ),
+        }
         self._fastwam_kv_executor = ThreadPoolExecutor(
             max_workers=1,
             thread_name_prefix=f"gate-kv-prefetch-{self._rank}",
@@ -2833,7 +2941,10 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
             raise RuntimeError("Gate K/V prefetch executor is not running.")
         emitted = micro_batch["emitted_gate"]
         metadata = emitted.kv_metadata
-        gate_valid = micro_batch["gate_valid_mask"].bool().reshape(-1)
+        gate_valid = fastwam_effective_gate_kv_mask(
+            micro_batch["gate_valid_mask"],
+            micro_batch.get("gate_kv_sample_mask"),
+        ).reshape(-1)
         references = metadata.payload_reference_ids.reshape(-1)
         batch_indices = gate_valid.nonzero(as_tuple=False).reshape(-1).cpu()
         handles = tuple(
@@ -2933,7 +3044,7 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
         if torch.cuda.is_available():
             free_gpu, _ = torch.cuda.mem_get_info(self.device)
             peak_gpu = torch.cuda.max_memory_allocated(self.device)
-        return {
+        metrics = {
             "kv_cache/prefetch_wait_seconds": self._fastwam_kv_prefetch_wait_seconds,
             "kv_cache/prefetch_wait_time": self._fastwam_kv_prefetch_wait_seconds,
             "kv_cache/h2d_bytes": float(self._fastwam_kv_h2d_bytes),
@@ -2948,6 +3059,8 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
                 getattr(process_memory, "uss", process_memory.rss)
             ),
         }
+        metrics.update(getattr(self, "_fastwam_gate_kv_sampling_metrics", {}))
+        return metrics
 
     @Worker.timer("run_training")
     def run_training(
@@ -3081,13 +3194,22 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
                     is SupportedModel.FASTWAM_ADAPTIVE
                 ):
                     route_info = train_global_batch["route_info"]
-                    gate_count = train_global_batch["gate_valid_mask"].bool().sum()
+                    effective_gate_mask = fastwam_effective_gate_kv_mask(
+                        train_global_batch["gate_valid_mask"],
+                        train_global_batch.get("gate_kv_sample_mask"),
+                    )
+                    gate_count = effective_gate_mask.sum()
+                    full_gate_count = train_global_batch["gate_valid_mask"].bool().sum()
                     flow_count = (
                         train_global_batch["flow_valid_mask"].bool()
                         & (route_info.route_used == int(WAMRoute.UNCOND))
                     ).sum()
                     counts = torch.tensor(
-                        [float(gate_count), float(flow_count)],
+                        [
+                            float(gate_count),
+                            float(flow_count),
+                            float(full_gate_count),
+                        ],
                         device=self.device,
                         dtype=torch.float32,
                     )
@@ -3100,8 +3222,18 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
                     )
                     selected_loss_scales = {
                         "gate": (
-                            scale_numerator / counts[0].item()
-                            if counts[0].item() > 0
+                            scale_numerator
+                            / (
+                                counts[2].item()
+                                * float(
+                                    getattr(
+                                        self,
+                                        "_fastwam_gate_kv_sample_probability",
+                                        1.0,
+                                    )
+                                )
+                            )
+                            if counts[2].item() > 0
                             else 0.0
                         ),
                         "flow": (
@@ -3336,11 +3468,15 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
         route_info = micro_batch["route_info"]
         emitted_gate = micro_batch["emitted_gate"]
         selected_loss_scales = selected_loss_scales or {}
+        effective_gate_mask = fastwam_effective_gate_kv_mask(
+            micro_batch["gate_valid_mask"],
+            micro_batch.get("gate_kv_sample_mask"),
+        )
         policy_loss_value, metrics = compute_fastwam_dual_ppo_loss(
             gate_logprobs=output_dict["gate_logprobs"].float(),
             gate_old_logprobs=emitted_gate.old_logprob.float(),
             gate_advantages=micro_batch["gate_advantages"].float(),
-            gate_valid_mask=micro_batch["gate_valid_mask"].bool(),
+            gate_valid_mask=effective_gate_mask,
             gate_clip_ratio_low=float(gate_cfg.clip_ratio_low),
             gate_clip_ratio_high=float(gate_cfg.clip_ratio_high),
             gate_behavior_probabilities=output_dict[
@@ -3388,7 +3524,7 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
             collapse_loss, collapse_metrics = compute_gate_collapse_penalty(
                 base_idm_probabilities=output_dict["gate_base_probabilities"].float(),
                 episode_ids=emitted_gate.episode_ids,
-                valid_mask=micro_batch["gate_valid_mask"].bool(),
+                valid_mask=effective_gate_mask,
                 tau_calls=float(collapse_cfg.get("tau_calls", 1.0)),
                 scope=str(collapse_cfg.get("scope", "microbatch")),
             )

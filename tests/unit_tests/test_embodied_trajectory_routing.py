@@ -17,11 +17,15 @@ import inspect
 from types import SimpleNamespace
 
 import pytest
+import torch
 
 import rlinf.workers.actor.fsdp_actor_worker as actor_worker_module
 from rlinf.data.embodied_io_struct import ACTOR_TRAJECTORY_CHANNEL_TAG
 from rlinf.scheduler.worker.routing import CommMapper
-from rlinf.workers.actor.fsdp_actor_worker import EmbodiedFSDPActor
+from rlinf.workers.actor.fsdp_actor_worker import (
+    EmbodiedFSDPActor,
+    summarize_fastwam_gate_kv_episode_contributions,
+)
 from rlinf.workers.env.env_worker import EnvWorker
 
 
@@ -34,6 +38,42 @@ class _Placement:
 
     def get_world_size(self, name: str) -> int:
         return self._world_sizes[name]
+
+
+def test_gate_kv_episode_contributions_do_not_merge_environment_columns():
+    contributions = summarize_fastwam_gate_kv_episode_contributions(
+        episode_ids=torch.tensor([[0, 0], [0, 0], [1, 0]]),
+        gate_valid_mask=torch.tensor(
+            [[True, True], [True, False], [False, True]],
+        ),
+        gate_kv_sample_mask=torch.tensor(
+            [[True, True], [False, True], [True, True]],
+        ),
+    )
+
+    assert contributions == [
+        {
+            "trajectory_column": 0,
+            "episode_id": 0,
+            "emitted_chunk_count": 2,
+            "sampled_kv_count": 1,
+            "sampled_eligible_gate_count": 1,
+        },
+        {
+            "trajectory_column": 0,
+            "episode_id": 1,
+            "emitted_chunk_count": 1,
+            "sampled_kv_count": 1,
+            "sampled_eligible_gate_count": 0,
+        },
+        {
+            "trajectory_column": 1,
+            "episode_id": 0,
+            "emitted_chunk_count": 3,
+            "sampled_kv_count": 3,
+            "sampled_eligible_gate_count": 2,
+        },
+    ]
 
 
 class _AsyncValue:

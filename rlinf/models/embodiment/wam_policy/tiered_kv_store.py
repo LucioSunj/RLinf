@@ -178,6 +178,8 @@ class TieredGateKVStore:
         source_rank: int,
         device: torch.device | str,
         config: GateKVReplayConfig,
+        expected_global_samples: int | None = None,
+        expected_local_samples: int | None = None,
     ) -> None:
         if config.transport != "host_staging":
             raise ValueError(
@@ -191,6 +193,27 @@ class TieredGateKVStore:
             else torch.device(device)
         )
         self.config = config
+        self.expected_global_samples = expected_global_samples
+        self.expected_local_samples = expected_local_samples
+        if config.gate_kv_sample_budget is not None:
+            for name, value in (
+                ("expected_global_samples", expected_global_samples),
+                ("expected_local_samples", expected_local_samples),
+            ):
+                if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+                    raise ValueError(
+                        f"`{name}` must be a positive integer when Gate K/V "
+                        "sampling is enabled."
+                    )
+            assert expected_global_samples is not None
+            assert expected_local_samples is not None
+            if expected_global_samples % expected_local_samples != 0:
+                raise ValueError(
+                    "Global Gate K/V candidates must divide evenly across rollout ranks."
+                )
+            source_world_size = expected_global_samples // expected_local_samples
+            if not 0 <= self.source_rank < source_world_size:
+                raise ValueError("Gate K/V source rank is outside the sampling world.")
         self.generation = 0
         self._next_local_id = 0
         self._entries: dict[int, _StoredEntry] = {}
@@ -202,6 +225,11 @@ class TieredGateKVStore:
         self._peak_nvme_bytes = 0
         self._emitted_count = 0
         self._emitted_bytes = 0
+        self._sampled_count = 0
+        self._sampled_bytes = 0
+        self._unsampled_count = 0
+        self._unsampled_bytes = 0
+        self._selected_local_positions: set[int] | None = None
         self._eligible_count = 0
         self._eligible_bytes = 0
         self._discarded_count = 0
@@ -251,6 +279,28 @@ class TieredGateKVStore:
         self.generation = generation
         self._next_local_id = 0
         self._reset_interval_metrics()
+        self._prepare_sample_plan()
+
+    def _prepare_sample_plan(self) -> None:
+        budget = self.config.gate_kv_sample_budget
+        if budget is None:
+            self._selected_local_positions = None
+            return
+        assert self.expected_global_samples is not None
+        assert self.expected_local_samples is not None
+        selected_count = min(int(budget), int(self.expected_global_samples))
+        generator = torch.Generator(device="cpu")
+        generator.manual_seed(int(self.config.gate_kv_sample_seed) + self.generation)
+        selected = torch.randperm(
+            int(self.expected_global_samples),
+            generator=generator,
+        )[:selected_count]
+        local_start = self.source_rank * int(self.expected_local_samples)
+        local_stop = local_start + int(self.expected_local_samples)
+        local = selected[(selected >= local_start) & (selected < local_stop)]
+        self._selected_local_positions = {
+            int(value) - local_start for value in local.tolist()
+        }
 
     def _reset_interval_metrics(self) -> None:
         self._peak_gpu_bytes = self._gpu_bytes
@@ -258,6 +308,10 @@ class TieredGateKVStore:
         self._peak_nvme_bytes = self._nvme_bytes
         self._emitted_count = 0
         self._emitted_bytes = 0
+        self._sampled_count = 0
+        self._sampled_bytes = 0
+        self._unsampled_count = 0
+        self._unsampled_bytes = 0
         self._eligible_count = 0
         self._eligible_bytes = 0
         self._discarded_count = 0
@@ -444,6 +498,8 @@ class TieredGateKVStore:
         batch_size = batch_sizes.pop()
         handles: list[int] = []
         for sample_index in range(batch_size):
+            local_id = self._next_local_id
+            self._next_local_id += 1
             byte_count = sum(
                 _tensor_bytes(tensor[sample_index : sample_index + 1])
                 for tensor in packed.values()
@@ -457,6 +513,18 @@ class TieredGateKVStore:
                     f"registration: {byte_count} > "
                     f"{self.config.max_bytes_per_sample}."
                 )
+            self._emitted_count += 1
+            self._emitted_bytes += byte_count
+            selected = (
+                self._selected_local_positions is None
+                or local_id in self._selected_local_positions
+            )
+            if not selected:
+                self._unsampled_count += 1
+                self._unsampled_bytes += byte_count
+                handles.append(-1)
+                self._observe_resources()
+                continue
             hot = self._can_store_hot(byte_count)
             cold = not hot and self._cpu_bytes + byte_count <= int(
                 self.config.cold_capacity_bytes_per_rollout_rank
@@ -477,9 +545,8 @@ class TieredGateKVStore:
             handle = encode_gate_kv_handle(
                 source_rank=self.source_rank,
                 generation=self.generation,
-                local_id=self._next_local_id,
+                local_id=local_id,
             )
-            self._next_local_id += 1
             payload = None
             nvme_fields = None
             if nvme:
@@ -511,8 +578,8 @@ class TieredGateKVStore:
             self._peak_gpu_bytes = max(self._peak_gpu_bytes, self._gpu_bytes)
             self._peak_cpu_bytes = max(self._peak_cpu_bytes, self._cpu_bytes)
             self._peak_nvme_bytes = max(self._peak_nvme_bytes, self._nvme_bytes)
-            self._emitted_count += 1
-            self._emitted_bytes += byte_count
+            self._sampled_count += 1
+            self._sampled_bytes += byte_count
             handles.append(handle)
             self._observe_resources()
 
@@ -540,6 +607,18 @@ class TieredGateKVStore:
     def retain(self, handles: tuple[int, ...]) -> None:
         """Discard every ineligible payload after delayed-route audits pass."""
 
+        if (
+            self.expected_local_samples is not None
+            and self._emitted_count != self.expected_local_samples
+        ):
+            raise RuntimeError(
+                "Gate K/V store observed a different local candidate count: "
+                f"{self._emitted_count} != {self.expected_local_samples}."
+            )
+        if self._sampled_count != len(self._entries):
+            raise RuntimeError(
+                "Gate K/V sampled count disagrees with resident entries."
+            )
         self._validate_handles(handles)
         keep = set(handles)
         discard = tuple(handle for handle in self._entries if handle not in keep)
@@ -631,6 +710,15 @@ class TieredGateKVStore:
             "peak_nvme_bytes": float(self._peak_nvme_bytes),
             "emitted_samples": float(self._emitted_count),
             "emitted_bytes": float(self._emitted_bytes),
+            "sampled_samples": float(self._sampled_count),
+            "sampled_bytes": float(self._sampled_bytes),
+            "unsampled_samples": float(self._unsampled_count),
+            "unsampled_bytes": float(self._unsampled_bytes),
+            "actual_sample_rate": (
+                float(self._sampled_count / self._emitted_count)
+                if self._emitted_count
+                else 0.0
+            ),
             "eligible_samples": float(self._eligible_count),
             "eligible_bytes": float(self._eligible_bytes),
             "discarded_samples": float(self._discarded_count),
