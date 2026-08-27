@@ -2747,6 +2747,7 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
         request_channel: Channel,
         response_channel: Channel,
         update_epoch: int,
+        episode_contributions: list[dict[str, int]],
     ) -> None:
         emitted = self.rollout_batch.get("emitted_gate")
         metadata = None if emitted is None else emitted.kv_metadata
@@ -2819,11 +2820,6 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
             recommended_candidate_budget = math.ceil(
                 int(configured_budget) / candidate_eligibility_rate
             )
-        contributions = summarize_fastwam_gate_kv_episode_contributions(
-            episode_ids=self.rollout_batch["emitted_gate"].episode_ids,
-            gate_valid_mask=gate_valid,
-            gate_kv_sample_mask=sample_mask,
-        )
         sample_audit = {
             "schema": "fastwam-gate-kv-sample-audit-v1",
             "actor_version": int(self.version),
@@ -2842,7 +2838,7 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
                 candidate_to_effective_gap_fraction
             ),
             "recommended_candidate_budget": recommended_candidate_budget,
-            "episode_contributions": contributions,
+            "episode_contributions": episode_contributions,
         }
         print(
             f"{FASTWAM_GATE_KV_SAMPLE_AUDIT_SENTINEL} "
@@ -3497,6 +3493,23 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
             self.rollout_batch["prev_logprobs"].shape[0]
             * self.rollout_batch["prev_logprobs"].shape[1]
         )
+        gate_kv_episode_contributions = []
+        if self._uses_fastwam_handle_replay():
+            emitted_gate = self.rollout_batch.get("emitted_gate")
+            metadata = None if emitted_gate is None else emitted_gate.kv_metadata
+            references = None if metadata is None else metadata.payload_reference_ids
+            gate_valid = self.rollout_batch.get("gate_valid_mask")
+            if references is None or gate_valid is None:
+                raise ValueError(
+                    "Stored Gate replay requires K/V references and a valid mask."
+                )
+            gate_kv_episode_contributions = (
+                summarize_fastwam_gate_kv_episode_contributions(
+                    episode_ids=emitted_gate.episode_ids,
+                    gate_valid_mask=gate_valid,
+                    gate_kv_sample_mask=references >= 0,
+                )
+            )
         g = torch.Generator()
         g.manual_seed(self.cfg.actor.seed + self._rank)
         shuffle_id = torch.randperm(rollout_size, generator=g)
@@ -3527,6 +3540,7 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
                 request_channel=kv_request_channel,
                 response_channel=kv_response_channel,
                 update_epoch=update_epoch,
+                episode_contributions=gate_kv_episode_contributions,
             )
         gate_gradient_diagnostic_metrics = {}
         if gate_gradient_diagnostic_config is not None:
