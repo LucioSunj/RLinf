@@ -85,25 +85,30 @@ def _training_metrics(
     gate_entropy: float = 0.5,
     gate_samples: float = 100.0,
     uncond_samples: float = 8.0,
+    effective_gate_samples: float | None = None,
+    full_eligible_gate_samples: float | None = None,
 ):
-    return [
-        {
-            "actor/grad_norm": 1.0,
-            "critic/explained_variance": -0.2,
-            "critic/value_clip_ratio": 0.0,
-            "critic/value_loss": 0.4,
-            "gate/approx_kl": gate_kl,
-            "gate/clip_fraction": gate_clip,
-            "gate/entropy": gate_entropy,
-            "gate/ratio": 1.0,
-            "gate/sample_count": gate_samples,
-            "uncond_flow/approx_kl": 0.001,
-            "uncond_flow/clip_fraction": 0.0,
-            "uncond_flow/entropy": 14.0,
-            "uncond_flow/ratio": 1.0,
-            "uncond_flow/sample_count": uncond_samples,
-        }
-    ]
+    metrics = {
+        "actor/grad_norm": 1.0,
+        "critic/explained_variance": -0.2,
+        "critic/value_clip_ratio": 0.0,
+        "critic/value_loss": 0.4,
+        "gate/approx_kl": gate_kl,
+        "gate/clip_fraction": gate_clip,
+        "gate/entropy": gate_entropy,
+        "gate/ratio": 1.0,
+        "gate/sample_count": gate_samples,
+        "uncond_flow/approx_kl": 0.001,
+        "uncond_flow/clip_fraction": 0.0,
+        "uncond_flow/entropy": 14.0,
+        "uncond_flow/ratio": 1.0,
+        "uncond_flow/sample_count": uncond_samples,
+    }
+    if effective_gate_samples is not None:
+        metrics["kv_cache/effective_gate_gradient_count"] = effective_gate_samples
+    if full_eligible_gate_samples is not None:
+        metrics["kv_cache/full_eligible_gate_samples"] = full_eligible_gate_samples
+    return [metrics]
 
 
 def _scalar(total: float, count: int) -> FastWAMScalarAudit:
@@ -386,6 +391,51 @@ def test_training_guard_reconciles_route_and_ppo_sample_counts() -> None:
     mismatched[0]["gate/sample_count"] = 99.0
     with pytest.raises(RuntimeError, match="does not reconcile"):
         guard.observe_training(mismatched)
+
+
+def test_training_guard_reconciles_sampled_gate_ppo_with_effective_count() -> None:
+    guard = FastWAMTrainingGuard(_config())
+    guard.observe_rollout(_rollout_metrics(successes=1))
+
+    result = guard.observe_training(
+        _training_metrics(
+            gate_samples=40.0,
+            effective_gate_samples=40.0,
+            full_eligible_gate_samples=100.0,
+        )
+    )
+
+    assert result["gate_sample_count_basis"] == "sampled_effective"
+    assert result["expected_gate_sample_count"] == 40.0
+    assert result["observed_gate_sample_count"] == 40.0
+
+
+def test_training_guard_rejects_sampled_gate_count_disagreement() -> None:
+    guard = FastWAMTrainingGuard(_config())
+    guard.observe_rollout(_rollout_metrics(successes=1))
+
+    with pytest.raises(RuntimeError, match="Gate PPO sample count"):
+        guard.observe_training(
+            _training_metrics(
+                gate_samples=39.0,
+                effective_gate_samples=40.0,
+                full_eligible_gate_samples=100.0,
+            )
+        )
+
+
+def test_training_guard_rejects_sampled_full_eligible_disagreement() -> None:
+    guard = FastWAMTrainingGuard(_config())
+    guard.observe_rollout(_rollout_metrics(successes=1))
+
+    with pytest.raises(RuntimeError, match="full eligible Gate count"):
+        guard.observe_training(
+            _training_metrics(
+                gate_samples=40.0,
+                effective_gate_samples=40.0,
+                full_eligible_gate_samples=99.0,
+            )
+        )
 
 
 def test_training_guard_fails_closed_on_missing_or_nonfinite_metrics() -> None:

@@ -28,6 +28,8 @@ from typing import Any
 FASTWAM_TRAINING_GUARD_STATE_SCHEMA = "fastwam-training-guard-state-v2"
 FASTWAM_BREAK_EVEN_METRIC = "fastwam/counterfactual/break_even_idm_cost"
 FASTWAM_CONFIGURED_COST_METRIC = "fastwam/counterfactual/configured_idm_cost"
+FASTWAM_EFFECTIVE_GATE_COUNT_METRIC = "kv_cache/effective_gate_gradient_count"
+FASTWAM_FULL_ELIGIBLE_GATE_COUNT_METRIC = "kv_cache/full_eligible_gate_samples"
 
 
 def _plain_mapping(value: Any) -> dict[str, Any]:
@@ -432,6 +434,39 @@ class FastWAMTrainingGuard:
                 "Training metrics arrived without a rollout observation."
             )
         metrics = self._aggregate(metrics_list, self._TRAINING_KEYS)
+        gate_sample_count_basis = "full_eligible_rollout"
+        expected_gate_sample_count = float(self._pending_gate_sample_count)
+        sampling_count_keys = (
+            FASTWAM_EFFECTIVE_GATE_COUNT_METRIC,
+            FASTWAM_FULL_ELIGIBLE_GATE_COUNT_METRIC,
+        )
+        if any(
+            key in worker_metrics
+            for worker_metrics in metrics_list
+            for key in sampling_count_keys
+        ):
+            sampling_counts = self._aggregate(metrics_list, sampling_count_keys)
+            full_eligible_count = sampling_counts[
+                FASTWAM_FULL_ELIGIBLE_GATE_COUNT_METRIC
+            ]
+            if not math.isclose(
+                full_eligible_count,
+                float(self._pending_gate_sample_count),
+                abs_tol=1e-6,
+            ):
+                raise RuntimeError(
+                    "FastWAM full eligible Gate count does not reconcile with "
+                    "the rollout."
+                )
+            expected_gate_sample_count = sampling_counts[
+                FASTWAM_EFFECTIVE_GATE_COUNT_METRIC
+            ]
+            if not 0.0 <= expected_gate_sample_count <= full_eligible_count:
+                raise RuntimeError(
+                    "FastWAM effective Gate gradient count is outside the full "
+                    "eligible count."
+                )
+            gate_sample_count_basis = "sampled_effective"
         gate_kl = metrics["gate/approx_kl"]
         gate_clip = metrics["gate/clip_fraction"]
         gate_entropy = metrics["gate/entropy"]
@@ -447,7 +482,7 @@ class FastWAMTrainingGuard:
             )
         if not math.isclose(
             metrics["gate/sample_count"],
-            float(self._pending_gate_sample_count),
+            expected_gate_sample_count,
             abs_tol=1e-6,
         ):
             raise RuntimeError("FastWAM Gate PPO sample count does not reconcile.")
@@ -509,6 +544,9 @@ class FastWAMTrainingGuard:
             "consecutive_break_even_below_cost": (
                 self._consecutive_break_even_below_cost
             ),
+            "gate_sample_count_basis": gate_sample_count_basis,
+            "expected_gate_sample_count": expected_gate_sample_count,
+            "observed_gate_sample_count": metrics["gate/sample_count"],
         }
 
     def state_dict(self) -> dict[str, Any]:
