@@ -17,10 +17,12 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import math
 import time
 from collections.abc import Mapping
 from dataclasses import dataclass, field, replace
+from pathlib import Path
 from typing import Any, Literal, Protocol
 
 import torch
@@ -69,6 +71,7 @@ class FastWAMChunkSample:
     forward_inputs: dict[str, torch.Tensor] = field(default_factory=dict)
     critic_features: FastWAMValueFeatures | torch.Tensor | None = None
     action_execution_trace: ActionExecutionTrace | None = None
+    detailed_timing_seconds: dict[str, torch.Tensor] | None = None
 
     def __post_init__(self) -> None:
         batch_size = self.actions.shape[0]
@@ -96,6 +99,14 @@ class FastWAMChunkSample:
             and self.action_execution_trace.batch_size != batch_size
         ):
             raise ValueError("Action trace batch must match actions.")
+        if self.detailed_timing_seconds is not None:
+            for name, values in self.detailed_timing_seconds.items():
+                if values.shape != (batch_size,):
+                    raise ValueError(f"Detailed timing {name!r} must have shape [B].")
+                if not torch.isfinite(values).all() or (values < 0).any():
+                    raise ValueError(
+                        f"Detailed timing {name!r} must be finite and non-negative."
+                    )
 
 
 class FastWAMPolicyRuntime(Protocol):
@@ -109,6 +120,7 @@ class FastWAMPolicyRuntime(Protocol):
         mode: Literal["train", "eval"],
         actor_version: int,
         collect_replay: bool = True,
+        collect_detailed_timing: bool = False,
     ) -> FastWAMChunkSample: ...
 
     def replay_action_batch(
@@ -151,6 +163,7 @@ class FastWAMAdaptivePolicyConfig:
     eval_routing_seed: int = 0
     eval_microbatch_size: int = 1
     eval_timing_cuda_synchronize: bool = False
+    eval_detailed_timing_output: str | None = None
     training_rollout_microbatch_size: int | None = None
     formal_training_sampling_seed: int | None = None
     decision_telemetry_enabled: bool = False
@@ -167,6 +180,16 @@ class FastWAMAdaptivePolicyConfig:
             raise TypeError("`eval_timing_cuda_synchronize` must be a boolean.")
         if not isinstance(self.decision_telemetry_enabled, bool):
             raise TypeError("`decision_telemetry_enabled` must be a boolean.")
+        timing_output = self.eval_detailed_timing_output
+        if timing_output is not None:
+            if not isinstance(timing_output, str) or not timing_output.strip():
+                raise TypeError(
+                    "`eval_detailed_timing_output` must be a non-empty path or null."
+                )
+            if not self.eval_timing_cuda_synchronize:
+                raise ValueError(
+                    "Detailed evaluation timing requires CUDA synchronization."
+                )
         training_microbatch = self.training_rollout_microbatch_size
         if training_microbatch is not None:
             if isinstance(training_microbatch, bool) or not isinstance(
@@ -339,6 +362,7 @@ class FastWAMAdaptivePolicy(nn.Module, BasePolicy):
         self.config = config or FastWAMAdaptivePolicyConfig()
         self.route_tracker = PendingRouteTracker()
         self.actor_version = 0
+        self._eval_detailed_timing_initialized = False
         self._enforce_frozen_actor()
         self.actor.eval()
 
@@ -830,6 +854,23 @@ class FastWAMAdaptivePolicy(nn.Module, BasePolicy):
             results.append(result)
         return self._merge_training_microbatch_results(actions, results)
 
+    def _append_eval_detailed_timing_records(
+        self,
+        records: list[dict[str, Any]],
+    ) -> None:
+        """Append synchronized C1 timing records to the configured artifact."""
+
+        output = self.config.eval_detailed_timing_output
+        if output is None:
+            raise RuntimeError("Detailed timing output is not configured.")
+        path = Path(output).expanduser().resolve()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        mode = "a" if self._eval_detailed_timing_initialized else "x"
+        with path.open(mode, encoding="utf-8") as handle:
+            for record in records:
+                handle.write(json.dumps(record, sort_keys=True, allow_nan=False) + "\n")
+        self._eval_detailed_timing_initialized = True
+
     @torch.no_grad()
     def _predict_eval_action_batch(
         self,
@@ -849,8 +890,17 @@ class FastWAMAdaptivePolicy(nn.Module, BasePolicy):
         measure_gate_latency = self.config.eval_timing_cuda_synchronize
         gate_latencies: list[torch.Tensor] = []
         gate_h2d_latencies: list[torch.Tensor] = []
+        collect_detailed_timing = self.config.eval_detailed_timing_output is not None
+        detailed_timings: list[dict[str, torch.Tensor]] = []
+        policy_timing_device = next(self.actor.parameters()).device
+        if collect_detailed_timing and policy_timing_device.type == "cuda":
+            torch.cuda.synchronize(policy_timing_device)
+        policy_started_at = time.perf_counter() if collect_detailed_timing else None
         for start in range(0, batch_size, microbatch):
             end = min(start + microbatch, batch_size)
+            sample_kwargs = {}
+            if collect_detailed_timing:
+                sample_kwargs["collect_detailed_timing"] = True
             sample = self.runtime.sample_action_batch(
                 env_obs=self._slice_env_obs(
                     env_obs,
@@ -862,7 +912,14 @@ class FastWAMAdaptivePolicy(nn.Module, BasePolicy):
                 mode="eval",
                 actor_version=self.actor_version,
                 collect_replay=False,
+                **sample_kwargs,
             )
+            if collect_detailed_timing:
+                if sample.detailed_timing_seconds is None:
+                    raise RuntimeError(
+                        "FastWAM runtime omitted requested detailed timing."
+                    )
+                detailed_timings.append(sample.detailed_timing_seconds)
             gate_parameter = next(self.gate.parameters(), None)
             timing_device = (
                 sample.actions.device
@@ -977,6 +1034,39 @@ class FastWAMAdaptivePolicy(nn.Module, BasePolicy):
                 [trace for trace in action_traces if trace is not None], dim=0
             )
         )
+        if collect_detailed_timing:
+            if policy_timing_device.type == "cuda":
+                torch.cuda.synchronize(policy_timing_device)
+            if policy_started_at is None:
+                raise RuntimeError("Detailed policy timer did not start.")
+            whole_policy_seconds = time.perf_counter() - policy_started_at
+            merged_timings = {
+                name: torch.cat([timing[name] for timing in detailed_timings])
+                for name in (
+                    "prepare_action_condition_seconds",
+                    "video_diffusion_seconds",
+                    "action_denoise_seconds",
+                    "vae_encode_seconds",
+                )
+            }
+            records = []
+            for index in range(batch_size):
+                records.append(
+                    {
+                        "schema": "fastwam-eval-detailed-timing-v1",
+                        "env_id": int(env_ids[index]),
+                        "episode_id": int(route_info.episode_ids[index]),
+                        "chunk_id": int(route_info.chunk_ids[index]),
+                        "actor_version": int(route_info.actor_versions[index]),
+                        "route": int(route_info.route_used[index]),
+                        "whole_policy_call_seconds": whole_policy_seconds,
+                        **{
+                            name: float(values[index])
+                            for name, values in merged_timings.items()
+                        },
+                    }
+                )
+            self._append_eval_detailed_timing_records(records)
         return torch.cat(actions, dim=0), {
             "prev_logprobs": torch.empty(
                 batch_size,

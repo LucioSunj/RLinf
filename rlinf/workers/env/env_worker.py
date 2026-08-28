@@ -2691,6 +2691,12 @@ class EnvWorker(Worker):
                             "FastWAM evaluation collector requires a pending "
                             "identity snapshot."
                         )
+                    detailed_eval_timing = (
+                        self.cfg.rollout.model.get("eval_detailed_timing_output")
+                        is not None
+                    )
+                    if detailed_eval_timing and torch.cuda.is_available():
+                        torch.cuda.synchronize()
                     environment_started_at = time.perf_counter()
                     contract_violation_recorded = False
                     try:
@@ -2720,6 +2726,8 @@ class EnvWorker(Worker):
                             )
                         )
                         contract_violation_recorded = True
+                    if detailed_eval_timing and torch.cuda.is_available():
+                        torch.cuda.synchronize()
                     environment_latency_seconds = (
                         time.perf_counter() - environment_started_at
                     )

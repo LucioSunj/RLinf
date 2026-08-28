@@ -491,6 +491,7 @@ def get_model(cfg, torch_dtype):
         eval_timing_cuda_synchronize=bool(
             cfg.get("eval_timing_cuda_synchronize", False)
         ),
+        eval_detailed_timing_output=cfg.get("eval_detailed_timing_output"),
         training_rollout_microbatch_size=(
             None
             if cfg.get("training_rollout_microbatch_size") is None

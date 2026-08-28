@@ -90,6 +90,7 @@ _FASTWAM_EVAL_RUNTIME_ONLY_PATHS = (
     "eval_microbatch_size",
     "eval_timing_cuda_synchronize",
     "decision_telemetry_enabled",
+    "eval_detailed_timing_output",
     "eval_without_critic",
 )
 

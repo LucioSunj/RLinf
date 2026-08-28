@@ -18,8 +18,10 @@ from __future__ import annotations
 
 import hashlib
 import math
+import time
+from contextlib import contextmanager
 from pathlib import Path
-from typing import Any, Literal
+from typing import Any, Iterator, Literal
 
 import torch
 from fastwam.adapters import PolicyRegime
@@ -67,6 +69,28 @@ DEFAULT_FASTWAM_PROMPT_TEMPLATE = (
     "A video recorded from a robot's point of view executing the following "
     "instruction: {task}"
 )
+
+
+@contextmanager
+def _cuda_timed_segment(
+    timings: dict[str, float] | None,
+    name: str,
+    device: torch.device,
+) -> Iterator[None]:
+    """Measure one explicitly synchronized CUDA segment when requested."""
+
+    if timings is None:
+        yield
+        return
+    if device.type == "cuda":
+        torch.cuda.synchronize(device)
+    started_at = time.perf_counter()
+    try:
+        yield
+    finally:
+        if device.type == "cuda":
+            torch.cuda.synchronize(device)
+        timings[name] = time.perf_counter() - started_at
 
 
 def _format_fastwam_prompts(
@@ -621,16 +645,51 @@ class LiberoFastWAMRuntime:
         regime: PolicyRegime,
         idm_initial_latents: torch.Tensor | None = None,
         idm_noise_seed: int | None = None,
+        timing_seconds: dict[str, float] | None = None,
     ) -> tuple[CachedActionCondition, torch.Tensor | None]:
-        first_frame = self.actor._encode_input_image_latents_tensor(
-            image,
-            tiled=self.tiled_vae,
-        )
+        with _cuda_timed_segment(
+            timing_seconds,
+            "prepare_action_condition_seconds",
+            self.device,
+        ):
+            return self._prepare_action_condition_impl(
+                image=image,
+                context=context,
+                context_mask=context_mask,
+                regime=regime,
+                idm_initial_latents=idm_initial_latents,
+                idm_noise_seed=idm_noise_seed,
+                timing_seconds=timing_seconds,
+            )
+
+    @torch.no_grad()
+    def _prepare_action_condition_impl(
+        self,
+        *,
+        image: torch.Tensor,
+        context: torch.Tensor,
+        context_mask: torch.Tensor,
+        regime: PolicyRegime,
+        idm_initial_latents: torch.Tensor | None = None,
+        idm_noise_seed: int | None = None,
+        timing_seconds: dict[str, float] | None = None,
+    ) -> tuple[CachedActionCondition, torch.Tensor | None]:
+        with _cuda_timed_segment(
+            timing_seconds,
+            "vae_encode_seconds",
+            self.device,
+        ):
+            first_frame = self.actor._encode_input_image_latents_tensor(
+                image,
+                tiled=self.tiled_vae,
+            )
         fuse_flag = bool(
             getattr(self.actor.video_expert, "fuse_vae_embedding_in_latents", False)
         )
         video_latents = first_frame
         replay_initial_latents = None
+        if timing_seconds is not None:
+            timing_seconds["video_diffusion_seconds"] = 0.0
         if regime is PolicyRegime.IDM:
             latent_t = (
                 self.num_video_frames - 1
@@ -684,21 +743,26 @@ class LiberoFastWAMRuntime:
                     shift_override=self.sigma_shift,
                 )
             )
-            for timestep, delta in zip(video_timesteps, video_deltas):
-                timestep_batch = timestep.expand(1).to(dtype=self.dtype)
-                velocity = self.actor._video_denoise_step_compiled(
-                    latents_video=video_latents,
-                    timestep_video=timestep_batch,
-                    context=context,
-                    context_mask=context_mask,
-                    fuse_flag=fuse_flag,
-                )
-                video_latents = self.actor.infer_video_scheduler.step(
-                    velocity,
-                    delta,
-                    video_latents,
-                )
-                video_latents[:, :, :1] = first_frame
+            with _cuda_timed_segment(
+                timing_seconds,
+                "video_diffusion_seconds",
+                self.device,
+            ):
+                for timestep, delta in zip(video_timesteps, video_deltas):
+                    timestep_batch = timestep.expand(1).to(dtype=self.dtype)
+                    velocity = self.actor._video_denoise_step_compiled(
+                        latents_video=video_latents,
+                        timestep_video=timestep_batch,
+                        context=context,
+                        context_mask=context_mask,
+                        fuse_flag=fuse_flag,
+                    )
+                    video_latents = self.actor.infer_video_scheduler.step(
+                        velocity,
+                        delta,
+                        video_latents,
+                    )
+                    video_latents[:, :, :1] = first_frame
 
         video_pre = self.actor.video_expert.pre_dit(
             x=video_latents,
@@ -793,6 +857,7 @@ class LiberoFastWAMRuntime:
         mode: Literal["train", "eval"],
         actor_version: int,
         collect_replay: bool = True,
+        collect_detailed_timing: bool = False,
     ) -> FastWAMChunkSample:
         _validate_flow_sde_sampling(
             mode=mode,
@@ -852,6 +917,7 @@ class LiberoFastWAMRuntime:
                 name="IDM video noise",
             )
         rollouts = []
+        detailed_timings: list[dict[str, float]] = []
         idm_initial_latents = []
         critic_features: list[FastWAMValueFeatures] = []
         for index, route_value in enumerate(routes.tolist()):
@@ -860,6 +926,7 @@ class LiberoFastWAMRuntime:
                 if int(route_value) == int(WAMRoute.IDM)
                 else PolicyRegime.UNCOND
             )
+            timing_seconds = {} if collect_detailed_timing else None
             condition, replay_video_noise = self._prepare_action_condition(
                 image=images[index : index + 1],
                 context=context[index : index + 1],
@@ -875,6 +942,7 @@ class LiberoFastWAMRuntime:
                     if idm_noise_seeds is not None and regime is PolicyRegime.IDM
                     else None
                 ),
+                timing_seconds=timing_seconds,
             )
             if self.critic_feature_config is not None and mode == "train":
                 # Rollout, actor replay, and GAE bootstrap must use one critic
@@ -946,27 +1014,34 @@ class LiberoFastWAMRuntime:
                         domain="flow-sde",
                     )
                 )
-            rollout = sample_action_flow_sde(
-                initial_noise,
-                velocity_fn=self._velocity(
-                    condition,
-                    regime=regime,
-                    capture_gate_kv=True,
-                    actor_version=actor_version,
-                ),
-                timesteps=timesteps,
-                scheduler_deltas=deltas,
-                num_train_timesteps=(
-                    self.actor.infer_action_scheduler.num_train_timesteps
-                ),
-                noise_level=self.flow_sde_noise_level,
-                generator=flow_generator,
-                gate_last_n=self.gate_denoise_last_n,
-                ignore_last_transition=self.flow_sde_ignore_last_transition,
-                stochastic=mode == "train" and regime is PolicyRegime.UNCOND,
-                collect_replay=collect_replay,
-            )
+            with _cuda_timed_segment(
+                timing_seconds,
+                "action_denoise_seconds",
+                self.device,
+            ):
+                rollout = sample_action_flow_sde(
+                    initial_noise,
+                    velocity_fn=self._velocity(
+                        condition,
+                        regime=regime,
+                        capture_gate_kv=True,
+                        actor_version=actor_version,
+                    ),
+                    timesteps=timesteps,
+                    scheduler_deltas=deltas,
+                    num_train_timesteps=(
+                        self.actor.infer_action_scheduler.num_train_timesteps
+                    ),
+                    noise_level=self.flow_sde_noise_level,
+                    generator=flow_generator,
+                    gate_last_n=self.gate_denoise_last_n,
+                    ignore_last_transition=self.flow_sde_ignore_last_transition,
+                    stochastic=mode == "train" and regime is PolicyRegime.UNCOND,
+                    collect_replay=collect_replay,
+                )
             rollouts.append(rollout)
+            if timing_seconds is not None:
+                detailed_timings.append(timing_seconds)
 
         gate_snapshots = tuple(
             _cat_snapshots([rollout.gate_taps[tap_index] for rollout in rollouts])
@@ -1018,6 +1093,22 @@ class LiberoFastWAMRuntime:
                 else FastWAMValueFeatures.cat(critic_features)
             ),
             action_execution_trace=action_execution_trace,
+            detailed_timing_seconds=(
+                None
+                if not collect_detailed_timing
+                else {
+                    name: torch.tensor(
+                        [timing[name] for timing in detailed_timings],
+                        dtype=torch.float64,
+                    )
+                    for name in (
+                        "prepare_action_condition_seconds",
+                        "video_diffusion_seconds",
+                        "action_denoise_seconds",
+                        "vae_encode_seconds",
+                    )
+                }
+            ),
         )
 
     @torch.no_grad()

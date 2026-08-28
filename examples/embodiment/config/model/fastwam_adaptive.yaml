@@ -105,6 +105,7 @@ eval_random_lag1_autocorrelation: null
 eval_routing_seed: 0
 eval_microbatch_size: 1
 eval_timing_cuda_synchronize: false
+eval_detailed_timing_output: null
 
 kv_replay:
   # Set to recompute only for the explicit memory ablation. Stored replay keeps

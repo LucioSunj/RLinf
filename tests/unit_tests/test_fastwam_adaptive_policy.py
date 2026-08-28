@@ -14,6 +14,7 @@
 
 import hashlib
 import importlib.util
+import json
 import sys
 from enum import Enum
 from pathlib import Path
@@ -227,6 +228,7 @@ class _Runtime:
         mode,
         actor_version,
         collect_replay=True,
+        collect_detailed_timing=False,
     ):
         del mode, actor_version
         batch = routes.shape[0]
@@ -253,6 +255,24 @@ class _Runtime:
             gate_snapshots=_snapshots(routes),
             forward_inputs={"critic_states": env_obs["states"].clone()},
             critic_features=_value_features(env_obs["states"]),
+            detailed_timing_seconds=(
+                None
+                if not collect_detailed_timing
+                else {
+                    "prepare_action_condition_seconds": torch.full(
+                        (batch,), 0.004, dtype=torch.float64
+                    ),
+                    "video_diffusion_seconds": torch.full(
+                        (batch,), 0.002, dtype=torch.float64
+                    ),
+                    "action_denoise_seconds": torch.full(
+                        (batch,), 0.003, dtype=torch.float64
+                    ),
+                    "vae_encode_seconds": torch.full(
+                        (batch,), 0.001, dtype=torch.float64
+                    ),
+                }
+            ),
         )
 
     def replay_action_batch(self, *, forward_inputs, route_info):
@@ -350,6 +370,7 @@ def _make_policy(
     eval_random_lag1_autocorrelation=None,
     eval_routing_seed=0,
     eval_timing_cuda_synchronize=False,
+    eval_detailed_timing_output=None,
     training_rollout_microbatch_size=None,
     formal_training_sampling_seed=None,
     decision_telemetry_enabled=False,
@@ -378,6 +399,7 @@ def _make_policy(
             eval_random_lag1_autocorrelation=(eval_random_lag1_autocorrelation),
             eval_routing_seed=eval_routing_seed,
             eval_timing_cuda_synchronize=eval_timing_cuda_synchronize,
+            eval_detailed_timing_output=eval_detailed_timing_output,
             training_rollout_microbatch_size=training_rollout_microbatch_size,
             formal_training_sampling_seed=formal_training_sampling_seed,
             decision_telemetry_enabled=decision_telemetry_enabled,
@@ -629,6 +651,37 @@ def test_policy_eval_gate_timing_is_explicit_and_finite() -> None:
     assert gate_h2d.shape == (2,)
     assert torch.equal(gate_h2d, torch.zeros(2, dtype=torch.float64))
     assert enabled.runtime.sample_batch_sizes == [1, 1]
+
+
+def test_policy_eval_detailed_timing_requires_sync() -> None:
+    with pytest.raises(ValueError, match="requires CUDA synchronization"):
+        FastWAMAdaptivePolicyConfig(eval_detailed_timing_output="timing.jsonl")
+
+
+def test_policy_eval_writes_detailed_synchronized_segments(tmp_path: Path) -> None:
+    output = tmp_path / "timing.jsonl"
+    policy = _make_policy(
+        eval_timing_cuda_synchronize=True,
+        eval_detailed_timing_output=str(output),
+    )
+    obs = {
+        "states": torch.ones(2, 3),
+        "_fastwam_env_ids": torch.tensor([11, 22]),
+        "_fastwam_reset_mask": torch.tensor([True, True]),
+    }
+
+    policy.predict_action_batch(obs, mode="eval")
+
+    records = [json.loads(line) for line in output.read_text().splitlines()]
+    assert len(records) == 2
+    assert [record["env_id"] for record in records] == [11, 22]
+    assert [record["chunk_id"] for record in records] == [0, 0]
+    for record in records:
+        assert record["whole_policy_call_seconds"] > 0
+        assert record["prepare_action_condition_seconds"] == pytest.approx(0.004)
+        assert record["video_diffusion_seconds"] == pytest.approx(0.002)
+        assert record["action_denoise_seconds"] == pytest.approx(0.003)
+        assert record["vae_encode_seconds"] == pytest.approx(0.001)
 
 
 @pytest.mark.parametrize(
