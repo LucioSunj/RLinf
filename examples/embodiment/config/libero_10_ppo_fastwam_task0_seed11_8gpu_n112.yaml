@@ -18,8 +18,8 @@ hydra:
   searchpath:
     - file://${oc.env:EMBODIED_PATH}/config/
 
-# RTX-4090 host: one actor plus seven rollout ranks.  One environment per
-# rollout rank avoids multiplying video-diffusion activations on a 24 GiB GPU.
+# Eight 48 GiB RTX 4090s: one actor plus seven rollout ranks.  The E=4/rank
+# geometry is the measured throughput optimum on the stricter 40 GiB MIG host.
 cluster:
   component_placement:
     actor: "0-0"
@@ -28,32 +28,32 @@ cluster:
 
 runner:
   logger:
-    experiment_name: formal_task0_seed11_8gpu_n98_20260828_v1
+    experiment_name: formal_task0_seed11_8gpu_n112_20260828_v1
 
 env:
   train:
-    total_num_envs: 7
-    rollout_epoch: 14
+    total_num_envs: 28
+    rollout_epoch: 4
     seed: 11
 
 actor:
-  global_batch_size: 686
+  global_batch_size: 784
   seed: 11
   model:
     runtime:
       text_embedding_cache_dir: /data0/FastWAM-PERF-002-storage/root-migration-20260716T0311Z/repo-runs-performance-assets/text_embeds_cache/libero
     kv_replay:
-      hot_capacity_bytes_per_rollout_rank: 2147483648
+      hot_capacity_bytes_per_rollout_rank: 13421772800
       cold_capacity_bytes_per_rollout_rank: 8589934592
-      nvme_capacity_bytes_per_rollout_rank: 12884901888
-      nvme_path: /data0/fastwam_kv/formal_task0_seed11_8gpu_n98_20260828_v1
+      nvme_capacity_bytes_per_rollout_rank: 4294967296
+      nvme_path: /data0/fastwam_kv/formal_task0_seed11_8gpu_n112_20260828_v1
 
 rollout:
   model:
     runtime:
       text_embedding_cache_dir: /data0/FastWAM-PERF-002-storage/root-migration-20260716T0311Z/repo-runs-performance-assets/text_embeds_cache/libero
     kv_replay:
-      hot_capacity_bytes_per_rollout_rank: 2147483648
+      hot_capacity_bytes_per_rollout_rank: 13421772800
       cold_capacity_bytes_per_rollout_rank: 8589934592
-      nvme_capacity_bytes_per_rollout_rank: 12884901888
-      nvme_path: /data0/fastwam_kv/formal_task0_seed11_8gpu_n98_20260828_v1
+      nvme_capacity_bytes_per_rollout_rank: 4294967296
+      nvme_path: /data0/fastwam_kv/formal_task0_seed11_8gpu_n112_20260828_v1
