@@ -147,6 +147,26 @@ def test_checkpoint_contract_covers_continuation_semantics_not_run_length() -> N
     assert MODULE.build_fastwam_checkpoint_contract(cfg, world_size=2) != baseline
 
 
+def test_checkpoint_contract_binds_explicit_training_task_filter() -> None:
+    cfg = _checkpoint_cfg()
+    unfiltered = MODULE.build_fastwam_checkpoint_contract(cfg, world_size=2)
+    assert "task_id_filter" not in unfiltered["env_train"]
+
+    cfg.env.train.task_id_filter = [0]
+    task_zero = MODULE.build_fastwam_checkpoint_contract(cfg, world_size=2)
+    assert task_zero["env_train"]["task_id_filter"] == [0]
+
+    cfg.env.train.task_id_filter = [1]
+    task_one = MODULE.build_fastwam_checkpoint_contract(cfg, world_size=2)
+    with pytest.raises(ValueError, match="env_train.task_id_filter"):
+        MODULE.validate_fastwam_training_checkpoint_contract(
+            task_zero,
+            task_one,
+            allow_n4_to_three_rollout_expansion=False,
+            owner="actor",
+        )
+
+
 def test_checkpoint_contract_normalizes_validate_cfg_inserted_defaults() -> None:
     unvalidated = _checkpoint_cfg()
     del unvalidated.runner.weight_sync_interval

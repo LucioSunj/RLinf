@@ -49,7 +49,7 @@ def _load_advantages_module():
         ),
         "rlinf.algorithms.utils": types.SimpleNamespace(
             kl_penalty=lambda *_args, **_kwargs: None,
-            safe_normalize=lambda value, loss_mask=None: value,
+            safe_normalize=lambda value, loss_mask=None, **_kwargs: value,
         ),
         "rlinf.utils.utils": types.SimpleNamespace(
             masked_mean=lambda value, mask=None: value.mean()
@@ -322,6 +322,109 @@ def _counterfactual_records():
     )
     dones = torch.zeros(4, 2, 1, dtype=torch.bool)
     return route, emitted, dones
+
+
+def _one_decision_symmetric_counterfactual(delta: float):
+    batch_size = 4
+    destination_routes = torch.tensor(
+        [WAMRoute.IDM, WAMRoute.IDM, WAMRoute.UNCOND, WAMRoute.UNCOND],
+        dtype=torch.long,
+    )
+    route_used = torch.stack(
+        (
+            torch.full((batch_size,), int(WAMRoute.IDM), dtype=torch.long),
+            destination_routes,
+        )
+    )
+    chunk_ids = torch.tensor([[0] * batch_size, [1] * batch_size])
+    episode_ids = torch.arange(batch_size).repeat(2, 1)
+    route = ChunkRouteRecord(
+        route_used=route_used,
+        route_was_forced=torch.tensor([[True] * batch_size, [False] * batch_size]),
+        chunk_ids=chunk_ids,
+        episode_ids=episode_ids,
+        route_source_chunk_ids=torch.tensor([[-1] * batch_size, [0] * batch_size]),
+        actor_versions=torch.full_like(route_used, 5),
+    )
+    probability = torch.full(route.shape, 0.5, dtype=torch.float64)
+    emitted = GateDecisionRecord(
+        next_route=torch.stack(
+            (
+                destination_routes,
+                torch.full((batch_size,), int(WAMRoute.UNCOND), dtype=torch.long),
+            )
+        ),
+        base_probability=probability,
+        behavior_probability=probability,
+        old_logprob=torch.log(probability),
+        epsilon=torch.full(route.shape, 0.1, dtype=torch.float64),
+        temperature=torch.ones(route.shape, dtype=torch.float64),
+        valid=torch.tensor([[True] * batch_size, [False] * batch_size]),
+        source_chunk_ids=chunk_ids.clone(),
+        episode_ids=episode_ids.clone(),
+        actor_versions=torch.full_like(route_used, 5),
+        kv_metadata=GateKVMetadata(
+            layer_indices=(0,),
+            denoise_timesteps=torch.ones(*route.shape, 1),
+            total_bytes=torch.full(route.shape, 16, dtype=torch.long),
+        ),
+    )
+    rewards = torch.zeros(2, batch_size, 1, dtype=torch.float64)
+    rewards[1, :2, 0] = delta
+    values = torch.zeros(3, batch_size, 1, dtype=torch.float64)
+    dones = torch.zeros(3, batch_size, 1, dtype=torch.bool)
+    dones[2] = True
+    valid_mask = torch.ones(2, batch_size, 1, dtype=torch.bool)
+    return rewards, route, emitted, dones, values, valid_mask
+
+
+@pytest.mark.parametrize("delta", (0.001, 0.005, 0.02, 0.05))
+def test_break_even_cost_matches_symmetric_per_chunk_reward_delta(delta: float):
+    rewards, route, emitted, dones, values, valid_mask = (
+        _one_decision_symmetric_counterfactual(delta)
+    )
+    zero_cost_rewards = advantages.apply_fastwam_chunk_cost(
+        environment_rewards=rewards,
+        route_used=route.route_used,
+        idm_cost=0.0,
+        valid_mask=valid_mask,
+    ).rewards
+    zero_cost_advantages, _ = advantages.compute_gae_advantages_and_returns(
+        rewards=zero_cost_rewards[..., 0],
+        values=values[..., 0],
+        dones=dones[..., 0],
+        gamma=0.99,
+        gae_lambda=0.95,
+        normalize_advantages=True,
+        loss_mask=valid_mask[..., 0],
+    )
+    configured_alignment = advantages.align_fastwam_policy_advantages(
+        advantages=zero_cost_advantages.unsqueeze(-1),
+        route=route,
+        emitted=emitted,
+        dones=dones,
+        rollout_epoch=1,
+        carry_pending_across_epochs=False,
+        loss_mask=valid_mask,
+    )
+
+    audit = advantages.summarize_fastwam_counterfactual_costs(
+        environment_rewards=rewards,
+        route=route,
+        emitted=emitted,
+        dones=dones,
+        values=values,
+        valid_mask=valid_mask,
+        idm_costs=(0.0, 0.1),
+        configured_idm_cost=0.0,
+        configured_gate_advantages=configured_alignment.gate_advantages,
+        gamma=0.99,
+        gae_lambda=0.95,
+        rollout_epoch=1,
+        carry_pending_across_epochs=False,
+    )
+
+    assert audit.break_even_idm_cost == pytest.approx(delta, abs=1.0e-12)
 
 
 def test_counterfactual_cost_audit_is_read_only_and_lowers_idm_advantage():

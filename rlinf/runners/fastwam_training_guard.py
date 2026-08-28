@@ -159,8 +159,11 @@ class FastWAMTrainingGuard:
         self.zero_success_patience = int(raw.get("zero_success_patience", 1))
         self.break_even_patience = int(raw.get("break_even_patience", 3))
         cost_audit = _plain_mapping(raw.get("cost_audit", None))
-        self.break_even_guard_enabled = self.enabled and bool(
+        self.cost_audit_enabled = self.enabled and bool(
             cost_audit.get("enabled", False)
+        )
+        self.break_even_guard_enabled = self.cost_audit_enabled and bool(
+            cost_audit.get("break_even_guard_enabled", True)
         )
         self.window_size = int(raw.get("window_size", 3))
         self.eligible_idm_fraction_min = float(
@@ -307,7 +310,7 @@ class FastWAMTrainingGuard:
         configured_idm_cost = None
         break_even_route_window: list[float] = []
         break_even_route_monotonic_decline = False
-        if self.break_even_guard_enabled:
+        if self.cost_audit_enabled:
             missing_cost = [
                 index
                 for index, worker_metrics in enumerate(metrics_list)
@@ -315,7 +318,7 @@ class FastWAMTrainingGuard:
             ]
             if missing_cost:
                 raise ValueError(
-                    "FastWAM break-even guard is missing configured-cost metrics "
+                    "FastWAM counterfactual cost audit is missing configured-cost metrics "
                     f"from workers {missing_cost}."
                 )
             configured_costs = [
@@ -353,6 +356,8 @@ class FastWAMTrainingGuard:
                 break_even = min(break_even_values)
                 if break_even < 0.0:
                     raise ValueError("FastWAM break-even IDM cost is negative.")
+
+        if self.break_even_guard_enabled:
             below_cost = configured_idm_cost > 0.0 and (
                 break_even is None or break_even < configured_idm_cost
             )

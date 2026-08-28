@@ -89,6 +89,7 @@ _FASTWAM_EVAL_RUNTIME_ONLY_PATHS = (
     "eval_routing_seed",
     "eval_microbatch_size",
     "eval_timing_cuda_synchronize",
+    "decision_telemetry_enabled",
     "eval_without_critic",
 )
 
@@ -363,6 +364,13 @@ def build_fastwam_checkpoint_contract(cfg: Any, *, world_size: int) -> dict[str,
             formal_execution_profile
         )
     env_train = _selected_checkpoint_values(cfg.env.train, env_keys)
+    task_id_filter = OmegaConf.select(
+        cfg.env.train,
+        "task_id_filter",
+        default=None,
+    )
+    if task_id_filter is not None:
+        env_train["task_id_filter"] = _resolved_checkpoint_value(task_id_filter)
     if formal_execution_profile is not None:
         env_train["stage_invariant_fixed_reset_ids"] = bool(
             OmegaConf.select(

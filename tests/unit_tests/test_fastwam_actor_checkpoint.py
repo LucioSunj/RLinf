@@ -108,12 +108,35 @@ class _SidecarAdapter:
         return metadata
 
 
+class _CorruptingSidecarAdapter(_SidecarAdapter):
+    def load_sidecar(
+        self,
+        path: str,
+        *,
+        expected_parent_checkpoint_sha256: str,
+        strict: bool,
+    ) -> dict[str, Any]:
+        metadata = super().load_sidecar(
+            path,
+            expected_parent_checkpoint_sha256=expected_parent_checkpoint_sha256,
+            strict=strict,
+        )
+        self.parameter.add_(1.0)
+        return metadata
+
+
 class _BootstrapPolicy(_Policy):
     def __init__(self) -> None:
         super().__init__()
         self.lora_adapter = _SidecarAdapter(self.weight)
         self.gate = _Stateful(11.0)
         self.critic = SimpleNamespace(value_head=_Stateful(12.0))
+
+
+class _CorruptingBootstrapPolicy(_BootstrapPolicy):
+    def __init__(self) -> None:
+        super().__init__()
+        self.lora_adapter = _CorruptingSidecarAdapter(self.weight)
 
 
 _FAKE_MISSING = object()
@@ -153,7 +176,9 @@ def _checkpoint_worker() -> Any:
     class CheckpointWorker:
         _checkpoint_cpu_clone = staticmethod(EmbodiedFSDPActor._checkpoint_cpu_clone)
         _fastwam_policy_module = EmbodiedFSDPActor._fastwam_policy_module
+        _fastwam_effective_idm_cost = EmbodiedFSDPActor._fastwam_effective_idm_cost
         bootstrap_fastwam_uncond_lora = EmbodiedFSDPActor.bootstrap_fastwam_uncond_lora
+        set_fastwam_idm_cost = EmbodiedFSDPActor.set_fastwam_idm_cost
         save_checkpoint = EmbodiedFSDPActor.save_checkpoint
         load_checkpoint = EmbodiedFSDPActor.load_checkpoint
 
@@ -164,6 +189,14 @@ def _checkpoint_worker() -> Any:
     worker.model = _Policy()
     worker.cfg = SimpleNamespace(
         runner=SimpleNamespace(resume_dir=None),
+        algorithm={
+            "fixed_branch_cost": {
+                "enabled": True,
+                "idm_cost": 0.01,
+                "uncond_cost": 0.0,
+                "fair_cost": {"enabled": True},
+            }
+        },
         actor=SimpleNamespace(
             model=SimpleNamespace(
                 model_type="fastwam_adaptive",
@@ -182,6 +215,103 @@ def _checkpoint_worker() -> Any:
     worker.is_weight_offloaded = False
     worker.is_optimizer_offloaded = False
     return worker
+
+
+def test_fastwam_actor_uses_only_current_step_runtime_idm_cost() -> None:
+    worker = _checkpoint_worker()
+    worker.version = 4
+    cost_cfg = worker.cfg.algorithm["fixed_branch_cost"]
+
+    worker.set_fastwam_idm_cost(0.0375, 4)
+
+    assert worker._fastwam_effective_idm_cost(cost_cfg) == pytest.approx(0.0375)
+    worker.version = 5
+    with pytest.raises(RuntimeError, match="not published.*step 5"):
+        worker._fastwam_effective_idm_cost(cost_cfg)
+
+
+def test_disabled_collapse_regularizer_preserves_legacy_metric_shape(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class LossWorker:
+        _compute_fastwam_loss = EmbodiedFSDPActor._compute_fastwam_loss
+
+    worker = LossWorker()
+    worker.cfg = OmegaConf.create(
+        {
+            "algorithm": {
+                "gate_ppo": {
+                    "clip_ratio_low": 0.2,
+                    "clip_ratio_high": 0.2,
+                    "entropy_coefficient": 0.0,
+                    "loss_weight": 1.0,
+                },
+                "uncond_flow_ppo": {
+                    "clip_ratio_low": 0.2,
+                    "clip_ratio_high": 0.2,
+                    "entropy_coefficient": 0.0,
+                    "loss_weight": 1.0,
+                },
+                "regularization": {
+                    "base_uncond_kl": {"enabled": False, "log_metric": False},
+                    "collapse": {
+                        "enabled": False,
+                        "coefficient": 0.0,
+                        "tau_calls": 1.0,
+                        "target_floor": 0.1,
+                        "scope": "microbatch",
+                    },
+                },
+                "critic_loss": {
+                    "value_clip": 0.2,
+                    "huber_delta": 10.0,
+                    "loss_weight": 1.0,
+                },
+            },
+            "env": {"train": {"max_episode_steps": 700}},
+        }
+    )
+    monkeypatch.setattr(
+        worker_module,
+        "compute_fastwam_dual_ppo_loss",
+        lambda **_kwargs: (torch.tensor(2.0), {}),
+    )
+    monkeypatch.setattr(
+        worker_module,
+        "compute_ppo_critic_loss",
+        lambda **_kwargs: (torch.tensor(3.0), {}),
+    )
+    route_info = SimpleNamespace(route_used=torch.tensor([0]))
+    emitted_gate = SimpleNamespace(
+        old_logprob=torch.tensor([0.0]),
+        episode_ids=torch.tensor([1]),
+    )
+    micro_batch = {
+        "route_info": route_info,
+        "emitted_gate": emitted_gate,
+        "flow_advantages": torch.tensor([0.0]),
+        "flow_valid_mask": torch.tensor([True]),
+        "gate_advantages": torch.tensor([0.0]),
+        "gate_valid_mask": torch.tensor([True]),
+        "prev_logprobs": torch.tensor([0.0]),
+        "returns": torch.tensor([0.0]),
+        "prev_values": torch.tensor([0.0]),
+    }
+    output = {
+        "gate_logprobs": torch.tensor([0.0]),
+        "gate_base_probabilities": torch.tensor([0.5]),
+        "gate_behavior_probabilities": torch.tensor([0.5]),
+        "flow_logprobs": torch.tensor([0.0]),
+        "values": torch.tensor([0.0]),
+    }
+
+    loss, metrics = worker._compute_fastwam_loss(
+        micro_batch=micro_batch,
+        output_dict=output,
+    )
+
+    assert loss.item() == pytest.approx(5.0)
+    assert "collapse/loss" not in metrics
 
 
 def _write_bc_sidecar(
@@ -679,6 +809,22 @@ def test_fastwam_actor_bc_bootstrap_failure_is_atomic(tmp_path: Path) -> None:
     digest = _write_bc_sidecar(sidecar, bc_config_sha256="invalid")
 
     with pytest.raises(ValueError, match="bc_config_sha256"):
+        worker.bootstrap_fastwam_uncond_lora(str(sidecar), digest)
+
+    assert torch.equal(worker.model.weight, torch.tensor([1.0]))
+    assert not hasattr(worker, "_fastwam_bc_bootstrap")
+
+
+def test_fastwam_actor_bc_bootstrap_rejects_non_bitwise_load_atomically(
+    tmp_path: Path,
+) -> None:
+    worker = _checkpoint_worker()
+    worker.optimizer_steps = 0
+    worker.model = _CorruptingBootstrapPolicy()
+    sidecar = tmp_path / "silently-changed-lora.pt"
+    digest = _write_bc_sidecar(sidecar)
+
+    with pytest.raises(ValueError, match="not bitwise equal"):
         worker.bootstrap_fastwam_uncond_lora(str(sidecar), digest)
 
     assert torch.equal(worker.model.weight, torch.tensor([1.0]))

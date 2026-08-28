@@ -131,6 +131,8 @@ def _records(
         source_chunk_ids=route.chunk_ids.clone(),
         episode_ids=route.episode_ids.clone(),
         actor_versions=route.actor_versions.clone(),
+        exploration_forced=torch.zeros(len(routes), dtype=torch.bool),
+        mode_flip_delta=torch.zeros(len(routes), dtype=torch.float32),
         kv_metadata=None,
     )
     selection = EvaluationRouteSelection(
@@ -252,6 +254,8 @@ def test_typed_eval_result_split_merge_preserves_all_records(split_sizes) -> Non
         source_chunk_ids=route.chunk_ids.clone(),
         episode_ids=route.episode_ids.clone(),
         actor_versions=route.actor_versions.clone(),
+        exploration_forced=torch.zeros(6, dtype=torch.bool),
+        mode_flip_delta=torch.zeros(6),
     )
     selection = EvaluationRouteSelection(
         mode="matched_random",

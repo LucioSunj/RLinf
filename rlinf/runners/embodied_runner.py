@@ -25,6 +25,10 @@ from typing import TYPE_CHECKING, Union
 from omegaconf.dictconfig import DictConfig
 
 from rlinf.config_contracts import validate_fastwam_resume_steps
+from rlinf.runners.fastwam_fair_cost import (
+    FastWAMFairCostController,
+    append_fastwam_fair_cost_control_jsonl,
+)
 from rlinf.runners.fastwam_training_guard import FastWAMTrainingGuard
 from rlinf.scheduler import Channel
 from rlinf.scheduler import WorkerGroupFuncResult as Handle
@@ -80,6 +84,12 @@ class EmbodiedRunner:
         )
         self.fastwam_training_guard = FastWAMTrainingGuard(
             self.cfg.runner.get("fastwam_training_guard", None)
+        )
+        algorithm_cfg = self.cfg.get("algorithm", {})
+        self.fastwam_fair_cost_controller = (
+            FastWAMFairCostController.from_branch_cost_config(
+                algorithm_cfg.get("fixed_branch_cost", {})
+            )
         )
 
         # Step-gated profiling: ``cluster.profiling.steps`` lists the global step
@@ -248,6 +258,46 @@ class EmbodiedRunner:
         rollout_handle: Handle = self.rollout.set_global_step(self.global_step)
         actor_handle.wait()
         rollout_handle.wait()
+
+    def _set_fastwam_runtime_cost(self) -> None:
+        """Publish a cost computed strictly from earlier rollout audits."""
+
+        if not self.fastwam_fair_cost_controller.enabled:
+            return
+        decision = self.fastwam_fair_cost_controller.decision_for_step(self.global_step)
+        self.actor.set_fastwam_idm_cost(
+            decision.applied_idm_cost,
+            self.global_step,
+        ).wait()
+
+    def _observe_fastwam_fair_cost(
+        self,
+        actor_rollout_metrics: list[dict],
+        guard_result: dict,
+    ) -> dict | None:
+        """Update the next-step controller only after this rollout is complete."""
+
+        if not self.fastwam_fair_cost_controller.enabled:
+            return None
+        if guard_result.get("status") != "PASS":
+            raise RuntimeError(
+                "FastWAM fair-cost control requires an enabled scientific guard."
+            )
+        record = self.fastwam_fair_cost_controller.observe_rollout(
+            runner_step=self.global_step,
+            break_even_idm_cost=guard_result.get("break_even_idm_cost"),
+            idm_fraction=float(guard_result["eligible_idm_fraction"]),
+        )
+        metrics = self.fastwam_fair_cost_controller.record_metrics(record)
+        for worker_metrics in actor_rollout_metrics:
+            worker_metrics.update(metrics)
+        audit_path = (
+            Path(str(self.cfg.runner.logger.log_path))
+            / str(self.cfg.runner.logger.experiment_name)
+            / "audits/fair_cost_control.jsonl"
+        )
+        append_fastwam_fair_cost_control_jsonl(audit_path, record)
+        return record
 
     def evaluate(self):
         env_handle: Handle = self.env.evaluate(
@@ -650,6 +700,7 @@ class EmbodiedRunner:
         for _step in range(start_step, self.max_steps):
             # set global step
             self._set_worker_global_step()
+            self._set_fastwam_runtime_cost()
 
             profiled_step = (
                 self.global_step
@@ -693,7 +744,13 @@ class EmbodiedRunner:
                     actor_rollout_metrics = (
                         self.actor.compute_advantages_and_returns().wait()
                     )
-                    self.fastwam_training_guard.observe_rollout(actor_rollout_metrics)
+                    guard_result = self.fastwam_training_guard.observe_rollout(
+                        actor_rollout_metrics
+                    )
+                    self._observe_fastwam_fair_cost(
+                        actor_rollout_metrics,
+                        guard_result,
+                    )
 
                 # actor training.
                 with self.timer("actor_training"):
@@ -856,15 +913,30 @@ class EmbodiedRunner:
         return self.global_step // self.num_steps_per_epoch
 
     def _save_fastwam_training_guard(self, checkpoint_dir: str) -> None:
-        if not self.fastwam_training_guard.enabled:
+        if (
+            not self.fastwam_training_guard.enabled
+            and not self.fastwam_fair_cost_controller.enabled
+        ):
             return
         path = Path(checkpoint_dir) / "training_guard.json"
         temporary = path.with_name(f".{path.name}.tmp")
-        payload = {
-            "schema": "fastwam-training-guard-checkpoint-v1",
-            "global_step": int(self.global_step),
-            "state": self.fastwam_training_guard.state_dict(),
-        }
+        if self.fastwam_fair_cost_controller.enabled:
+            payload = {
+                "schema": "fastwam-training-guard-checkpoint-v2",
+                "global_step": int(self.global_step),
+                "state": self.fastwam_training_guard.state_dict(),
+                "fair_cost_controller": (
+                    self.fastwam_fair_cost_controller.state_dict()
+                ),
+            }
+        else:
+            # Preserve the exact checkpoint schema used by existing fixed-cost
+            # runs; the v2 payload is selected only with fair-cost control.
+            payload = {
+                "schema": "fastwam-training-guard-checkpoint-v1",
+                "global_step": int(self.global_step),
+                "state": self.fastwam_training_guard.state_dict(),
+            }
         try:
             with temporary.open("w", encoding="utf-8") as stream:
                 json.dump(payload, stream, sort_keys=True, indent=2)
@@ -877,7 +949,10 @@ class EmbodiedRunner:
                 temporary.unlink()
 
     def _load_fastwam_training_guard(self, checkpoint_dir: str) -> None:
-        if not self.fastwam_training_guard.enabled:
+        if (
+            not self.fastwam_training_guard.enabled
+            and not self.fastwam_fair_cost_controller.enabled
+        ):
             return
         path = Path(checkpoint_dir) / "training_guard.json"
         if not path.is_file():
@@ -886,7 +961,12 @@ class EmbodiedRunner:
             )
         with path.open("r", encoding="utf-8") as stream:
             payload = json.load(stream)
-        if payload.get("schema") != "fastwam-training-guard-checkpoint-v1":
+        expected_schema = (
+            "fastwam-training-guard-checkpoint-v2"
+            if self.fastwam_fair_cost_controller.enabled
+            else "fastwam-training-guard-checkpoint-v1"
+        )
+        if payload.get("schema") != expected_schema:
             raise ValueError("FastWAM training guard checkpoint schema mismatch.")
         if int(payload.get("global_step", -1)) != int(self.global_step):
             raise ValueError(
@@ -894,6 +974,15 @@ class EmbodiedRunner:
                 "actor/rollout checkpoint."
             )
         state = payload.get("state")
-        if not isinstance(state, dict):
+        if self.fastwam_training_guard.enabled and not isinstance(state, dict):
             raise TypeError("FastWAM training guard checkpoint state is malformed.")
-        self.fastwam_training_guard.load_state_dict(state)
+        if self.fastwam_training_guard.enabled:
+            self.fastwam_training_guard.load_state_dict(state)
+        if self.fastwam_fair_cost_controller.enabled:
+            fair_cost_state = payload.get("fair_cost_controller")
+            if not isinstance(fair_cost_state, dict):
+                raise TypeError(
+                    "FastWAM fair-cost controller checkpoint state is malformed."
+                )
+            self.fastwam_fair_cost_controller.load_state_dict(fair_cost_state)
+            self.fastwam_fair_cost_controller.decision_for_step(self.global_step)

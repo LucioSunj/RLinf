@@ -501,6 +501,7 @@ def get_model(cfg, torch_dtype):
             if cfg.get("formal_training_sampling_seed") is None
             else cfg.formal_training_sampling_seed
         ),
+        decision_telemetry_enabled=bool(cfg.get("decision_telemetry_enabled", False)),
         kv_replay=replay_config,
     )
 

@@ -816,12 +816,21 @@ def test_training_episode_identity_stream_is_stable_across_stage_partitioning() 
 
 def test_guarded_training_rollout_input_injects_live_action_contract() -> None:
     contract = _contract()
+    environment = _TrainingActionTraceEnv(contract)
+    environment.task_ids = np.asarray([3, 7])
+    environment.trial_ids = np.asarray([24, 49])
+    environment.reset_state_ids = np.asarray([174, 349])
     worker = object.__new__(EnvWorker)
     worker.cfg = OmegaConf.create(
         {"runner": {"fastwam_training_guard": {"enabled": True}}}
     )
-    worker.model_cfg = OmegaConf.create({"model_type": "fastwam_adaptive"})
-    worker.env_list = [_TrainingActionTraceEnv(contract)]
+    worker.model_cfg = OmegaConf.create(
+        {
+            "model_type": "fastwam_adaptive",
+            "decision_telemetry_enabled": True,
+        }
+    )
+    worker.env_list = [environment]
     worker.stage_num = 1
     worker.train_num_envs_per_stage = 2
     worker.eval_num_envs_per_stage = 2
@@ -856,6 +865,9 @@ def test_guarded_training_rollout_input_injects_live_action_contract() -> None:
         contract.canonical_sha256,
         contract.canonical_sha256,
     ]
+    assert rollout_obs["_fastwam_task_ids"].tolist() == [3, 7]
+    assert rollout_obs["_fastwam_trial_ids"].tolist() == [24, 49]
+    assert rollout_obs["_fastwam_reset_state_ids"].tolist() == [174, 349]
 
 
 def test_guarded_training_rollout_input_requires_typed_live_contract() -> None:

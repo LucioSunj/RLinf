@@ -12,7 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from typing import Optional
+import math
+from typing import Any, Optional
 
 import torch
 
@@ -394,11 +395,55 @@ def expand_to_target_dim(tensor, target_shape):
     return tensor
 
 
-def safe_normalize(array, loss_mask):
+def safe_normalize(
+    array: torch.Tensor,
+    loss_mask: torch.Tensor,
+    *,
+    std_floor: float = 0.0,
+    statistics: dict[str, Any] | None = None,
+) -> torch.Tensor:
+    """Normalize valid values without amplifying a degenerate batch.
+
+    The unfloored branch intentionally retains the original expression so
+    batches above the floor remain bitwise identical to the legacy behavior.
+    """
+
+    if isinstance(std_floor, bool) or not isinstance(std_floor, (int, float)):
+        raise TypeError("Normalization standard-deviation floor must be numeric.")
+    std_floor = float(std_floor)
+    if not math.isfinite(std_floor) or std_floor < 0.0:
+        raise ValueError(
+            "Normalization standard-deviation floor must be finite and non-negative."
+        )
     valid_array = array[loss_mask]
+    floor_hit = False
+    standard_deviation = None
+    effective_standard_deviation = None
     if len(valid_array) > 0:
         mean = valid_array.mean()
         std = valid_array.std()
-        array = (array - mean) / (std + 1e-5)
+        standard_deviation = float(std.detach().item())
+        floor_hit = not (standard_deviation >= std_floor)
+        if floor_hit:
+            divisor = torch.as_tensor(
+                std_floor,
+                dtype=std.dtype,
+                device=std.device,
+            )
+            array = (array - mean) / divisor
+            effective_standard_deviation = std_floor
+        else:
+            array = (array - mean) / (std + 1e-5)
+            effective_standard_deviation = standard_deviation + 1e-5
+
+    if statistics is not None:
+        statistics.update(
+            {
+                "valid_count": int(valid_array.numel()),
+                "standard_deviation": standard_deviation,
+                "effective_standard_deviation": effective_standard_deviation,
+                "floor_hit_fraction": float(floor_hit),
+            }
+        )
 
     return array

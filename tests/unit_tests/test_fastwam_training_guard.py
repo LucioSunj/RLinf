@@ -36,7 +36,15 @@ from rlinf.runners.fastwam_training_guard import (
 FIXTURE_ROOT = Path(__file__).resolve().parents[1] / "fixtures"
 
 
-def _config(*, patience: int = 3, cost_audit: bool = False):
+def _config(
+    *,
+    patience: int = 3,
+    cost_audit: bool = False,
+    break_even_guard_enabled: bool | None = None,
+):
+    cost_audit_config = {"enabled": cost_audit}
+    if break_even_guard_enabled is not None:
+        cost_audit_config["break_even_guard_enabled"] = break_even_guard_enabled
     return OmegaConf.create(
         {
             "enabled": True,
@@ -45,12 +53,12 @@ def _config(*, patience: int = 3, cost_audit: bool = False):
             "window_size": 3,
             "eligible_idm_fraction_min": 0.05,
             "eligible_idm_fraction_max": 0.95,
-            "gate_entropy_min": 0.1,
+            "gate_entropy_min": 0.35,
             "gate_kl_median_max": 0.05,
             "gate_kl_single_max": 0.1,
             "gate_clip_median_max": 0.6,
             "gate_clip_single_max": 0.8,
-            "cost_audit": {"enabled": cost_audit},
+            "cost_audit": cost_audit_config,
         }
     )
 
@@ -64,6 +72,8 @@ def _rollout_metrics(*, successes: int, idm_fraction: float = 0.5):
             "fastwam/eligible_gate_decision_count": 100.0,
             "fastwam/eligible_idm_decision_count": 100.0 * idm_fraction,
             "fastwam/valid_uncond_chunk_count": 8.0,
+            "fastwam/counterfactual/break_even_idm_cost": 0.0275,
+            "fastwam/counterfactual/configured_idm_cost": 0.015,
             "rewards": 0.1,
             "advantages_max": 1.0,
             "advantages_mean": 0.0,
@@ -271,6 +281,50 @@ def test_v10_stable_route_does_not_trip_break_even_guard() -> None:
     assert result["break_even_route_monotonic_decline"] is False
 
 
+def test_explicitly_disabled_break_even_guard_ignores_fixed_price_abort_rule() -> None:
+    guard = FastWAMTrainingGuard(
+        _config(cost_audit=True, break_even_guard_enabled=False)
+    )
+
+    for idm_fraction in (0.6, 0.5, 0.4):
+        result = guard.observe_rollout(
+            _rollout_metrics(successes=1, idm_fraction=idm_fraction)
+        )
+        guard.observe_training(_training_metrics())
+
+    assert guard.break_even_guard_enabled is False
+    assert guard.cost_audit_enabled is True
+    assert result["break_even_idm_cost"] == pytest.approx(0.0275)
+    assert result["configured_idm_cost"] == pytest.approx(0.015)
+    assert result["consecutive_break_even_below_cost"] == 0
+
+
+def test_route_bounds_remain_active_when_break_even_guard_is_disabled() -> None:
+    guard = FastWAMTrainingGuard(
+        _config(cost_audit=True, break_even_guard_enabled=False)
+    )
+
+    for _ in range(2):
+        guard.observe_rollout(_rollout_metrics(successes=1, idm_fraction=0.0))
+        guard.observe_training(_training_metrics())
+    guard.observe_rollout(_rollout_metrics(successes=1, idm_fraction=0.0))
+    with pytest.raises(RuntimeError, match="eligible IDM fraction"):
+        guard.observe_training(_training_metrics())
+
+
+def test_entropy_guard_remains_active_when_break_even_guard_is_disabled() -> None:
+    guard = FastWAMTrainingGuard(
+        _config(cost_audit=True, break_even_guard_enabled=False)
+    )
+
+    for _ in range(2):
+        guard.observe_rollout(_rollout_metrics(successes=1))
+        guard.observe_training(_training_metrics(gate_entropy=0.34))
+    guard.observe_rollout(_rollout_metrics(successes=1))
+    with pytest.raises(RuntimeError, match="Gate entropy"):
+        guard.observe_training(_training_metrics(gate_entropy=0.34))
+
+
 def test_counterfactual_cost_audit_appends_full_jsonl_tables(tmp_path: Path) -> None:
     path = tmp_path / "run/audits/counterfactual_cost_audit.jsonl"
     scalar = {
@@ -462,6 +516,22 @@ def test_training_guard_rejects_route_collapse_after_full_window() -> None:
     guard.observe_rollout(_rollout_metrics(successes=1, idm_fraction=0.01))
     with pytest.raises(RuntimeError, match="IDM fraction"):
         guard.observe_training(_training_metrics())
+
+
+def test_training_guard_triggers_on_low_selected_gate_entropy() -> None:
+    guard = FastWAMTrainingGuard(_config())
+    base_probability = 0.92
+    base_entropy = -(
+        base_probability * math.log(base_probability)
+        + (1.0 - base_probability) * math.log(1.0 - base_probability)
+    )
+    assert base_entropy < 0.35
+    for _ in range(2):
+        guard.observe_rollout(_rollout_metrics(successes=1))
+        guard.observe_training(_training_metrics(gate_entropy=base_entropy))
+    guard.observe_rollout(_rollout_metrics(successes=1))
+    with pytest.raises(RuntimeError, match="Gate entropy"):
+        guard.observe_training(_training_metrics(gate_entropy=base_entropy))
 
 
 def test_guard_state_rejects_config_mismatch() -> None:

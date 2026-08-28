@@ -14,10 +14,13 @@
 
 """Native step-zero FastWAM adaptive project-checkpoint export."""
 
+from __future__ import annotations
+
 import hashlib
 from pathlib import Path
 from typing import Any
 
+import torch
 from omegaconf import OmegaConf
 
 
@@ -71,6 +74,49 @@ def _resolve_uncond_lora_bootstrap(
     return sidecar, expected_hash
 
 
+def _validate_uncond_lora_bootstrap_contract(cfg: Any, sidecar: Path) -> None:
+    """Reject rank/config mismatches before allocating the adaptive model."""
+
+    payload = torch.load(sidecar, map_location="cpu", weights_only=True)
+    if not isinstance(payload, dict):
+        raise TypeError("BC LoRA sidecar payload must be a mapping.")
+    metadata = payload.get("metadata")
+    state = payload.get("state_dict")
+    if not isinstance(metadata, dict) or not isinstance(state, dict) or not state:
+        raise TypeError("BC LoRA sidecar requires metadata and non-empty state_dict.")
+    target_groups = OmegaConf.select(
+        cfg,
+        "actor.model.uncond_lora.target_groups",
+        default=[],
+    )
+    expected = {
+        "schema": "fastwam-regime-lora-v1",
+        "parent_checkpoint_sha256": str(
+            OmegaConf.select(
+                cfg,
+                "actor.model.actor_checkpoint_sha256",
+                default="",
+            )
+        ).lower(),
+        "active_regime": "uncond",
+        "rank": int(OmegaConf.select(cfg, "actor.model.uncond_lora.rank", default=-1)),
+        "alpha": float(
+            OmegaConf.select(cfg, "actor.model.uncond_lora.alpha", default=-1.0)
+        ),
+        "dropout": float(
+            OmegaConf.select(cfg, "actor.model.uncond_lora.dropout", default=-1.0)
+        ),
+        "target_groups": [str(value) for value in target_groups],
+    }
+    mismatches = {
+        key: {"expected": expected_value, "actual": metadata.get(key)}
+        for key, expected_value in expected.items()
+        if metadata.get(key) != expected_value
+    }
+    if mismatches:
+        raise ValueError(f"BC LoRA bootstrap contract mismatch: {mismatches}.")
+
+
 def validate_initial_checkpoint_export_config(
     cfg: Any,
     *,
@@ -107,7 +153,9 @@ def validate_initial_checkpoint_export_config(
         raise ValueError("Step-zero export requires independent Gate blocks.")
     if int(OmegaConf.select(cfg, "actor.model.gate.denoise_last_n", default=-1)) != 1:
         raise ValueError("Step-zero export requires gate.denoise_last_n=1.")
-    _resolve_uncond_lora_bootstrap(cfg)
+    bootstrap = _resolve_uncond_lora_bootstrap(cfg)
+    if bootstrap is not None:
+        _validate_uncond_lora_bootstrap_contract(cfg, bootstrap[0])
     return Path(str(output_value)).expanduser().resolve()
 
 

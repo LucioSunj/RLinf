@@ -44,6 +44,9 @@ from rlinf.models.embodiment.wam_policy.evaluation import (
     EvaluationRoutingConfig,
     EvaluationRoutingMode,
 )
+from rlinf.runners.fastwam_decision_telemetry import (
+    build_fastwam_decision_telemetry_record,
+)
 
 LEDGER_SCHEMA_V1 = "fastwam-libero-eval-ledger-v1"
 LEDGER_SCHEMA_V2 = "fastwam-libero-eval-ledger-v2"
@@ -271,6 +274,7 @@ class FastWAMLiberoEvalCollector:
         random_lag1_autocorrelation: float | None = None,
         routing_seed: int,
         fixed_idm_cost: float,
+        decision_telemetry_enabled: bool = False,
         noise_seed_mode: str = "stateless_per_chunk",
         contract_violation_outcome: str = "raise",
         resume: bool = False,
@@ -298,6 +302,9 @@ class FastWAMLiberoEvalCollector:
         self.random_lag1_autocorrelation = routing_config.random_lag1_autocorrelation
         self.routing_seed = routing_config.routing_seed
         self.fixed_idm_cost = float(fixed_idm_cost)
+        if not isinstance(decision_telemetry_enabled, bool):
+            raise TypeError("decision_telemetry_enabled must be a boolean.")
+        self.decision_telemetry_enabled = decision_telemetry_enabled
         self.noise_seed_mode = str(noise_seed_mode)
         self.contract_violation_outcome = str(contract_violation_outcome)
         self.resume = bool(resume)
@@ -855,6 +862,39 @@ class FastWAMLiberoEvalCollector:
             action_max = float(actions.max().item()) if actions.numel() else None
             entry = state.entry
             identity = str(entry["episode_identity"])
+            decision_telemetry = None
+            if self.decision_telemetry_enabled:
+                if (
+                    emitted.exploration_forced is None
+                    or emitted.mode_flip_delta is None
+                ):
+                    raise ValueError(
+                        "FastWAM evaluation is missing per-decision Gate telemetry."
+                    )
+                decision_telemetry = build_fastwam_decision_telemetry_record(
+                    phase="evaluation",
+                    run_id=self.run_id,
+                    rank=self.rank,
+                    trajectory_id=identity,
+                    env_id=int(slot.env_id),
+                    episode_id=route_episode_id,
+                    task_suite=str(entry["task_suite"]),
+                    task_id=int(entry["task_id"]),
+                    trial_id=int(entry["trial_id"]),
+                    reset_state_id=int(entry["reset_state_id"]),
+                    cycle_index=chunk_id,
+                    update_step=actor_version,
+                    actor_version=actor_version,
+                    route=int(emitted.next_route[index]),
+                    base_probability=probability,
+                    behavior_probability=float(emitted.behavior_probability[index]),
+                    forced_exploration=bool(emitted.exploration_forced[index]),
+                    mode_flip_delta=float(emitted.mode_flip_delta[index]),
+                    configured_idm_cost=None,
+                    destination_advantage_unnormalized=None,
+                    destination_advantage_normalized=None,
+                    eligible_decision=valid,
+                )
             record = {
                 "schema": CHUNK_SCHEMA,
                 "run_id": self.run_id,
@@ -886,6 +926,11 @@ class FastWAMLiberoEvalCollector:
                 "emitted_decision_consumed": valid,
                 "emitted_decision_discarded": not valid,
                 "eligible_decision": valid,
+                **(
+                    {"decision_telemetry": decision_telemetry}
+                    if self.decision_telemetry_enabled
+                    else {}
+                ),
                 "primitive_steps_executed": int(
                     entry.get("execution_horizon", entry.get("action_horizon", -1))
                 ),
@@ -1006,6 +1051,39 @@ class FastWAMLiberoEvalCollector:
             )
             entry = state.entry
             identity = str(entry["episode_identity"])
+            decision_telemetry = None
+            if self.decision_telemetry_enabled:
+                if (
+                    emitted.exploration_forced is None
+                    or emitted.mode_flip_delta is None
+                ):
+                    raise ValueError(
+                        "FastWAM evaluation is missing per-decision Gate telemetry."
+                    )
+                decision_telemetry = build_fastwam_decision_telemetry_record(
+                    phase="evaluation",
+                    run_id=self.run_id,
+                    rank=self.rank,
+                    trajectory_id=identity,
+                    env_id=int(slot.env_id),
+                    episode_id=route_episode_id,
+                    task_suite=str(entry["task_suite"]),
+                    task_id=int(entry["task_id"]),
+                    trial_id=int(entry["trial_id"]),
+                    reset_state_id=int(entry["reset_state_id"]),
+                    cycle_index=chunk_id,
+                    update_step=actor_version,
+                    actor_version=actor_version,
+                    route=int(emitted.next_route[index]),
+                    base_probability=probability,
+                    behavior_probability=float(emitted.behavior_probability[index]),
+                    forced_exploration=bool(emitted.exploration_forced[index]),
+                    mode_flip_delta=float(emitted.mode_flip_delta[index]),
+                    configured_idm_cost=None,
+                    destination_advantage_unnormalized=None,
+                    destination_advantage_normalized=None,
+                    eligible_decision=False,
+                )
             per_environment_audit = {
                 **failure_audit,
                 "violations": [
@@ -1052,6 +1130,11 @@ class FastWAMLiberoEvalCollector:
                 "emitted_decision_consumed": False,
                 "emitted_decision_discarded": True,
                 "eligible_decision": False,
+                **(
+                    {"decision_telemetry": decision_telemetry}
+                    if self.decision_telemetry_enabled
+                    else {}
+                ),
                 "primitive_steps_executed": 0,
                 "action_submission_status": "rejected",
                 "action_contract_violation": per_environment_audit,

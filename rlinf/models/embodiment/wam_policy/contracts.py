@@ -478,6 +478,12 @@ class GateDecisionRecord:
     episode_ids: torch.Tensor
     actor_versions: torch.Tensor
     kv_metadata: GateKVMetadata | None = None
+    exploration_forced: torch.Tensor | None = None
+    mode_flip_delta: torch.Tensor | None = None
+    environment_ids: torch.Tensor | None = None
+    task_ids: torch.Tensor | None = None
+    trial_ids: torch.Tensor | None = None
+    reset_state_ids: torch.Tensor | None = None
 
     def __post_init__(self) -> None:
         shape = self.next_route.shape
@@ -498,6 +504,35 @@ class GateDecisionRecord:
             value = getattr(self, name)
             _require_integer(name, value)
             _require_shape(name, value, shape)
+        if self.exploration_forced is not None:
+            _require_bool("exploration_forced", self.exploration_forced)
+            _require_shape("exploration_forced", self.exploration_forced, shape)
+            _raise_where(
+                self.exploration_forced & (self.epsilon <= 0),
+                "Forced exploration requires a positive epsilon.",
+            )
+        if self.mode_flip_delta is not None:
+            _require_float("mode_flip_delta", self.mode_flip_delta)
+            _require_shape("mode_flip_delta", self.mode_flip_delta, shape)
+            _raise_where(
+                ~torch.isfinite(self.mode_flip_delta),
+                "mode_flip_delta must be finite.",
+            )
+        for name in (
+            "environment_ids",
+            "task_ids",
+            "trial_ids",
+            "reset_state_ids",
+        ):
+            value = getattr(self, name)
+            if value is None:
+                continue
+            _require_integer(name, value)
+            _require_shape(name, value, shape)
+            _raise_where(
+                self.valid & (value < 0),
+                f"Valid Gate decisions require non-negative {name}.",
+            )
 
         for name in ("base_probability", "behavior_probability", "epsilon"):
             value = getattr(self, name)
@@ -555,6 +590,34 @@ class GateDecisionRecord:
             kv_metadata=(
                 self.kv_metadata.cpu() if self.kv_metadata is not None else None
             ),
+            exploration_forced=(
+                self.exploration_forced.cpu().contiguous()
+                if self.exploration_forced is not None
+                else None
+            ),
+            mode_flip_delta=(
+                self.mode_flip_delta.cpu().contiguous()
+                if self.mode_flip_delta is not None
+                else None
+            ),
+            environment_ids=(
+                self.environment_ids.cpu().contiguous()
+                if self.environment_ids is not None
+                else None
+            ),
+            task_ids=(
+                self.task_ids.cpu().contiguous() if self.task_ids is not None else None
+            ),
+            trial_ids=(
+                self.trial_ids.cpu().contiguous()
+                if self.trial_ids is not None
+                else None
+            ),
+            reset_state_ids=(
+                self.reset_state_ids.cpu().contiguous()
+                if self.reset_state_ids is not None
+                else None
+            ),
         )
 
     @classmethod
@@ -587,6 +650,30 @@ class GateDecisionRecord:
             "episode_ids",
             "actor_versions",
         )
+        optional_tensor_fields = (
+            "exploration_forced",
+            "mode_flip_delta",
+            "environment_ids",
+            "task_ids",
+            "trial_ids",
+            "reset_state_ids",
+        )
+        combined_optional: dict[str, torch.Tensor | None] = {}
+        for field_name in optional_tensor_fields:
+            values = tuple(getattr(record, field_name) for record in record_tuple)
+            if all(value is None for value in values):
+                combined_optional[field_name] = None
+            elif any(value is None for value in values):
+                raise ValueError(
+                    "Cannot combine Gate decisions with inconsistent "
+                    f"{field_name} metadata."
+                )
+            else:
+                combined_optional[field_name] = _combine_tensors(
+                    (value for value in values if value is not None),
+                    operation=operation,
+                    dim=dim,
+                )
         return cls(
             **{
                 field_name: _combine_tensors(
@@ -596,6 +683,7 @@ class GateDecisionRecord:
                 )
                 for field_name in tensor_fields
             },
+            **combined_optional,
             kv_metadata=(
                 GateKVMetadata._combine(
                     (
@@ -651,11 +739,30 @@ class GateDecisionRecord:
             if self.kv_metadata is not None
             else (None,) * len(field_chunks["next_route"])
         )
+        optional_chunks = {}
+        for field_name in (
+            "exploration_forced",
+            "mode_flip_delta",
+            "environment_ids",
+            "task_ids",
+            "trial_ids",
+            "reset_state_ids",
+        ):
+            value = getattr(self, field_name)
+            optional_chunks[field_name] = (
+                torch.chunk(value, chunks, dim=dim)
+                if value is not None
+                else (None,) * len(field_chunks["next_route"])
+            )
         return tuple(
             GateDecisionRecord(
                 **{
                     field_name: values[index]
                     for field_name, values in field_chunks.items()
+                },
+                **{
+                    field_name: values[index]
+                    for field_name, values in optional_chunks.items()
                 },
                 kv_metadata=metadata_chunks[index],
             )
@@ -688,11 +795,30 @@ class GateDecisionRecord:
             if self.kv_metadata is not None
             else (None,) * len(field_splits["next_route"])
         )
+        optional_splits = {}
+        for field_name in (
+            "exploration_forced",
+            "mode_flip_delta",
+            "environment_ids",
+            "task_ids",
+            "trial_ids",
+            "reset_state_ids",
+        ):
+            value = getattr(self, field_name)
+            optional_splits[field_name] = (
+                torch.split(value, split_sizes, dim=dim)
+                if value is not None
+                else (None,) * len(field_splits["next_route"])
+            )
         return tuple(
             GateDecisionRecord(
                 **{
                     field_name: values[index]
                     for field_name, values in field_splits.items()
+                },
+                **{
+                    field_name: values[index]
+                    for field_name, values in optional_splits.items()
                 },
                 kv_metadata=metadata_splits[index],
             )
@@ -941,6 +1067,52 @@ def shift_emitted_gate_decisions(
         ),
         actor_versions=_shift_time(
             emitted.actor_versions, valid=aligned_valid, fill_value=-1
+        ),
+        exploration_forced=(
+            _shift_time(
+                emitted.exploration_forced,
+                valid=aligned_valid,
+                fill_value=False,
+            )
+            if emitted.exploration_forced is not None
+            else None
+        ),
+        mode_flip_delta=(
+            _shift_time(
+                emitted.mode_flip_delta,
+                valid=aligned_valid,
+                fill_value=0.0,
+            )
+            if emitted.mode_flip_delta is not None
+            else None
+        ),
+        environment_ids=(
+            _shift_time(
+                emitted.environment_ids,
+                valid=aligned_valid,
+                fill_value=-1,
+            )
+            if emitted.environment_ids is not None
+            else None
+        ),
+        task_ids=(
+            _shift_time(emitted.task_ids, valid=aligned_valid, fill_value=-1)
+            if emitted.task_ids is not None
+            else None
+        ),
+        trial_ids=(
+            _shift_time(emitted.trial_ids, valid=aligned_valid, fill_value=-1)
+            if emitted.trial_ids is not None
+            else None
+        ),
+        reset_state_ids=(
+            _shift_time(
+                emitted.reset_state_ids,
+                valid=aligned_valid,
+                fill_value=-1,
+            )
+            if emitted.reset_state_ids is not None
+            else None
         ),
         kv_metadata=shifted_metadata,
     )

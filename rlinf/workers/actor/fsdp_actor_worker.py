@@ -41,6 +41,7 @@ from rlinf.algorithms.advantages import (
     FastWAMGateUpdateAudit,
     align_fastwam_policy_advantages,
     apply_fastwam_chunk_cost,
+    compute_fastwam_unnormalized_gate_alignment,
     summarize_fastwam_chunk_cost,
     summarize_fastwam_counterfactual_costs,
     summarize_fastwam_environment_rewards,
@@ -86,6 +87,10 @@ from rlinf.models.embodiment.base_policy import ForwardType
 from rlinf.models.embodiment.wam_policy.contracts import WAMRoute
 from rlinf.models.embodiment.wam_policy.critic import (
     critic_parent_checkpoint_sha256,
+)
+from rlinf.runners.fastwam_decision_telemetry import (
+    append_fastwam_decision_telemetry_jsonl,
+    build_fastwam_training_decision_records,
 )
 from rlinf.runners.fastwam_training_guard import (
     append_fastwam_counterfactual_cost_audit_jsonl,
@@ -1646,6 +1651,14 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
             raise TypeError("FastWAM adaptive policy has no LoRA adapter.")
         previous_lora = adapter.lora_state_dict()
         try:
+            sidecar_payload = torch.load(
+                resolved_path,
+                map_location="cpu",
+                weights_only=True,
+            )
+            expected_lora = sidecar_payload.get("state_dict")
+            if not isinstance(expected_lora, dict) or not expected_lora:
+                raise TypeError("BC LoRA sidecar has no tensor state_dict.")
             metadata = adapter.load_sidecar(
                 resolved_path,
                 expected_parent_checkpoint_sha256=str(
@@ -1670,6 +1683,20 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
                     self.cfg.actor.model.actor_checkpoint_sha256
                 ).lower(),
             )
+            loaded_lora = adapter.lora_state_dict()
+            if set(loaded_lora) != set(expected_lora):
+                raise ValueError("BC LoRA bootstrap tensor names changed on load.")
+            for name, expected_tensor in expected_lora.items():
+                loaded_tensor = loaded_lora[name]
+                if (
+                    not isinstance(expected_tensor, torch.Tensor)
+                    or loaded_tensor.shape != expected_tensor.shape
+                    or loaded_tensor.dtype != expected_tensor.dtype
+                    or not torch.equal(loaded_tensor.cpu(), expected_tensor.cpu())
+                ):
+                    raise ValueError(
+                        f"BC LoRA bootstrap tensor {name!r} is not bitwise equal."
+                    )
         except Exception:
             adapter.load_lora_state_dict(previous_lora, strict=True)
             raise
@@ -2100,6 +2127,24 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
 
         return rollout_batch
 
+    def _fastwam_effective_idm_cost(self, cost_cfg: Any) -> float:
+        configured = float(cost_cfg.get("idm_cost", 0.0))
+        fair_cost = cost_cfg.get("fair_cost", {})
+        if not bool(fair_cost.get("enabled", False)):
+            return configured
+        runtime_step = getattr(self, "_fastwam_runtime_idm_cost_step", None)
+        if runtime_step != int(self.version):
+            raise RuntimeError(
+                "FastWAM fair IDM cost was not published for the current runner "
+                f"step {self.version}."
+            )
+        runtime_cost = float(getattr(self, "_fastwam_runtime_idm_cost", math.nan))
+        if not math.isfinite(runtime_cost) or runtime_cost < 0.0:
+            raise ValueError(
+                "FastWAM runtime IDM cost must be finite and non-negative."
+            )
+        return runtime_cost
+
     @Worker.timer("actor/compute_adv")
     def compute_advantages_and_returns(self) -> dict[str, torch.Tensor]:
         """
@@ -2113,6 +2158,10 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
         cost_audit = None
         counterfactual_cost_audit = None
         rollout_state_audit = None
+        decision_telemetry_count = 0
+        decision_telemetry_enabled = bool(
+            self.cfg.actor.model.get("decision_telemetry_enabled", False)
+        )
         if model_type is SupportedModel.FASTWAM_ADAPTIVE:
             if self.cfg.algorithm.reward_type != "chunk_level":
                 raise ValueError(
@@ -2150,13 +2199,14 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
                 if short_canary_guard:
                     reward_audit.require_success_signal()
             cost_cfg = self.cfg.algorithm.get("fixed_branch_cost", {})
+            configured_idm_cost = self._fastwam_effective_idm_cost(cost_cfg)
             if bool(cost_cfg.get("enabled", False)):
                 if "fastwam_branch_costs" in self.rollout_batch:
                     raise RuntimeError("FastWAM branch cost was already applied.")
                 cost_result = apply_fastwam_chunk_cost(
                     environment_rewards=raw_environment_rewards,
                     route_used=self.rollout_batch["route_info"].route_used,
-                    idm_cost=float(cost_cfg.get("idm_cost", 0.0)),
+                    idm_cost=configured_idm_cost,
                     uncond_cost=float(cost_cfg.get("uncond_cost", 0.0)),
                     valid_mask=self.rollout_batch.get("loss_mask", None),
                 )
@@ -2167,7 +2217,7 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
                         environment_rewards=raw_environment_rewards,
                         route=self.rollout_batch["route_info"],
                         cost_result=cost_result,
-                        idm_cost=float(cost_cfg.get("idm_cost", 0.0)),
+                        idm_cost=configured_idm_cost,
                         uncond_cost=float(cost_cfg.get("uncond_cost", 0.0)),
                         valid_mask=self.rollout_batch.get("loss_mask", None),
                     )
@@ -2200,8 +2250,31 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
                 self.cfg.algorithm.get("normalize_advantages", True)
             ),
         }
+        normalization_statistics = None
+        normalization_std_floor = self.cfg.algorithm.get(
+            "advantage_normalization_std_floor", None
+        )
+        if (
+            model_type is SupportedModel.FASTWAM_ADAPTIVE
+            and normalization_std_floor is not None
+        ):
+            normalization_statistics = {}
+            kwargs.update(
+                {
+                    "normalization_std_floor": float(normalization_std_floor),
+                    "normalization_statistics": normalization_statistics,
+                }
+            )
 
         advantages_and_returns = calculate_adv_and_returns(**kwargs)
+        if normalization_statistics is not None:
+            if "floor_hit_fraction" not in normalization_statistics:
+                raise RuntimeError(
+                    "FastWAM advantage normalization did not report floor usage."
+                )
+            self._fastwam_advantage_normalization_statistics = dict(
+                normalization_statistics
+            )
 
         self.rollout_batch.update(advantages_and_returns)
         if model_type is SupportedModel.FASTWAM_ADAPTIVE:
@@ -2222,7 +2295,70 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
                     "gate_valid_mask": alignment.gate_valid_mask,
                 }
             )
+            if decision_telemetry_enabled:
+                if bool(cost_cfg.get("enabled", False)):
+                    configured_rewards = self.rollout_batch["rewards"]
+                    telemetry_idm_cost = configured_idm_cost
+                else:
+                    configured_rewards = raw_environment_rewards.sum(
+                        dim=-1, keepdim=True
+                    )
+                    telemetry_idm_cost = 0.0
+                unnormalized_alignment = compute_fastwam_unnormalized_gate_alignment(
+                    rewards=configured_rewards,
+                    route=self.rollout_batch["route_info"],
+                    emitted=self.rollout_batch["emitted_gate"],
+                    dones=self.rollout_batch["dones"],
+                    values=self.rollout_batch["prev_values"],
+                    valid_mask=self.rollout_batch.get("loss_mask", None),
+                    gamma=float(self.cfg.algorithm.get("gamma", 1.0)),
+                    gae_lambda=float(self.cfg.algorithm.get("gae_lambda", 1.0)),
+                    rollout_epoch=int(self.cfg.env.train.rollout_epoch),
+                    carry_pending_across_epochs=bool(self.cfg.env.train.auto_reset),
+                )
+                if not torch.equal(
+                    unnormalized_alignment.gate_valid_mask,
+                    alignment.gate_valid_mask,
+                ):
+                    raise ValueError(
+                        "Normalized and unnormalized Gate telemetry eligibility "
+                        "disagree."
+                    )
+                decision_records = build_fastwam_training_decision_records(
+                    emitted=self.rollout_batch["emitted_gate"],
+                    gate_valid_mask=alignment.gate_valid_mask,
+                    unnormalized_gate_advantages=(
+                        unnormalized_alignment.gate_advantages
+                    ),
+                    normalized_gate_advantages=alignment.gate_advantages,
+                    runner_step=int(self.version),
+                    rank=int(self._rank),
+                    run_id=str(self.cfg.runner.logger.experiment_name),
+                    task_suite=str(
+                        self.cfg.env.train.get(
+                            "task_suite_name",
+                            self.cfg.env.train.get("env_type", "unknown"),
+                        )
+                    ),
+                    configured_idm_cost=telemetry_idm_cost,
+                )
+                decision_path = (
+                    Path(str(self.cfg.runner.logger.log_path))
+                    / str(self.cfg.runner.logger.experiment_name)
+                    / f"audits/training_decisions.rank-{self._rank}.jsonl"
+                )
+                append_fastwam_decision_telemetry_jsonl(
+                    decision_path,
+                    decision_records,
+                )
+                decision_telemetry_count = len(decision_records)
             if cost_audit_enabled:
+                counterfactual_idm_costs = [
+                    float(item)
+                    for item in cost_audit_cfg.get("counterfactual_idm_costs", [])
+                ]
+                if bool(cost_cfg.get("fair_cost", {}).get("enabled", False)):
+                    counterfactual_idm_costs.append(configured_idm_cost)
                 counterfactual_cost_audit = summarize_fastwam_counterfactual_costs(
                     environment_rewards=raw_environment_rewards,
                     route=self.rollout_batch["route_info"],
@@ -2230,11 +2366,8 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
                     dones=self.rollout_batch["dones"],
                     values=self.rollout_batch["prev_values"],
                     valid_mask=self.rollout_batch.get("loss_mask", None),
-                    idm_costs=tuple(
-                        float(item)
-                        for item in cost_audit_cfg.get("counterfactual_idm_costs", [])
-                    ),
-                    configured_idm_cost=float(cost_cfg.get("idm_cost", 0.0)),
+                    idm_costs=tuple(sorted(set(counterfactual_idm_costs))),
+                    configured_idm_cost=configured_idm_cost,
                     configured_gate_advantages=alignment.gate_advantages,
                     gamma=float(self.cfg.algorithm.get("gamma", 1.0)),
                     gae_lambda=float(self.cfg.algorithm.get("gae_lambda", 1.0)),
@@ -2317,6 +2450,12 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
                             "source_chunk_ids",
                             "episode_ids",
                             "actor_versions",
+                            "exploration_forced",
+                            "mode_flip_delta",
+                            "environment_ids",
+                            "task_ids",
+                            "trial_ids",
+                            "reset_state_ids",
                         )
                     },
                     "kv_metadata": (
@@ -2386,6 +2525,10 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
             rollout_metrics.update(cost_audit.to_metrics())
         if counterfactual_cost_audit is not None:
             rollout_metrics.update(counterfactual_cost_audit.to_metrics())
+        if decision_telemetry_count:
+            rollout_metrics["fastwam/decision_telemetry/count"] = float(
+                decision_telemetry_count
+            )
         return rollout_metrics
 
     @Worker.timer("actor/compute_opd_teacher_logprobs")
@@ -3892,6 +4035,12 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
             gate_valid_mask=effective_gate_mask,
             gate_clip_ratio_low=float(gate_cfg.clip_ratio_low),
             gate_clip_ratio_high=float(gate_cfg.clip_ratio_high),
+            gate_base_probabilities=(
+                output_dict["gate_base_probabilities"].float()
+                if str(gate_cfg.get("entropy_metric_source", "behavior")).lower()
+                == "base"
+                else None
+            ),
             gate_behavior_probabilities=output_dict[
                 "gate_behavior_probabilities"
             ].float(),
@@ -3939,6 +4088,11 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
                 episode_ids=emitted_gate.episode_ids,
                 valid_mask=effective_gate_mask,
                 tau_calls=float(collapse_cfg.get("tau_calls", 1.0)),
+                target_floor=(
+                    None
+                    if collapse_cfg.get("target_floor", None) is None
+                    else float(collapse_cfg.target_floor)
+                ),
                 scope=str(collapse_cfg.get("scope", "microbatch")),
             )
             policy_loss_value = (
@@ -4066,6 +4220,21 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
                 output_dict=output_dict,
                 selected_loss_scales=selected_loss_scales,
             )
+            normalization_statistics = getattr(
+                self,
+                "_fastwam_advantage_normalization_statistics",
+                None,
+            )
+            if normalization_statistics is not None:
+                if not isinstance(normalization_statistics, dict) or (
+                    "floor_hit_fraction" not in normalization_statistics
+                ):
+                    raise RuntimeError(
+                        "FastWAM training is missing advantage-normalization telemetry."
+                    )
+                metrics_data["normalize/floor_hit_fraction"] = float(
+                    normalization_statistics["floor_hit_fraction"]
+                )
         else:
             loss_kwargs = {
                 "loss_type": self.cfg.algorithm.loss_type,
@@ -4145,6 +4314,38 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
         self.version = global_step
         if hasattr(self.model, "set_global_step"):
             self.model.set_global_step(global_step)
+
+    def set_fastwam_idm_cost(
+        self,
+        idm_cost: float,
+        runner_step: int,
+    ) -> dict[str, float]:
+        """Publish the runner's lagged fair cost before advantage computation."""
+
+        if (
+            SupportedModel(self.cfg.actor.model.model_type)
+            is not SupportedModel.FASTWAM_ADAPTIVE
+        ):
+            raise ValueError("Runtime IDM cost is specific to fastwam_adaptive.")
+        branch_cost = self.cfg.algorithm.get("fixed_branch_cost", {})
+        if not bool(branch_cost.get("enabled", False)) or not bool(
+            branch_cost.get("fair_cost", {}).get("enabled", False)
+        ):
+            raise ValueError("Runtime IDM cost requires enabled fair-cost shaping.")
+        if int(runner_step) != int(self.version):
+            raise ValueError(
+                "Runtime IDM cost step does not match the actor version: "
+                f"{runner_step} != {self.version}."
+            )
+        idm_cost = float(idm_cost)
+        if not math.isfinite(idm_cost) or idm_cost < 0.0:
+            raise ValueError("Runtime IDM cost must be finite and non-negative.")
+        self._fastwam_runtime_idm_cost = idm_cost
+        self._fastwam_runtime_idm_cost_step = int(runner_step)
+        return {
+            "runner_step": float(runner_step),
+            "idm_cost": idm_cost,
+        }
 
     def finish_global_batch(self, metrics: dict[str, list[float]]) -> None:
         self.torch_platform.empty_cache()

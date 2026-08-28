@@ -18,6 +18,7 @@ import hashlib
 from pathlib import Path
 
 import pytest
+import torch
 from omegaconf import OmegaConf
 
 from rlinf.runners.fastwam_checkpoint_export import (
@@ -60,6 +61,17 @@ def _cfg(output_dir: Path):
             "actor": {
                 "model": {
                     "model_type": "fastwam_adaptive",
+                    "actor_checkpoint_sha256": "a" * 64,
+                    "uncond_lora": {
+                        "rank": 16,
+                        "alpha": 16.0,
+                        "dropout": 0.0,
+                        "target_groups": [
+                            "self_attention_qkvo",
+                            "cross_attention_qkvo",
+                            "ffn",
+                        ],
+                    },
                     "fastwam": {"action_dit_config": {"num_layers": 30}},
                     "gate": {
                         "share_blocks": False,
@@ -74,6 +86,31 @@ def _cfg(output_dir: Path):
             },
         }
     )
+
+
+def _write_sidecar(path: Path, *, rank: int = 16) -> str:
+    torch.save(
+        {
+            "metadata": {
+                "schema": "fastwam-regime-lora-v1",
+                "parent_checkpoint_sha256": "a" * 64,
+                "active_regime": "uncond",
+                "rank": rank,
+                "alpha": 16.0,
+                "dropout": 0.0,
+                "target_groups": [
+                    "self_attention_qkvo",
+                    "cross_attention_qkvo",
+                    "ffn",
+                ],
+            },
+            "state_dict": {
+                "blocks.0.self_attn.q.lora_A": torch.ones(rank, 2),
+            },
+        },
+        path,
+    )
+    return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
 def test_export_initial_actor_checkpoint_uses_only_production_step_zero_save(
@@ -162,8 +199,7 @@ def test_export_explicit_bc_sidecar_loads_before_single_step_zero_save(
 ) -> None:
     output_dir = tmp_path / "bc-bootstrap-step0"
     sidecar = tmp_path / "trained-uncond-lora.pt"
-    sidecar.write_bytes(b"strict-sidecar-fixture")
-    digest = hashlib.sha256(sidecar.read_bytes()).hexdigest()
+    digest = _write_sidecar(sidecar)
     cfg = _cfg(output_dir)
     cfg.runner.bootstrap_uncond_lora_sidecar = str(sidecar)
     cfg.runner.bootstrap_uncond_lora_sidecar_sha256 = digest
@@ -210,4 +246,18 @@ def test_initial_checkpoint_export_rejects_bc_sidecar_hash_mismatch(
     cfg.runner.bootstrap_uncond_lora_sidecar_sha256 = "a" * 64
 
     with pytest.raises(ValueError, match="hash mismatch"):
+        validate_initial_checkpoint_export_config(cfg, actor_world_size=1)
+
+
+def test_initial_checkpoint_export_rejects_rank_16_sidecar_for_rank_32_rl(
+    tmp_path: Path,
+) -> None:
+    sidecar = tmp_path / "rank16.pt"
+    digest = _write_sidecar(sidecar, rank=16)
+    cfg = _cfg(tmp_path / "checkpoint")
+    cfg.actor.model.uncond_lora.rank = 32
+    cfg.runner.bootstrap_uncond_lora_sidecar = str(sidecar)
+    cfg.runner.bootstrap_uncond_lora_sidecar_sha256 = digest
+
+    with pytest.raises(ValueError, match="contract mismatch.*rank"):
         validate_initial_checkpoint_export_config(cfg, actor_world_size=1)

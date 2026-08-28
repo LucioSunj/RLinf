@@ -46,6 +46,26 @@ def _as_float_tensor(
     return torch.as_tensor(value, dtype=torch.float32, device=reference.device)
 
 
+def _bernoulli_entropy(
+    probabilities: torch.Tensor,
+    *,
+    name: str,
+) -> torch.Tensor:
+    if not probabilities.is_floating_point():
+        raise TypeError(f"{name} must use a floating dtype.")
+    probabilities = probabilities.float()
+    if bool(
+        ((~torch.isfinite(probabilities)) | (probabilities < 0) | (probabilities > 1))
+        .any()
+        .item()
+    ):
+        raise ValueError(f"{name} must be finite and lie in [0, 1].")
+    return -(
+        torch.xlogy(probabilities, probabilities)
+        + torch.xlogy(1.0 - probabilities, 1.0 - probabilities)
+    )
+
+
 def epsilon_mixture_bernoulli(
     logits: torch.Tensor,
     *,
@@ -131,9 +151,9 @@ def epsilon_mixture_bernoulli(
         torch.log(behavior_probability),
         torch.log1p(-behavior_probability),
     )
-    entropy = -(
-        torch.xlogy(behavior_probability, behavior_probability)
-        + torch.xlogy(1.0 - behavior_probability, 1.0 - behavior_probability)
+    entropy = _bernoulli_entropy(
+        behavior_probability,
+        name="Gate behavior probabilities",
     )
     return EpsilonMixtureBernoulli(
         base_probability=base_probability,
@@ -292,6 +312,7 @@ def _compute_masked_clipped_ppo_loss(
     clip_ratio_high: float,
     prefix: str,
     entropy: torch.Tensor | None = None,
+    reported_entropy: torch.Tensor | None = None,
     entropy_coefficient: float = 0.0,
     selected_loss_scale: float | torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
@@ -366,7 +387,18 @@ def _compute_masked_clipped_ppo_loss(
             if selected_loss_scale is None
             else selected_entropy.sum() * selected_loss_scale
         )
-        metric_entropy = selected_entropy.detach().mean()
+    entropy_for_reporting = entropy if reported_entropy is None else reported_entropy
+    if entropy_for_reporting is not None:
+        if not entropy_for_reporting.is_floating_point():
+            raise TypeError("reported_entropy must use a floating dtype.")
+        expanded_reported_entropy = _expand_trailing_dimensions(
+            entropy_for_reporting,
+            logprobs,
+            name="reported_entropy",
+        )
+        metric_entropy = (
+            expanded_reported_entropy[expanded_mask].float().detach().mean()
+        )
     total_loss = policy_loss - entropy_coefficient * entropy_mean
     metric_total_loss = metric_policy_loss - entropy_coefficient * metric_entropy
 
@@ -413,19 +445,29 @@ def compute_gate_ppo_loss(
     valid_mask: torch.Tensor,
     clip_ratio_low: float,
     clip_ratio_high: float,
+    base_probabilities: torch.Tensor | None = None,
     behavior_probabilities: torch.Tensor | None = None,
     entropy_coefficient: float = 0.0,
     selected_loss_scale: float | torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
     """Compute the separately clipped delayed-Gate PPO loss."""
 
-    entropy = None
-    if behavior_probabilities is not None:
-        probabilities = behavior_probabilities.float()
-        entropy = -(
-            torch.xlogy(probabilities, probabilities)
-            + torch.xlogy(1.0 - probabilities, 1.0 - probabilities)
+    if base_probabilities is not None and behavior_probabilities is None:
+        raise ValueError(
+            "Base Gate entropy reporting also requires behavior probabilities."
         )
+    behavior_entropy = None
+    base_entropy = None
+    if behavior_probabilities is not None:
+        behavior_entropy = _bernoulli_entropy(
+            behavior_probabilities,
+            name="Gate behavior probabilities",
+        )
+        if base_probabilities is not None:
+            base_entropy = _bernoulli_entropy(
+                base_probabilities,
+                name="Gate base probabilities",
+            )
     return _compute_masked_clipped_ppo_loss(
         logprobs=logprobs,
         old_logprobs=old_logprobs,
@@ -434,7 +476,8 @@ def compute_gate_ppo_loss(
         clip_ratio_low=clip_ratio_low,
         clip_ratio_high=clip_ratio_high,
         prefix="gate",
-        entropy=entropy,
+        entropy=behavior_entropy,
+        reported_entropy=(behavior_entropy if base_entropy is None else base_entropy),
         entropy_coefficient=entropy_coefficient,
         selected_loss_scale=selected_loss_scale,
     )
@@ -529,6 +572,7 @@ def compute_fastwam_dual_ppo_loss(
     flow_clip_ratio_low: float,
     flow_clip_ratio_high: float,
     flow_valid_mask: torch.Tensor | None = None,
+    gate_base_probabilities: torch.Tensor | None = None,
     gate_behavior_probabilities: torch.Tensor | None = None,
     gate_entropy_coefficient: float = 0.0,
     flow_entropy: torch.Tensor | None = None,
@@ -549,6 +593,7 @@ def compute_fastwam_dual_ppo_loss(
         valid_mask=gate_valid_mask,
         clip_ratio_low=gate_clip_ratio_low,
         clip_ratio_high=gate_clip_ratio_high,
+        base_probabilities=gate_base_probabilities,
         behavior_probabilities=gate_behavior_probabilities,
         entropy_coefficient=gate_entropy_coefficient,
         selected_loss_scale=gate_selected_loss_scale,
@@ -650,12 +695,15 @@ def compute_gate_collapse_penalty(
     episode_ids: torch.Tensor,
     valid_mask: torch.Tensor,
     tau_calls: float,
+    target_floor: float | None = None,
     scope: str = "episode",
 ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
     """Apply the optional exponential expected-call anti-collapse surrogate."""
 
     if tau_calls <= 0:
         raise ValueError("Collapse-penalty `tau_calls` must be positive.")
+    if target_floor is not None and not 0.0 < target_floor <= 0.5:
+        raise ValueError("Collapse-penalty `target_floor` must lie in (0, 0.5].")
     if scope not in {"episode", "microbatch"}:
         raise ValueError("Collapse-penalty scope must be `episode` or `microbatch`.")
     if not base_idm_probabilities.is_floating_point():
@@ -677,6 +725,11 @@ def compute_gate_collapse_penalty(
             "collapse/group_count": zero.detach(),
             "collapse/expected_idm_calls": zero.detach(),
             "collapse/expected_uncond_calls": zero.detach(),
+            **(
+                {"collapse/effective_tau_calls": zero.detach()}
+                if target_floor is not None
+                else {}
+            ),
         }
 
     selected_probabilities = probabilities[valid_mask]
@@ -692,8 +745,25 @@ def compute_gate_collapse_penalty(
     uncond_calls = torch.stack(
         [(1.0 - selected_probabilities[group]).sum() for group in groups]
     )
+    if target_floor is None:
+        effective_tau = torch.full(
+            (len(groups),),
+            float(tau_calls),
+            dtype=torch.float32,
+            device=probabilities.device,
+        )
+    else:
+        group_sizes = torch.tensor(
+            [int(group.sum().item()) for group in groups],
+            dtype=torch.float32,
+            device=probabilities.device,
+        )
+        effective_tau = torch.maximum(
+            torch.full_like(group_sizes, float(tau_calls)),
+            group_sizes * float(target_floor) / 3.0,
+        )
     penalty = (
-        torch.exp(-idm_calls / tau_calls) + torch.exp(-uncond_calls / tau_calls)
+        torch.exp(-idm_calls / effective_tau) + torch.exp(-uncond_calls / effective_tau)
     ).mean()
     return penalty, {
         "collapse/loss": penalty.detach(),
@@ -702,6 +772,11 @@ def compute_gate_collapse_penalty(
         ),
         "collapse/expected_idm_calls": idm_calls.detach().mean(),
         "collapse/expected_uncond_calls": uncond_calls.detach().mean(),
+        **(
+            {"collapse/effective_tau_calls": effective_tau.detach().mean()}
+            if target_floor is not None
+            else {}
+        ),
     }
 
 

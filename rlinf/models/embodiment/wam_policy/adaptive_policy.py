@@ -20,11 +20,12 @@ import hashlib
 import math
 import time
 from collections.abc import Mapping
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Any, Literal, Protocol
 
 import torch
 import torch.nn as nn
+from fastwam.adapters import PolicyRegime
 from fastwam.models.wan22.gate_transformer import epsilon_mixture_bernoulli
 from fastwam.models.wan22.kv_tap import GateKVSnapshot
 
@@ -152,6 +153,7 @@ class FastWAMAdaptivePolicyConfig:
     eval_timing_cuda_synchronize: bool = False
     training_rollout_microbatch_size: int | None = None
     formal_training_sampling_seed: int | None = None
+    decision_telemetry_enabled: bool = False
     kv_replay: GateKVReplayConfig = field(default_factory=GateKVReplayConfig)
 
     def __post_init__(self) -> None:
@@ -163,6 +165,8 @@ class FastWAMAdaptivePolicyConfig:
             raise ValueError("`eval_microbatch_size` must be positive.")
         if not isinstance(self.eval_timing_cuda_synchronize, bool):
             raise TypeError("`eval_timing_cuda_synchronize` must be a boolean.")
+        if not isinstance(self.decision_telemetry_enabled, bool):
+            raise TypeError("`decision_telemetry_enabled` must be a boolean.")
         training_microbatch = self.training_rollout_microbatch_size
         if training_microbatch is not None:
             if isinstance(training_microbatch, bool) or not isinstance(
@@ -223,6 +227,58 @@ def _bytes_per_sample(packed: PackedGateKVTaps) -> torch.Tensor:
         per_sample = tensor[0].numel() * tensor.element_size()
         result += per_sample
     return result
+
+
+def _flip_gate_snapshot_current_modes(
+    snapshots: tuple[GateKVSnapshot, ...],
+) -> tuple[GateKVSnapshot, ...]:
+    """Flip only the current-regime bit in detached Gate inputs."""
+
+    flipped = []
+    for snapshot in snapshots:
+        layers = []
+        for layer in snapshot.layers:
+            modes = tuple(
+                PolicyRegime.UNCOND if mode is PolicyRegime.IDM else PolicyRegime.IDM
+                for mode in layer.current_mode
+            )
+            layers.append(replace(layer, current_mode=modes))
+        flipped.append(replace(snapshot, layers=tuple(layers)))
+    return tuple(flipped)
+
+
+def _sample_epsilon_mixture_with_component(
+    *,
+    base_probability: torch.Tensor,
+    behavior_probability: torch.Tensor,
+    epsilon: torch.Tensor,
+    generator: torch.Generator | None = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Sample one epsilon mixture and expose its exploration component.
+
+    One uniform draw is partitioned into base-IDM, exploration-IDM,
+    base-UNCOND, and exploration-UNCOND mass. The resulting route therefore
+    has exactly ``behavior_probability`` while the returned boolean states
+    whether the draw came from the epsilon component.
+    """
+
+    if not (base_probability.shape == behavior_probability.shape == epsilon.shape):
+        raise ValueError("Gate mixture tensors must have identical shapes.")
+    draw = torch.rand(
+        base_probability.shape,
+        dtype=base_probability.dtype,
+        device=base_probability.device,
+        generator=generator,
+    )
+    route_is_idm = draw < behavior_probability
+    base_idm_upper = (1 - epsilon) * base_probability
+    base_uncond_upper = behavior_probability + (1 - epsilon) * (1 - base_probability)
+    exploration_forced = torch.where(
+        route_is_idm,
+        draw >= base_idm_upper,
+        draw >= base_uncond_upper,
+    )
+    return route_is_idm.to(dtype=torch.long), exploration_forced
 
 
 def _column_values(values: torch.Tensor, *, batch_size: int) -> torch.Tensor:
@@ -430,19 +486,95 @@ class FastWAMAdaptivePolicy(nn.Module, BasePolicy):
             reset_mask = torch.as_tensor(reset_mask, device=device, dtype=torch.bool)
         return env_ids, reset_mask
 
+    @staticmethod
+    def _decision_identity_metadata(
+        env_obs: dict[str, Any],
+        *,
+        batch_size: int,
+        device: torch.device,
+    ) -> dict[str, torch.Tensor | None]:
+        """Return optional environment identity carried with each decision."""
+
+        source_keys = {
+            "task_ids": "_fastwam_task_ids",
+            "trial_ids": "_fastwam_trial_ids",
+            "reset_state_ids": "_fastwam_reset_state_ids",
+        }
+        present = {
+            field_name: env_obs.get(source_key)
+            for field_name, source_key in source_keys.items()
+        }
+        if any(value is not None for value in present.values()) and any(
+            value is None for value in present.values()
+        ):
+            raise ValueError(
+                "FastWAM decision identity requires task, trial, and reset-state IDs."
+            )
+        result: dict[str, torch.Tensor | None] = {}
+        for field_name, value in present.items():
+            if value is None:
+                result[field_name] = None
+                continue
+            tensor = torch.as_tensor(value, device=device, dtype=torch.long)
+            if tensor.shape != (batch_size,):
+                raise ValueError(
+                    f"FastWAM {field_name} must have shape [{batch_size}], got "
+                    f"{tuple(tensor.shape)}."
+                )
+            if bool((tensor < 0).any().item()):
+                raise ValueError(f"FastWAM {field_name} must be non-negative.")
+            result[field_name] = tensor
+        return result
+
+    def _mode_flip_delta(
+        self,
+        *,
+        snapshots: tuple[GateKVSnapshot, ...],
+        base_probability: torch.Tensor,
+    ) -> torch.Tensor:
+        """Return flipped-current-mode minus observed base IDM probability."""
+
+        with torch.no_grad():
+            flipped_logits = self.gate(_flip_gate_snapshot_current_modes(snapshots))
+            flipped = epsilon_mixture_bernoulli(
+                flipped_logits,
+                temperature=self.config.gate_temperature,
+                epsilon=0.0,
+            ).base_idm_probability
+        if flipped.shape != base_probability.shape:
+            raise ValueError("Mode-flip Gate output changed the decision shape.")
+        return (flipped - base_probability.detach()).detach()
+
     def _training_gate_decision(
         self,
         *,
         logits: torch.Tensor,
         sampling_seeds: torch.Tensor | None = None,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    ) -> tuple[
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor | None,
+    ]:
         behavior = epsilon_mixture_bernoulli(
             logits,
             temperature=self.config.gate_temperature,
             epsilon=self.config.gate_epsilon,
         )
         if sampling_seeds is None:
-            route = behavior.sample()
+            if self.config.decision_telemetry_enabled:
+                epsilon = torch.full_like(logits, self.config.gate_epsilon)
+                route, exploration_forced = _sample_epsilon_mixture_with_component(
+                    base_probability=behavior.base_idm_probability,
+                    behavior_probability=behavior.behavior_idm_probability,
+                    epsilon=epsilon,
+                )
+            else:
+                # Preserve the established sampler and RNG stream unless the
+                # explicit telemetry profile requests mixture attribution.
+                route = behavior.sample()
+                exploration_forced = None
         else:
             seeds = torch.as_tensor(sampling_seeds, device="cpu", dtype=torch.long)
             if seeds.shape != logits.shape:
@@ -451,26 +583,48 @@ class FastWAMAdaptivePolicy(nn.Module, BasePolicy):
                     f"{tuple(seeds.shape)} != {tuple(logits.shape)}."
                 )
             routes = []
-            for probability, seed in zip(
-                behavior.behavior_idm_probability.reshape(-1),
-                seeds.reshape(-1),
-                strict=True,
+            exploration_flags = []
+            epsilon = torch.full_like(logits, self.config.gate_epsilon)
+            for index, (probability, seed) in enumerate(
+                zip(
+                    behavior.behavior_idm_probability.reshape(-1),
+                    seeds.reshape(-1),
+                    strict=True,
+                )
             ):
                 generator = torch.Generator(device=probability.device)
                 generator.manual_seed(int(seed.item()))
-                routes.append(
-                    torch.bernoulli(
+                if self.config.decision_telemetry_enabled:
+                    sampled_route, sampled_exploration = (
+                        _sample_epsilon_mixture_with_component(
+                            base_probability=behavior.base_idm_probability.reshape(-1)[
+                                index
+                            ].reshape(1),
+                            behavior_probability=probability.reshape(1),
+                            epsilon=epsilon.reshape(-1)[index].reshape(1),
+                            generator=generator,
+                        )
+                    )
+                    exploration_flags.append(sampled_exploration)
+                else:
+                    sampled_route = torch.bernoulli(
                         probability.reshape(1),
                         generator=generator,
                     )
-                )
+                routes.append(sampled_route)
             route = torch.cat(routes).reshape_as(logits).to(dtype=torch.long)
+            exploration_forced = (
+                torch.cat(exploration_flags).reshape_as(logits)
+                if self.config.decision_telemetry_enabled
+                else None
+            )
         logprob = behavior.log_prob(route)
         return (
             route,
             behavior.base_idm_probability,
             behavior.behavior_idm_probability,
             logprob,
+            exploration_forced,
         )
 
     def _formal_training_sampling_seeds(
@@ -683,6 +837,7 @@ class FastWAMAdaptivePolicy(nn.Module, BasePolicy):
         env_obs: dict[str, Any],
         route_info: ChunkRouteRecord,
         env_ids: torch.Tensor,
+        identity_metadata: dict[str, torch.Tensor | None],
     ) -> tuple[torch.Tensor, dict[str, Any]]:
         """Run deterministic evaluation without constructing PPO replay."""
 
@@ -725,6 +880,14 @@ class FastWAMAdaptivePolicy(nn.Module, BasePolicy):
                 source_chunk_ids=route_info.chunk_ids[start:end],
                 current_routes=route_info.route_used[start:end],
             )
+            mode_flip_delta = (
+                self._mode_flip_delta(
+                    snapshots=sample.gate_snapshots,
+                    base_probability=decision[1],
+                )
+                if self.config.decision_telemetry_enabled
+                else None
+            )
             if measure_gate_latency:
                 if logits.device.type == "cuda":
                     torch.cuda.synchronize(logits.device)
@@ -733,7 +896,7 @@ class FastWAMAdaptivePolicy(nn.Module, BasePolicy):
                     torch.full((end - start,), elapsed, dtype=torch.float64)
                 )
                 gate_h2d_latencies.append(torch.zeros(end - start, dtype=torch.float64))
-            decisions.append(decision)
+            decisions.append((*decision, mode_flip_delta))
             actions.append(sample.actions)
             action_traces.append(sample.action_execution_trace)
 
@@ -743,6 +906,11 @@ class FastWAMAdaptivePolicy(nn.Module, BasePolicy):
         gate_logprob = torch.cat([item[3] for item in decisions], dim=0)
         evaluation_selection = EvaluationRouteSelection.cat(
             [item[4] for item in decisions]
+        )
+        mode_flip_delta = (
+            torch.cat([item[5] for item in decisions if item[5] is not None], dim=0)
+            if self.config.decision_telemetry_enabled
+            else None
         )
         self.route_tracker.emit(
             env_ids=env_ids,
@@ -765,6 +933,35 @@ class FastWAMAdaptivePolicy(nn.Module, BasePolicy):
             source_chunk_ids=route_info.chunk_ids.to(next_route.device),
             episode_ids=route_info.episode_ids.to(next_route.device),
             actor_versions=torch.full_like(next_route, self.actor_version),
+            exploration_forced=(
+                torch.zeros_like(next_route, dtype=torch.bool)
+                if self.config.decision_telemetry_enabled
+                else None
+            ),
+            mode_flip_delta=mode_flip_delta,
+            environment_ids=(
+                env_ids.to(next_route.device)
+                if self.config.decision_telemetry_enabled
+                else None
+            ),
+            task_ids=(
+                identity_metadata["task_ids"].to(next_route.device)
+                if self.config.decision_telemetry_enabled
+                and identity_metadata["task_ids"] is not None
+                else None
+            ),
+            trial_ids=(
+                identity_metadata["trial_ids"].to(next_route.device)
+                if self.config.decision_telemetry_enabled
+                and identity_metadata["trial_ids"] is not None
+                else None
+            ),
+            reset_state_ids=(
+                identity_metadata["reset_state_ids"].to(next_route.device)
+                if self.config.decision_telemetry_enabled
+                and identity_metadata["reset_state_ids"] is not None
+                else None
+            ),
             kv_metadata=None,
         )
         if any(trace is None for trace in action_traces) and not all(
@@ -830,6 +1027,15 @@ class FastWAMAdaptivePolicy(nn.Module, BasePolicy):
             )
         device = env_obs["states"].device
         env_ids, reset_mask = self._routing_metadata(env_obs, batch_size, device)
+        identity_metadata = (
+            self._decision_identity_metadata(
+                env_obs,
+                batch_size=batch_size,
+                device=device,
+            )
+            if self.config.decision_telemetry_enabled
+            else {"task_ids": None, "trial_ids": None, "reset_state_ids": None}
+        )
         route_info = self.route_tracker.consume(
             env_ids=env_ids,
             reset_mask=reset_mask,
@@ -841,6 +1047,7 @@ class FastWAMAdaptivePolicy(nn.Module, BasePolicy):
                 env_obs=env_obs,
                 route_info=route_info,
                 env_ids=env_ids,
+                identity_metadata=identity_metadata,
             )
 
         sampling_seeds = self._formal_training_sampling_seeds(
@@ -868,13 +1075,23 @@ class FastWAMAdaptivePolicy(nn.Module, BasePolicy):
             collect_replay=True,
         )
         logits = self.gate(sample.gate_snapshots)
-        next_route, base_probability, behavior_probability, gate_logprob = (
-            self._training_gate_decision(
-                logits=logits,
-                sampling_seeds=(
-                    None if sampling_seeds is None else sampling_seeds["gate"]
-                ),
+        (
+            next_route,
+            base_probability,
+            behavior_probability,
+            gate_logprob,
+            exploration_forced,
+        ) = self._training_gate_decision(
+            logits=logits,
+            sampling_seeds=(None if sampling_seeds is None else sampling_seeds["gate"]),
+        )
+        mode_flip_delta = (
+            self._mode_flip_delta(
+                snapshots=sample.gate_snapshots,
+                base_probability=base_probability,
             )
+            if self.config.decision_telemetry_enabled
+            else None
         )
         self.route_tracker.emit(
             env_ids=env_ids,
@@ -936,6 +1153,31 @@ class FastWAMAdaptivePolicy(nn.Module, BasePolicy):
             source_chunk_ids=route_info.chunk_ids.to(next_route.device),
             episode_ids=route_info.episode_ids.to(next_route.device),
             actor_versions=torch.full_like(next_route, self.actor_version),
+            exploration_forced=exploration_forced,
+            mode_flip_delta=mode_flip_delta,
+            environment_ids=(
+                env_ids.to(next_route.device)
+                if self.config.decision_telemetry_enabled
+                else None
+            ),
+            task_ids=(
+                identity_metadata["task_ids"].to(next_route.device)
+                if self.config.decision_telemetry_enabled
+                and identity_metadata["task_ids"] is not None
+                else None
+            ),
+            trial_ids=(
+                identity_metadata["trial_ids"].to(next_route.device)
+                if self.config.decision_telemetry_enabled
+                and identity_metadata["trial_ids"] is not None
+                else None
+            ),
+            reset_state_ids=(
+                identity_metadata["reset_state_ids"].to(next_route.device)
+                if self.config.decision_telemetry_enabled
+                and identity_metadata["reset_state_ids"] is not None
+                else None
+            ),
             kv_metadata=kv_metadata,
         )
 

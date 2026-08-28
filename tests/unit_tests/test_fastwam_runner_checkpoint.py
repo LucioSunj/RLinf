@@ -16,6 +16,7 @@
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -23,6 +24,7 @@ import pytest
 from omegaconf import OmegaConf
 
 from rlinf.runners.embodied_runner import EmbodiedRunner
+from rlinf.runners.fastwam_fair_cost import FastWAMFairCostController
 from rlinf.runners.fastwam_training_guard import FastWAMTrainingGuard
 
 
@@ -51,16 +53,33 @@ class _WorkerGroup:
         self.calls.append(("save_checkpoint", path, step))
         return _Handle()
 
+    def set_fastwam_idm_cost(self, idm_cost, runner_step):
+        self.calls.append(("set_fastwam_idm_cost", idm_cost, runner_step))
+        return _Handle()
+
 
 def _runner_cfg(
     tmp_path: Path,
     *,
     resume_dir: str | None = None,
     guard_enabled: bool = False,
+    fair_cost_enabled: bool = False,
 ):
     return OmegaConf.create(
         {
             "actor": {"model": {"model_type": "fastwam_adaptive"}},
+            "algorithm": {
+                "fixed_branch_cost": {
+                    "enabled": True,
+                    "idm_cost": 0.01,
+                    "uncond_cost": 0.0,
+                    "fair_cost": {
+                        "enabled": fair_cost_enabled,
+                        "window_size": 5,
+                        "pi": {"enabled": False},
+                    },
+                }
+            },
             "runner": {
                 "resume_dir": resume_dir,
                 "fastwam_training_guard": {
@@ -69,7 +88,7 @@ def _runner_cfg(
                     "window_size": 3,
                     "eligible_idm_fraction_min": 0.05,
                     "eligible_idm_fraction_max": 0.95,
-                    "gate_entropy_min": 0.1,
+                    "gate_entropy_min": 0.35,
                     "gate_kl_median_max": 0.05,
                     "gate_kl_single_max": 0.1,
                     "gate_clip_median_max": 0.6,
@@ -95,6 +114,11 @@ def _bare_runner(cfg, *, actor, rollout, env=None):
     runner.global_step = 0
     runner.fastwam_training_guard = FastWAMTrainingGuard(
         cfg.runner.fastwam_training_guard
+    )
+    runner.fastwam_fair_cost_controller = (
+        FastWAMFairCostController.from_branch_cost_config(
+            cfg.algorithm.fixed_branch_cost
+        )
     )
     return runner
 
@@ -150,6 +174,24 @@ def test_worker_global_step_is_awaited_before_training_continues(
         ("wait", "actor"),
         ("wait", "rollout"),
     ]
+
+
+def test_lagged_fair_cost_is_published_after_global_step(tmp_path: Path) -> None:
+    actor = _WorkerGroup()
+    runner = _bare_runner(
+        _runner_cfg(
+            tmp_path,
+            guard_enabled=True,
+            fair_cost_enabled=True,
+        ),
+        actor=actor,
+        rollout=_WorkerGroup(),
+    )
+    runner.global_step = 0
+
+    runner._set_fastwam_runtime_cost()
+
+    assert actor.calls == [("set_fastwam_idm_cost", 0.01, 0)]
 
 
 def test_fastwam_resume_restores_paired_actor_and_rollout_steps(tmp_path: Path) -> None:
@@ -229,6 +271,10 @@ def test_fastwam_guard_state_is_saved_and_restored_with_runner_step(
 
     checkpoint = tmp_path / "l12/checkpoints/global_step_3"
     assert (checkpoint / "training_guard.json").is_file()
+    assert (
+        json.loads((checkpoint / "training_guard.json").read_text())["schema"]
+        == "fastwam-training-guard-checkpoint-v1"
+    )
 
     resumed = _bare_runner(
         _runner_cfg(
@@ -244,6 +290,48 @@ def test_fastwam_guard_state_is_saved_and_restored_with_runner_step(
     assert resumed.fastwam_training_guard.state_dict() == (
         source.fastwam_training_guard.state_dict()
     )
+
+
+def test_fastwam_fair_cost_state_is_saved_and_restored_with_runner_step(
+    tmp_path: Path,
+) -> None:
+    cfg = _runner_cfg(
+        tmp_path,
+        guard_enabled=True,
+        fair_cost_enabled=True,
+    )
+    source = _bare_runner(cfg, actor=_WorkerGroup(), rollout=_WorkerGroup())
+    source.fastwam_fair_cost_controller.observe_rollout(
+        runner_step=0,
+        break_even_idm_cost=0.03,
+        idm_fraction=0.6,
+    )
+    source.global_step = 1
+    source._save_checkpoint()
+    checkpoint = tmp_path / "l12/checkpoints/global_step_1"
+    assert (
+        json.loads((checkpoint / "training_guard.json").read_text())["schema"]
+        == "fastwam-training-guard-checkpoint-v2"
+    )
+
+    resumed = _bare_runner(
+        _runner_cfg(
+            tmp_path,
+            resume_dir=str(checkpoint),
+            guard_enabled=True,
+            fair_cost_enabled=True,
+        ),
+        actor=_WorkerGroup(loaded_steps=[1]),
+        rollout=_WorkerGroup(loaded_steps=[1]),
+    )
+    resumed.init_workers()
+
+    assert resumed.fastwam_fair_cost_controller.state_dict() == (
+        source.fastwam_fair_cost_controller.state_dict()
+    )
+    assert resumed.fastwam_fair_cost_controller.decision_for_step(
+        1
+    ).applied_idm_cost == pytest.approx(0.03)
 
 
 def test_fastwam_guard_resume_fails_closed_when_state_is_missing(

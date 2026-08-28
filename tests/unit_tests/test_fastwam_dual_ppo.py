@@ -109,6 +109,39 @@ def test_gate_ppo_clips_independently_and_reports_selected_count():
     assert metrics["gate/log_ratio_max_abs"].item() == pytest.approx(abs(math.log(0.5)))
 
 
+@pytest.mark.parametrize("epsilon", [0.05, 0.1, 0.25])
+def test_gate_metric_uses_base_entropy_while_loss_keeps_behavior_entropy(epsilon):
+    base_probability = torch.tensor([0.958], dtype=torch.float32, requires_grad=True)
+    behavior_probability = (1.0 - epsilon) * base_probability + epsilon * 0.5
+    coefficient = 0.7
+
+    loss, metrics = dual_ppo.compute_gate_ppo_loss(
+        logprobs=torch.zeros(1, dtype=torch.float32),
+        old_logprobs=torch.zeros(1, dtype=torch.float32),
+        advantages=torch.zeros(1, dtype=torch.float32),
+        valid_mask=torch.ones(1, dtype=torch.bool),
+        clip_ratio_low=0.2,
+        clip_ratio_high=0.2,
+        base_probabilities=base_probability,
+        behavior_probabilities=behavior_probability,
+        entropy_coefficient=coefficient,
+    )
+
+    base_entropy = -(
+        base_probability * torch.log(base_probability)
+        + (1.0 - base_probability) * torch.log(1.0 - base_probability)
+    ).item()
+    behavior_entropy = -(
+        behavior_probability * torch.log(behavior_probability)
+        + (1.0 - behavior_probability) * torch.log(1.0 - behavior_probability)
+    ).item()
+    assert metrics["gate/entropy"].item() == pytest.approx(base_entropy)
+    assert metrics["gate/entropy"].item() != pytest.approx(behavior_entropy)
+    assert not metrics["gate/entropy"].requires_grad
+    assert not metrics["gate/total_loss"].requires_grad
+    assert loss.item() == pytest.approx(-coefficient * behavior_entropy)
+
+
 def test_dual_ppo_uses_gate_mask_and_uncond_route_mask_separately():
     gate_logprobs = torch.zeros(3, requires_grad=True)
     flow_logprobs = torch.zeros(3, requires_grad=True)
@@ -407,3 +440,37 @@ def test_collapse_penalty_empty_mask_is_differentiable_zero():
     penalty.backward()
     assert penalty.item() == 0.0
     assert torch.equal(probabilities.grad, torch.zeros_like(probabilities))
+
+
+@pytest.mark.parametrize("idm_fraction", [0.05, 0.95])
+def test_adaptive_collapse_penalty_remains_live_near_target_floor(idm_fraction):
+    decision_count = 1035
+    probabilities = torch.full(
+        (decision_count,), idm_fraction, dtype=torch.float32, requires_grad=True
+    )
+    penalty, metrics = dual_ppo.compute_gate_collapse_penalty(
+        base_idm_probabilities=probabilities,
+        episode_ids=torch.zeros(decision_count, dtype=torch.long),
+        valid_mask=torch.ones(decision_count, dtype=torch.bool),
+        tau_calls=1.0,
+        target_floor=0.1,
+        scope="microbatch",
+    )
+
+    assert penalty.item() > 1e-6
+    assert metrics["collapse/effective_tau_calls"].item() == pytest.approx(34.5)
+
+
+@pytest.mark.parametrize("idm_fraction", [0.3, 0.5, 0.7])
+def test_adaptive_collapse_penalty_is_negligible_in_healthy_region(idm_fraction):
+    decision_count = 1035
+    penalty, _metrics = dual_ppo.compute_gate_collapse_penalty(
+        base_idm_probabilities=torch.full((decision_count,), idm_fraction),
+        episode_ids=torch.zeros(decision_count, dtype=torch.long),
+        valid_mask=torch.ones(decision_count, dtype=torch.bool),
+        tau_calls=1.0,
+        target_floor=0.1,
+        scope="microbatch",
+    )
+
+    assert penalty.item() < 1.3e-4

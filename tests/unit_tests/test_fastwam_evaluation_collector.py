@@ -178,6 +178,8 @@ def _rollout(
         source_chunk_ids=torch.tensor([chunk_id]),
         episode_ids=torch.tensor([0]),
         actor_versions=torch.tensor([3]),
+        exploration_forced=torch.tensor([False]),
+        mode_flip_delta=torch.tensor([0.0]),
         kv_metadata=None,
     )
     selection = EvaluationRouteSelection(
@@ -238,6 +240,7 @@ def _collector(
     random_lag1_autocorrelation: float | None = None,
     policy_checkpoint_sha256: str = "a" * 64,
     evaluation_runtime_identity: dict | None = None,
+    decision_telemetry_enabled: bool = False,
 ) -> FastWAMLiberoEvalCollector:
     tmp_path.mkdir(parents=True, exist_ok=True)
     ledger_path = tmp_path / "ledger.json"
@@ -254,6 +257,7 @@ def _collector(
         random_lag1_autocorrelation=random_lag1_autocorrelation,
         routing_seed=0,
         fixed_idm_cost=0.01,
+        decision_telemetry_enabled=decision_telemetry_enabled,
         noise_seed_mode=noise_seed_mode,
         contract_violation_outcome=contract_violation_outcome,
         resume=resume,
@@ -386,6 +390,7 @@ def test_collector_records_aligned_chunks_episode_and_atomic_shards(tmp_path) ->
     assert chunks[0]["route_was_forced"] is True
     assert chunks[0]["emitted_decision_consumed"] is True
     assert chunks[0]["gate_temperature"] == 1.0
+    assert "decision_telemetry" not in chunks[0]
     assert chunks[1]["route"] == "uncond"
     assert chunks[1]["emitted_decision_discarded"] is True
     assert chunks[1]["terminal"] is True
@@ -402,6 +407,28 @@ def test_collector_records_aligned_chunks_episode_and_atomic_shards(tmp_path) ->
     serialized = json.dumps({"chunks": chunks, "episodes": episodes}).lower()
     for forbidden in ("gate_kv", "observation", "main_images", "model_weights"):
         assert forbidden not in serialized
+
+
+def test_collector_adds_decision_telemetry_only_when_enabled(tmp_path) -> None:
+    collector = _collector(tmp_path, decision_telemetry_enabled=True)
+    snapshot = collector.snapshot_before_step(0, _IdentityEnv(), torch.tensor([7]))
+
+    collector.record_chunk(
+        snapshot=snapshot,
+        rollout_result=_rollout(
+            chunk_id=0,
+            route_used=1,
+            forced=True,
+            source_chunk_id=-1,
+            terminal=False,
+        ),
+        env_output=_outcome(terminal=False),
+        environment_latency_seconds=0.02,
+    )
+
+    record = json.loads((tmp_path / "chunks.rank-0.jsonl").read_text().splitlines()[0])
+    assert record["decision_telemetry"]["phase"] == "evaluation"
+    assert record["decision_telemetry"]["eligible_decision"] is True
 
 
 def test_collector_writes_each_equivalent_live_contract(tmp_path) -> None:
@@ -699,6 +726,8 @@ def test_collector_writes_parallel_episodes_in_frozen_ledger_order(tmp_path) -> 
                 source_chunk_ids=torch.tensor([0, 0]),
                 episode_ids=torch.tensor([0, 0]),
                 actor_versions=torch.tensor([3, 3]),
+                exploration_forced=torch.tensor([False, False]),
+                mode_flip_delta=torch.tensor([0.0, 0.0]),
                 kv_metadata=None,
             ),
             evaluation_selection=EvaluationRouteSelection(

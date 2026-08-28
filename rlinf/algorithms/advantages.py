@@ -15,7 +15,7 @@
 import math
 from collections.abc import Sequence
 from dataclasses import dataclass
-from typing import Optional
+from typing import Any, Optional
 
 import torch
 
@@ -41,6 +41,37 @@ FASTWAM_COUNTERFACTUAL_COST_AUDIT_SENTINEL = (
 )
 FASTWAM_GATE_UPDATE_AUDIT_SCHEMA = "fastwam-gate-update-audit-v1"
 FASTWAM_GATE_UPDATE_AUDIT_SENTINEL = "FASTWAM_TRAINING_GATE_UPDATE_AUDIT"
+
+
+def compute_fastwam_break_even_idm_cost(
+    points: Sequence[tuple[float, float, int, float, int]],
+) -> float | None:
+    """Compute the zero-gap IDM cost from counterfactual destination summaries."""
+
+    if len(points) < 2:
+        return None
+    lower = min(points, key=lambda point: point[0])
+    upper = max(points, key=lambda point: point[0])
+    cost_span = upper[0] - lower[0]
+    if not math.isclose(lower[0], 0.0, rel_tol=0.0, abs_tol=1.0e-12):
+        raise ValueError("Counterfactual break-even requires a zero-cost entry.")
+    if cost_span <= 0.0:
+        return None
+
+    def destination_gap(point: tuple[float, float, int, float, int]) -> float:
+        _, idm_total, idm_count, uncond_total, uncond_count = point
+        if idm_count < 1 or uncond_count < 1:
+            raise ValueError(
+                "Counterfactual break-even requires finite IDM and UNCOND samples."
+            )
+        return idm_total / idm_count - uncond_total / uncond_count
+
+    gap_at_zero = destination_gap(lower)
+    slope = (destination_gap(upper) - gap_at_zero) / cost_span
+    if gap_at_zero <= 0.0 or slope >= 0.0:
+        return None
+    break_even = gap_at_zero / -slope
+    return break_even if math.isfinite(break_even) else None
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
@@ -239,37 +270,21 @@ class FastWAMCounterfactualCostAudit:
     eligible_uncond_decision_count: int
     entries: tuple[FastWAMCounterfactualCostEntry, ...]
 
-    @staticmethod
-    def _unnormalized_destination_gap(
-        entry: FastWAMCounterfactualCostEntry,
-    ) -> float:
-        idm = entry.unnormalized_idm_gate_advantage
-        uncond = entry.unnormalized_uncond_gate_advantage
-        if idm.finite_count < 1 or uncond.finite_count < 1:
-            raise ValueError(
-                "Counterfactual break-even requires finite IDM and UNCOND samples."
-            )
-        return idm.total / idm.finite_count - uncond.total / uncond.finite_count
-
     @property
     def break_even_idm_cost(self) -> float | None:
         """Return the interpolated cost where the unnormalized route gap is zero."""
 
-        if len(self.entries) < 2:
-            return None
-        lower = min(self.entries, key=lambda entry: entry.idm_cost)
-        upper = max(self.entries, key=lambda entry: entry.idm_cost)
-        cost_span = upper.idm_cost - lower.idm_cost
-        if not math.isclose(lower.idm_cost, 0.0, rel_tol=0.0, abs_tol=1.0e-12):
-            raise ValueError("Counterfactual break-even requires a zero-cost entry.")
-        if cost_span <= 0.0:
-            return None
-        gap_at_zero = self._unnormalized_destination_gap(lower)
-        slope = (self._unnormalized_destination_gap(upper) - gap_at_zero) / cost_span
-        if gap_at_zero <= 0.0 or slope >= 0.0:
-            return None
-        break_even = gap_at_zero / -slope
-        return break_even if math.isfinite(break_even) else None
+        points = tuple(
+            (
+                entry.idm_cost,
+                entry.unnormalized_idm_gate_advantage.total,
+                entry.unnormalized_idm_gate_advantage.finite_count,
+                entry.unnormalized_uncond_gate_advantage.total,
+                entry.unnormalized_uncond_gate_advantage.finite_count,
+            )
+            for entry in self.entries
+        )
+        return compute_fastwam_break_even_idm_cost(points)
 
     def to_artifact(self) -> dict[str, object]:
         """Return compact counterfactual evidence."""
@@ -1450,6 +1465,8 @@ def compute_gae_advantages_and_returns(
     normalize_returns: bool = False,
     loss_mask: Optional[torch.Tensor] = None,
     dones: Optional[torch.Tensor] = None,
+    normalization_std_floor: float = 0.0,
+    normalization_statistics: dict[str, Any] | None = None,
     **kwargs,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """
@@ -1498,11 +1515,70 @@ def compute_gae_advantages_and_returns(
     advantages = returns - values[:-1] if not critic_free else returns
 
     if normalize_advantages:
-        advantages = safe_normalize(advantages, loss_mask=loss_mask)
+        advantages = safe_normalize(
+            advantages,
+            loss_mask=loss_mask,
+            std_floor=normalization_std_floor,
+            statistics=normalization_statistics,
+        )
     if normalize_returns:
         returns = safe_normalize(returns, loss_mask=loss_mask)
 
     return advantages, returns
+
+
+def compute_fastwam_unnormalized_gate_alignment(
+    *,
+    rewards: torch.Tensor,
+    route: ChunkRouteRecord,
+    emitted: GateDecisionRecord,
+    dones: torch.Tensor,
+    values: torch.Tensor,
+    valid_mask: torch.Tensor | None,
+    gamma: float,
+    gae_lambda: float,
+    rollout_epoch: int,
+    carry_pending_across_epochs: bool,
+) -> FastWAMPolicyAlignment:
+    """Return configured-cost destination advantages before normalization."""
+
+    if rewards.shape != (*route.shape, 1):
+        raise ValueError("FastWAM configured rewards must have shape [time, batch, 1].")
+    expected_values_shape = (route.shape[0] + 1, route.shape[1], 1)
+    if values.shape != expected_values_shape:
+        raise ValueError(
+            "FastWAM critic values must include one bootstrap timestep; "
+            f"expected {expected_values_shape}, got {tuple(values.shape)}."
+        )
+    if dones.shape[:2] != expected_values_shape[:2] or dones.dtype != torch.bool:
+        raise ValueError(
+            "FastWAM dones must be boolean and include one bootstrap timestep."
+        )
+    chunk_mask = _chunk_mask(
+        valid_mask,
+        shape=route.shape,
+        name="valid_mask",
+        device=route.route_used.device,
+    )
+    gae_dones = dones.reshape(*dones.shape[:2], -1).any(dim=-1)
+    unnormalized, _ = compute_gae_advantages_and_returns(
+        rewards=rewards[..., 0],
+        gamma=gamma,
+        gae_lambda=gae_lambda,
+        values=values[..., 0],
+        normalize_advantages=False,
+        loss_mask=chunk_mask,
+        dones=gae_dones,
+    )
+    return align_fastwam_policy_advantages(
+        advantages=unnormalized.unsqueeze(-1),
+        route=route,
+        emitted=emitted,
+        dones=dones,
+        rollout_epoch=rollout_epoch,
+        carry_pending_across_epochs=carry_pending_across_epochs,
+        loss_mask=valid_mask,
+    )
 
 
 def summarize_fastwam_counterfactual_costs(

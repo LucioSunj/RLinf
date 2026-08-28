@@ -288,6 +288,15 @@ class _Gate(nn.Module):
         return self.bias.expand(snapshots[0].batch_size)
 
 
+class _ModeGate(nn.Module):
+    def forward(self, snapshots):
+        layer = snapshots[-1].layers[0]
+        return torch.tensor(
+            [1.0 if mode is PolicyRegime.IDM else -1.0 for mode in layer.current_mode],
+            device=layer.action.key.device,
+        )
+
+
 class _ThirtyBlockGate(nn.Module):
     def __init__(self):
         super().__init__()
@@ -343,6 +352,7 @@ def _make_policy(
     eval_timing_cuda_synchronize=False,
     training_rollout_microbatch_size=None,
     formal_training_sampling_seed=None,
+    decision_telemetry_enabled=False,
     critic_kind="pi05",
 ):
     if not with_critic:
@@ -370,6 +380,7 @@ def _make_policy(
             eval_timing_cuda_synchronize=eval_timing_cuda_synchronize,
             training_rollout_microbatch_size=training_rollout_microbatch_size,
             formal_training_sampling_seed=formal_training_sampling_seed,
+            decision_telemetry_enabled=decision_telemetry_enabled,
             kv_replay=_policy.GateKVReplayConfig(
                 backend=backend,
                 pin_memory=False,
@@ -686,6 +697,111 @@ def test_training_gate_sampling_does_not_call_evaluation_selector(monkeypatch):
         "_fastwam_reset_mask": torch.tensor([True, True]),
     }
     policy.predict_action_batch(obs, mode="train", compute_values=False)
+
+
+def test_disabled_decision_telemetry_preserves_legacy_gate_path(monkeypatch):
+    policy = _make_policy(decision_telemetry_enabled=False)
+    monkeypatch.setattr(
+        policy,
+        "_mode_flip_delta",
+        lambda **kwargs: pytest.fail("disabled telemetry ran mode-flip Gate"),
+    )
+    monkeypatch.setattr(
+        _policy,
+        "_sample_epsilon_mixture_with_component",
+        lambda **kwargs: pytest.fail("disabled telemetry changed Gate sampling"),
+    )
+    obs = {
+        "states": torch.ones(2, 3),
+        "_fastwam_env_ids": torch.tensor([11, 22]),
+        "_fastwam_reset_mask": torch.tensor([True, True]),
+        "_fastwam_task_ids": torch.tensor([3, 4]),
+        "_fastwam_trial_ids": torch.tensor([7, 8]),
+        "_fastwam_reset_state_ids": torch.tensor([107, 208]),
+    }
+
+    _, result = policy.predict_action_batch(obs, mode="train", compute_values=False)
+
+    emitted = result["emitted_gate"]
+    assert emitted.exploration_forced is None
+    assert emitted.mode_flip_delta is None
+    assert emitted.environment_ids is None
+    assert emitted.task_ids is None
+    assert emitted.trial_ids is None
+    assert emitted.reset_state_ids is None
+
+
+def test_training_gate_records_mode_flip_exploration_and_environment_identity():
+    policy = _make_policy(decision_telemetry_enabled=True)
+    policy.gate = _ModeGate()
+    obs = {
+        "states": torch.ones(2, 3),
+        "_fastwam_env_ids": torch.tensor([11, 22]),
+        "_fastwam_reset_mask": torch.tensor([True, True]),
+        "_fastwam_task_ids": torch.tensor([3, 4]),
+        "_fastwam_trial_ids": torch.tensor([7, 8]),
+        "_fastwam_reset_state_ids": torch.tensor([107, 208]),
+    }
+
+    _, result = policy.predict_action_batch(obs, mode="train", compute_values=False)
+
+    emitted = result["emitted_gate"]
+    expected_base = torch.full((2,), torch.sigmoid(torch.tensor(1.0)))
+    expected_flipped = torch.full((2,), torch.sigmoid(torch.tensor(-1.0)))
+    assert torch.allclose(emitted.base_probability, expected_base)
+    assert torch.allclose(
+        emitted.mode_flip_delta,
+        expected_flipped - expected_base,
+    )
+    assert not emitted.mode_flip_delta.requires_grad
+    assert emitted.exploration_forced.tolist() == [False, False]
+    assert emitted.environment_ids.tolist() == [11, 22]
+    assert emitted.task_ids.tolist() == [3, 4]
+    assert emitted.trial_ids.tolist() == [7, 8]
+    assert emitted.reset_state_ids.tolist() == [107, 208]
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is unavailable")
+def test_training_gate_moves_cpu_identity_to_cuda_decision_device():
+    policy = _make_policy(decision_telemetry_enabled=True)
+    policy.gate = policy.gate.cuda()
+    obs = {
+        "states": torch.ones(2, 3),
+        "_fastwam_env_ids": torch.tensor([11, 22]),
+        "_fastwam_reset_mask": torch.tensor([True, True]),
+        "_fastwam_task_ids": torch.tensor([3, 4]),
+        "_fastwam_trial_ids": torch.tensor([7, 8]),
+        "_fastwam_reset_state_ids": torch.tensor([107, 208]),
+    }
+
+    _, result = policy.predict_action_batch(obs, mode="train", compute_values=False)
+
+    emitted = result["emitted_gate"]
+    assert emitted.valid.device.type == "cuda"
+    assert emitted.task_ids.device == emitted.valid.device
+    assert emitted.trial_ids.device == emitted.valid.device
+    assert emitted.reset_state_ids.device == emitted.valid.device
+
+
+def test_epsilon_mixture_component_flag_uses_the_declared_mixture_mass():
+    base = torch.linspace(0.1, 0.9, 64)
+    generator = torch.Generator().manual_seed(9)
+    _, no_exploration = _policy._sample_epsilon_mixture_with_component(
+        base_probability=base,
+        behavior_probability=base,
+        epsilon=torch.zeros_like(base),
+        generator=generator,
+    )
+    generator = torch.Generator().manual_seed(9)
+    _, all_exploration = _policy._sample_epsilon_mixture_with_component(
+        base_probability=base,
+        behavior_probability=torch.full_like(base, 0.5),
+        epsilon=torch.ones_like(base),
+        generator=generator,
+    )
+
+    assert not bool(no_exploration.any())
+    assert bool(all_exploration.all())
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is unavailable")
@@ -1368,6 +1484,7 @@ def test_sparse_handle_replay_matches_full_loss_gradients_and_optimizer_delta():
             flow_clip_ratio_low=0.2,
             flow_clip_ratio_high=0.2,
             flow_valid_mask=flow_valid_mask,
+            gate_base_probabilities=replay["gate_base_probabilities"],
             gate_behavior_probabilities=replay["gate_behavior_probabilities"],
             flow_entropy=replay["flow_entropy"],
         )

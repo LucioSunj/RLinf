@@ -312,6 +312,13 @@ def test_libero_adaptive_config_composes_with_confirmed_defaults(monkeypatch) ->
     assert cfg.algorithm.fixed_branch_cost.idm_cost == 0.01
     assert cfg.env.eval.reward_coef == cfg.algorithm.reward_coef
     assert cfg.algorithm.fixed_branch_cost.uncond_cost == 0.0
+    assert "fair_cost" not in cfg.algorithm.fixed_branch_cost
+    assert "advantage_normalization_std_floor" not in cfg.algorithm
+    assert "entropy_metric_source" not in cfg.algorithm.gate_ppo
+    assert "decision_telemetry_enabled" not in cfg.actor.model
+    assert (
+        "break_even_guard_enabled" not in cfg.runner.fastwam_training_guard.cost_audit
+    )
     assert cfg.env.train.use_step_penalty is False
     assert cfg.actor.model.critic.kind == "pi0_5_value_after_vlm"
     assert cfg.actor.model.critic.backbone_checkpoint_sha256 == "b" * 64
@@ -496,7 +503,20 @@ def test_formal_profile_requires_stage_invariant_internal_contract(
         "use_training_pipeline": False,
     }
     with initialize_config_dir(version_base=None, config_dir=str(CONFIG_ROOT)):
-        cfg = compose(config_name="libero_10_ppo_fastwam_adaptive_formal")
+        cfg = compose(
+            config_name="libero_10_ppo_fastwam_adaptive_formal",
+            overrides=["+profile=fastwam_fair_cost_stability_telemetry"],
+        )
+    assert cfg.algorithm.fixed_branch_cost.fair_cost.enabled is True
+    assert cfg.algorithm.fixed_branch_cost.fair_cost.pi.enabled is False
+    assert cfg.runner.fastwam_training_guard.cost_audit.enabled is True
+    assert (
+        cfg.runner.fastwam_training_guard.cost_audit.break_even_guard_enabled is False
+    )
+    assert cfg.actor.model.decision_telemetry_enabled is True
+    assert cfg.rollout.model.decision_telemetry_enabled is True
+    assert cfg.algorithm.gate_ppo.entropy_metric_source == "base"
+    assert cfg.algorithm.advantage_normalization_std_floor == 0.15
     cfg.rollout.pipeline_stage_num = 2
     cfg.actor.micro_batch_size = 1
     for path, value in (
@@ -512,6 +532,30 @@ def test_formal_profile_requires_stage_invariant_internal_contract(
         OmegaConf.update(cfg, path, value, force_add=True)
 
     _validate_fastwam_adaptive_cfg(cfg, only_eval=False)
+
+    invalid = OmegaConf.create(OmegaConf.to_container(cfg, resolve=False))
+    OmegaConf.update(
+        invalid,
+        "runner.fastwam_training_guard.cost_audit.break_even_guard_enabled",
+        True,
+    )
+    with pytest.raises(ValueError, match="fixed-price abort guard"):
+        _validate_fastwam_adaptive_cfg(invalid, only_eval=False)
+
+    for disabled_path, message in (
+        (
+            "runner.fastwam_training_guard.enabled",
+            "cost audit requires the scientific guard",
+        ),
+        (
+            "runner.fastwam_training_guard.cost_audit.enabled",
+            "fair-cost control requires",
+        ),
+    ):
+        invalid = OmegaConf.create(OmegaConf.to_container(cfg, resolve=False))
+        OmegaConf.update(invalid, disabled_path, False)
+        with pytest.raises(ValueError, match=message):
+            _validate_fastwam_adaptive_cfg(invalid, only_eval=False)
 
     for updates in (
         {

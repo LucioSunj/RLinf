@@ -935,6 +935,7 @@ def _validate_fastwam_adaptive_cfg(cfg, *, only_eval: bool) -> None:
         "eval_microbatch_size",
         "training_rollout_microbatch_size",
         "formal_training_sampling_seed",
+        "decision_telemetry_enabled",
         "kv_replay",
         "flow_sde",
         "runtime",
@@ -1297,11 +1298,44 @@ def _validate_fastwam_adaptive_cfg(cfg, *, only_eval: bool) -> None:
             "no policy gradient and `entropy_coefficient` must remain zero."
         )
 
+    entropy_metric_source = str(
+        cfg.algorithm.gate_ppo.get("entropy_metric_source", "behavior")
+    ).lower()
+    if entropy_metric_source not in {"behavior", "base"}:
+        raise ValueError(
+            "FastWAM Gate entropy metric source must be `behavior` or `base`."
+        )
+
     branch_cost = cfg.algorithm.get("fixed_branch_cost", {})
-    if float(branch_cost.get("idm_cost", 0.0)) < 0:
-        raise ValueError("FastWAM IDM chunk cost must be non-negative.")
+    idm_cost = float(branch_cost.get("idm_cost", 0.0))
+    if not math.isfinite(idm_cost) or idm_cost < 0:
+        raise ValueError("FastWAM IDM chunk cost must be finite and non-negative.")
     if float(branch_cost.get("uncond_cost", 0.0)) != 0:
         raise ValueError("FastWAM v0 permits cost only on executed IDM chunks.")
+    from rlinf.runners.fastwam_fair_cost import FastWAMFairCostController
+
+    fair_cost_controller = FastWAMFairCostController.from_branch_cost_config(
+        branch_cost
+    )
+    if fair_cost_controller.enabled:
+        if not bool(branch_cost.get("enabled", False)):
+            raise ValueError("FastWAM fair-cost control requires branch cost shaping.")
+        if not bool(training_guard.get("enabled", False)) or not bool(
+            cost_audit.get("enabled", False)
+        ):
+            raise ValueError(
+                "FastWAM fair-cost control requires the scientific guard and "
+                "counterfactual cost audit."
+            )
+        if bool(cost_audit.get("break_even_guard_enabled", True)):
+            raise ValueError(
+                "FastWAM fair-cost control requires "
+                "`runner.fastwam_training_guard.cost_audit."
+                "break_even_guard_enabled: false`. The fixed-price abort guard "
+                "treats a current break-even below the rolling fair price as an "
+                "error, while the fair-price controller continuously handles "
+                "that ordinary condition."
+            )
 
     regularization = cfg.algorithm.get("regularization", {})
     for name in ("base_uncond_kl", "collapse"):
@@ -1313,11 +1347,27 @@ def _validate_fastwam_adaptive_cfg(cfg, *, only_eval: bool) -> None:
     collapse = regularization.get("collapse", {})
     if float(collapse.get("tau_calls", 1.0)) <= 0:
         raise ValueError("FastWAM collapse `tau_calls` must be positive.")
+    collapse_target_floor = collapse.get("target_floor", None)
+    if collapse_target_floor is not None:
+        collapse_target_floor = float(collapse_target_floor)
+        if not 0.0 < collapse_target_floor <= 0.5:
+            raise ValueError("FastWAM collapse `target_floor` must lie in (0, 0.5].")
     if str(collapse.get("scope", "microbatch")) != "microbatch":
         raise ValueError(
             "FastWAM v0 supports only `microbatch` collapse scope because PPO "
             "shuffle does not preserve complete episodes or train-global batches."
         )
+
+    normalization_std_floor = cfg.algorithm.get(
+        "advantage_normalization_std_floor", None
+    )
+    if normalization_std_floor is not None:
+        normalization_std_floor = float(normalization_std_floor)
+        if not math.isfinite(normalization_std_floor) or normalization_std_floor <= 0.0:
+            raise ValueError(
+                "FastWAM advantage normalization standard-deviation floor must be "
+                "finite and positive when configured."
+            )
 
     for path in (
         "actor.optim.gate_lr",

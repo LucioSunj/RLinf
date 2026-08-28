@@ -1,0 +1,42 @@
+# @package _global_
+
+# Explicit opt-in for the lagged fair-cost, Gate-stability, and per-decision
+# telemetry suite. Existing FastWAM presets omit this profile and retain their
+# original sampling, losses, guard thresholds, checkpoints, and artifacts.
+actor:
+  model:
+    decision_telemetry_enabled: true
+
+rollout:
+  model:
+    decision_telemetry_enabled: true
+
+runner:
+  fastwam_training_guard:
+    enabled: true
+    gate_entropy_min: 0.35
+    cost_audit:
+      enabled: true
+      break_even_guard_enabled: false
+      counterfactual_idm_costs: [0.0, 0.0025, 0.005, 0.01, 0.015, 0.025, 0.0375, 0.05, 0.1]
+
+algorithm:
+  advantage_normalization_std_floor: 0.15
+  gate_ppo:
+    entropy_metric_source: base
+  regularization:
+    collapse:
+      target_floor: 0.1
+  fixed_branch_cost:
+    enabled: true
+    # Bootstrap price used only until a prior rollout supplies a valid estimate.
+    idm_cost: 0.015
+    fair_cost:
+      enabled: true
+      window_size: 5
+      pi:
+        # PI remains separately opt-in after gain calibration.
+        enabled: false
+        target_idm_fraction: 0.5
+        integral_gain: 0.05
+        proportional_gain: 0.6

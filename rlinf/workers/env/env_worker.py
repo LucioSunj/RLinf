@@ -708,6 +708,9 @@ class EnvWorker(Worker):
                     "eval_random_lag1_autocorrelation", None
                 ),
                 routing_seed=self.model_cfg.eval_routing_seed,
+                decision_telemetry_enabled=bool(
+                    self.model_cfg.get("decision_telemetry_enabled", False)
+                ),
                 evaluation_runtime_identity={
                     "model": OmegaConf.to_container(
                         self.model_cfg,
@@ -1806,6 +1809,40 @@ class EnvWorker(Worker):
                 if isinstance(first_value, torch.Tensor)
                 else len(first_value)
             )
+            is_fastwam = str(self.model_cfg.model_type) == "fastwam_adaptive"
+            if is_fastwam and bool(
+                self.model_cfg.get("decision_telemetry_enabled", False)
+            ):
+                environment = (
+                    self.eval_env_list[stage_id]
+                    if eval_mode
+                    else self.env_list[stage_id]
+                )
+                identity_values = {
+                    "_fastwam_task_ids": get_env_attr(environment, "task_ids"),
+                    "_fastwam_trial_ids": get_env_attr(environment, "trial_ids"),
+                    "_fastwam_reset_state_ids": get_env_attr(
+                        environment, "reset_state_ids"
+                    ),
+                }
+                if any(value is not None for value in identity_values.values()):
+                    if any(value is None for value in identity_values.values()):
+                        raise ValueError(
+                            "FastWAM environment identity requires task, trial, "
+                            "and reset-state IDs."
+                        )
+                    rollout_obs = dict(data["obs"])
+                    for name, value in identity_values.items():
+                        tensor = torch.as_tensor(value, dtype=torch.long).reshape(-1)
+                        if tensor.shape != (batch_size,):
+                            raise ValueError(
+                                f"{name} must have shape [{batch_size}], got "
+                                f"{tuple(tensor.shape)}."
+                            )
+                        if bool((tensor < 0).any().item()):
+                            raise ValueError(f"{name} must be non-negative.")
+                        rollout_obs[name] = tensor.clone()
+                    data["obs"] = rollout_obs
             training_action_audit = bool(
                 not eval_mode
                 and self.cfg.get("runner", {})
@@ -1813,7 +1850,7 @@ class EnvWorker(Worker):
                 .get("enabled", False)
             )
             if training_action_audit:
-                if str(self.model_cfg.model_type) != "fastwam_adaptive":
+                if not is_fastwam:
                     raise ValueError(
                         "FastWAM training Action audit requires fastwam_adaptive."
                     )
