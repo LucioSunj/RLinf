@@ -208,9 +208,7 @@ class FastWAMAdaptivePolicyConfig:
             mode=self.eval_routing_mode,
             idm_threshold=self.eval_idm_threshold,
             random_idm_probability=self.eval_random_idm_probability,
-            random_lag1_autocorrelation=(
-                self.eval_random_lag1_autocorrelation
-            ),
+            random_lag1_autocorrelation=(self.eval_random_lag1_autocorrelation),
             routing_seed=self.eval_routing_seed,
         )
 

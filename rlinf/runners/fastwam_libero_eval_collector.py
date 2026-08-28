@@ -295,9 +295,7 @@ class FastWAMLiberoEvalCollector:
         self.routing_mode = routing_config.mode
         self.idm_threshold = routing_config.idm_threshold
         self.random_idm_probability = routing_config.random_idm_probability
-        self.random_lag1_autocorrelation = (
-            routing_config.random_lag1_autocorrelation
-        )
+        self.random_lag1_autocorrelation = routing_config.random_lag1_autocorrelation
         self.routing_seed = routing_config.routing_seed
         self.fixed_idm_cost = float(fixed_idm_cost)
         self.noise_seed_mode = str(noise_seed_mode)

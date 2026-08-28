@@ -365,9 +365,7 @@ def _make_policy(
             eval_idm_threshold=0.5,
             eval_routing_mode=eval_routing_mode,
             eval_random_idm_probability=eval_random_idm_probability,
-            eval_random_lag1_autocorrelation=(
-                eval_random_lag1_autocorrelation
-            ),
+            eval_random_lag1_autocorrelation=(eval_random_lag1_autocorrelation),
             eval_routing_seed=eval_routing_seed,
             eval_timing_cuda_synchronize=eval_timing_cuda_synchronize,
             training_rollout_microbatch_size=training_rollout_microbatch_size,

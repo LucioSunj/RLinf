@@ -61,17 +61,14 @@ def autocorrelated_transition_probabilities(
     try:
         autocorrelation = float(lag1_autocorrelation)
     except (TypeError, ValueError) as exc:
-        raise TypeError(
-            "`eval_random_lag1_autocorrelation` must be finite."
-        ) from exc
+        raise TypeError("`eval_random_lag1_autocorrelation` must be finite.") from exc
     if not math.isfinite(autocorrelation):
         raise ValueError("`eval_random_lag1_autocorrelation` must be finite.")
 
     probability_after_idm = probability + (1.0 - probability) * autocorrelation
     probability_after_uncond = probability - probability * autocorrelation
     if not (
-        0.0 <= probability_after_idm <= 1.0
-        and 0.0 <= probability_after_uncond <= 1.0
+        0.0 <= probability_after_idm <= 1.0 and 0.0 <= probability_after_uncond <= 1.0
     ):
         raise ValueError(
             "`eval_random_lag1_autocorrelation` yields invalid transition "
@@ -96,8 +93,7 @@ class EvaluationRoutingConfig:
         except (TypeError, ValueError) as exc:
             supported = ", ".join(item.value for item in EvaluationRoutingMode)
             raise ValueError(
-                "`eval_routing_mode` must be one of "
-                f"{supported}; got {self.mode!r}."
+                f"`eval_routing_mode` must be one of {supported}; got {self.mode!r}."
             ) from exc
         object.__setattr__(self, "mode", mode)
         object.__setattr__(
@@ -125,9 +121,7 @@ class EvaluationRoutingConfig:
             EvaluationRoutingMode.AUTOCORRELATION_MATCHED_RANDOM,
         }
         if mode in random_modes and random_probability is None:
-            raise ValueError(
-                f"`{mode.value}` requires eval_random_idm_probability."
-            )
+            raise ValueError(f"`{mode.value}` requires eval_random_idm_probability.")
 
         autocorrelation = self.random_lag1_autocorrelation
         if mode is EvaluationRoutingMode.AUTOCORRELATION_MATCHED_RANDOM:
@@ -221,8 +215,7 @@ class EvaluationRouteSelection:
         shape = self.effective_next_route.shape
         if len(shape) != 1:
             raise ValueError(
-                "Evaluation routes must have shape [B], got "
-                f"{tuple(shape)}."
+                f"Evaluation routes must have shape [B], got {tuple(shape)}."
             )
         for name, value in (
             ("effective_next_route", self.effective_next_route),
@@ -232,9 +225,7 @@ class EvaluationRouteSelection:
                 raise ValueError(f"`{name}` must have shape {tuple(shape)}.")
             if value.dtype not in _INTEGER_DTYPES:
                 raise TypeError(f"`{name}` must use an integer dtype.")
-            invalid = (value != int(WAMRoute.UNCOND)) & (
-                value != int(WAMRoute.IDM)
-            )
+            invalid = (value != int(WAMRoute.UNCOND)) & (value != int(WAMRoute.IDM))
             if bool(invalid.any().item()):
                 raise ValueError(f"`{name}` contains an invalid route.")
 
@@ -291,8 +282,7 @@ class EvaluationRouteSelection:
             raise ValueError("Cannot combine different evaluation routing modes.")
         first_has_draws = items[0].random_draws is not None
         if any(
-            (item.random_draws is not None) != first_has_draws
-            for item in items[1:]
+            (item.random_draws is not None) != first_has_draws for item in items[1:]
         ):
             raise ValueError("Cannot combine inconsistent random-draw metadata.")
         return cls(
@@ -412,9 +402,7 @@ def select_evaluation_routes(
         | (gate_idm_probabilities > 1)
     )
     if bool(invalid_probability.any().item()):
-        raise ValueError(
-            "`gate_idm_probabilities` must be finite and lie in [0, 1]."
-        )
+        raise ValueError("`gate_idm_probabilities` must be finite and lie in [0, 1].")
 
     shape = gate_idm_probabilities.shape
     for name, value in (
@@ -444,13 +432,11 @@ def select_evaluation_routes(
         config.mode is EvaluationRoutingMode.AUTOCORRELATION_MATCHED_RANDOM
         and current_routes is None
     ):
-        raise ValueError(
-            "`autocorrelation_matched_random` requires current_routes."
-        )
+        raise ValueError("`autocorrelation_matched_random` requires current_routes.")
 
-    counterfactual = (
-        gate_idm_probabilities >= config.idm_threshold
-    ).to(dtype=torch.long)
+    counterfactual = (gate_idm_probabilities >= config.idm_threshold).to(
+        dtype=torch.long
+    )
     random_draws = None
     if config.mode is EvaluationRoutingMode.LEARNED_THRESHOLD:
         effective = counterfactual.clone()
@@ -481,9 +467,7 @@ def select_evaluation_routes(
             device=gate_idm_probabilities.device,
         )
         if config.mode is EvaluationRoutingMode.MATCHED_RANDOM:
-            idm_thresholds: float | torch.Tensor = float(
-                config.random_idm_probability
-            )
+            idm_thresholds: float | torch.Tensor = float(config.random_idm_probability)
         else:
             probability_after_idm, probability_after_uncond = (
                 autocorrelated_transition_probabilities(

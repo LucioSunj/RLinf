@@ -503,8 +503,7 @@ def restore_worker_simulator_only_for_audit(
     mismatches = _sim_restore_mismatches(sim, sim_state)
     if mismatches:
         raise RuntimeError(
-            "MuJoCo-only audit state did not restore exactly: "
-            + "; ".join(mismatches)
+            "MuJoCo-only audit state did not restore exactly: " + "; ".join(mismatches)
         )
 
 

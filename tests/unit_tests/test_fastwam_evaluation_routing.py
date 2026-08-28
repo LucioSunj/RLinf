@@ -258,9 +258,10 @@ def test_matched_random_is_stateless_and_batch_order_invariant() -> None:
             config,
             **{name: value[index : index + 1] for name, value in inputs.items()},
         )
-        assert single.effective_next_route.item() == baseline.effective_next_route[
-            index
-        ].item()
+        assert (
+            single.effective_next_route.item()
+            == baseline.effective_next_route[index].item()
+        )
         assert single.random_draws.item() == baseline.random_draws[index].item()
 
 
@@ -281,7 +282,9 @@ def test_matched_random_key_uses_every_declared_identity_field() -> None:
     for field in ("env_ids", "episode_ids", "source_chunk_ids"):
         changed = dict(inputs)
         changed[field] = changed[field] + 1
-        changed_draws.append(select_evaluation_routes(config, **changed).random_draws.item())
+        changed_draws.append(
+            select_evaluation_routes(config, **changed).random_draws.item()
+        )
     changed_seed = select_evaluation_routes(
         EvaluationRoutingConfig(
             mode="matched_random",
@@ -331,7 +334,9 @@ def test_pending_tracker_forces_first_chunk_before_selected_route(mode) -> None:
         random_idm_probability=(
             0.5
             if mode == "autocorrelation_matched_random"
-            else 1.0 if mode == "matched_random" else None
+            else 1.0
+            if mode == "matched_random"
+            else None
         ),
         random_lag1_autocorrelation=(
             -0.2 if mode == "autocorrelation_matched_random" else None
