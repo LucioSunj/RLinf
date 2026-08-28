@@ -290,6 +290,7 @@ def test_libero_adaptive_config_composes_with_confirmed_defaults(monkeypatch) ->
     assert cfg.actor.model.eval_routing_mode == "learned_threshold"
     assert cfg.actor.model.eval_idm_threshold == 0.5
     assert cfg.actor.model.eval_random_idm_probability is None
+    assert cfg.actor.model.eval_random_lag1_autocorrelation is None
     assert cfg.actor.model.eval_routing_seed == 0
     assert cfg.actor.model.eval_microbatch_size == 1
     assert cfg.actor.model.kv_replay.backend == "stored"

@@ -85,6 +85,7 @@ _FASTWAM_EVAL_RUNTIME_ONLY_PATHS = (
     "eval_routing_mode",
     "eval_idm_threshold",
     "eval_random_idm_probability",
+    "eval_random_lag1_autocorrelation",
     "eval_routing_seed",
     "eval_microbatch_size",
     "eval_timing_cuda_synchronize",

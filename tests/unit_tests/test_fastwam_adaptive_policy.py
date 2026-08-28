@@ -338,6 +338,7 @@ def _make_policy(
     with_critic=True,
     eval_routing_mode="learned_threshold",
     eval_random_idm_probability=None,
+    eval_random_lag1_autocorrelation=None,
     eval_routing_seed=0,
     eval_timing_cuda_synchronize=False,
     training_rollout_microbatch_size=None,
@@ -364,6 +365,9 @@ def _make_policy(
             eval_idm_threshold=0.5,
             eval_routing_mode=eval_routing_mode,
             eval_random_idm_probability=eval_random_idm_probability,
+            eval_random_lag1_autocorrelation=(
+                eval_random_lag1_autocorrelation
+            ),
             eval_routing_seed=eval_routing_seed,
             eval_timing_cuda_synchronize=eval_timing_cuda_synchronize,
             training_rollout_microbatch_size=training_rollout_microbatch_size,
@@ -619,22 +623,25 @@ def test_policy_eval_gate_timing_is_explicit_and_finite() -> None:
 
 
 @pytest.mark.parametrize(
-    ("mode", "random_probability", "expected_next"),
+    ("mode", "random_probability", "random_autocorrelation", "expected_next"),
     [
-        ("learned_threshold", None, [0, 0]),
-        ("forced_idm", None, [1, 1]),
-        ("forced_uncond", None, [0, 0]),
-        ("matched_random", 1.0, [1, 1]),
+        ("learned_threshold", None, None, [0, 0]),
+        ("forced_idm", None, None, [1, 1]),
+        ("forced_uncond", None, None, [0, 0]),
+        ("matched_random", 1.0, None, [1, 1]),
+        ("autocorrelation_matched_random", 1.0, 0.0, [1, 1]),
     ],
 )
 def test_policy_eval_uses_explicit_route_control_after_forced_first_chunk(
     mode,
     random_probability,
+    random_autocorrelation,
     expected_next,
 ):
     policy = _make_policy(
         eval_routing_mode=mode,
         eval_random_idm_probability=random_probability,
+        eval_random_lag1_autocorrelation=random_autocorrelation,
         eval_routing_seed=41,
     )
     obs = {
@@ -657,7 +664,9 @@ def test_policy_eval_uses_explicit_route_control_after_forced_first_chunk(
     assert selection.mode.value == mode
     assert selection.effective_next_route.tolist() == expected_next
     assert selection.counterfactual_next_route.tolist() == [0, 0]
-    assert (selection.random_draws is not None) == (mode == "matched_random")
+    assert (selection.random_draws is not None) == (
+        mode in {"matched_random", "autocorrelation_matched_random"}
+    )
     assert policy.critic.predict_calls == 0
 
     obs["_fastwam_reset_mask"] = torch.tensor([False, False])

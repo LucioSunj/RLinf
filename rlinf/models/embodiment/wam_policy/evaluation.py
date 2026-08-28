@@ -35,6 +35,7 @@ class EvaluationRoutingMode(str, Enum):
     FORCED_IDM = "forced_idm"
     FORCED_UNCOND = "forced_uncond"
     MATCHED_RANDOM = "matched_random"
+    AUTOCORRELATION_MATCHED_RANDOM = "autocorrelation_matched_random"
 
 
 def _finite_probability(value: object, *, field_name: str) -> float:
@@ -47,6 +48,38 @@ def _finite_probability(value: object, *, field_name: str) -> float:
     return probability
 
 
+def autocorrelated_transition_probabilities(
+    idm_probability: object,
+    lag1_autocorrelation: object,
+) -> tuple[float, float]:
+    """Return P(next IDM | current IDM/UNCOND) for a stationary binary chain."""
+
+    probability = _finite_probability(
+        idm_probability,
+        field_name="eval_random_idm_probability",
+    )
+    try:
+        autocorrelation = float(lag1_autocorrelation)
+    except (TypeError, ValueError) as exc:
+        raise TypeError(
+            "`eval_random_lag1_autocorrelation` must be finite."
+        ) from exc
+    if not math.isfinite(autocorrelation):
+        raise ValueError("`eval_random_lag1_autocorrelation` must be finite.")
+
+    probability_after_idm = probability + (1.0 - probability) * autocorrelation
+    probability_after_uncond = probability - probability * autocorrelation
+    if not (
+        0.0 <= probability_after_idm <= 1.0
+        and 0.0 <= probability_after_uncond <= 1.0
+    ):
+        raise ValueError(
+            "`eval_random_lag1_autocorrelation` yields invalid transition "
+            "probabilities for eval_random_idm_probability."
+        )
+    return probability_after_idm, probability_after_uncond
+
+
 @dataclass(frozen=True, slots=True)
 class EvaluationRoutingConfig:
     """Validated evaluation-only routing configuration."""
@@ -54,6 +87,7 @@ class EvaluationRoutingConfig:
     mode: EvaluationRoutingMode | str = EvaluationRoutingMode.LEARNED_THRESHOLD
     idm_threshold: float = 0.5
     random_idm_probability: float | None = None
+    random_lag1_autocorrelation: float | None = None
     routing_seed: int = 0
 
     def __post_init__(self) -> None:
@@ -86,9 +120,35 @@ class EvaluationRoutingConfig:
                 "random_idm_probability",
                 random_probability,
             )
-        if mode is EvaluationRoutingMode.MATCHED_RANDOM and random_probability is None:
+        random_modes = {
+            EvaluationRoutingMode.MATCHED_RANDOM,
+            EvaluationRoutingMode.AUTOCORRELATION_MATCHED_RANDOM,
+        }
+        if mode in random_modes and random_probability is None:
             raise ValueError(
-                "`matched_random` requires eval_random_idm_probability."
+                f"`{mode.value}` requires eval_random_idm_probability."
+            )
+
+        autocorrelation = self.random_lag1_autocorrelation
+        if mode is EvaluationRoutingMode.AUTOCORRELATION_MATCHED_RANDOM:
+            if autocorrelation is None:
+                raise ValueError(
+                    "`autocorrelation_matched_random` requires "
+                    "eval_random_lag1_autocorrelation."
+                )
+            _, _ = autocorrelated_transition_probabilities(
+                random_probability,
+                autocorrelation,
+            )
+            object.__setattr__(
+                self,
+                "random_lag1_autocorrelation",
+                float(autocorrelation),
+            )
+        elif autocorrelation is not None:
+            raise ValueError(
+                "`eval_random_lag1_autocorrelation` is only valid for "
+                "autocorrelation_matched_random."
             )
 
         if isinstance(self.routing_seed, bool) or not isinstance(
@@ -178,9 +238,13 @@ class EvaluationRouteSelection:
             if bool(invalid.any().item()):
                 raise ValueError(f"`{name}` contains an invalid route.")
 
-        if mode is EvaluationRoutingMode.MATCHED_RANDOM:
+        random_modes = {
+            EvaluationRoutingMode.MATCHED_RANDOM,
+            EvaluationRoutingMode.AUTOCORRELATION_MATCHED_RANDOM,
+        }
+        if mode in random_modes:
             if self.random_draws is None:
-                raise ValueError("Matched-random selection requires random draws.")
+                raise ValueError("Random route selection requires random draws.")
             if self.random_draws.shape != shape:
                 raise ValueError(f"`random_draws` must have shape {tuple(shape)}.")
             if not self.random_draws.is_floating_point():
@@ -193,7 +257,7 @@ class EvaluationRouteSelection:
             if bool(invalid_draw.any().item()):
                 raise ValueError("`random_draws` must be finite and lie in [0, 1).")
         elif self.random_draws is not None:
-            raise ValueError("Only matched-random selections may carry random draws.")
+            raise ValueError("Only random route selections may carry random draws.")
 
     def cpu(self) -> EvaluationRouteSelection:
         """Return a contiguous CPU copy suitable for worker transport."""
@@ -331,6 +395,7 @@ def select_evaluation_routes(
     env_ids: torch.Tensor,
     episode_ids: torch.Tensor,
     source_chunk_ids: torch.Tensor,
+    current_routes: torch.Tensor | None = None,
 ) -> EvaluationRouteSelection:
     """Select effective next routes without mutable or process-global RNG state."""
 
@@ -363,6 +428,26 @@ def select_evaluation_routes(
                 f"`{name}` must have shape {tuple(shape)}, got {tuple(value.shape)}."
             )
 
+    if current_routes is not None:
+        _validate_route_tensor("current_routes", current_routes)
+        if current_routes.shape != shape:
+            raise ValueError(
+                "`current_routes` must have shape "
+                f"{tuple(shape)}, got {tuple(current_routes.shape)}."
+            )
+        invalid_route = (current_routes != int(WAMRoute.UNCOND)) & (
+            current_routes != int(WAMRoute.IDM)
+        )
+        if bool(invalid_route.any().item()):
+            raise ValueError("`current_routes` contains an invalid route.")
+    if (
+        config.mode is EvaluationRoutingMode.AUTOCORRELATION_MATCHED_RANDOM
+        and current_routes is None
+    ):
+        raise ValueError(
+            "`autocorrelation_matched_random` requires current_routes."
+        )
+
     counterfactual = (
         gate_idm_probabilities >= config.idm_threshold
     ).to(dtype=torch.long)
@@ -373,7 +458,10 @@ def select_evaluation_routes(
         effective = torch.full_like(counterfactual, int(WAMRoute.IDM))
     elif config.mode is EvaluationRoutingMode.FORCED_UNCOND:
         effective = torch.full_like(counterfactual, int(WAMRoute.UNCOND))
-    else:
+    elif config.mode in {
+        EvaluationRoutingMode.MATCHED_RANDOM,
+        EvaluationRoutingMode.AUTOCORRELATION_MATCHED_RANDOM,
+    }:
         key_values = zip(
             env_ids.detach().cpu().tolist(),
             episode_ids.detach().cpu().tolist(),
@@ -392,9 +480,27 @@ def select_evaluation_routes(
             dtype=torch.float64,
             device=gate_idm_probabilities.device,
         )
-        effective = (
-            random_draws < float(config.random_idm_probability)
-        ).to(dtype=torch.long)
+        if config.mode is EvaluationRoutingMode.MATCHED_RANDOM:
+            idm_thresholds: float | torch.Tensor = float(
+                config.random_idm_probability
+            )
+        else:
+            probability_after_idm, probability_after_uncond = (
+                autocorrelated_transition_probabilities(
+                    config.random_idm_probability,
+                    config.random_lag1_autocorrelation,
+                )
+            )
+            assert current_routes is not None
+            idm_thresholds = torch.where(
+                current_routes.to(device=gate_idm_probabilities.device)
+                == int(WAMRoute.IDM),
+                probability_after_idm,
+                probability_after_uncond,
+            )
+        effective = (random_draws < idm_thresholds).to(dtype=torch.long)
+    else:  # pragma: no cover - enum validation makes this unreachable.
+        raise AssertionError(f"Unhandled evaluation routing mode {config.mode}.")
 
     return EvaluationRouteSelection(
         mode=config.mode,
@@ -408,5 +514,6 @@ __all__ = [
     "EvaluationRouteSelection",
     "EvaluationRoutingConfig",
     "EvaluationRoutingMode",
+    "autocorrelated_transition_probabilities",
     "select_evaluation_routes",
 ]

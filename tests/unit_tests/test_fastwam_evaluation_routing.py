@@ -47,6 +47,9 @@ _contracts, _routing_state, _evaluation = _load_wam_policy_modules()
 EvaluationRouteSelection = _evaluation.EvaluationRouteSelection
 EvaluationRoutingConfig = _evaluation.EvaluationRoutingConfig
 EvaluationRoutingMode = _evaluation.EvaluationRoutingMode
+autocorrelated_transition_probabilities = (
+    _evaluation.autocorrelated_transition_probabilities
+)
 PendingRouteTracker = _routing_state.PendingRouteTracker
 WAMRoute = _contracts.WAMRoute
 select_evaluation_routes = _evaluation.select_evaluation_routes
@@ -67,11 +70,13 @@ def test_routing_modes_are_exact_and_defaults_are_learned_threshold() -> None:
         "forced_idm",
         "forced_uncond",
         "matched_random",
+        "autocorrelation_matched_random",
     ]
     config = EvaluationRoutingConfig()
     assert config.mode is EvaluationRoutingMode.LEARNED_THRESHOLD
     assert config.idm_threshold == 0.5
     assert config.random_idm_probability is None
+    assert config.random_lag1_autocorrelation is None
     assert config.routing_seed == 0
 
 
@@ -93,6 +98,33 @@ def test_routing_modes_are_exact_and_defaults_are_learned_threshold() -> None:
             {"mode": "matched_random", "random_idm_probability": None},
             "requires eval_random_idm_probability",
         ),
+        (
+            {
+                "mode": "autocorrelation_matched_random",
+                "random_idm_probability": 0.52,
+            },
+            "requires eval_random_lag1_autocorrelation",
+        ),
+        (
+            {"random_lag1_autocorrelation": -0.2},
+            "only valid for autocorrelation_matched_random",
+        ),
+        (
+            {
+                "mode": "autocorrelation_matched_random",
+                "random_idm_probability": 0.25,
+                "random_lag1_autocorrelation": -1.0,
+            },
+            "invalid transition probabilities",
+        ),
+        (
+            {
+                "mode": "autocorrelation_matched_random",
+                "random_idm_probability": 0.52,
+                "random_lag1_autocorrelation": float("nan"),
+            },
+            "eval_random_lag1_autocorrelation",
+        ),
         ({"routing_seed": -1}, "eval_routing_seed"),
         ({"routing_seed": 0.5}, "eval_routing_seed"),
     ],
@@ -111,6 +143,45 @@ def test_routing_config_accepts_probability_boundaries(probability) -> None:
     )
     assert config.idm_threshold == probability
     assert config.random_idm_probability == probability
+
+
+def test_autocorrelated_transition_formula_matches_preregistered_self_check() -> None:
+    after_idm, after_uncond = autocorrelated_transition_probabilities(0.52, -0.20)
+
+    assert after_idm == pytest.approx(0.424)
+    assert after_uncond == pytest.approx(0.624)
+
+
+def test_autocorrelation_matched_random_uses_current_route_conditionals() -> None:
+    sample_count = 20_000
+    half = sample_count // 2
+    inputs = {
+        "gate_idm_probabilities": torch.full((sample_count,), 0.5),
+        "env_ids": torch.arange(sample_count),
+        "episode_ids": torch.zeros(sample_count, dtype=torch.long),
+        "source_chunk_ids": torch.zeros(sample_count, dtype=torch.long),
+        "current_routes": torch.cat(
+            (
+                torch.full((half,), int(WAMRoute.IDM)),
+                torch.full((half,), int(WAMRoute.UNCOND)),
+            )
+        ),
+    }
+    selection = select_evaluation_routes(
+        EvaluationRoutingConfig(
+            mode="autocorrelation_matched_random",
+            random_idm_probability=0.52,
+            random_lag1_autocorrelation=-0.20,
+            routing_seed=17,
+        ),
+        **inputs,
+    )
+
+    measured_after_idm = selection.effective_next_route[:half].float().mean().item()
+    measured_after_uncond = selection.effective_next_route[half:].float().mean().item()
+    assert measured_after_idm == pytest.approx(0.424, abs=0.015)
+    assert measured_after_uncond == pytest.approx(0.624, abs=0.015)
+    assert selection.random_draws is not None
 
 
 @pytest.mark.parametrize(
@@ -246,12 +317,25 @@ def test_route_selection_record_round_trips_cpu_cat_and_chunks() -> None:
 
 @pytest.mark.parametrize(
     "mode",
-    ["learned_threshold", "forced_idm", "forced_uncond", "matched_random"],
+    [
+        "learned_threshold",
+        "forced_idm",
+        "forced_uncond",
+        "matched_random",
+        "autocorrelation_matched_random",
+    ],
 )
 def test_pending_tracker_forces_first_chunk_before_selected_route(mode) -> None:
     config = EvaluationRoutingConfig(
         mode=mode,
-        random_idm_probability=1.0 if mode == "matched_random" else None,
+        random_idm_probability=(
+            0.5
+            if mode == "autocorrelation_matched_random"
+            else 1.0 if mode == "matched_random" else None
+        ),
+        random_lag1_autocorrelation=(
+            -0.2 if mode == "autocorrelation_matched_random" else None
+        ),
     )
     tracker = PendingRouteTracker()
     env_ids = torch.tensor([5, 9])
@@ -269,6 +353,7 @@ def test_pending_tracker_forces_first_chunk_before_selected_route(mode) -> None:
         env_ids=env_ids,
         episode_ids=first.episode_ids,
         source_chunk_ids=first.chunk_ids,
+        current_routes=first.route_used,
     )
     tracker.emit(
         env_ids=env_ids,
@@ -307,6 +392,20 @@ def test_selector_rejects_misaligned_or_invalid_inputs(field) -> None:
     with pytest.raises(ValueError, match="non-negative"):
         select_evaluation_routes(EvaluationRoutingConfig(), **inputs)
 
+    autocorrelated = EvaluationRoutingConfig(
+        mode="autocorrelation_matched_random",
+        random_idm_probability=0.5,
+        random_lag1_autocorrelation=-0.2,
+    )
+    with pytest.raises(ValueError, match="requires current_routes"):
+        select_evaluation_routes(autocorrelated, **_inputs())
+    with pytest.raises(ValueError, match="invalid route"):
+        select_evaluation_routes(
+            autocorrelated,
+            **_inputs(),
+            current_routes=torch.tensor([0, 1, 2]),
+        )
+
 
 def _only_eval_config(**model_overrides):
     from omegaconf import OmegaConf
@@ -316,6 +415,7 @@ def _only_eval_config(**model_overrides):
         "eval_routing_mode": "learned_threshold",
         "eval_idm_threshold": 0.5,
         "eval_random_idm_probability": None,
+        "eval_random_lag1_autocorrelation": None,
         "eval_routing_seed": 0,
         "critic": {"load_for_eval": False},
     }
@@ -338,6 +438,13 @@ def test_rlinf_only_eval_config_validates_routing_before_critic_return() -> None
     )
     _validate_fastwam_adaptive_cfg(config, only_eval=True)
     assert config.rollout.model.eval_without_critic is True
+
+    autocorrelated = _only_eval_config(
+        eval_routing_mode="autocorrelation_matched_random",
+        eval_random_idm_probability=0.52,
+        eval_random_lag1_autocorrelation=-0.2,
+    )
+    _validate_fastwam_adaptive_cfg(autocorrelated, only_eval=True)
 
     invalid_cases = [
         (

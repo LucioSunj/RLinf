@@ -296,6 +296,13 @@ class LiberoEnv(gym.Env):
             raise RuntimeError("Causal task observation requires num_envs=1.")
         return self.env.observe_causal_task_states(id=[0])[0]
 
+    def observe_causal_determinism_state(self):
+        """Return physical and contact state for a single-environment audit."""
+
+        if self.num_envs != 1:
+            raise RuntimeError("Causal determinism observation requires num_envs=1.")
+        return self.env.observe_causal_determinism_states(id=[0])[0]
+
     def restore_causal_snapshot(self, snapshot: CausalSnapshotV1 | CausalSnapshotV2):
         """Restore a fork point and return its exact stored policy observation."""
 

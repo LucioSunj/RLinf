@@ -325,6 +325,7 @@ def _eval_model_cfg():
             "eval_routing_mode": "learned_threshold",
             "eval_idm_threshold": 0.5,
             "eval_random_idm_probability": None,
+            "eval_random_lag1_autocorrelation": None,
             "eval_routing_seed": 0,
             "eval_microbatch_size": 1,
             "kv_replay": {"backend": "stored"},

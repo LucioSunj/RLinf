@@ -89,6 +89,7 @@ rollout:
     eval_routing_mode: forced_uncond
     eval_idm_threshold: 0.5
     eval_random_idm_probability: null
+    eval_random_lag1_autocorrelation: null
     eval_routing_seed: 0
     fastwam:
       load_text_encoder: true

@@ -855,11 +855,19 @@ def _validate_fastwam_adaptive_cfg(cfg, *, only_eval: bool) -> None:
     )
 
     random_probability = model_cfg.get("eval_random_idm_probability", None)
+    random_autocorrelation = model_cfg.get(
+        "eval_random_lag1_autocorrelation", None
+    )
     EvaluationRoutingConfig(
         mode=str(model_cfg.get("eval_routing_mode", "learned_threshold")),
         idm_threshold=float(model_cfg.get("eval_idm_threshold", 0.5)),
         random_idm_probability=(
             None if random_probability is None else float(random_probability)
+        ),
+        random_lag1_autocorrelation=(
+            None
+            if random_autocorrelation is None
+            else float(random_autocorrelation)
         ),
         routing_seed=model_cfg.get("eval_routing_seed", 0),
     )
@@ -926,6 +934,7 @@ def _validate_fastwam_adaptive_cfg(cfg, *, only_eval: bool) -> None:
         "eval_routing_mode",
         "eval_idm_threshold",
         "eval_random_idm_probability",
+        "eval_random_lag1_autocorrelation",
         "eval_routing_seed",
         "eval_microbatch_size",
         "training_rollout_microbatch_size",

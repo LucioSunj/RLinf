@@ -235,6 +235,7 @@ def _collector(
     contract_violation_outcome: str = "raise",
     routing_mode: str = "forced_uncond",
     random_idm_probability: float | None = None,
+    random_lag1_autocorrelation: float | None = None,
     policy_checkpoint_sha256: str = "a" * 64,
     evaluation_runtime_identity: dict | None = None,
 ) -> FastWAMLiberoEvalCollector:
@@ -250,6 +251,7 @@ def _collector(
         routing_mode=routing_mode,
         idm_threshold=0.5,
         random_idm_probability=random_idm_probability,
+        random_lag1_autocorrelation=random_lag1_autocorrelation,
         routing_seed=0,
         fixed_idm_cost=0.01,
         noise_seed_mode=noise_seed_mode,
@@ -1033,21 +1035,32 @@ def test_collector_resume_restores_completed_episode_without_duplicates(
     assert len({item["record_id"] for item in chunks}) == 2
 
 
-def test_collector_refuses_matched_random_resume_with_restarted_route_ids(
+@pytest.mark.parametrize(
+    ("routing_mode", "random_lag1_autocorrelation"),
+    [
+        ("matched_random", None),
+        ("autocorrelation_matched_random", -0.2),
+    ],
+)
+def test_collector_refuses_random_resume_with_restarted_route_ids(
     tmp_path,
+    routing_mode,
+    random_lag1_autocorrelation,
 ) -> None:
     _collector(
         tmp_path,
-        routing_mode="matched_random",
+        routing_mode=routing_mode,
         random_idm_probability=0.25,
+        random_lag1_autocorrelation=random_lag1_autocorrelation,
         policy_checkpoint_sha256="c" * 64,
     )
 
     with pytest.raises(ValueError, match="restarts its route episode ids"):
         _collector(
             tmp_path,
-            routing_mode="matched_random",
+            routing_mode=routing_mode,
             random_idm_probability=0.25,
+            random_lag1_autocorrelation=random_lag1_autocorrelation,
             resume=True,
             policy_checkpoint_sha256="c" * 64,
         )

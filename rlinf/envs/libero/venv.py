@@ -23,6 +23,7 @@ import numpy as np
 from rlinf.envs.libero.action_contract import inspect_libero_action_contract
 from rlinf.envs.libero.causal_snapshot import (
     capture_worker_causal_state,
+    observe_worker_causal_determinism_state,
     observe_worker_causal_task_state,
     restore_worker_causal_state,
     restore_worker_simulator_only_for_audit,
@@ -164,6 +165,8 @@ def _worker(
                 p.send(capture_worker_causal_state(env))
             elif cmd == "observe_causal_task_state":
                 p.send(observe_worker_causal_task_state(env))
+            elif cmd == "observe_causal_determinism_state":
+                p.send(observe_worker_causal_determinism_state(env))
             elif cmd == "restore_causal_state":
                 restore_worker_causal_state(env, data)
                 p.send(None)
@@ -225,6 +228,12 @@ class ReconfigureSubprocEnvWorker(SubprocEnvWorker):
         self.parent_remote.send(["observe_causal_task_state", None])
         return self.parent_remote.recv()
 
+    def observe_causal_determinism_state(self):
+        """Read physical state and native contacts for restore audits."""
+
+        self.parent_remote.send(["observe_causal_determinism_state", None])
+        return self.parent_remote.recv()
+
     def restore_causal_state(self, state):
         """Restore worker-owned state before executing another branch."""
 
@@ -271,6 +280,15 @@ class ReconfigureSubprocEnv(SubprocVectorEnv):
         if self.is_async:
             self._assert_id(ids)
         return [self.workers[index].observe_causal_task_state() for index in ids]
+
+    def observe_causal_determinism_states(self, id=None):
+        """Read physical and contact state from selected ready environments."""
+
+        self._assert_is_not_closed()
+        ids = self._wrap_id(id)
+        if self.is_async:
+            self._assert_id(ids)
+        return [self.workers[index].observe_causal_determinism_state() for index in ids]
 
     def restore_causal_states(self, states, id=None):
         """Restore worker states in the same order as selected environments."""

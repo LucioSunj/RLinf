@@ -146,6 +146,7 @@ class FastWAMAdaptivePolicyConfig:
     )
     eval_idm_threshold: float = 0.5
     eval_random_idm_probability: float | None = None
+    eval_random_lag1_autocorrelation: float | None = None
     eval_routing_seed: int = 0
     eval_microbatch_size: int = 1
     eval_timing_cuda_synchronize: bool = False
@@ -192,6 +193,11 @@ class FastWAMAdaptivePolicyConfig:
             "eval_random_idm_probability",
             evaluation.random_idm_probability,
         )
+        object.__setattr__(
+            self,
+            "eval_random_lag1_autocorrelation",
+            evaluation.random_lag1_autocorrelation,
+        )
         object.__setattr__(self, "eval_routing_seed", evaluation.routing_seed)
 
     @property
@@ -202,6 +208,9 @@ class FastWAMAdaptivePolicyConfig:
             mode=self.eval_routing_mode,
             idm_threshold=self.eval_idm_threshold,
             random_idm_probability=self.eval_random_idm_probability,
+            random_lag1_autocorrelation=(
+                self.eval_random_lag1_autocorrelation
+            ),
             routing_seed=self.eval_routing_seed,
         )
 
@@ -515,6 +524,7 @@ class FastWAMAdaptivePolicy(nn.Module, BasePolicy):
         env_ids: torch.Tensor,
         episode_ids: torch.Tensor,
         source_chunk_ids: torch.Tensor,
+        current_routes: torch.Tensor,
     ) -> tuple[
         torch.Tensor,
         torch.Tensor,
@@ -533,6 +543,7 @@ class FastWAMAdaptivePolicy(nn.Module, BasePolicy):
             env_ids=env_ids,
             episode_ids=episode_ids,
             source_chunk_ids=source_chunk_ids,
+            current_routes=current_routes,
         )
         route = selection.effective_next_route
         return (
@@ -714,6 +725,7 @@ class FastWAMAdaptivePolicy(nn.Module, BasePolicy):
                 env_ids=env_ids[start:end],
                 episode_ids=route_info.episode_ids[start:end],
                 source_chunk_ids=route_info.chunk_ids[start:end],
+                current_routes=route_info.route_used[start:end],
             )
             if measure_gate_latency:
                 if logits.device.type == "cuda":

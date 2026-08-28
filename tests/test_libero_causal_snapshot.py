@@ -30,6 +30,7 @@ from rlinf.envs.libero.causal_snapshot import (
     audit_interleaved_snapshot_restore,
     capture_process_rng_state,
     capture_worker_causal_state,
+    observe_worker_causal_determinism_state,
     observe_worker_causal_task_state,
     restore_worker_causal_state,
     restore_worker_simulator_only_for_audit,
@@ -44,6 +45,13 @@ from rlinf.models.embodiment.wam_policy.causal_runtime import (
 
 class _Sim:
     def __init__(self) -> None:
+        contact = SimpleNamespace(
+            geom1=3,
+            geom2=7,
+            dist=-0.002,
+            pos=np.array([0.1, 0.2, 0.3]),
+            frame=np.arange(9, dtype=np.float64),
+        )
         self.data = SimpleNamespace(
             time=1.5,
             qpos=np.array([1.0, 2.0]),
@@ -53,6 +61,8 @@ class _Sim:
             mocap_quat=np.array([[1.0, 0.0, 0.0, 0.0]]),
             ctrl=np.array([0.3]),
             qacc_warmstart=np.array([0.4, 0.5]),
+            ncon=1,
+            contact=(contact,),
         )
 
     def set_state_from_flattened(self, state) -> None:
@@ -60,7 +70,6 @@ class _Sim:
         self.data.time = float(state[0])
         self.data.qpos[...] = state[1:3]
         self.data.qvel[...] = state[3:5]
-        self.data.act[...] = state[5:6]
 
     def forward(self) -> None:
         pass
@@ -119,7 +128,9 @@ class _Env:
 
     def get_sim_state(self):
         data = self.sim.data
-        return np.concatenate([[data.time], data.qpos, data.qvel, data.act])
+        # Match robosuite's real MjSimState: actuator activation is not part of
+        # the flattened state and must be restored separately.
+        return np.concatenate([[data.time], data.qpos, data.qvel])
 
     def _eval_predicate(self, _goal):
         return self.predicate_active
@@ -220,6 +231,20 @@ def test_simulator_only_negative_control_leaves_controller_state_mutated() -> No
     assert np.array_equal(env.robots[0].controller.goal_pos, [-2.0, -2.0, -2.0])
 
 
+def test_restore_accepts_one_ulp_mujoco_qpos_normalization() -> None:
+    env = _Env()
+    snapshot = capture_worker_causal_state(env)
+
+    def normalize_qpos_like_mujoco_forward() -> None:
+        env.sim.data.qpos[0] = np.nextafter(env.sim.data.qpos[0], np.inf)
+
+    env.sim.forward = normalize_qpos_like_mujoco_forward
+    restore_worker_causal_state(env, snapshot)
+
+    assert env.sim.data.qpos[0] != snapshot["sim"]["qpos"][0]
+    assert abs(env.sim.data.qpos[0] - snapshot["sim"]["qpos"][0]) <= 1e-15
+
+
 def test_native_task_observation_reads_predicate_and_gripper_contact() -> None:
     env = _Env()
     first = observe_worker_causal_task_state(env)
@@ -238,6 +263,22 @@ def test_native_task_observation_reads_predicate_and_gripper_contact() -> None:
     assert second["predicate_progress"] == 1.0
     assert second["contact_by_object"] == {"target": True}
     assert second["contact_active"] is True
+
+
+def test_determinism_observation_reads_full_physics_and_contacts() -> None:
+    env = _Env()
+    observed = observe_worker_causal_determinism_state(env)
+
+    assert observed["schema"] == "causal-libero-determinism-observation-v1"
+    assert observed["simulator"]["time"] == 1.5
+    assert np.array_equal(observed["simulator"]["qpos"], [1.0, 2.0])
+    assert np.array_equal(observed["simulator"]["dynamic"]["ctrl"], [0.3])
+    assert len(observed["contacts"]) == 1
+    assert observed["contacts"][0]["geom1"] == 3
+    assert observed["contacts"][0]["geom2"] == 7
+    assert observed["contacts"][0]["dist"] == -0.002
+    assert np.array_equal(observed["contacts"][0]["pos"], [0.1, 0.2, 0.3])
+    assert observed["task"]["contact_active"] is False
 
 
 def test_outer_snapshot_contract_carries_history_policy_and_identity() -> None:

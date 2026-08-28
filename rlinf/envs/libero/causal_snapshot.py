@@ -101,6 +101,7 @@ _OBSERVABLE_FIELDS = (
     "_current_observed_value",
     "_sampled",
 )
+_SIM_RESTORE_QPOS_ATOL = 1e-15
 
 
 def _clone(value: Any) -> Any:
@@ -199,6 +200,34 @@ def _restore_fields(owner: Any, state: Mapping[str, Any]) -> None:
             current.copy_(value.to(device=current.device, dtype=current.dtype))
         else:
             setattr(owner, name, _clone(value))
+
+
+def _sim_restore_mismatches(sim: Any, state: Mapping[str, Any]) -> list[str]:
+    mismatches = []
+    if float(sim.data.time) != float(state["time"]):
+        mismatches.append(
+            f"time(current={float(sim.data.time)!r}, expected={float(state['time'])!r})"
+        )
+    for name in ("qpos", "qvel", "act"):
+        current = np.asarray(getattr(sim.data, name))
+        expected = np.asarray(state[name])
+        matched = (
+            np.allclose(current, expected, rtol=0.0, atol=_SIM_RESTORE_QPOS_ATOL)
+            if name == "qpos"
+            else np.array_equal(current, expected)
+        )
+        if matched:
+            continue
+        max_abs = (
+            float(np.max(np.abs(current - expected)))
+            if current.shape == expected.shape and current.size
+            else None
+        )
+        mismatches.append(
+            f"{name}(current_shape={current.shape}, expected_shape={expected.shape}, "
+            f"max_abs={max_abs!r})"
+        )
+    return mismatches
 
 
 def _capture_controller(controller: Any) -> dict[str, Any]:
@@ -390,6 +419,38 @@ def observe_worker_causal_task_state(env: Any) -> dict[str, Any]:
     }
 
 
+def observe_worker_causal_determinism_state(env: Any) -> dict[str, Any]:
+    """Read the physical and contact state used by restore determinism audits."""
+
+    sim = _find_sim(env)
+    contacts = []
+    for index in range(int(sim.data.ncon)):
+        contact = sim.data.contact[index]
+        contacts.append(
+            {
+                "geom1": int(contact.geom1),
+                "geom2": int(contact.geom2),
+                "dist": float(contact.dist),
+                "pos": np.asarray(contact.pos).copy(),
+                "frame": np.asarray(contact.frame).copy(),
+            }
+        )
+    return {
+        "schema": "causal-libero-determinism-observation-v1",
+        "simulator": {
+            "time": float(sim.data.time),
+            "qpos": np.asarray(sim.data.qpos).copy(),
+            "qvel": np.asarray(sim.data.qvel).copy(),
+            "act": np.asarray(sim.data.act).copy(),
+            "mocap_pos": np.asarray(sim.data.mocap_pos).copy(),
+            "mocap_quat": np.asarray(sim.data.mocap_quat).copy(),
+            "dynamic": _capture_fields(sim.data, _SIM_DYNAMIC_FIELDS),
+        },
+        "contacts": tuple(contacts),
+        "task": observe_worker_causal_task_state(env),
+    }
+
+
 def restore_worker_causal_state(env: Any, state: Mapping[str, Any]) -> None:
     """Restore every worker-owned state component before another branch."""
 
@@ -398,17 +459,18 @@ def restore_worker_causal_state(env: Any, state: Mapping[str, Any]) -> None:
     sim = _find_sim(env)
     sim_state = state["sim"]
     sim.set_state_from_flattened(np.asarray(sim_state["flattened"]))
+    # robosuite's MjSimState flatten/restore contract contains time, qpos, and
+    # qvel, but not actuator activation. Restore it explicitly before forward.
+    sim.data.act[...] = sim_state["act"]
     sim.data.mocap_pos[...] = sim_state["mocap_pos"]
     sim.data.mocap_quat[...] = sim_state["mocap_quat"]
     sim.forward()
     _restore_fields(sim.data, sim_state["dynamic"])
-    if not (
-        float(sim.data.time) == float(sim_state["time"])
-        and np.array_equal(sim.data.qpos, sim_state["qpos"])
-        and np.array_equal(sim.data.qvel, sim_state["qvel"])
-        and np.array_equal(sim.data.act, sim_state["act"])
-    ):
-        raise RuntimeError("MuJoCo state did not restore exactly.")
+    mismatches = _sim_restore_mismatches(sim, sim_state)
+    if mismatches:
+        raise RuntimeError(
+            "MuJoCo state did not restore exactly: " + "; ".join(mismatches)
+        )
     _restore_environment_fields(env, state["environment_fields"])
     robots = _find_robots(env)
     if len(robots) != len(state["robots"]):
@@ -433,17 +495,17 @@ def restore_worker_simulator_only_for_audit(
     sim = _find_sim(env)
     sim_state = state["sim"]
     sim.set_state_from_flattened(np.asarray(sim_state["flattened"]))
+    sim.data.act[...] = sim_state["act"]
     sim.data.mocap_pos[...] = sim_state["mocap_pos"]
     sim.data.mocap_quat[...] = sim_state["mocap_quat"]
     sim.forward()
     _restore_fields(sim.data, sim_state["dynamic"])
-    if not (
-        float(sim.data.time) == float(sim_state["time"])
-        and np.array_equal(sim.data.qpos, sim_state["qpos"])
-        and np.array_equal(sim.data.qvel, sim_state["qvel"])
-        and np.array_equal(sim.data.act, sim_state["act"])
-    ):
-        raise RuntimeError("MuJoCo-only audit state did not restore exactly.")
+    mismatches = _sim_restore_mismatches(sim, sim_state)
+    if mismatches:
+        raise RuntimeError(
+            "MuJoCo-only audit state did not restore exactly: "
+            + "; ".join(mismatches)
+        )
 
 
 @dataclass(frozen=True)

@@ -101,6 +101,7 @@ gate_temperature: 1.0
 eval_routing_mode: learned_threshold
 eval_idm_threshold: 0.5
 eval_random_idm_probability: null
+eval_random_lag1_autocorrelation: null
 eval_routing_seed: 0
 eval_microbatch_size: 1
 eval_timing_cuda_synchronize: false

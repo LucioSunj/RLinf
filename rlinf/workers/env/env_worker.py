@@ -663,6 +663,9 @@ class EnvWorker(Worker):
                 random_idm_probability=self.model_cfg.get(
                     "eval_random_idm_probability", None
                 ),
+                random_lag1_autocorrelation=self.model_cfg.get(
+                    "eval_random_lag1_autocorrelation", None
+                ),
                 routing_seed=self.model_cfg.eval_routing_seed,
                 evaluation_runtime_identity={
                     "model": OmegaConf.to_container(

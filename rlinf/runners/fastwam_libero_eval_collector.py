@@ -40,7 +40,10 @@ from rlinf.envs.action_contract import (
 )
 from rlinf.envs.libero.action_contract import LiberoActionContract
 from rlinf.envs.utils import get_env_attr
-from rlinf.models.embodiment.wam_policy.evaluation import EvaluationRoutingMode
+from rlinf.models.embodiment.wam_policy.evaluation import (
+    EvaluationRoutingConfig,
+    EvaluationRoutingMode,
+)
 
 LEDGER_SCHEMA_V1 = "fastwam-libero-eval-ledger-v1"
 LEDGER_SCHEMA_V2 = "fastwam-libero-eval-ledger-v2"
@@ -265,6 +268,7 @@ class FastWAMLiberoEvalCollector:
         routing_mode: str,
         idm_threshold: float,
         random_idm_probability: float | None,
+        random_lag1_autocorrelation: float | None = None,
         routing_seed: int,
         fixed_idm_cost: float,
         noise_seed_mode: str = "stateless_per_chunk",
@@ -281,12 +285,20 @@ class FastWAMLiberoEvalCollector:
         if not self.run_id:
             raise ValueError("Evaluation run_id must be non-empty.")
         self.rank = int(rank)
-        self.routing_mode = EvaluationRoutingMode(routing_mode)
-        self.idm_threshold = float(idm_threshold)
-        self.random_idm_probability = (
-            None if random_idm_probability is None else float(random_idm_probability)
+        routing_config = EvaluationRoutingConfig(
+            mode=routing_mode,
+            idm_threshold=idm_threshold,
+            random_idm_probability=random_idm_probability,
+            random_lag1_autocorrelation=random_lag1_autocorrelation,
+            routing_seed=routing_seed,
         )
-        self.routing_seed = int(routing_seed)
+        self.routing_mode = routing_config.mode
+        self.idm_threshold = routing_config.idm_threshold
+        self.random_idm_probability = routing_config.random_idm_probability
+        self.random_lag1_autocorrelation = (
+            routing_config.random_lag1_autocorrelation
+        )
+        self.routing_seed = routing_config.routing_seed
         self.fixed_idm_cost = float(fixed_idm_cost)
         self.noise_seed_mode = str(noise_seed_mode)
         self.contract_violation_outcome = str(contract_violation_outcome)
@@ -329,9 +341,12 @@ class FastWAMLiberoEvalCollector:
             raise ValueError(
                 "Resumable evaluation requires evaluation_runtime_identity."
             )
-        if self.resume and self.routing_mode is EvaluationRoutingMode.MATCHED_RANDOM:
+        if self.resume and self.routing_mode in {
+            EvaluationRoutingMode.MATCHED_RANDOM,
+            EvaluationRoutingMode.AUTOCORRELATION_MATCHED_RANDOM,
+        }:
             raise ValueError(
-                "Resuming matched_random evaluation is not supported because a "
+                "Resuming random-routing evaluation is not supported because a "
                 "fresh rollout worker restarts its route episode ids and would "
                 "therefore change the preregistered random draws."
             )
@@ -382,6 +397,7 @@ class FastWAMLiberoEvalCollector:
             "routing_mode": self.routing_mode.value,
             "idm_threshold": self.idm_threshold,
             "random_idm_probability": self.random_idm_probability,
+            "random_lag1_autocorrelation": self.random_lag1_autocorrelation,
             "routing_seed": self.routing_seed,
             "fixed_idm_cost": self.fixed_idm_cost,
             "noise_seed_mode": self.noise_seed_mode,
