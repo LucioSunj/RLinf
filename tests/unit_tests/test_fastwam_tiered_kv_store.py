@@ -125,6 +125,75 @@ def test_tier_capacity_fails_without_dropping_samples():
         store.register_forward_inputs(_packed_inputs(batch_size=1))
 
 
+def test_fixed_global_sample_budget_is_exact_deterministic_and_rng_private():
+    config = GateKVReplayConfig(
+        pin_memory=False,
+        gate_kv_sample_budget=5,
+        gate_kv_sample_seed=73,
+        hot_capacity_bytes_per_rollout_rank=0,
+        cold_capacity_bytes_per_rollout_rank=1024 * 1024,
+    )
+    global_rng_before = torch.random.get_rng_state().clone()
+    references_by_rank = []
+    for rank in range(3):
+        store = TieredGateKVStore(
+            source_rank=rank,
+            device="cpu",
+            config=config,
+            expected_global_samples=12,
+            expected_local_samples=4,
+        )
+        store.begin_generation(9)
+        _, references = store.register_forward_inputs(_packed_inputs(batch_size=4))
+        selected = references >= 0
+        references_by_rank.append(references)
+        store.retain(tuple(int(value) for value in references[selected]))
+        metrics = store.metrics()
+        assert metrics["sampled_samples"] == selected.sum().item()
+        assert metrics["unsampled_samples"] == 4 - selected.sum().item()
+        store.release(tuple(int(value) for value in references[selected]))
+
+    assert sum(int((references >= 0).sum()) for references in references_by_rank) == 5
+    assert torch.equal(torch.random.get_rng_state(), global_rng_before)
+
+    repeated = []
+    for rank in range(3):
+        store = TieredGateKVStore(
+            source_rank=rank,
+            device="cpu",
+            config=config,
+            expected_global_samples=12,
+            expected_local_samples=4,
+        )
+        store.begin_generation(9)
+        _, references = store.register_forward_inputs(_packed_inputs(batch_size=4))
+        repeated.append(references >= 0)
+    assert all(
+        torch.equal(first >= 0, second)
+        for first, second in zip(references_by_rank, repeated)
+    )
+
+
+def test_fixed_sample_budget_rejects_an_unexpected_candidate_count():
+    store = TieredGateKVStore(
+        source_rank=0,
+        device="cpu",
+        config=GateKVReplayConfig(
+            pin_memory=False,
+            gate_kv_sample_budget=2,
+            hot_capacity_bytes_per_rollout_rank=0,
+            cold_capacity_bytes_per_rollout_rank=1024 * 1024,
+        ),
+        expected_global_samples=4,
+        expected_local_samples=4,
+    )
+    store.begin_generation(0)
+    store.register_forward_inputs(_packed_inputs(batch_size=3))
+
+    with pytest.raises(RuntimeError, match="different local candidate count"):
+        store.retain(())
+
+
 def test_nvme_tier_round_trips_exact_payload_and_removes_shard(tmp_path):
     store = TieredGateKVStore(
         source_rank=1,

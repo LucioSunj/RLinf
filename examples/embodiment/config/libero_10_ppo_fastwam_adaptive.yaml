@@ -58,6 +58,14 @@ runner:
     lora: 40.0
     value_head: 1.0
 
+  # Step-E-only readout. It replays full and uniformly subsampled Gate losses
+  # without changing parameters, optimizer state, RNG, or non-Gate losses.
+  fastwam_gate_gradient_diagnostic:
+    enabled: false
+    sample_sizes: [250, 500, 1000, 2000]
+    repeats: 5
+    seed: 0
+
   # Disabled in the base preset. Formal capacity/pilot launchers enable this
   # fail-closed guard and bind it into the continuation contract.
   fastwam_training_guard:

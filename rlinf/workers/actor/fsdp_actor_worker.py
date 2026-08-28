@@ -51,6 +51,7 @@ from rlinf.algorithms.fastwam_dual_ppo import (
     compute_base_uncond_kl_loss,
     compute_fastwam_dual_ppo_loss,
     compute_gate_collapse_penalty,
+    compute_gate_ppo_loss,
     finalize_fastwam_weighted_metrics,
     pop_fastwam_weighted_metric_sums,
 )
@@ -152,6 +153,8 @@ from rlinf.workers.rollout.utils import RankMapper
 _FASTWAM_BC_BOOTSTRAP_SCHEMA = "fastwam-uncond-bc-bootstrap-v1"
 FASTWAM_ACCELERATION_SEMANTICS_AUDIT_SENTINEL = "FASTWAM_ACCELERATION_SEMANTICS_AUDIT"
 FASTWAM_PREUPDATE_LOG_RATIO_AUDIT_SENTINEL = "FASTWAM_PREUPDATE_LOG_RATIO_AUDIT"
+FASTWAM_GATE_KV_SAMPLE_AUDIT_SENTINEL = "FASTWAM_GATE_KV_SAMPLE_AUDIT"
+FASTWAM_GATE_GRADIENT_CURVE_AUDIT_SENTINEL = "FASTWAM_GATE_GRADIENT_CURVE_AUDIT"
 _FASTWAM_BC_BOOTSTRAP_KEYS = {
     "schema",
     "bc_step",
@@ -159,6 +162,58 @@ _FASTWAM_BC_BOOTSTRAP_KEYS = {
     "sidecar_sha256",
     "parent_checkpoint_sha256",
 }
+
+
+def fastwam_effective_gate_kv_mask(
+    gate_valid_mask: torch.Tensor,
+    gate_kv_sample_mask: torch.Tensor | None,
+) -> torch.Tensor:
+    """Restrict only Gate replay while leaving every non-Gate mask untouched."""
+
+    gate_valid = gate_valid_mask.bool()
+    if gate_kv_sample_mask is None:
+        return gate_valid
+    sampled = gate_kv_sample_mask.bool()
+    if sampled.shape != gate_valid.shape:
+        raise ValueError("Gate-valid and Gate K/V sample masks must have equal shape.")
+    return gate_valid & sampled
+
+
+def summarize_fastwam_gate_kv_episode_contributions(
+    *,
+    episode_ids: torch.Tensor,
+    gate_valid_mask: torch.Tensor,
+    gate_kv_sample_mask: torch.Tensor,
+) -> list[dict[str, int]]:
+    """Count sampled K/V and usable Gate rows for each rollout trajectory."""
+
+    if episode_ids.ndim != 2:
+        raise ValueError("Gate K/V episode telemetry requires [time, batch] tensors.")
+    if (
+        gate_valid_mask.shape != episode_ids.shape
+        or gate_kv_sample_mask.shape != episode_ids.shape
+    ):
+        raise ValueError("Gate K/V episode telemetry tensors must have equal shape.")
+    gate_valid = gate_valid_mask.bool()
+    sampled = gate_kv_sample_mask.bool()
+    contributions = []
+    for trajectory_column in range(int(episode_ids.shape[1])):
+        column_episodes = episode_ids[:, trajectory_column]
+        contributions.append(
+            {
+                "trajectory_column": trajectory_column,
+                "initial_episode_id": int(column_episodes[0].item()),
+                "observed_episode_id_count": int(torch.unique(column_episodes).numel()),
+                "emitted_chunk_count": int(episode_ids.shape[0]),
+                "sampled_kv_count": int(sampled[:, trajectory_column].sum().item()),
+                "sampled_eligible_gate_count": int(
+                    (sampled[:, trajectory_column] & gate_valid[:, trajectory_column])
+                    .sum()
+                    .item()
+                ),
+            }
+        )
+    return contributions
 
 
 def _fastwam_sha256_file(path: str) -> str:
@@ -2692,6 +2747,7 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
         request_channel: Channel,
         response_channel: Channel,
         update_epoch: int,
+        episode_contributions: list[dict[str, int]],
     ) -> None:
         emitted = self.rollout_batch.get("emitted_gate")
         metadata = None if emitted is None else emitted.kv_metadata
@@ -2707,16 +2763,16 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
             raise ValueError(
                 "Gate-valid mask and K/V payload references must have equal shape."
             )
+        references = metadata.payload_reference_ids
+        sample_mask = references >= 0
+        self.rollout_batch["gate_kv_sample_mask"] = sample_mask
         all_handles = tuple(
-            int(value)
-            for value in metadata.payload_reference_ids.detach().cpu().reshape(-1)
+            int(value) for value in references[sample_mask].detach().cpu().reshape(-1)
         )
+        effective_gate_valid = fastwam_effective_gate_kv_mask(gate_valid, sample_mask)
         eligible_handles = tuple(
             int(value)
-            for value in metadata.payload_reference_ids[gate_valid.bool()]
-            .detach()
-            .cpu()
-            .reshape(-1)
+            for value in references[effective_gate_valid].detach().cpu().reshape(-1)
         )
         if len(set(all_handles)) != len(all_handles):
             raise ValueError(
@@ -2731,6 +2787,89 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
             handle: int(update_epoch) for handle in eligible_handles
         }
         self._fastwam_kv_all_handles = all_handles
+        emitted_count = int(references.numel())
+        sampled_count = int(sample_mask.sum().item())
+        configured_budget = self.cfg.actor.model.kv_replay.get(
+            "gate_kv_sample_budget", None
+        )
+        expected_sampled_count = (
+            emitted_count
+            if configured_budget is None
+            else min(int(configured_budget), emitted_count)
+        )
+        if sampled_count != expected_sampled_count:
+            raise RuntimeError(
+                "Global Gate K/V sample count disagrees with its budget: "
+                f"{sampled_count} != {expected_sampled_count}."
+            )
+        self._fastwam_gate_kv_sample_probability = (
+            sampled_count / emitted_count if emitted_count else 1.0
+        )
+        full_eligible_count = int(gate_valid.bool().sum().item())
+        effective_gate_gradient_count = int(effective_gate_valid.sum().item())
+        candidate_eligibility_rate = (
+            effective_gate_gradient_count / sampled_count if sampled_count else 0.0
+        )
+        candidate_to_effective_gap_fraction = 1.0 - candidate_eligibility_rate
+        recommended_candidate_budget = configured_budget
+        if (
+            configured_budget is not None
+            and candidate_to_effective_gap_fraction > 0.05
+            and candidate_eligibility_rate > 0.0
+        ):
+            recommended_candidate_budget = math.ceil(
+                int(configured_budget) / candidate_eligibility_rate
+            )
+        sample_audit = {
+            "schema": "fastwam-gate-kv-sample-audit-v1",
+            "actor_version": int(self.version),
+            "configured_budget": configured_budget,
+            "configured_seed": int(
+                self.cfg.actor.model.kv_replay.get("gate_kv_sample_seed", 0)
+            ),
+            "emitted_candidate_count": emitted_count,
+            "sampled_kv_count": sampled_count,
+            "actual_sample_rate": self._fastwam_gate_kv_sample_probability,
+            "full_eligible_gate_count": full_eligible_count,
+            "sampled_eligible_gate_count": effective_gate_gradient_count,
+            "effective_gate_gradient_count": effective_gate_gradient_count,
+            "candidate_eligibility_rate": candidate_eligibility_rate,
+            "candidate_to_effective_gap_fraction": (
+                candidate_to_effective_gap_fraction
+            ),
+            "recommended_candidate_budget": recommended_candidate_budget,
+            "episode_contributions": episode_contributions,
+        }
+        print(
+            f"{FASTWAM_GATE_KV_SAMPLE_AUDIT_SENTINEL} "
+            + json.dumps(sample_audit, sort_keys=True),
+            flush=True,
+        )
+        self._fastwam_gate_kv_sampling_metrics = {
+            "kv_cache/sampled_kv_samples": float(sampled_count),
+            "kv_cache/emitted_kv_candidates": float(emitted_count),
+            "kv_cache/actual_sample_rate": float(
+                self._fastwam_gate_kv_sample_probability
+            ),
+            "kv_cache/full_eligible_gate_samples": float(full_eligible_count),
+            "kv_cache/sampled_eligible_gate_samples": float(
+                effective_gate_gradient_count
+            ),
+            "kv_cache/effective_gate_gradient_count": float(
+                effective_gate_gradient_count
+            ),
+            "kv_cache/candidate_eligibility_rate": float(candidate_eligibility_rate),
+            "kv_cache/candidate_to_effective_gap_fraction": float(
+                candidate_to_effective_gap_fraction
+            ),
+        }
+        if configured_budget is not None:
+            self._fastwam_gate_kv_sampling_metrics["kv_cache/configured_budget"] = (
+                float(configured_budget)
+            )
+            self._fastwam_gate_kv_sampling_metrics[
+                "kv_cache/recommended_candidate_budget"
+            ] = float(recommended_candidate_budget)
         self._fastwam_kv_executor = ThreadPoolExecutor(
             max_workers=1,
             thread_name_prefix=f"gate-kv-prefetch-{self._rank}",
@@ -2833,7 +2972,10 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
             raise RuntimeError("Gate K/V prefetch executor is not running.")
         emitted = micro_batch["emitted_gate"]
         metadata = emitted.kv_metadata
-        gate_valid = micro_batch["gate_valid_mask"].bool().reshape(-1)
+        gate_valid = fastwam_effective_gate_kv_mask(
+            micro_batch["gate_valid_mask"],
+            micro_batch.get("gate_kv_sample_mask"),
+        ).reshape(-1)
         references = metadata.payload_reference_ids.reshape(-1)
         batch_indices = gate_valid.nonzero(as_tuple=False).reshape(-1).cpu()
         handles = tuple(
@@ -2913,6 +3055,356 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
                 expect_response=False,
             )
 
+    def _prepare_fastwam_gate_diagnostic_forward_inputs(
+        self,
+        *,
+        micro_batch: dict,
+        forward_inputs: dict[str, torch.Tensor],
+    ) -> dict[str, torch.Tensor]:
+        """Allow an opt-in actor subclass to add existing replay-only inputs."""
+
+        del micro_batch
+        return forward_inputs
+
+    def _fastwam_gate_gradient_diagnostic_config(
+        self,
+    ) -> tuple[tuple[int, ...], int, int] | None:
+        raw = self.cfg.runner.get("fastwam_gate_gradient_diagnostic", {})
+        if not bool(raw.get("enabled", False)):
+            return None
+        if self._world_size != 1:
+            raise ValueError(
+                "Gate gradient diagnostics currently require one actor rank."
+            )
+        if (
+            self.cfg.actor.model.kv_replay.get("gate_kv_sample_budget", None)
+            is not None
+        ):
+            raise ValueError(
+                "Gate gradient diagnostics require full resident K/V replay."
+            )
+        sample_sizes = tuple(int(value) for value in raw.get("sample_sizes", ()))
+        if (
+            not sample_sizes
+            or any(value < 1 for value in sample_sizes)
+            or len(set(sample_sizes)) != len(sample_sizes)
+        ):
+            raise ValueError(
+                "Gate gradient diagnostic sample_sizes must be unique positive integers."
+            )
+        repeats = raw.get("repeats", 0)
+        seed = raw.get("seed", 0)
+        if isinstance(repeats, bool) or not isinstance(repeats, int) or repeats < 1:
+            raise ValueError("Gate gradient diagnostic repeats must be positive.")
+        if isinstance(seed, bool) or not isinstance(seed, int) or seed < 0:
+            raise ValueError(
+                "Gate gradient diagnostic seed must be a non-negative integer."
+            )
+        return sample_sizes, int(repeats), int(seed)
+
+    def _fastwam_optimizer_group_parameters(
+        self, group_name: str
+    ) -> tuple[nn.Parameter, ...]:
+        matching = [
+            group
+            for group in self.optimizer.param_groups
+            if str(group.get("name", "")) == group_name
+        ]
+        if len(matching) != 1:
+            raise RuntimeError(
+                f"Expected one FastWAM optimizer group {group_name!r}, "
+                f"got {len(matching)}."
+            )
+        parameters = tuple(matching[0]["params"])
+        if not parameters:
+            raise RuntimeError(f"FastWAM optimizer group {group_name!r} is empty.")
+        return parameters
+
+    @staticmethod
+    def _capture_fastwam_gradient_vector(
+        parameters: tuple[nn.Parameter, ...],
+    ) -> tuple[torch.Tensor | None, ...]:
+        captured = []
+        for parameter in parameters:
+            gradient = parameter.grad
+            if gradient is None:
+                captured.append(None)
+                continue
+            if gradient.is_sparse:
+                raise TypeError("Gate gradient diagnostics require dense gradients.")
+            gradient = gradient.detach().float()
+            if not bool(torch.isfinite(gradient).all().item()):
+                raise FloatingPointError(
+                    "Gate gradient diagnostics produced a non-finite gradient."
+                )
+            captured.append(gradient.cpu().contiguous().clone())
+        return tuple(captured)
+
+    @staticmethod
+    def _fastwam_gradient_cosine(
+        reference: tuple[torch.Tensor | None, ...],
+        estimate: tuple[torch.Tensor | None, ...],
+    ) -> tuple[float, float, float]:
+        if len(reference) != len(estimate):
+            raise ValueError("Gate gradient vectors have different tensor counts.")
+        dot = 0.0
+        reference_square = 0.0
+        estimate_square = 0.0
+        for reference_tensor, estimate_tensor in zip(reference, estimate):
+            if reference_tensor is not None:
+                reference_square += float(
+                    reference_tensor.square().sum(dtype=torch.float64).item()
+                )
+            if estimate_tensor is not None:
+                estimate_square += float(
+                    estimate_tensor.square().sum(dtype=torch.float64).item()
+                )
+            if reference_tensor is not None and estimate_tensor is not None:
+                if reference_tensor.shape != estimate_tensor.shape:
+                    raise ValueError(
+                        "Gate gradient tensor shapes changed across passes."
+                    )
+                dot += float(
+                    (reference_tensor * estimate_tensor).sum(dtype=torch.float64).item()
+                )
+        reference_norm = math.sqrt(reference_square)
+        estimate_norm = math.sqrt(estimate_square)
+        if reference_norm <= 0.0 or estimate_norm <= 0.0:
+            raise RuntimeError("Gate gradient diagnostic found a zero gradient norm.")
+        cosine = dot / (reference_norm * estimate_norm)
+        return float(cosine), float(reference_norm), float(estimate_norm)
+
+    def _compute_fastwam_gate_gradient_for_indices(
+        self,
+        indices: torch.Tensor,
+    ) -> tuple[tuple[torch.Tensor | None, ...], dict[str, int]]:
+        if indices.ndim != 1 or indices.numel() < 1:
+            raise ValueError("Gate gradient diagnostic indices must be non-empty 1-D.")
+        selected_count = int(indices.numel())
+
+        def select(tensor: torch.Tensor) -> torch.Tensor:
+            return tensor.index_select(0, indices.to(tensor.device)).contiguous()
+
+        selected_batch = map_nested_tensors(self.rollout_batch, select)
+        micro_batch_size = int(self.cfg.actor.micro_batch_size)
+        chunks = math.ceil(selected_count / micro_batch_size)
+        micro_batches = split_dict_to_chunk(selected_batch, chunks)
+        gate_parameters = self._fastwam_optimizer_group_parameters("gate")
+        non_gate_parameters = self._fastwam_optimizer_group_parameters(
+            "uncond_lora"
+        ) + self._fastwam_optimizer_group_parameters("value_head")
+        gate_cfg = self.cfg.algorithm.gate_ppo
+        self.optimizer.zero_grad()
+        restored_handles = 0
+        pending_prefetches: deque[Future] = deque()
+        next_prefetch_index = 0
+        prefetch_depth = min(
+            int(self.cfg.actor.model.kv_replay.prefetch_depth),
+            len(micro_batches),
+        )
+        while next_prefetch_index < prefetch_depth:
+            pending_prefetches.append(
+                self._schedule_fastwam_kv_prefetch(micro_batches[next_prefetch_index])
+            )
+            next_prefetch_index += 1
+        for index, micro_batch in enumerate(micro_batches):
+            prefetch = pending_prefetches.popleft()
+            if next_prefetch_index < len(micro_batches):
+                pending_prefetches.append(
+                    self._schedule_fastwam_kv_prefetch(
+                        micro_batches[next_prefetch_index]
+                    )
+                )
+                next_prefetch_index += 1
+            self._consume_fastwam_kv_prefetch(micro_batch, prefetch)
+            micro_batch = put_tensor_device(micro_batch, self.device)
+            emitted_gate = micro_batch["emitted_gate"]
+            forward_inputs = dict(micro_batch["forward_inputs"])
+            if emitted_gate.kv_metadata is None:
+                raise ValueError("Gate gradient diagnostics require K/V metadata.")
+            forward_inputs["gate_kv_layer_indices"] = torch.tensor(
+                emitted_gate.kv_metadata.layer_indices,
+                dtype=torch.long,
+                device=self.device,
+            )
+            forward_inputs = self._prepare_fastwam_gate_diagnostic_forward_inputs(
+                micro_batch=micro_batch,
+                forward_inputs=forward_inputs,
+            )
+            backward_ctx = self.before_micro_batch(
+                self.model,
+                is_last_micro_batch=(index + 1) == len(micro_batches),
+            )
+            with self.amp_context:
+                output_dict = self.model(
+                    forward_inputs=forward_inputs,
+                    compute_logprobs=True,
+                    compute_entropy=True,
+                    compute_values=False,
+                    use_cache=False,
+                    route_info=micro_batch["route_info"],
+                    emitted_gate=emitted_gate,
+                    compute_base_logprobs=False,
+                )
+                gate_loss, _ = compute_gate_ppo_loss(
+                    logprobs=output_dict["gate_logprobs"].float(),
+                    old_logprobs=emitted_gate.old_logprob.float(),
+                    advantages=micro_batch["gate_advantages"].float(),
+                    valid_mask=micro_batch["gate_valid_mask"].bool(),
+                    clip_ratio_low=float(gate_cfg.clip_ratio_low),
+                    clip_ratio_high=float(gate_cfg.clip_ratio_high),
+                    behavior_probabilities=output_dict[
+                        "gate_behavior_probabilities"
+                    ].float(),
+                    entropy_coefficient=float(gate_cfg.entropy_coefficient),
+                    selected_loss_scale=1.0 / selected_count,
+                )
+                gate_loss = float(gate_cfg.get("loss_weight", 1.0)) * gate_loss
+            with backward_ctx:
+                gate_loss.backward()
+            restored_handles += (
+                self._restore_fastwam_fsdp_parameter_views_after_backward()
+            )
+            micro_batches[index] = None
+            del micro_batch, output_dict, gate_loss
+        gradient = self._capture_fastwam_gradient_vector(gate_parameters)
+        non_gate_nonzero = 0
+        for parameter in non_gate_parameters:
+            if parameter.grad is not None:
+                values = parameter.grad.detach()
+                if not bool(torch.isfinite(values).all().item()):
+                    raise FloatingPointError(
+                        "Gate diagnostic produced a non-finite non-Gate gradient."
+                    )
+                non_gate_nonzero += int(bool((values != 0).any().item()))
+        self.optimizer.zero_grad()
+        return gradient, {
+            "selected_count": selected_count,
+            "non_gate_nonzero_parameter_count": non_gate_nonzero,
+            "fsdp_view_restore_handles": restored_handles,
+        }
+
+    def _run_fastwam_gate_gradient_diagnostic(
+        self,
+        config: tuple[tuple[int, ...], int, int],
+    ) -> dict[str, float]:
+        sample_sizes, repeats, base_seed = config
+        effective_mask = fastwam_effective_gate_kv_mask(
+            self.rollout_batch["gate_valid_mask"],
+            self.rollout_batch.get("gate_kv_sample_mask"),
+        ).reshape(-1)
+        eligible_indices = effective_mask.nonzero(as_tuple=False).reshape(-1).cpu()
+        full_count = int(eligible_indices.numel())
+        if full_count < 1:
+            raise ValueError(
+                "Gate gradient diagnostic requires at least one effective Gate sample."
+            )
+        rng_state = get_rng_state()
+        optimizer_steps_before = int(self.optimizer_steps)
+        results = []
+        metrics: dict[str, float] = {}
+        try:
+            full_gradient, full_metadata = (
+                self._compute_fastwam_gate_gradient_for_indices(eligible_indices)
+            )
+            _, full_norm, _ = self._fastwam_gradient_cosine(
+                full_gradient, full_gradient
+            )
+            if full_metadata["non_gate_nonzero_parameter_count"] != 0:
+                raise RuntimeError(
+                    "Full Gate diagnostic gradient reached a non-Gate parameter."
+                )
+            metrics["gate_gradient_curve/full_effective_count"] = float(full_count)
+            metrics["gate_gradient_curve/full_gradient_norm"] = full_norm
+            for sample_size_index, sample_size in enumerate(sample_sizes):
+                effective_count = min(sample_size, full_count)
+                reused_full_gradient = effective_count == full_count
+                repeat_results = []
+                for repeat in range(repeats):
+                    seed = base_seed + sample_size_index * repeats + repeat
+                    if reused_full_gradient:
+                        cosine = 1.0
+                        estimate_norm = full_norm
+                        metadata = full_metadata
+                    else:
+                        generator = torch.Generator(device="cpu")
+                        generator.manual_seed(seed)
+                        selected = eligible_indices[
+                            torch.randperm(full_count, generator=generator)[
+                                :effective_count
+                            ]
+                        ]
+                        estimate, metadata = (
+                            self._compute_fastwam_gate_gradient_for_indices(selected)
+                        )
+                        cosine, _, estimate_norm = self._fastwam_gradient_cosine(
+                            full_gradient, estimate
+                        )
+                        if metadata["non_gate_nonzero_parameter_count"] != 0:
+                            raise RuntimeError(
+                                "Subsampled Gate diagnostic gradient reached a "
+                                "non-Gate parameter."
+                            )
+                        del estimate
+                    repeat_results.append(
+                        {
+                            "seed": seed,
+                            "requested_effective_count": sample_size,
+                            "effective_count": effective_count,
+                            "capped_to_full": sample_size > full_count,
+                            "reused_full_gradient": reused_full_gradient,
+                            "cosine": cosine,
+                            "gradient_norm": estimate_norm,
+                            **metadata,
+                        }
+                    )
+                cosines = [result["cosine"] for result in repeat_results]
+                summary = {
+                    "requested_effective_count": sample_size,
+                    "effective_count": effective_count,
+                    "capped_to_full": sample_size > full_count,
+                    "reused_full_gradient": reused_full_gradient,
+                    "cosine_mean": float(sum(cosines) / len(cosines)),
+                    "cosine_min": float(min(cosines)),
+                    "cosine_max": float(max(cosines)),
+                    "repeats": repeat_results,
+                }
+                results.append(summary)
+                prefix = f"gate_gradient_curve/n_{sample_size}"
+                metrics[f"{prefix}/cosine_mean"] = summary["cosine_mean"]
+                metrics[f"{prefix}/cosine_min"] = summary["cosine_min"]
+                metrics[f"{prefix}/cosine_max"] = summary["cosine_max"]
+                metrics[f"{prefix}/effective_count"] = float(effective_count)
+                metrics[f"{prefix}/requested_effective_count"] = float(sample_size)
+            del full_gradient
+        finally:
+            self.optimizer.zero_grad()
+            set_rng_state(rng_state)
+        if int(self.optimizer_steps) != optimizer_steps_before:
+            raise RuntimeError("Gate gradient diagnostic changed optimizer steps.")
+        if checkpoint_state_sha256(get_rng_state()) != checkpoint_state_sha256(
+            rng_state
+        ):
+            raise RuntimeError("Gate gradient diagnostic did not restore RNG state.")
+        audit = {
+            "schema": "fastwam-gate-gradient-curve-audit-v1",
+            "status": "PASS",
+            "actor_version": int(self.version),
+            "full_effective_count": full_count,
+            "full_gradient_norm": full_norm,
+            "sample_sizes": results,
+            "optimizer_steps_before": optimizer_steps_before,
+            "optimizer_steps_after": int(self.optimizer_steps),
+            "rng_restored": True,
+            "non_gate_gradient_nonzero_parameter_count": 0,
+        }
+        print(
+            f"{FASTWAM_GATE_GRADIENT_CURVE_AUDIT_SENTINEL} "
+            + json.dumps(audit, sort_keys=True),
+            flush=True,
+        )
+        return metrics
+
     def _stop_fastwam_handle_replay(self) -> dict[str, float]:
         for source_rank in self._rollout_all_ranks:
             self._post_fastwam_kv_request(
@@ -2933,7 +3425,7 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
         if torch.cuda.is_available():
             free_gpu, _ = torch.cuda.mem_get_info(self.device)
             peak_gpu = torch.cuda.max_memory_allocated(self.device)
-        return {
+        metrics = {
             "kv_cache/prefetch_wait_seconds": self._fastwam_kv_prefetch_wait_seconds,
             "kv_cache/prefetch_wait_time": self._fastwam_kv_prefetch_wait_seconds,
             "kv_cache/h2d_bytes": float(self._fastwam_kv_h2d_bytes),
@@ -2948,6 +3440,8 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
                 getattr(process_memory, "uss", process_memory.rss)
             ),
         }
+        metrics.update(getattr(self, "_fastwam_gate_kv_sampling_metrics", {}))
+        return metrics
 
     @Worker.timer("run_training")
     def run_training(
@@ -3014,6 +3508,23 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
             self.rollout_batch["prev_logprobs"].shape[0]
             * self.rollout_batch["prev_logprobs"].shape[1]
         )
+        gate_kv_episode_contributions = []
+        if self._uses_fastwam_handle_replay():
+            emitted_gate = self.rollout_batch.get("emitted_gate")
+            metadata = None if emitted_gate is None else emitted_gate.kv_metadata
+            references = None if metadata is None else metadata.payload_reference_ids
+            gate_valid = self.rollout_batch.get("gate_valid_mask")
+            if references is None or gate_valid is None:
+                raise ValueError(
+                    "Stored Gate replay requires K/V references and a valid mask."
+                )
+            gate_kv_episode_contributions = (
+                summarize_fastwam_gate_kv_episode_contributions(
+                    episode_ids=emitted_gate.episode_ids,
+                    gate_valid_mask=gate_valid,
+                    gate_kv_sample_mask=references >= 0,
+                )
+            )
         g = torch.Generator()
         g.manual_seed(self.cfg.actor.seed + self._rank)
         shuffle_id = torch.randperm(rollout_size, generator=g)
@@ -3029,6 +3540,11 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
                 ),
             )
         update_epoch = int(self.cfg.algorithm.get("update_epoch", 1))
+        gate_gradient_diagnostic_config = (
+            self._fastwam_gate_gradient_diagnostic_config()
+            if self._uses_fastwam_handle_replay()
+            else None
+        )
         if self._uses_fastwam_handle_replay():
             if kv_request_channel is None or kv_response_channel is None:
                 raise ValueError(
@@ -3039,6 +3555,14 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
                 request_channel=kv_request_channel,
                 response_channel=kv_response_channel,
                 update_epoch=update_epoch,
+                episode_contributions=gate_kv_episode_contributions,
+            )
+        gate_gradient_diagnostic_metrics = {}
+        if gate_gradient_diagnostic_config is not None:
+            gate_gradient_diagnostic_metrics = (
+                self._run_fastwam_gate_gradient_diagnostic(
+                    gate_gradient_diagnostic_config
+                )
             )
 
         # Split to make minibatch iterator for updating the actor
@@ -3049,6 +3573,8 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
             f"{rollout_size} is not divisible by {batch_size_per_rank}"
         )
         metrics = {}
+        if gate_gradient_diagnostic_metrics:
+            append_to_dict(metrics, gate_gradient_diagnostic_metrics)
         preupdate_log_ratio_audit_pending = (
             SupportedModel(self.cfg.actor.model.model_type)
             is SupportedModel.FASTWAM_ADAPTIVE
@@ -3081,13 +3607,22 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
                     is SupportedModel.FASTWAM_ADAPTIVE
                 ):
                     route_info = train_global_batch["route_info"]
-                    gate_count = train_global_batch["gate_valid_mask"].bool().sum()
+                    effective_gate_mask = fastwam_effective_gate_kv_mask(
+                        train_global_batch["gate_valid_mask"],
+                        train_global_batch.get("gate_kv_sample_mask"),
+                    )
+                    gate_count = effective_gate_mask.sum()
+                    full_gate_count = train_global_batch["gate_valid_mask"].bool().sum()
                     flow_count = (
                         train_global_batch["flow_valid_mask"].bool()
                         & (route_info.route_used == int(WAMRoute.UNCOND))
                     ).sum()
                     counts = torch.tensor(
-                        [float(gate_count), float(flow_count)],
+                        [
+                            float(gate_count),
+                            float(flow_count),
+                            float(full_gate_count),
+                        ],
                         device=self.device,
                         dtype=torch.float32,
                     )
@@ -3100,8 +3635,18 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
                     )
                     selected_loss_scales = {
                         "gate": (
-                            scale_numerator / counts[0].item()
-                            if counts[0].item() > 0
+                            scale_numerator
+                            / (
+                                counts[2].item()
+                                * float(
+                                    getattr(
+                                        self,
+                                        "_fastwam_gate_kv_sample_probability",
+                                        1.0,
+                                    )
+                                )
+                            )
+                            if counts[2].item() > 0
                             else 0.0
                         ),
                         "flow": (
@@ -3336,11 +3881,15 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
         route_info = micro_batch["route_info"]
         emitted_gate = micro_batch["emitted_gate"]
         selected_loss_scales = selected_loss_scales or {}
+        effective_gate_mask = fastwam_effective_gate_kv_mask(
+            micro_batch["gate_valid_mask"],
+            micro_batch.get("gate_kv_sample_mask"),
+        )
         policy_loss_value, metrics = compute_fastwam_dual_ppo_loss(
             gate_logprobs=output_dict["gate_logprobs"].float(),
             gate_old_logprobs=emitted_gate.old_logprob.float(),
             gate_advantages=micro_batch["gate_advantages"].float(),
-            gate_valid_mask=micro_batch["gate_valid_mask"].bool(),
+            gate_valid_mask=effective_gate_mask,
             gate_clip_ratio_low=float(gate_cfg.clip_ratio_low),
             gate_clip_ratio_high=float(gate_cfg.clip_ratio_high),
             gate_behavior_probabilities=output_dict[
@@ -3388,7 +3937,7 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
             collapse_loss, collapse_metrics = compute_gate_collapse_penalty(
                 base_idm_probabilities=output_dict["gate_base_probabilities"].float(),
                 episode_ids=emitted_gate.episode_ids,
-                valid_mask=micro_batch["gate_valid_mask"].bool(),
+                valid_mask=effective_gate_mask,
                 tau_calls=float(collapse_cfg.get("tau_calls", 1.0)),
                 scope=str(collapse_cfg.get("scope", "microbatch")),
             )

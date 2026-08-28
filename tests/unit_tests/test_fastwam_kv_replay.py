@@ -1,3 +1,17 @@
+# Copyright 2026 The RLinf Authors.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 import importlib.util
 import sys
 from dataclasses import replace
@@ -9,8 +23,8 @@ import torch
 FASTWAM_SRC = Path(__file__).resolve().parents[3] / "FastWAM/src"
 sys.path.insert(0, str(FASTWAM_SRC))
 
-from fastwam.adapters import PolicyRegime
-from fastwam.models.wan22.kv_tap import (
+from fastwam.adapters import PolicyRegime  # noqa: E402
+from fastwam.models.wan22.kv_tap import (  # noqa: E402
     GateKVSnapshot,
     GateLayerKV,
     KeyValueBank,
@@ -21,7 +35,9 @@ KV_REPLAY_PATH = (
     Path(__file__).resolve().parents[2]
     / "rlinf/models/embodiment/wam_policy/kv_replay.py"
 )
-_spec = importlib.util.spec_from_file_location("fastwam_kv_replay_under_test", KV_REPLAY_PATH)
+_spec = importlib.util.spec_from_file_location(
+    "fastwam_kv_replay_under_test", KV_REPLAY_PATH
+)
 _module = importlib.util.module_from_spec(_spec)
 sys.modules[_spec.name] = _module
 _spec.loader.exec_module(_module)
@@ -51,9 +67,7 @@ def _snapshot(action_offset, timestep):
                 layer_index=0,
                 denoise_timestep=torch.tensor([timestep]),
                 current_mode=(PolicyRegime.UNCOND,),
-                current_frame_video=_bank(
-                    KVSource.CURRENT_FRAME_VIDEO, [1.0, 2.0]
-                ),
+                current_frame_video=_bank(KVSource.CURRENT_FRAME_VIDEO, [1.0, 2.0]),
                 action=_bank(
                     KVSource.ACTION,
                     [3.0 + action_offset, 4.0 + action_offset],
@@ -69,6 +83,20 @@ def test_default_config_is_stored_bfloat16():
     config = GateKVReplayConfig()
     assert config.backend is GateKVReplayBackend.STORED
     assert config.torch_dtype is torch.bfloat16
+    assert config.gate_kv_sample_budget is None
+    assert config.gate_kv_sample_seed == 0
+
+
+@pytest.mark.parametrize("budget", [True, 0, -1, 1.5])
+def test_gate_kv_sample_budget_rejects_invalid_values(budget):
+    with pytest.raises(ValueError, match="gate_kv_sample_budget"):
+        GateKVReplayConfig(gate_kv_sample_budget=budget)
+
+
+@pytest.mark.parametrize("seed", [True, -1, 1.5])
+def test_gate_kv_sample_seed_rejects_invalid_values(seed):
+    with pytest.raises(ValueError, match="gate_kv_sample_seed"):
+        GateKVReplayConfig(gate_kv_sample_seed=seed)
 
 
 def test_stored_config_rejects_fake_deduplication_toggle():

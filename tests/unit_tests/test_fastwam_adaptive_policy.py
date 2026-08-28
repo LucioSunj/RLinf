@@ -1283,8 +1283,8 @@ def test_policy_sparse_handle_replay_preserves_eligible_gate_values():
     ):
         torch.testing.assert_close(sparse[key][1], full[key][1])
         assert sparse[key][0].item() == 0
-    torch.testing.assert_close(sparse["flow_logprobs"], full["flow_logprobs"])
-    torch.testing.assert_close(sparse["values"], full["values"])
+    assert torch.equal(sparse["flow_logprobs"], full["flow_logprobs"])
+    assert torch.equal(sparse["values"], full["values"])
 
 
 def test_sparse_handle_replay_matches_full_loss_gradients_and_optimizer_delta():
@@ -1343,10 +1343,8 @@ def test_sparse_handle_replay_matches_full_loss_gradients_and_optimizer_delta():
     ):
         torch.testing.assert_close(sparse_replay[key][1], full_replay[key][1])
         assert sparse_replay[key][0].item() == 0
-    torch.testing.assert_close(
-        sparse_replay["flow_logprobs"], full_replay["flow_logprobs"]
-    )
-    torch.testing.assert_close(sparse_replay["values"], full_replay["values"])
+    assert torch.equal(sparse_replay["flow_logprobs"], full_replay["flow_logprobs"])
+    assert torch.equal(sparse_replay["values"], full_replay["values"])
 
     gate_old_logprobs = full_replay["gate_logprobs"].detach().clone()
     flow_old_logprobs = full_replay["flow_logprobs"].detach().clone()
@@ -1419,7 +1417,7 @@ def test_sparse_handle_replay_matches_full_loss_gradients_and_optimizer_delta():
         for full_parameter, sparse_parameter in zip(
             full_group["params"], sparse_group["params"], strict=True
         ):
-            torch.testing.assert_close(sparse_parameter.grad, full_parameter.grad)
+            assert torch.equal(sparse_parameter.grad, full_parameter.grad)
 
     full_optimizer.step()
     sparse_optimizer.step()
@@ -1440,9 +1438,9 @@ def test_sparse_handle_replay_matches_full_loss_gradients_and_optimizer_delta():
         sparse_after,
         strict=True,
     ):
-        torch.testing.assert_close(sparse_start, full_start)
-        torch.testing.assert_close(sparse_end, full_end)
-        torch.testing.assert_close(sparse_end - sparse_start, full_end - full_start)
+        assert torch.equal(sparse_start, full_start)
+        assert torch.equal(sparse_end, full_end)
+        assert torch.equal(sparse_end - sparse_start, full_end - full_start)
     assert all(
         not torch.equal(start, end) for start, end in zip(full_before, full_after)
     )

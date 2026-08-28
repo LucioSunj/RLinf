@@ -116,6 +116,11 @@ kv_replay:
   deduplicate_static_banks: true
   # Fail closed if a shape/config change exceeds the measured all-layer budget.
   max_bytes_per_sample: 268435456
+  # Optional exact global budget for K/V-bearing Gate replay candidates in one
+  # runner update. Sampling uses a private deterministic RNG and leaves the
+  # reward, advantage, Action/Flow PPO, and critic paths at full rollout size.
+  gate_kv_sample_budget: null
+  gate_kv_sample_seed: 0
   # Per-rollout-rank bounded tiers. The 12.5 GiB hot limit plus the dynamic 4 GiB
   # free-memory floor applies to the 40 GiB MIG profile used by the formal run.
   hot_capacity_bytes_per_rollout_rank: 13421772800

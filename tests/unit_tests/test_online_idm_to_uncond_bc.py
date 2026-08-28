@@ -38,6 +38,7 @@ from rlinf.models.embodiment.wam_policy.adaptive_policy import (
 from rlinf.models.embodiment.wam_policy.contracts import ChunkRouteRecord, WAMRoute
 from rlinf.models.embodiment.wam_policy.libero_runtime import LiberoFastWAMRuntime
 from rlinf.models.embodiment.wam_policy.online_idm_bc.actor import (
+    OnlineIDMBCFSDPActor,
     assemble_online_idm_bc_loss,
     audit_online_idm_bc_backward_gradient_ownership,
     audit_online_idm_bc_gradient_ownership,
@@ -64,6 +65,22 @@ from rlinf.models.embodiment.wam_policy.online_idm_bc.runtime import (
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 CONFIG_ROOT = REPO_ROOT / "examples" / "embodiment" / "config"
+
+
+def test_gate_gradient_diagnostic_preserves_online_bc_replay_inputs() -> None:
+    actor = object.__new__(OnlineIDMBCFSDPActor)
+    flow_valid = torch.tensor([True, False])
+    original_inputs = {"existing": torch.tensor([1.0, 2.0])}
+
+    prepared = actor._prepare_fastwam_gate_diagnostic_forward_inputs(
+        micro_batch={"flow_valid_mask": flow_valid},
+        forward_inputs=original_inputs,
+    )
+
+    assert prepared is not original_inputs
+    assert ONLINE_IDM_BC_FLOW_VALID not in original_inputs
+    assert prepared["existing"] is original_inputs["existing"]
+    assert prepared[ONLINE_IDM_BC_FLOW_VALID] is flow_valid
 
 
 class _TinyActor(nn.Module):

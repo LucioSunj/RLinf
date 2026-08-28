@@ -325,6 +325,10 @@ class EmbodiedRunner:
             "peak_nvme_bytes",
             "emitted_samples",
             "emitted_bytes",
+            "sampled_samples",
+            "sampled_bytes",
+            "unsampled_samples",
+            "unsampled_bytes",
             "eligible_samples",
             "eligible_bytes",
             "discarded_samples",
@@ -386,6 +390,12 @@ class EmbodiedRunner:
             destination[f"kv_cache/{key}"] = reduced
         destination["kv_cache/discarded_ineligible_bytes"] = destination.get(
             "kv_cache/discarded_bytes", 0.0
+        )
+        emitted = destination.get("kv_cache/emitted_samples", 0.0)
+        destination["kv_cache/actual_sample_rate"] = (
+            destination.get("kv_cache/sampled_samples", 0.0) / emitted
+            if emitted
+            else 0.0
         )
         fetched = destination.get("kv_cache/fetched_samples", 0.0)
         destination["kv_cache/hit_fraction"] = (

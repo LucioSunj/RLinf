@@ -44,6 +44,13 @@ def _load_builder_package():
 _builder = _load_builder_package()
 
 
+def test_adaptive_config_defaults_to_full_gate_kv_replay() -> None:
+    config = OmegaConf.load(CONFIG_ROOT / "model/fastwam_adaptive.yaml")
+
+    assert config.kv_replay.gate_kv_sample_budget is None
+    assert config.kv_replay.gate_kv_sample_seed == 0
+
+
 def _critic_config():
     return OmegaConf.create(
         {

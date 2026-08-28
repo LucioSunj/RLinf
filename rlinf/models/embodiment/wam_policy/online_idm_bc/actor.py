@@ -338,6 +338,20 @@ class OnlineIDMBCFSDPActor(EmbodiedFSDPActor):
         )
         return wrapped
 
+    def _prepare_fastwam_gate_diagnostic_forward_inputs(
+        self,
+        *,
+        micro_batch: dict,
+        forward_inputs: dict[str, torch.Tensor],
+    ) -> dict[str, torch.Tensor]:
+        """Preserve the online policy's existing replay-input contract."""
+
+        if ONLINE_IDM_BC_FLOW_VALID in forward_inputs:
+            raise KeyError("Online IDM BC flow-valid replay field already exists.")
+        prepared = dict(forward_inputs)
+        prepared[ONLINE_IDM_BC_FLOW_VALID] = micro_batch["flow_valid_mask"]
+        return prepared
+
     def train_micro_batch(
         self,
         micro_batch: dict[str, torch.Tensor],

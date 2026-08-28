@@ -300,6 +300,17 @@ class MultiStepRolloutWorker(Worker):
                 source_rank=self._rank,
                 device=self.device,
                 config=self.hf_model.config.kv_replay,
+                expected_global_samples=(
+                    self.total_num_train_envs
+                    * self.rollout_epoch
+                    * self.n_train_chunk_steps
+                ),
+                expected_local_samples=(
+                    self.per_node_train_batch_size
+                    * self.num_pipeline_stages
+                    * self.rollout_epoch
+                    * self.n_train_chunk_steps
+                ),
             )
         if self.enable_offload:
             self.offload_model()
