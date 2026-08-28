@@ -31,9 +31,10 @@ runner:
   task_type: embodied
   logger:
     log_path: ../results
-    project_name: rlinf
+    project_name: fastwam-adaptive
     experiment_name: original_cost0p0175_task0_seed11_8gpu_n84_20260828_v1
-    logger_backends: [tensorboard]
+    logger_backends: [tensorboard, wandb]
+    wandb_entity: luciojunsun-xi-an-jiaotong-liverpool-university
     fastwam_observability:
       enabled: true
       tensorboard:
@@ -51,7 +52,7 @@ runner:
   max_steps: 30
   only_eval: false
   val_check_interval: -1
-  save_interval: 5
+  save_interval: 10
   resume_dir: null
   ckpt_path: null
   overlap_env_bootstrap: false
