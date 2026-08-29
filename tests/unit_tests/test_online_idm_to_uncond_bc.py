@@ -251,6 +251,31 @@ def test_online_config_validator_rejects_a_wrong_runtime(monkeypatch) -> None:
         validate_online_idm_bc_training_config(invalid)
 
 
+def test_online_config_validator_accepts_microbatch_four(monkeypatch) -> None:
+    _set_asset_environment(monkeypatch)
+    with initialize_config_dir(version_base=None, config_dir=str(CONFIG_ROOT)):
+        config = compose(
+            config_name="libero_10_ppo_fastwam_adaptive_formal",
+            overrides=["+online_idm_bc=enabled", "actor.micro_batch_size=4"],
+        )
+
+    validated = validate_online_idm_bc_training_config(config)
+
+    assert validated == OnlineIDMBCConfig(enabled=True, loss_weight=0.2)
+
+
+def test_online_config_validator_rejects_unapproved_microbatch(monkeypatch) -> None:
+    _set_asset_environment(monkeypatch)
+    with initialize_config_dir(version_base=None, config_dir=str(CONFIG_ROOT)):
+        config = compose(
+            config_name="libero_10_ppo_fastwam_adaptive_formal",
+            overrides=["+online_idm_bc=enabled", "actor.micro_batch_size=2"],
+        )
+
+    with pytest.raises(ValueError, match="requires microbatch 1 or 4"):
+        validate_online_idm_bc_training_config(config)
+
+
 def test_rollout_teacher_targets_only_uncond_and_reuses_student_noise(
     monkeypatch,
 ) -> None:
