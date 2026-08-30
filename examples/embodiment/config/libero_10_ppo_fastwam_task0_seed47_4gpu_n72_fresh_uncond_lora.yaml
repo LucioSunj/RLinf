@@ -1,0 +1,62 @@
+defaults:
+  - env/libero_10@env.train
+  - env/libero_10@env.eval
+  - model/fastwam_adaptive@actor.model
+  - model/fastwam_adaptive@rollout.model
+  - hybrid_engines/fsdp@actor.fsdp_config
+  - weight_syncer/patch_syncer@weight_syncer
+  - profile: fastwam_fair_cost_stability_telemetry
+  - online_idm_bc: enabled
+  - libero_10_ppo_fastwam_task0_formal_base
+  - override hydra/job_logging: stdout
+  - _self_
+
+hydra:
+  run:
+    dir: .
+  output_subdir: null
+  searchpath:
+    - file://${oc.env:EMBODIED_PATH}/config/
+
+# Four-MIG host B: preserve three rollout ranks with four environments each so
+# collection concurrency is unchanged. Six rollout epochs emit 72 episodes.
+cluster:
+  component_placement:
+    actor: "0-0"
+    env: "1-3"
+    rollout: "1-3"
+
+runner:
+  # Native fresh rank-16/alpha-16 UNCOND LoRA; no offline sidecar is loaded.
+  bootstrap_uncond_lora_sidecar: null
+  bootstrap_uncond_lora_sidecar_sha256: null
+  logger:
+    experiment_name: formal_task0_seed47_4gpu_n72_fresh_uncond_lora_30updates_20260829_v1
+
+env:
+  train:
+    total_num_envs: 12
+    rollout_epoch: 6
+    seed: 47
+
+actor:
+  global_batch_size: 504
+  seed: 47
+  model:
+    runtime:
+      text_embedding_cache_dir: /XYFS02/HDD_POOL/nju_shklu/nju_shklu_1/When-will-inference-time-prediction-beneficial-/FastWAM/data/text_embeds_cache/libero
+    kv_replay:
+      hot_capacity_bytes_per_rollout_rank: 13421772800
+      cold_capacity_bytes_per_rollout_rank: 12884901888
+      nvme_capacity_bytes_per_rollout_rank: 25769803776
+      nvme_path: /tmp/fastwam_kv/formal_task0_seed47_4gpu_n72_fresh_uncond_lora_20260829_v1
+
+rollout:
+  model:
+    runtime:
+      text_embedding_cache_dir: /XYFS02/HDD_POOL/nju_shklu/nju_shklu_1/When-will-inference-time-prediction-beneficial-/FastWAM/data/text_embeds_cache/libero
+    kv_replay:
+      hot_capacity_bytes_per_rollout_rank: 13421772800
+      cold_capacity_bytes_per_rollout_rank: 12884901888
+      nvme_capacity_bytes_per_rollout_rank: 25769803776
+      nvme_path: /tmp/fastwam_kv/formal_task0_seed47_4gpu_n72_fresh_uncond_lora_20260829_v1
