@@ -28,6 +28,7 @@ OUTER = Path(__file__).resolve().parents[3]
 sys.path.insert(0, str(OUTER / "FastWAM/src"))
 
 from fastwam.adapters import PolicyRegime  # noqa: E402
+from fastwam.models.wan22.adaptive_sampler import VelocityOutput  # noqa: E402
 from fastwam.models.wan22.condition_kv import ConditionLayerKV  # noqa: E402
 from fastwam.models.wan22.kv_tap import (  # noqa: E402
     GateKVSnapshot,
@@ -180,6 +181,165 @@ def test_libero_runtime_materializes_hydra_structured_value_config():
         FastWAMValueTransformerConfig,
     )
     assert runtime.critic_feature_config.source_dim == 2
+
+
+@pytest.mark.parametrize(
+    ("route", "mode", "expected_regime"),
+    [
+        (1, "eval", PolicyRegime.IDM),
+        (0, "eval", PolicyRegime.UNCOND),
+        (0, "train", PolicyRegime.UNCOND),
+    ],
+)
+def test_pre_fix_runtime_captures_gate_layers_on_every_denoise_step(
+    monkeypatch,
+    route,
+    mode,
+    expected_regime,
+):
+    """Pin legacy runtime waste for deterministic and stochastic routes."""
+
+    num_steps = 10
+    selected_layers = (14, 15, 16)
+    gate_last_n = 1
+    calls = {"plain": 0, "tapped": 0}
+    captured_layer_payloads = 0
+    constructed_capture_flags = []
+
+    class _Actor(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.anchor = nn.Parameter(torch.zeros(1))
+            self.action_expert = SimpleNamespace(action_dim=3)
+            self.mot = object()
+            self.infer_action_scheduler = SimpleNamespace(num_train_timesteps=1000)
+
+    class _SpyCachedActionVelocity:
+        def __init__(
+            self,
+            *,
+            regime,
+            gate_layer_indices,
+            capture_gate_kv,
+            actor_version,
+            **_kwargs,
+        ):
+            self.regime = regime
+            self.gate_layer_indices = gate_layer_indices
+            self.capture_gate_kv = capture_gate_kv
+            self.actor_version = actor_version
+            constructed_capture_flags.append(capture_gate_kv)
+
+        def __call__(self, action, timestep):
+            nonlocal captured_layer_payloads
+            call_kind = "tapped" if self.capture_gate_kv else "plain"
+            calls[call_kind] += 1
+            if not self.capture_gate_kv:
+                return VelocityOutput(torch.zeros_like(action))
+            layers = []
+            for layer_index in self.gate_layer_indices:
+                captured_layer_payloads += 1
+                value = torch.full(
+                    (action.shape[0], 1, 2),
+                    float(layer_index),
+                    dtype=action.dtype,
+                    device=action.device,
+                )
+                layers.append(
+                    GateLayerKV(
+                        layer_index=layer_index,
+                        denoise_timestep=timestep.detach().clone(),
+                        current_mode=(self.regime,),
+                        current_frame_video=KeyValueBank(
+                            source=KVSource.CURRENT_FRAME_VIDEO,
+                            key=value,
+                            value=value,
+                            valid_mask=torch.ones(
+                                value.shape[:2],
+                                dtype=torch.bool,
+                                device=value.device,
+                            ),
+                        ),
+                        action=KeyValueBank(
+                            source=KVSource.ACTION,
+                            key=value,
+                            value=value,
+                            valid_mask=torch.ones(
+                                value.shape[:2],
+                                dtype=torch.bool,
+                                device=value.device,
+                            ),
+                        ),
+                        context=KeyValueBank(
+                            source=KVSource.TEXT_STATE_CONTEXT,
+                            key=value,
+                            value=value,
+                            valid_mask=torch.ones(
+                                value.shape[:2],
+                                dtype=torch.bool,
+                                device=value.device,
+                            ),
+                        ),
+                        actor_version=self.actor_version,
+                    )
+                )
+            return VelocityOutput(
+                torch.zeros_like(action),
+                gate_tap=GateKVSnapshot(tuple(layers)),
+            )
+
+    monkeypatch.setattr(
+        _runtime_module,
+        "CachedActionVelocity",
+        _SpyCachedActionVelocity,
+    )
+    runtime = object.__new__(_runtime_module.LiberoFastWAMRuntime)
+    runtime.actor = _Actor()
+    runtime.lora_adapter = SimpleNamespace(regime_context=object())
+    runtime.critic_feature_config = None
+    runtime.flow_sde_noise_level = 0.5
+    runtime.flow_sde_ignore_last_transition = True
+    runtime.seeded_noise_device = "cpu"
+    runtime.gate_layer_indices = selected_layers
+    runtime.gate_denoise_last_n = gate_last_n
+    runtime.gate_replay_backend = _policy.GateKVReplayBackend.STORED
+    runtime.action_protocol = _runtime_module.LiberoActionProtocol(
+        generation_horizon=2,
+        execution_horizon=1,
+        prediction_video_frames=3,
+        reset_wait_steps=0,
+        max_episode_steps=2,
+    )
+    runtime._encode_condition = lambda _obs: (
+        torch.zeros(1, 3, 4, 4),
+        torch.zeros(1, 5, 2),
+        torch.ones(1, 5, dtype=torch.bool),
+    )
+    runtime._action_schedule = lambda: (
+        torch.linspace(1000.0, 100.0, num_steps),
+        torch.full((num_steps,), -0.1),
+    )
+    runtime._prepare_action_condition = lambda **kwargs: (
+        SimpleNamespace(regime=kwargs["regime"]),
+        None,
+    )
+    runtime._denormalize_action_stages = lambda actions, env_obs: (actions, None)
+
+    sample = runtime.sample_action_batch(
+        env_obs={"_fastwam_action_noise_seeds": torch.tensor([123])},
+        routes=torch.tensor([route]),
+        mode=mode,
+        actor_version=7,
+        collect_replay=False,
+    )
+
+    assert constructed_capture_flags == [True]
+    assert calls == {"plain": 0, "tapped": num_steps}
+    assert captured_layer_payloads == num_steps * len(selected_layers)
+    assert len(sample.gate_snapshots) == gate_last_n
+    assert sample.gate_snapshots[0].layer_indices == selected_layers
+    assert sample.gate_snapshots[0].layers[0].current_mode == (expected_regime,)
+    assert calls["tapped"] - len(sample.gate_snapshots) == num_steps - gate_last_n
 
 
 def _snapshots(routes):
