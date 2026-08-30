@@ -99,8 +99,11 @@ def validate_online_idm_bc_training_config(cfg: Any) -> OnlineIDMBCConfig:
         raise ValueError("Online IDM BC preserves the environment-only reward path.")
     if str(OmegaConf.select(cfg, "algorithm.loss_type")) != "fastwam_dual_ppo":
         raise ValueError("Online IDM BC requires the existing FastWAM dual-PPO loss.")
-    if int(OmegaConf.select(cfg, "actor.micro_batch_size")) != 1:
-        raise ValueError("The approved online IDM BC diagnostic requires microbatch 1.")
+    micro_batch_size = int(OmegaConf.select(cfg, "actor.micro_batch_size"))
+    if micro_batch_size not in {1, 4}:
+        raise ValueError(
+            "The approved online IDM BC diagnostic requires microbatch 1 or 4."
+        )
     for field, expected in {
         "online_idm_bc_implementation.actor_target": ONLINE_IDM_BC_ACTOR_TARGET,
         "online_idm_bc_implementation.policy_target": ONLINE_IDM_BC_POLICY_TARGET,
