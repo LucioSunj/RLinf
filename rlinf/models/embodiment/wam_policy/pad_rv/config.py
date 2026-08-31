@@ -239,6 +239,14 @@ def validate_pad_frozen_training_config(
         raise ValueError("PAD-Frozen prediction-budget controller target changed.")
     if float(budget.proportional_gain) != 0.0:
         raise ValueError("PAD-Frozen uses the projected dual without a P term.")
+    if (
+        OmegaConf.select(cfg, "algorithm.fixed_branch_cost.controller", default=None)
+        is not None
+    ):
+        raise ValueError(
+            "PAD-Frozen must not compose the generic fastwam_idm_cost_control "
+            "group; algorithm.prediction_budget is its sole controller source."
+        )
     pi = OmegaConf.select(cfg, "algorithm.fixed_branch_cost.fair_cost.pi")
     if pi is None or bool(pi.get("enabled", True)):
         raise ValueError("PAD-Frozen disables the inherited fair-cost PI controller.")

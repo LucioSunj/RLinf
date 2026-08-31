@@ -194,6 +194,15 @@ def test_pad_low_gain_budget_profile_is_config_selected(monkeypatch) -> None:
     )
 
 
+def test_pad_rejects_generic_idm_cost_controller_composition(monkeypatch) -> None:
+    cfg = _compose_pad_config(monkeypatch)
+    with open_dict(cfg):
+        cfg.algorithm.fixed_branch_cost.controller = {"type": "fixed"}
+
+    with pytest.raises(ValueError, match="sole controller source"):
+        validate_pad_frozen_training_config(cfg)
+
+
 def test_pad_low_gain_serial_send_profile_is_config_selected(monkeypatch) -> None:
     cfg = _compose_pad_config(
         monkeypatch,
