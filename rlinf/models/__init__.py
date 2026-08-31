@@ -284,7 +284,13 @@ _register_builtin_models()
 
 def get_model(cfg: DictConfig):
     model_type = str(cfg.model_type)
-    model_builder = _MODEL_REGISTRY.get(model_type)
+    builder_target = cfg.get("builder_target", None)
+    if builder_target is None:
+        model_builder = _MODEL_REGISTRY.get(model_type)
+    else:
+        from hydra.utils import get_method
+
+        model_builder = get_method(str(builder_target))
     if model_builder is None:
         return None
 

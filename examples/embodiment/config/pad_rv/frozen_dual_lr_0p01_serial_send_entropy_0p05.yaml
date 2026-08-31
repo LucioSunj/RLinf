@@ -1,0 +1,9 @@
+# @package _global_
+
+defaults:
+  - frozen_dual_lr_0p01_serial_send
+  - _self_
+
+algorithm:
+  gate_ppo:
+    entropy_coefficient: 0.05

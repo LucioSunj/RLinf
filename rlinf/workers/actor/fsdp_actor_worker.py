@@ -2015,6 +2015,7 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
         Args:
             input_channel: The input channel to read from.
         """
+        self._release_consumed_rollout_batch_before_receive()
         clear_memory(sync=False)
 
         env_world_size = self._component_placement.get_world_size("env")
@@ -2042,6 +2043,11 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
         self.rollout_batch = convert_trajectories_to_batch(recv_list, consume=True)
 
         self.rollout_batch = self._process_received_rollout_batch(self.rollout_batch)
+
+    def _release_consumed_rollout_batch_before_receive(self) -> None:
+        """Optional scheme hook before the next rollout transfer starts."""
+
+        return None
 
     def _process_received_rollout_batch(
         self, rollout_batch: dict[str, torch.Tensor]
@@ -2144,6 +2150,21 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
                 "FastWAM runtime IDM cost must be finite and non-negative."
             )
         return runtime_cost
+
+    def _align_fastwam_training_advantages(self, **kwargs):
+        """Extension point for route contracts; legacy keeps delayed alignment."""
+
+        return align_fastwam_policy_advantages(**kwargs)
+
+    def _summarize_fastwam_rollout_state(self, **kwargs):
+        """Extension point for replay-specific rollout audit semantics."""
+
+        return summarize_fastwam_rollout_state(**kwargs)
+
+    def _summarize_fastwam_counterfactual_costs(self, **kwargs):
+        """Extension point for route-contract-specific cost diagnostics."""
+
+        return summarize_fastwam_counterfactual_costs(**kwargs)
 
     @Worker.timer("actor/compute_adv")
     def compute_advantages_and_returns(self) -> dict[str, torch.Tensor]:
@@ -2278,7 +2299,7 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
 
         self.rollout_batch.update(advantages_and_returns)
         if model_type is SupportedModel.FASTWAM_ADAPTIVE:
-            alignment = align_fastwam_policy_advantages(
+            alignment = self._align_fastwam_training_advantages(
                 advantages=advantages_and_returns["advantages"],
                 route=self.rollout_batch["route_info"],
                 emitted=self.rollout_batch["emitted_gate"],
@@ -2359,20 +2380,22 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
                 ]
                 if bool(cost_cfg.get("fair_cost", {}).get("enabled", False)):
                     counterfactual_idm_costs.append(configured_idm_cost)
-                counterfactual_cost_audit = summarize_fastwam_counterfactual_costs(
-                    environment_rewards=raw_environment_rewards,
-                    route=self.rollout_batch["route_info"],
-                    emitted=self.rollout_batch["emitted_gate"],
-                    dones=self.rollout_batch["dones"],
-                    values=self.rollout_batch["prev_values"],
-                    valid_mask=self.rollout_batch.get("loss_mask", None),
-                    idm_costs=tuple(sorted(set(counterfactual_idm_costs))),
-                    configured_idm_cost=configured_idm_cost,
-                    configured_gate_advantages=alignment.gate_advantages,
-                    gamma=float(self.cfg.algorithm.get("gamma", 1.0)),
-                    gae_lambda=float(self.cfg.algorithm.get("gae_lambda", 1.0)),
-                    rollout_epoch=int(self.cfg.env.train.rollout_epoch),
-                    carry_pending_across_epochs=bool(self.cfg.env.train.auto_reset),
+                counterfactual_cost_audit = (
+                    self._summarize_fastwam_counterfactual_costs(
+                        environment_rewards=raw_environment_rewards,
+                        route=self.rollout_batch["route_info"],
+                        emitted=self.rollout_batch["emitted_gate"],
+                        dones=self.rollout_batch["dones"],
+                        values=self.rollout_batch["prev_values"],
+                        valid_mask=self.rollout_batch.get("loss_mask", None),
+                        idm_costs=tuple(sorted(set(counterfactual_idm_costs))),
+                        configured_idm_cost=configured_idm_cost,
+                        configured_gate_advantages=alignment.gate_advantages,
+                        gamma=float(self.cfg.algorithm.get("gamma", 1.0)),
+                        gae_lambda=float(self.cfg.algorithm.get("gae_lambda", 1.0)),
+                        rollout_epoch=int(self.cfg.env.train.rollout_epoch),
+                        carry_pending_across_epochs=bool(self.cfg.env.train.auto_reset),
+                    )
                 )
                 counterfactual_artifact = counterfactual_cost_audit.to_artifact()
                 print(
@@ -2393,7 +2416,7 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
                     )
             if audit_enabled:
                 kv_cfg = self.cfg.actor.model.kv_replay
-                rollout_state_audit = summarize_fastwam_rollout_state(
+                rollout_state_audit = self._summarize_fastwam_rollout_state(
                     route=self.rollout_batch["route_info"],
                     emitted=self.rollout_batch["emitted_gate"],
                     eligible_gate_mask=alignment.gate_valid_mask,
@@ -3647,10 +3670,8 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
             self._fastwam_policy_module().capture_gate_recompute_reference()
 
         self.model.train()
-        rollout_size = (
-            self.rollout_batch["prev_logprobs"].shape[0]
-            * self.rollout_batch["prev_logprobs"].shape[1]
-        )
+        batch_reference = self._training_batch_reference(self.rollout_batch)
+        rollout_size = batch_reference.shape[0] * batch_reference.shape[1]
         gate_kv_episode_contributions = []
         if self._uses_fastwam_handle_replay():
             emitted_gate = self.rollout_batch.get("emitted_gate")
@@ -3710,7 +3731,7 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
 
         # Split to make minibatch iterator for updating the actor
         # See PPO paper for details. https://arxiv.org/abs/1707.06347
-        rollout_size = self.rollout_batch["prev_logprobs"].size(0)
+        rollout_size = self._training_batch_reference(self.rollout_batch).size(0)
         batch_size_per_rank = self.cfg.actor.global_batch_size // self._world_size
         assert rollout_size % batch_size_per_rank == 0, (
             f"{rollout_size} is not divisible by {batch_size_per_rank}"
@@ -3729,7 +3750,9 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
             )
             for train_global_batch in rollout_dataloader_iter:
                 # split batch into micro_batches
-                train_global_batch_size = train_global_batch["prev_logprobs"].shape[0]
+                train_global_batch_size = self._training_batch_reference(
+                    train_global_batch
+                ).shape[0]
                 assert (
                     train_global_batch_size
                     == self.cfg.actor.global_batch_size
@@ -4123,6 +4146,22 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
             for key, value in metrics.items()
         }
 
+    def _training_batch_reference(
+        self,
+        batch: dict[str, Any],
+    ) -> torch.Tensor:
+        """Return the batch-shaped field used by the generic PPO loop."""
+
+        reference = batch.get("prev_logprobs")
+        if not isinstance(reference, torch.Tensor):
+            raise KeyError("PPO training requires tensor prev_logprobs.")
+        return reference
+
+    def _allows_absent_action_logprobs(self) -> bool:
+        """Whether a policy has no independently trainable Action distribution."""
+
+        return False
+
     def train_micro_batch(
         self,
         micro_batch: dict[str, torch.Tensor],
@@ -4136,7 +4175,9 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
         model_type = SupportedModel(self.cfg.actor.model.model_type)
         is_fastwam = model_type is SupportedModel.FASTWAM_ADAPTIVE
         advantages = micro_batch["advantages"]
-        prev_logprobs = micro_batch["prev_logprobs"]
+        prev_logprobs = micro_batch.get("prev_logprobs")
+        if prev_logprobs is None and not self._allows_absent_action_logprobs():
+            raise KeyError("PPO microbatch requires prev_logprobs.")
         returns = micro_batch.get("returns", None)
         prev_values = micro_batch.get("prev_values", None)
         loss_mask = micro_batch.get("loss_mask", None)

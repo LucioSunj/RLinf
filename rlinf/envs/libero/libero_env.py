@@ -415,10 +415,17 @@ class LiberoEnv(gym.Env):
         env_fns = []
 
         current_type_val = get_libero_type()
+        egl_instantiation_target = self.cfg.get("egl_instantiation_target", None)
+        if egl_instantiation_target is not None:
+            egl_instantiation_target = str(egl_instantiation_target)
 
         for env_fn_param in env_fn_params:
 
-            def env_fn(param=env_fn_param, _type_val=current_type_val):
+            def env_fn(
+                param=env_fn_param,
+                _type_val=current_type_val,
+                _egl_instantiation_target=egl_instantiation_target,
+            ):
                 os.environ["LIBERO_TYPE"] = _type_val
                 seed = param.pop("seed")
 
@@ -458,7 +465,13 @@ class LiberoEnv(gym.Env):
                 else:
                     from libero.libero.envs import OffScreenRenderEnv as WorkerEnv
 
-                env = instantiate_with_isolated_egl(WorkerEnv, param)
+                if _egl_instantiation_target is None:
+                    env = instantiate_with_isolated_egl(WorkerEnv, param)
+                else:
+                    from hydra.utils import get_method
+
+                    instantiate_environment = get_method(_egl_instantiation_target)
+                    env = instantiate_environment(WorkerEnv, param)
                 env._rlinf_action_contract = inspect_libero_action_contract(
                     env
                 ).to_artifact()

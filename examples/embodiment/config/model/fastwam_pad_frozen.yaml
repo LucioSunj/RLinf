@@ -1,0 +1,45 @@
+defaults:
+  - fastwam_adaptive
+  - _self_
+
+# PAD-RV Stage 1: selected only through stable builder/runtime interfaces.
+builder_target: rlinf.models.embodiment.wam_policy.pad_rv.builder.build_pad_frozen_model
+config_validator_target: rlinf.models.embodiment.wam_policy.pad_rv.config.validate_pad_frozen_training_config
+policy_target: rlinf.models.embodiment.wam_policy.pad_rv.policy.PadFrozenPolicy
+# Explicitly erase the inherited adaptive-action adapter config. The merged U
+# artifact is a plain ActionDiT and Stage 1 owns no online action delta.
+uncond_lora: null
+online_uncond_delta_lora: null
+route_action_experts:
+  idm_source: parent_checkpoint
+  uncond_merged_checkpoint: ${oc.env:FASTWAM_MERGED_WARM_U}
+  uncond_merged_checkpoint_sha256: ${oc.env:FASTWAM_MERGED_WARM_U_SHA256}
+  source_lora_sidecar_sha256: ${oc.env:FASTWAM_MERGED_WARM_U_SOURCE_LORA_SHA256}
+
+gate:
+  hidden_dim: 256
+  num_query_tokens: 4
+  share_blocks: false
+  ffn_multiplier: 4
+  denoise_last_n: 1
+  layer_taps:
+    mode: explicit
+    last_n: null
+    indices: [14, 15, 16, 17, 18, 19]
+  current_mode_embedding: false
+  layer_index_embedding: true
+  denoise_timestep_embedding: false
+
+kv_replay:
+  backend: condition
+  gate_kv_sample_budget: null
+
+flow_sde:
+  enabled: false
+  joint_logprob: false
+  denoise_index_sampling: uniform
+  noise_level: 0.0
+  ignore_last_transition: false
+
+runtime:
+  _target_: rlinf.models.embodiment.wam_policy.pad_rv.runtime.PadFrozenLiberoRuntime

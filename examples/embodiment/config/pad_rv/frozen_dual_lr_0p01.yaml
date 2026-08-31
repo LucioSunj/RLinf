@@ -1,0 +1,9 @@
+# @package _global_
+
+defaults:
+  - frozen
+  - _self_
+
+algorithm:
+  prediction_budget:
+    dual_lr: 0.01

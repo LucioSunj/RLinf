@@ -1,0 +1,8 @@
+# @package _global_
+
+defaults:
+  - frozen_dual_lr_0p01
+  - _self_
+
+pad_rv_implementation:
+  trajectory_send_mode: serialized

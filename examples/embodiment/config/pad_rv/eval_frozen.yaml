@@ -1,0 +1,45 @@
+# @package _global_
+
+algorithm:
+  pad_rv:
+    enabled: true
+    stage: gate_only_frozen_pair
+    routing_semantics: current_step
+  loss_type: fastwam_gate_only_ppo
+  prediction_budget:
+    enabled: true
+    controller_target: rlinf.models.embodiment.wam_policy.pad_rv.budget.PadPredictionBudgetController
+    target_idm_fraction: 0.5
+    dual_lr: 0.05
+    proportional_gain: 0.0
+  fixed_branch_cost:
+    fair_cost:
+      enabled: true
+      window_size: 5
+      pi:
+        enabled: false
+        target_idm_fraction: ${algorithm.prediction_budget.target_idm_fraction}
+        integral_gain: ${algorithm.prediction_budget.dual_lr}
+        proportional_gain: ${algorithm.prediction_budget.proportional_gain}
+  uncond_flow_ppo:
+    loss_weight: 0.0
+
+pad_rv_implementation:
+  rollout_worker_target: rlinf.models.embodiment.wam_policy.pad_rv.rollout.PadFrozenRolloutWorker
+  evaluation_runner_target: rlinf.models.embodiment.wam_policy.pad_rv.eval_runner.PadFrozenEvalRunner
+  env_worker_target: rlinf.models.embodiment.wam_policy.pad_rv.env.PadFrozenEnvWorker
+  text_cache_preflight_target: rlinf.models.embodiment.wam_policy.pad_rv.preflight.validate_pad_text_cache_coverage
+  policy_target: rlinf.models.embodiment.wam_policy.pad_rv.policy.PadFrozenPolicy
+  rollout_init_mode: serial_rank
+  trajectory_send_mode: concurrent
+  release_host_memory_after_rollout_init: true
+  release_host_memory_after_trajectory_send: true
+  release_host_memory_after_trajectory_receive: true
+
+env:
+  eval:
+    egl_instantiation_target: rlinf.models.embodiment.wam_policy.pad_rv.egl.instantiate_with_physical_egl
+
+rollout:
+  model:
+    formal_training_sampling_seed: 42

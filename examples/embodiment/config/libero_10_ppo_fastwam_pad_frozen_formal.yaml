@@ -1,0 +1,86 @@
+defaults:
+  - env/libero_10@env.train
+  - env/libero_10@env.eval
+  - model/fastwam_pad_frozen@actor.model
+  - model/fastwam_pad_frozen@rollout.model
+  - hybrid_engines/fsdp@actor.fsdp_config
+  - weight_syncer/patch_syncer@weight_syncer
+  - libero_10_ppo_fastwam_task0_formal_base
+  - pad_rv: frozen
+  - override hydra/job_logging: stdout
+  - _self_
+
+hydra:
+  run:
+    dir: .
+  output_subdir: null
+  searchpath:
+    - file://${oc.env:EMBODIED_PATH}/config/
+
+cluster:
+  num_nodes: 1
+  component_placement:
+    actor: "0-0"
+    env: "1-6"
+    rollout: "1-6"
+
+runner:
+  logger:
+    project_name: pad-rv
+    experiment_name: libero_10_ppo_fastwam_pad_frozen_formal
+  bootstrap_project_checkpoint_dir: null
+  bootstrap_uncond_lora_sidecar: null
+  bootstrap_uncond_lora_sidecar_sha256: null
+
+algorithm:
+  uncond_flow_ppo:
+    loss_weight: 0.0
+  regularization:
+    base_uncond_kl:
+      enabled: false
+      coefficient: 0.0
+      log_metric: false
+
+env:
+  train:
+    total_num_envs: 30
+
+actor:
+  global_batch_size: 210
+  seed: 42
+  model:
+    builder_target: rlinf.models.embodiment.wam_policy.pad_rv.builder.build_pad_frozen_model
+    config_validator_target: rlinf.models.embodiment.wam_policy.pad_rv.config.validate_pad_frozen_training_config
+    policy_target: rlinf.models.embodiment.wam_policy.pad_rv.policy.PadFrozenPolicy
+    uncond_lora: null
+    online_uncond_delta_lora: null
+    runtime:
+      _target_: rlinf.models.embodiment.wam_policy.pad_rv.runtime.PadFrozenLiberoRuntime
+      text_embedding_cache_dir: ${oc.env:FASTWAM_TEXT_CACHE}
+    kv_replay:
+      backend: condition
+      gate_kv_sample_budget: null
+    flow_sde:
+      enabled: false
+      joint_logprob: false
+      noise_level: 0.0
+      ignore_last_transition: false
+
+rollout:
+  model:
+    builder_target: rlinf.models.embodiment.wam_policy.pad_rv.builder.build_pad_frozen_model
+    config_validator_target: rlinf.models.embodiment.wam_policy.pad_rv.config.validate_pad_frozen_training_config
+    policy_target: rlinf.models.embodiment.wam_policy.pad_rv.policy.PadFrozenPolicy
+    uncond_lora: null
+    online_uncond_delta_lora: null
+    runtime:
+      _target_: rlinf.models.embodiment.wam_policy.pad_rv.runtime.PadFrozenLiberoRuntime
+      text_embedding_cache_dir: ${oc.env:FASTWAM_TEXT_CACHE}
+    kv_replay:
+      backend: condition
+      gate_kv_sample_budget: null
+    flow_sde:
+      enabled: false
+      joint_logprob: false
+      noise_level: 0.0
+      ignore_last_transition: false

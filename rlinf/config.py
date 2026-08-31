@@ -844,6 +844,12 @@ def _validate_fastwam_adaptive_cfg(cfg, *, only_eval: bool) -> None:
     model_cfg = cfg.rollout.model if only_eval else cfg.actor.model
     if SupportedModel(model_cfg.model_type) is not SupportedModel.FASTWAM_ADAPTIVE:
         return
+    validator_target = model_cfg.get("config_validator_target", None)
+    if validator_target is not None:
+        from hydra.utils import get_method
+
+        get_method(str(validator_target))(cfg, only_eval=only_eval)
+        return
 
     from rlinf.models.embodiment.wam_policy import (
         _validate_exact_pi05_critic_config,

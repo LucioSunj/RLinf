@@ -1048,7 +1048,7 @@ class EnvWorker(Worker):
             ).lower()
             environment = self.env_list[stage_id]
             if bool(failure_mask.any().item()) and violation_outcome == "fail_episode":
-                failure_audit = build_fastwam_action_failure_audit(
+                failure_audit = self._build_fastwam_training_action_failure_audit(
                     trace=pre_submission_trace,
                     contract=action_contract,
                     route=route_info,
@@ -1083,7 +1083,7 @@ class EnvWorker(Worker):
                 except ValueError as error:
                     if "Refusing to submit Action values outside" not in str(error):
                         raise
-                    failure_audit = build_fastwam_action_failure_audit(
+                    failure_audit = self._build_fastwam_training_action_failure_audit(
                         trace=pre_submission_trace,
                         contract=action_contract,
                         route=route_info,
@@ -2037,6 +2037,64 @@ class EnvWorker(Worker):
                 continue
             channel.put(chunk, async_op=True)
 
+    def _record_fastwam_training_policy_metadata(
+        self,
+        rollout_result: RolloutResult,
+        destination: list[torch.Tensor],
+    ) -> None:
+        """Record policy-specific metadata for the guarded Action audit."""
+
+        denoise_indices = rollout_result.forward_inputs.get("denoise_indices")
+        if denoise_indices is None:
+            raise ValueError(
+                "FastWAM guarded training requires Flow-SDE denoise indices."
+            )
+        destination.append(denoise_indices.detach().cpu())
+
+    def _build_fastwam_training_action_failure_audit(
+        self,
+        **kwargs: Any,
+    ) -> dict[str, Any]:
+        """Build failure provenance for the selected training policy."""
+
+        return build_fastwam_action_failure_audit(
+            **kwargs,
+            require_uncond_denoise_index=True,
+        )
+
+    def _build_fastwam_training_policy_metadata_audit(
+        self,
+        *,
+        streams: list[torch.Tensor],
+        traces: list[ActionExecutionTrace],
+        environment_count: int,
+        global_environment_offset: int,
+    ) -> dict[str, Any]:
+        """Summarize policy-specific metadata for the guarded Action audit."""
+
+        if len(streams) != len(traces):
+            raise RuntimeError("FastWAM denoise-index stream/trace counts disagree.")
+        return {
+            "denoise_index_stream_sha256_by_global_environment": [
+                {
+                    "global_environment_index": (
+                        global_environment_offset + environment_index
+                    ),
+                    "sha256": checkpoint_state_sha256(
+                        [stream.reshape(-1)[environment_index] for stream in streams]
+                    ),
+                }
+                for environment_index in range(environment_count)
+            ],
+            "flow_sde_denoise_indices": summarize_fastwam_flow_sde_denoise_indices(
+                streams,
+                num_inference_steps=int(self.model_cfg.runtime.num_inference_steps),
+                ignore_last_transition=bool(
+                    self.model_cfg.flow_sde.get("ignore_last_transition", False)
+                ),
+            ),
+        }
+
     @Worker.timer("run_interact_once")
     async def _run_interact_once(
         self,
@@ -2196,16 +2254,9 @@ class EnvWorker(Worker):
                                 ),
                             )
                         )
-                        denoise_indices = rollout_result.forward_inputs.get(
-                            "denoise_indices"
-                        )
-                        if denoise_indices is None:
-                            raise ValueError(
-                                "FastWAM guarded training requires Flow-SDE "
-                                "denoise indices."
-                            )
-                        training_flow_sde_denoise_indices[stage_id].append(
-                            denoise_indices.detach().cpu()
+                        self._record_fastwam_training_policy_metadata(
+                            rollout_result,
+                            training_flow_sde_denoise_indices[stage_id],
                         )
                     env_output, env_info, chunk_step_payload = self.env_interact_step(
                         rollout_result.actions,
@@ -2432,11 +2483,15 @@ class EnvWorker(Worker):
                     raise RuntimeError(
                         "FastWAM training Action stream environment counts differ."
                     )
-                denoise_streams = training_flow_sde_denoise_indices[stage_id]
-                if len(denoise_streams) != len(traces):
-                    raise RuntimeError(
-                        "FastWAM denoise-index stream/trace counts disagree."
+                global_environment_offset = stage_id * self.train_num_envs_per_stage
+                policy_metadata_audit = (
+                    self._build_fastwam_training_policy_metadata_audit(
+                        streams=training_flow_sde_denoise_indices[stage_id],
+                        traces=traces,
+                        environment_count=environment_count,
+                        global_environment_offset=global_environment_offset,
                     )
+                )
                 action_failure_audits = training_action_failure_audits[stage_id]
                 failure_event_count = sum(
                     any(not submitted for submitted in mask) for mask in submitted_masks
@@ -2446,7 +2501,6 @@ class EnvWorker(Worker):
                         "FastWAM Action failure audits do not reconcile with "
                         "submission masks."
                     )
-                global_environment_offset = stage_id * self.train_num_envs_per_stage
                 episode_outcomes = training_episode_outcomes[stage_id]
                 successful_first_steps = [
                     int(record["first_success_step"])
@@ -2536,33 +2590,7 @@ class EnvWorker(Worker):
                         }
                         for environment_index in range(environment_count)
                     ],
-                    "denoise_index_stream_sha256_by_global_environment": [
-                        {
-                            "global_environment_index": (
-                                global_environment_offset + environment_index
-                            ),
-                            "sha256": checkpoint_state_sha256(
-                                [
-                                    stream.reshape(-1)[environment_index]
-                                    for stream in denoise_streams
-                                ]
-                            ),
-                        }
-                        for environment_index in range(environment_count)
-                    ],
-                    "flow_sde_denoise_indices": (
-                        summarize_fastwam_flow_sde_denoise_indices(
-                            training_flow_sde_denoise_indices[stage_id],
-                            num_inference_steps=int(
-                                self.model_cfg.runtime.num_inference_steps
-                            ),
-                            ignore_last_transition=bool(
-                                self.model_cfg.flow_sde.get(
-                                    "ignore_last_transition", False
-                                )
-                            ),
-                        )
-                    ),
+                    **policy_metadata_audit,
                     "records": [
                         merged_trace.record_for_batch_index(index)
                         for index in range(merged_trace.batch_size)

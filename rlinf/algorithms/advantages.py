@@ -13,7 +13,7 @@
 # limitations under the License.
 
 import math
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from typing import Any, Optional
 
@@ -1596,13 +1596,17 @@ def summarize_fastwam_counterfactual_costs(
     gae_lambda: float,
     rollout_epoch: int,
     carry_pending_across_epochs: bool,
+    normalization_std_floor: float = 0.0,
+    alignment_fn: Callable[..., FastWAMPolicyAlignment] | None = None,
 ) -> FastWAMCounterfactualCostAudit:
     """Evaluate several IDM costs on one immutable rollout batch.
 
-    This diagnostic deliberately recomputes GAE and delayed Gate alignment
-    without autograd or optimizer work. The production rollout tensors are
-    never mutated, so every candidate observes identical rewards, values,
-    routes, dones, masks, and behavior-policy decisions.
+    This diagnostic deliberately recomputes GAE and Gate alignment without
+    autograd or optimizer work. The production rollout tensors are never
+    mutated, so every candidate observes identical rewards, values, routes,
+    dones, masks, and behavior-policy decisions. Legacy callers retain delayed
+    alignment; config-selected actor subclasses may supply their route-contract
+    alignment and configured normalization floor through the optional hooks.
     """
 
     normalized_costs = tuple(float(item) for item in idm_costs)
@@ -1641,6 +1645,7 @@ def summarize_fastwam_counterfactual_costs(
     )
     gae_dones = dones.reshape(*dones.shape[:2], -1).any(dim=-1)
     gae_values = values[..., 0]
+    align = alignment_fn or align_fastwam_policy_advantages
     results: list[
         tuple[
             float,
@@ -1675,8 +1680,9 @@ def summarize_fastwam_counterfactual_costs(
                 normalize_advantages=True,
                 loss_mask=chunk_mask,
                 dones=gae_dones,
+                normalization_std_floor=normalization_std_floor,
             )
-            unnormalized_alignment = align_fastwam_policy_advantages(
+            unnormalized_alignment = align(
                 advantages=unnormalized.unsqueeze(-1),
                 route=route,
                 emitted=emitted,
@@ -1685,7 +1691,7 @@ def summarize_fastwam_counterfactual_costs(
                 carry_pending_across_epochs=carry_pending_across_epochs,
                 loss_mask=valid_mask,
             )
-            normalized_alignment = align_fastwam_policy_advantages(
+            normalized_alignment = align(
                 advantages=normalized.unsqueeze(-1),
                 route=route,
                 emitted=emitted,
