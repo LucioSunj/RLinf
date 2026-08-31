@@ -1165,6 +1165,11 @@ def _validate_fastwam_adaptive_cfg(cfg, *, only_eval: bool) -> None:
                 "exclusive."
             )
     cost_audit = training_guard.get("cost_audit", {})
+    from rlinf.runners.fastwam_idm_cost_control import (
+        validate_fastwam_idm_cost_control_config,
+    )
+
+    validate_fastwam_idm_cost_control_config(cfg)
     if bool(cost_audit.get("enabled", False)):
         if not bool(training_guard.get("enabled", False)):
             raise ValueError("FastWAM cost audit requires the scientific guard.")
@@ -1183,10 +1188,12 @@ def _validate_fastwam_adaptive_cfg(cfg, *, only_eval: bool) -> None:
                 "FastWAM counterfactual IDM costs must be unique, sorted, "
                 "finite, and begin at zero."
             )
-        configured_cost = float(
-            cfg.algorithm.get("fixed_branch_cost", {}).get("idm_cost", 0.0)
-        )
-        if configured_cost not in candidates:
+        branch_cost_for_audit = cfg.algorithm.get("fixed_branch_cost", {})
+        configured_cost = float(branch_cost_for_audit.get("idm_cost", 0.0))
+        if (
+            branch_cost_for_audit.get("controller") is None
+            and configured_cost not in candidates
+        ):
             raise ValueError(
                 "FastWAM configured IDM cost must appear in the counterfactual grid."
             )

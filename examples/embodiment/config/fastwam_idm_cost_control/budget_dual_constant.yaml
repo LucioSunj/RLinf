@@ -1,0 +1,33 @@
+# @package _global_
+
+runner:
+  use_training_pipeline: false
+  weight_sync_interval: 1
+  fastwam_training_guard:
+    enabled: true
+
+algorithm:
+  fixed_branch_cost:
+    enabled: true
+    fair_cost:
+      enabled: false
+    controller:
+      type: budget_dual
+      constraint: upper_bound
+      rate:
+        scope: eligible_gate_decisions
+        feedback: expected_behavior_probability
+        target_idm_fraction: 0.5
+      charge_scope: eligible_nonforced_idm
+      initializer:
+        type: constant
+        idm_cost: 0.005
+      dual:
+        # Engineering smoke defaults only; formal gains remain uncalibrated.
+        learning_rate: 0.0025
+        ema_beta: 0.8
+        deadband: 0.02
+        update_interval: 1
+        min_idm_cost: 0.0
+        max_idm_cost: 0.1
+        max_delta_per_update: 0.005

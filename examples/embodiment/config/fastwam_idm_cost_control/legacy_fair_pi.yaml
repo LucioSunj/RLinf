@@ -1,0 +1,24 @@
+# @package _global_
+
+runner:
+  use_training_pipeline: false
+  weight_sync_interval: 1
+  fastwam_training_guard:
+    enabled: true
+    cost_audit:
+      enabled: true
+      break_even_guard_enabled: false
+      counterfactual_idm_costs: [0.0, 0.015]
+
+algorithm:
+  fixed_branch_cost:
+    enabled: true
+    fair_cost:
+      enabled: false
+    controller:
+      type: legacy_fair_pi
+      charge_scope: all_valid_idm
+      window_size: 5
+      target_idm_fraction: 0.5
+      integral_gain: 0.05
+      proportional_gain: 0.6

@@ -2130,7 +2130,11 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
     def _fastwam_effective_idm_cost(self, cost_cfg: Any) -> float:
         configured = float(cost_cfg.get("idm_cost", 0.0))
         fair_cost = cost_cfg.get("fair_cost", {})
-        if not bool(fair_cost.get("enabled", False)):
+        runtime_control_enabled = (
+            cost_cfg.get("controller") is not None
+            or bool(fair_cost.get("enabled", False))
+        )
+        if not runtime_control_enabled:
             return configured
         runtime_step = getattr(self, "_fastwam_runtime_idm_cost_step", None)
         if runtime_step != int(self.version):
@@ -2144,6 +2148,35 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
                 "FastWAM runtime IDM cost must be finite and non-negative."
             )
         return runtime_cost
+
+    @staticmethod
+    def _fastwam_charge_scope(cost_cfg: Any) -> str:
+        controller = cost_cfg.get("controller")
+        if controller is None:
+            return "all_valid_idm"
+        return str(controller.get("charge_scope", "all_valid_idm")).lower()
+
+    @staticmethod
+    def _fastwam_charge_mask(
+        *,
+        charge_scope: str,
+        route: Any,
+        valid_mask: torch.Tensor | None,
+    ) -> torch.Tensor | None:
+        if charge_scope == "all_valid_idm":
+            return None
+        if charge_scope != "eligible_nonforced_idm":
+            raise ValueError(f"Unsupported FastWAM charge scope {charge_scope!r}.")
+        if valid_mask is None:
+            valid_chunks = torch.ones_like(
+                route.route_was_forced,
+                dtype=torch.bool,
+            )
+        elif valid_mask.ndim == route.route_was_forced.ndim:
+            valid_chunks = valid_mask
+        else:
+            valid_chunks = valid_mask.reshape(*route.shape, -1).any(dim=-1)
+        return valid_chunks & ~route.route_was_forced
 
     @Worker.timer("actor/compute_adv")
     def compute_advantages_and_returns(self) -> dict[str, torch.Tensor]:
@@ -2200,6 +2233,12 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
                     reward_audit.require_success_signal()
             cost_cfg = self.cfg.algorithm.get("fixed_branch_cost", {})
             configured_idm_cost = self._fastwam_effective_idm_cost(cost_cfg)
+            charge_scope = self._fastwam_charge_scope(cost_cfg)
+            charge_mask = self._fastwam_charge_mask(
+                charge_scope=charge_scope,
+                route=self.rollout_batch["route_info"],
+                valid_mask=self.rollout_batch.get("loss_mask", None),
+            )
             if bool(cost_cfg.get("enabled", False)):
                 if "fastwam_branch_costs" in self.rollout_batch:
                     raise RuntimeError("FastWAM branch cost was already applied.")
@@ -2209,6 +2248,7 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
                     idm_cost=configured_idm_cost,
                     uncond_cost=float(cost_cfg.get("uncond_cost", 0.0)),
                     valid_mask=self.rollout_batch.get("loss_mask", None),
+                    charge_mask=charge_mask,
                 )
                 self.rollout_batch["rewards"] = cost_result.rewards
                 self.rollout_batch["fastwam_branch_costs"] = cost_result.costs
@@ -2220,6 +2260,8 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
                         idm_cost=configured_idm_cost,
                         uncond_cost=float(cost_cfg.get("uncond_cost", 0.0)),
                         valid_mask=self.rollout_batch.get("loss_mask", None),
+                        charge_mask=charge_mask,
+                        charge_scope=charge_scope,
                     )
                     print(
                         f"{FASTWAM_CHUNK_COST_AUDIT_SENTINEL} "
@@ -2357,7 +2399,10 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
                     float(item)
                     for item in cost_audit_cfg.get("counterfactual_idm_costs", [])
                 ]
-                if bool(cost_cfg.get("fair_cost", {}).get("enabled", False)):
+                if (
+                    cost_cfg.get("controller") is not None
+                    or bool(cost_cfg.get("fair_cost", {}).get("enabled", False))
+                ):
                     counterfactual_idm_costs.append(configured_idm_cost)
                 counterfactual_cost_audit = summarize_fastwam_counterfactual_costs(
                     environment_rewards=raw_environment_rewards,
@@ -2366,6 +2411,7 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
                     dones=self.rollout_batch["dones"],
                     values=self.rollout_batch["prev_values"],
                     valid_mask=self.rollout_batch.get("loss_mask", None),
+                    charge_mask=charge_mask,
                     idm_costs=tuple(sorted(set(counterfactual_idm_costs))),
                     configured_idm_cost=configured_idm_cost,
                     configured_gate_advantages=alignment.gate_advantages,
@@ -4328,10 +4374,14 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
         ):
             raise ValueError("Runtime IDM cost is specific to fastwam_adaptive.")
         branch_cost = self.cfg.algorithm.get("fixed_branch_cost", {})
-        if not bool(branch_cost.get("enabled", False)) or not bool(
-            branch_cost.get("fair_cost", {}).get("enabled", False)
-        ):
-            raise ValueError("Runtime IDM cost requires enabled fair-cost shaping.")
+        runtime_control_enabled = (
+            branch_cost.get("controller") is not None
+            or bool(branch_cost.get("fair_cost", {}).get("enabled", False))
+        )
+        if not bool(branch_cost.get("enabled", False)) or not runtime_control_enabled:
+            raise ValueError(
+                "Runtime IDM cost requires enabled FastWAM IDM cost control."
+            )
         if int(runner_step) != int(self.version):
             raise ValueError(
                 "Runtime IDM cost step does not match the actor version: "

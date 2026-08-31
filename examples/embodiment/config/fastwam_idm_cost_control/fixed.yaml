@@ -1,0 +1,10 @@
+# @package _global_
+
+algorithm:
+  fixed_branch_cost:
+    enabled: true
+    fair_cost:
+      enabled: false
+    controller:
+      type: fixed
+      charge_scope: all_valid_idm

@@ -281,24 +281,55 @@ class FastWAMTrainingGuard:
         metrics = self._aggregate(
             metrics_list,
             self._ROLLOUT_KEYS,
-            summed=frozenset(self._ROLLOUT_KEYS[:2]),
+            summed=frozenset(
+                (
+                    *self._ROLLOUT_KEYS[:2],
+                    "fastwam/eligible_gate_decision_count",
+                    "fastwam/eligible_idm_decision_count",
+                    "fastwam/valid_uncond_chunk_count",
+                )
+            ),
         )
         successes = int(metrics[self._ROLLOUT_KEYS[0]])
-        idm_fraction = metrics[self._ROLLOUT_KEYS[2]]
         eligible_count = int(metrics[self._ROLLOUT_KEYS[3]])
         eligible_idm_count = int(metrics[self._ROLLOUT_KEYS[4]])
         uncond_count = int(metrics[self._ROLLOUT_KEYS[5]])
         if successes < 0:
             raise ValueError("FastWAM success count must be non-negative.")
-        if not 0.0 <= idm_fraction <= 1.0:
-            raise ValueError("FastWAM eligible IDM fraction must lie in [0, 1].")
         if eligible_count < 1 or not 0 <= eligible_idm_count <= eligible_count:
             raise ValueError("FastWAM eligible Gate/IDM counts are invalid.")
         if uncond_count < 0:
             raise ValueError("FastWAM valid UNCOND count is negative.")
-        expected_fraction = eligible_idm_count / eligible_count
-        if not math.isclose(idm_fraction, expected_fraction, abs_tol=1e-12):
-            raise ValueError("FastWAM eligible IDM count/fraction do not reconcile.")
+        idm_fraction = eligible_idm_count / eligible_count
+        for worker, worker_metrics in enumerate(metrics_list):
+            local_count = _finite_float(
+                worker_metrics["fastwam/eligible_gate_decision_count"],
+                name=f"worker {worker} eligible Gate count",
+            )
+            local_idm_count = _finite_float(
+                worker_metrics["fastwam/eligible_idm_decision_count"],
+                name=f"worker {worker} eligible IDM count",
+            )
+            local_fraction = _finite_float(
+                worker_metrics["fastwam/eligible_idm_fraction"],
+                name=f"worker {worker} eligible IDM fraction",
+            )
+            if (
+                not local_count.is_integer()
+                or not local_idm_count.is_integer()
+                or local_count < 1
+                or not 0 <= local_idm_count <= local_count
+                or not math.isclose(
+                    local_fraction,
+                    local_idm_count / local_count,
+                    rel_tol=0.0,
+                    abs_tol=1.0e-12,
+                )
+            ):
+                raise ValueError(
+                    "FastWAM worker eligible IDM count/fraction values do not "
+                    "reconcile."
+                )
         if successes:
             self._consecutive_zero_success_batches = 0
         else:
@@ -404,6 +435,32 @@ class FastWAMTrainingGuard:
                 f"{self._consecutive_zero_success_batches} consecutive "
                 "zero sparse-success rollout batches."
             )
+        route_count_keys = {
+            "valid_chunk_count": "fastwam/route/valid_chunk_count",
+            "valid_idm_chunk_count": "fastwam/route/valid_idm_chunk_count",
+            "forced_route_count": "fastwam/route/forced_count",
+        }
+        route_counts: dict[str, int] = {}
+        present = {
+            source: [source in worker for worker in metrics_list]
+            for source in route_count_keys.values()
+        }
+        if any(any(values) and not all(values) for values in present.values()):
+            raise ValueError(
+                "FastWAM route count metrics are present for only some workers."
+            )
+        for destination, source in route_count_keys.items():
+            if all(present[source]):
+                values = [
+                    _finite_float(
+                        worker[source],
+                        name=f"FastWAM route count {source}",
+                    )
+                    for worker in metrics_list
+                ]
+                if any(value < 0 or not value.is_integer() for value in values):
+                    raise ValueError("FastWAM route count metrics are invalid.")
+                route_counts[destination] = int(sum(values))
         return {
             "status": "PASS",
             "positive_success_signal_count": successes,
@@ -419,6 +476,7 @@ class FastWAMTrainingGuard:
             "consecutive_break_even_below_cost": (
                 self._consecutive_break_even_below_cost
             ),
+            **route_counts,
             "break_even_route_window": break_even_route_window,
             "break_even_route_monotonic_decline": (break_even_route_monotonic_decline),
         }

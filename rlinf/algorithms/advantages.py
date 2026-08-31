@@ -154,6 +154,9 @@ class FastWAMChunkCostAudit:
     valid_idm_chunk_count: int
     forced_idm_chunk_count: int
     eligible_idm_chunk_count: int
+    charge_scope: str
+    charged_idm_chunk_count: int
+    uncharged_forced_idm_chunk_count: int
     valid_uncond_chunk_count: int
     expected_cost_sum: float
     raw_primitive_rewards: FastWAMScalarAudit
@@ -175,6 +178,11 @@ class FastWAMChunkCostAudit:
             "valid_idm_chunk_count": self.valid_idm_chunk_count,
             "forced_idm_chunk_count": self.forced_idm_chunk_count,
             "eligible_idm_chunk_count": self.eligible_idm_chunk_count,
+            "charge_scope": self.charge_scope,
+            "charged_idm_chunk_count": self.charged_idm_chunk_count,
+            "uncharged_forced_idm_chunk_count": (
+                self.uncharged_forced_idm_chunk_count
+            ),
             "valid_uncond_chunk_count": self.valid_uncond_chunk_count,
             "expected_cost_sum": self.expected_cost_sum,
             "raw_primitive_rewards": self.raw_primitive_rewards.to_artifact(),
@@ -199,6 +207,12 @@ class FastWAMChunkCostAudit:
             "fastwam/cost/forced_idm_chunk_count": float(self.forced_idm_chunk_count),
             "fastwam/cost/eligible_idm_chunk_count": float(
                 self.eligible_idm_chunk_count
+            ),
+            "fastwam/cost/charged_idm_chunk_count": float(
+                self.charged_idm_chunk_count
+            ),
+            "fastwam/cost/uncharged_forced_idm_chunk_count": float(
+                self.uncharged_forced_idm_chunk_count
             ),
             # Preserve the established flat tags used by training guards and
             # historical validators while adding grouped TensorBoard views.
@@ -822,6 +836,8 @@ def summarize_fastwam_chunk_cost(
     idm_cost: float,
     uncond_cost: float = 0.0,
     valid_mask: torch.Tensor | None = None,
+    charge_mask: torch.Tensor | None = None,
+    charge_scope: str = "all_valid_idm",
 ) -> FastWAMChunkCostAudit:
     """Audit the exact production reward aggregation and route cost."""
 
@@ -855,6 +871,18 @@ def summarize_fastwam_chunk_cost(
         name="valid_mask",
         device=environment_rewards.device,
     )
+    charged_chunk_mask = (
+        chunk_mask
+        if charge_mask is None
+        else _chunk_mask(
+            charge_mask,
+            shape=route.shape,
+            name="charge_mask",
+            device=environment_rewards.device,
+        )
+    )
+    if bool((charged_chunk_mask & ~chunk_mask).any().item()):
+        raise ValueError("charge_mask must be a subset of valid_mask.")
     primitive_mask = _primitive_reward_mask(
         valid_mask,
         reward_shape=environment_rewards.shape,
@@ -864,12 +892,15 @@ def summarize_fastwam_chunk_cost(
     uncond_mask = chunk_mask & (route.route_used == int(WAMRoute.UNCOND))
     forced_idm_mask = idm_mask & route.route_was_forced
     eligible_idm_mask = idm_mask & ~route.route_was_forced
+    charged_idm_mask = idm_mask & charged_chunk_mask
+    charged_uncond_mask = uncond_mask & charged_chunk_mask
+    uncharged_forced_idm_mask = forced_idm_mask & ~charged_chunk_mask
     aggregated = environment_rewards.sum(dim=-1, keepdim=True)
     identity_error = (cost_result.rewards - (aggregated - cost_result.costs)).abs()
     identity_max = float(identity_error.max().item()) if identity_error.numel() else 0.0
     expected_cost_sum = (
-        float(idm_mask.sum().item()) * idm_cost
-        + float(uncond_mask.sum().item()) * uncond_cost
+        float(charged_idm_mask.sum().item()) * idm_cost
+        + float(charged_uncond_mask.sum().item()) * uncond_cost
     )
 
     return FastWAMChunkCostAudit(
@@ -881,6 +912,11 @@ def summarize_fastwam_chunk_cost(
         valid_idm_chunk_count=int(idm_mask.sum().item()),
         forced_idm_chunk_count=int(forced_idm_mask.sum().item()),
         eligible_idm_chunk_count=int(eligible_idm_mask.sum().item()),
+        charge_scope=str(charge_scope),
+        charged_idm_chunk_count=int(charged_idm_mask.sum().item()),
+        uncharged_forced_idm_chunk_count=int(
+            uncharged_forced_idm_mask.sum().item()
+        ),
         valid_uncond_chunk_count=int(uncond_mask.sum().item()),
         expected_cost_sum=expected_cost_sum,
         raw_primitive_rewards=_summarize_selected_scalars(
@@ -1177,6 +1213,7 @@ def apply_fastwam_chunk_cost(
     idm_cost: float,
     uncond_cost: float = 0.0,
     valid_mask: torch.Tensor | None = None,
+    charge_mask: torch.Tensor | None = None,
 ) -> FastWAMChunkCost:
     """Aggregate primitive rewards, then subtract one actual-route cost.
 
@@ -1220,11 +1257,27 @@ def apply_fastwam_chunk_cost(
         torch.as_tensor(idm_cost, dtype=rewards.dtype, device=rewards.device),
         torch.as_tensor(uncond_cost, dtype=rewards.dtype, device=rewards.device),
     ).unsqueeze(-1)
-    if valid_mask is not None:
+    valid_chunk_mask = _chunk_mask(
+        valid_mask,
+        shape=route_used.shape,
+        name="valid_mask",
+        device=rewards.device,
+    )
+    charged_chunk_mask = (
+        valid_chunk_mask
+        if charge_mask is None
+        else _chunk_mask(
+            charge_mask,
+            shape=route_used.shape,
+            name="charge_mask",
+            device=rewards.device,
+        )
+    )
+    if bool((charged_chunk_mask & ~valid_chunk_mask).any().item()):
+        raise ValueError("charge_mask must be a subset of valid_mask.")
+    if valid_mask is not None or charge_mask is not None:
         costs = torch.where(
-            _chunk_mask(
-                valid_mask, shape=route_used.shape, name="valid_mask"
-            ).unsqueeze(-1),
+            charged_chunk_mask.unsqueeze(-1),
             costs,
             torch.zeros_like(costs),
         )
@@ -1589,6 +1642,7 @@ def summarize_fastwam_counterfactual_costs(
     dones: torch.Tensor,
     values: torch.Tensor,
     valid_mask: torch.Tensor | None,
+    charge_mask: torch.Tensor | None = None,
     idm_costs: Sequence[float],
     configured_idm_cost: float,
     configured_gate_advantages: torch.Tensor,
@@ -1657,6 +1711,7 @@ def summarize_fastwam_counterfactual_costs(
                 idm_cost=idm_cost,
                 uncond_cost=0.0,
                 valid_mask=valid_mask,
+                charge_mask=charge_mask,
             )
             unnormalized, _ = compute_gae_advantages_and_returns(
                 rewards=cost_result.rewards[..., 0],
