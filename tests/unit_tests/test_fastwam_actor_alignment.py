@@ -274,6 +274,97 @@ def test_chunk_cost_audit_reconciles_forced_eligible_and_padded_routes():
     json.dumps(artifact, sort_keys=True)
 
 
+def test_scoped_chunk_cost_excludes_forced_idm_and_preserves_legacy_default():
+    routes = torch.tensor(
+        [
+            [WAMRoute.IDM, WAMRoute.IDM, WAMRoute.UNCOND],
+            [WAMRoute.IDM, WAMRoute.UNCOND, WAMRoute.IDM],
+        ],
+        dtype=torch.long,
+    )
+    forced = torch.tensor(
+        [[True, False, False], [True, False, False]], dtype=torch.bool
+    )
+    valid = torch.tensor(
+        [[[True], [True], [True]], [[False], [True], [True]]],
+        dtype=torch.bool,
+    )
+    rewards = torch.arange(12, dtype=torch.float32).reshape(2, 3, 2)
+    valid_chunks = valid[..., 0]
+    eligible_charge = valid_chunks & ~forced
+
+    legacy = advantages.apply_fastwam_chunk_cost(
+        environment_rewards=rewards,
+        route_used=routes,
+        idm_cost=0.25,
+        valid_mask=valid,
+    )
+    explicit_legacy = advantages.apply_fastwam_chunk_cost(
+        environment_rewards=rewards,
+        route_used=routes,
+        idm_cost=0.25,
+        valid_mask=valid,
+        charge_mask=valid,
+    )
+    assert torch.equal(legacy.rewards, explicit_legacy.rewards)
+    assert torch.equal(legacy.costs, explicit_legacy.costs)
+
+    scoped = advantages.apply_fastwam_chunk_cost(
+        environment_rewards=rewards,
+        route_used=routes,
+        idm_cost=0.25,
+        valid_mask=valid,
+        charge_mask=eligible_charge,
+    )
+    assert torch.equal(
+        scoped.costs[..., 0],
+        torch.tensor([[0.0, 0.25, 0.0], [0.0, 0.0, 0.25]]),
+    )
+    assert float(scoped.costs.max()) == pytest.approx(0.25)
+
+    source_ids = torch.arange(6).reshape(2, 3)
+    source_ids[forced] = -1
+    route = ChunkRouteRecord(
+        route_used=routes,
+        route_was_forced=forced,
+        chunk_ids=torch.arange(6).reshape(2, 3),
+        episode_ids=torch.ones_like(routes),
+        route_source_chunk_ids=source_ids,
+        actor_versions=torch.zeros_like(routes),
+    )
+    audit = advantages.summarize_fastwam_chunk_cost(
+        environment_rewards=rewards,
+        route=route,
+        cost_result=scoped,
+        idm_cost=0.25,
+        valid_mask=valid,
+        charge_mask=eligible_charge,
+        charge_scope="eligible_nonforced_idm",
+    )
+    artifact = audit.to_artifact()
+    assert artifact["charge_scope"] == "eligible_nonforced_idm"
+    assert artifact["charged_idm_chunk_count"] == 2
+    assert artifact["uncharged_forced_idm_chunk_count"] == 1
+    assert artifact["expected_cost_sum"] == pytest.approx(0.5)
+    assert artifact["actual_branch_costs"]["sum"] == pytest.approx(0.5)
+
+
+def test_chunk_charge_mask_must_be_subset_of_valid_mask():
+    rewards = torch.zeros(1, 2, 1)
+    routes = torch.tensor([[WAMRoute.IDM, WAMRoute.UNCOND]], dtype=torch.long)
+    valid = torch.tensor([[[False], [True]]])
+    charge = torch.tensor([[True, False]])
+
+    with pytest.raises(ValueError, match="subset of valid_mask"):
+        advantages.apply_fastwam_chunk_cost(
+            environment_rewards=rewards,
+            route_used=routes,
+            idm_cost=0.1,
+            valid_mask=valid,
+            charge_mask=charge,
+        )
+
+
 def _counterfactual_records():
     routes = torch.tensor(
         [
