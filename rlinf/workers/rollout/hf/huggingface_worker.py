@@ -189,6 +189,51 @@ class MultiStepRolloutWorker(Worker):
         self.rollout_queue_size = self.cfg.rollout.get("rollout_queue_size", 0)
         self._fastwam_kv_store = None
 
+    def _load_fastwam_eval_checkpoint_payload(
+        self,
+        rollout_model_config: DictConfig,
+    ) -> dict[str, Any]:
+        """Load and validate the default adaptive FastWAM eval checkpoint."""
+
+        from rlinf.models.embodiment.wam_policy import (
+            resolve_fastwam_adaptive_eval_checkpoint,
+        )
+
+        checkpoint_path = resolve_fastwam_adaptive_eval_checkpoint(
+            self.cfg.runner.ckpt_path,
+            rank=self._rank,
+        )
+        payload = torch.load(
+            checkpoint_path,
+            map_location="cpu",
+            weights_only=False,
+        )
+        validate_fastwam_eval_checkpoint_contract(
+            payload,
+            rollout_model_config,
+            expected_parent_checkpoint_sha256=str(
+                self.model_cfg.actor_checkpoint_sha256
+            ),
+            load_critic=bool(rollout_model_config.critic.get("load_for_eval", False)),
+        )
+        return payload
+
+    def _restore_fastwam_eval_checkpoint_payload(
+        self,
+        payload: dict[str, Any],
+    ) -> int:
+        """Restore the default adaptive FastWAM policy payload."""
+
+        return self.hf_model.load_eval_checkpoint(
+            payload,
+            expected_parent_checkpoint_sha256=str(
+                self.model_cfg.actor_checkpoint_sha256
+            ),
+            expected_critic_parent_checkpoint_sha256=(
+                critic_parent_checkpoint_sha256(self.model_cfg.critic)
+            ),
+        )
+
     def init_worker(self):
         rollout_model_config = copy.deepcopy(self.model_cfg)
         with open_dict(rollout_model_config):
@@ -199,42 +244,16 @@ class MultiStepRolloutWorker(Worker):
         if self.cfg.runner.get("ckpt_path", None) and (
             SupportedModel(self.model_cfg.model_type) is SupportedModel.FASTWAM_ADAPTIVE
         ):
-            from rlinf.models.embodiment.wam_policy import (
-                resolve_fastwam_adaptive_eval_checkpoint,
-            )
-
-            checkpoint_path = resolve_fastwam_adaptive_eval_checkpoint(
-                self.cfg.runner.ckpt_path,
-                rank=self._rank,
-            )
-            fastwam_eval_payload = torch.load(
-                checkpoint_path,
-                map_location="cpu",
-                weights_only=False,
-            )
-            validate_fastwam_eval_checkpoint_contract(
-                fastwam_eval_payload,
-                rollout_model_config,
-                expected_parent_checkpoint_sha256=str(
-                    self.model_cfg.actor_checkpoint_sha256
-                ),
-                load_critic=bool(
-                    rollout_model_config.critic.get("load_for_eval", False)
-                ),
+            fastwam_eval_payload = self._load_fastwam_eval_checkpoint_payload(
+                rollout_model_config
             )
 
         self.hf_model: BasePolicy = get_model(rollout_model_config)
 
         if self.cfg.runner.get("ckpt_path", None):
             if fastwam_eval_payload is not None:
-                self.version = self.hf_model.load_eval_checkpoint(
-                    fastwam_eval_payload,
-                    expected_parent_checkpoint_sha256=str(
-                        self.model_cfg.actor_checkpoint_sha256
-                    ),
-                    expected_critic_parent_checkpoint_sha256=(
-                        critic_parent_checkpoint_sha256(self.model_cfg.critic)
-                    ),
+                self.version = self._restore_fastwam_eval_checkpoint_payload(
+                    fastwam_eval_payload
                 )
                 if not self.only_eval:
                     self._restore_fastwam_step0_training_runtime(fastwam_eval_payload)
