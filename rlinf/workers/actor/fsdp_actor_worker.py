@@ -2134,25 +2134,35 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
         return rollout_batch
 
     def _fastwam_effective_idm_cost(self, cost_cfg: Any) -> float:
+        """Return the effective IDM cost through the legacy scalar interface."""
+
+        return self._fastwam_effective_branch_costs(cost_cfg)[0]
+
+    def _fastwam_effective_branch_costs(self, cost_cfg: Any) -> tuple[float, float]:
+        """Return runner-published branch costs or unchanged configured values."""
+
         configured = float(cost_cfg.get("idm_cost", 0.0))
+        configured_uncond = float(cost_cfg.get("uncond_cost", 0.0))
         fair_cost = cost_cfg.get("fair_cost", {})
         runtime_control_enabled = cost_cfg.get("controller") is not None or bool(
             fair_cost.get("enabled", False)
         )
         if not runtime_control_enabled:
-            return configured
-        runtime_step = getattr(self, "_fastwam_runtime_idm_cost_step", None)
+            return configured, configured_uncond
+        runtime_step = getattr(self, "_fastwam_runtime_branch_cost_step", None)
         if runtime_step != int(self.version):
             raise RuntimeError(
-                "FastWAM fair IDM cost was not published for the current runner "
+                "FastWAM branch costs were not published for the current runner "
                 f"step {self.version}."
             )
         runtime_cost = float(getattr(self, "_fastwam_runtime_idm_cost", math.nan))
-        if not math.isfinite(runtime_cost) or runtime_cost < 0.0:
-            raise ValueError(
-                "FastWAM runtime IDM cost must be finite and non-negative."
-            )
-        return runtime_cost
+        runtime_uncond = float(getattr(self, "_fastwam_runtime_uncond_cost", math.nan))
+        if any(
+            not math.isfinite(cost) or cost < 0.0
+            for cost in (runtime_cost, runtime_uncond)
+        ):
+            raise ValueError("FastWAM runtime branch costs must be non-negative.")
+        return runtime_cost, runtime_uncond
 
     @staticmethod
     def _fastwam_charge_scope(cost_cfg: Any) -> str:
@@ -2170,7 +2180,7 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
     ) -> torch.Tensor | None:
         if charge_scope == "all_valid_idm":
             return None
-        if charge_scope != "eligible_nonforced_idm":
+        if charge_scope not in {"eligible_nonforced_idm", "eligible_nonforced"}:
             raise ValueError(f"Unsupported FastWAM charge scope {charge_scope!r}.")
         if valid_mask is None:
             valid_chunks = torch.ones_like(
@@ -2252,7 +2262,9 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
                 if short_canary_guard:
                     reward_audit.require_success_signal()
             cost_cfg = self.cfg.algorithm.get("fixed_branch_cost", {})
-            configured_idm_cost = self._fastwam_effective_idm_cost(cost_cfg)
+            configured_idm_cost, configured_uncond_cost = (
+                self._fastwam_effective_branch_costs(cost_cfg)
+            )
             charge_scope = self._fastwam_charge_scope(cost_cfg)
             charge_mask = self._fastwam_charge_mask(
                 charge_scope=charge_scope,
@@ -2266,7 +2278,7 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
                     environment_rewards=raw_environment_rewards,
                     route_used=self.rollout_batch["route_info"].route_used,
                     idm_cost=configured_idm_cost,
-                    uncond_cost=float(cost_cfg.get("uncond_cost", 0.0)),
+                    uncond_cost=configured_uncond_cost,
                     valid_mask=self.rollout_batch.get("loss_mask", None),
                     charge_mask=charge_mask,
                 )
@@ -2278,7 +2290,7 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
                         route=self.rollout_batch["route_info"],
                         cost_result=cost_result,
                         idm_cost=configured_idm_cost,
-                        uncond_cost=float(cost_cfg.get("uncond_cost", 0.0)),
+                        uncond_cost=configured_uncond_cost,
                         valid_mask=self.rollout_batch.get("loss_mask", None),
                         charge_mask=charge_mask,
                         charge_scope=charge_scope,
@@ -2434,6 +2446,7 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
                         charge_mask=charge_mask,
                         idm_costs=tuple(sorted(set(counterfactual_idm_costs))),
                         configured_idm_cost=configured_idm_cost,
+                        uncond_cost=configured_uncond_cost,
                         configured_gate_advantages=alignment.gate_advantages,
                         gamma=float(self.cfg.algorithm.get("gamma", 1.0)),
                         gae_lambda=float(self.cfg.algorithm.get("gae_lambda", 1.0)),
@@ -4405,7 +4418,26 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
         idm_cost: float,
         runner_step: int,
     ) -> dict[str, float]:
-        """Publish the runner's lagged fair cost before advantage computation."""
+        """Publish an IDM cost while retaining the configured UNCOND cost."""
+
+        branch_cost = self.cfg.algorithm.get("fixed_branch_cost", {})
+        published = self.set_fastwam_branch_costs(
+            idm_cost,
+            float(branch_cost.get("uncond_cost", 0.0)),
+            runner_step,
+        )
+        return {
+            "runner_step": published["runner_step"],
+            "idm_cost": published["idm_cost"],
+        }
+
+    def set_fastwam_branch_costs(
+        self,
+        idm_cost: float,
+        uncond_cost: float,
+        runner_step: int,
+    ) -> dict[str, float]:
+        """Publish lagged, non-negative IDM and UNCOND costs for one step."""
 
         if (
             SupportedModel(self.cfg.actor.model.model_type)
@@ -4426,13 +4458,19 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
                 f"{runner_step} != {self.version}."
             )
         idm_cost = float(idm_cost)
-        if not math.isfinite(idm_cost) or idm_cost < 0.0:
-            raise ValueError("Runtime IDM cost must be finite and non-negative.")
+        uncond_cost = float(uncond_cost)
+        if any(
+            not math.isfinite(cost) or cost < 0.0 for cost in (idm_cost, uncond_cost)
+        ):
+            raise ValueError("Runtime branch costs must be finite and non-negative.")
         self._fastwam_runtime_idm_cost = idm_cost
+        self._fastwam_runtime_uncond_cost = uncond_cost
+        self._fastwam_runtime_branch_cost_step = int(runner_step)
         self._fastwam_runtime_idm_cost_step = int(runner_step)
         return {
             "runner_step": float(runner_step),
             "idm_cost": idm_cost,
+            "uncond_cost": uncond_cost,
         }
 
     def finish_global_batch(self, metrics: dict[str, list[float]]) -> None:

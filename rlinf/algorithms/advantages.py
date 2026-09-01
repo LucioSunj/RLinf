@@ -1639,6 +1639,7 @@ def summarize_fastwam_counterfactual_costs(
     charge_mask: torch.Tensor | None = None,
     idm_costs: Sequence[float],
     configured_idm_cost: float,
+    uncond_cost: float = 0.0,
     configured_gate_advantages: torch.Tensor,
     gamma: float,
     gae_lambda: float,
@@ -1668,6 +1669,9 @@ def summarize_fastwam_counterfactual_costs(
             "Counterfactual IDM costs must be unique, sorted, finite, and begin at zero."
         )
     configured_idm_cost = float(configured_idm_cost)
+    uncond_cost = float(uncond_cost)
+    if not math.isfinite(uncond_cost) or uncond_cost < 0.0:
+        raise ValueError("Counterfactual UNCOND cost must be finite and non-negative.")
     if configured_idm_cost not in normalized_costs:
         raise ValueError("Configured IDM cost is absent from the counterfactual grid.")
     if route.shape != environment_rewards.shape[:2] or emitted.shape != route.shape:
@@ -1708,7 +1712,7 @@ def summarize_fastwam_counterfactual_costs(
                 environment_rewards=environment_rewards,
                 route_used=route.route_used,
                 idm_cost=idm_cost,
-                uncond_cost=0.0,
+                uncond_cost=uncond_cost,
                 valid_mask=valid_mask,
                 charge_mask=charge_mask,
             )

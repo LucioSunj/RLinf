@@ -1,0 +1,11 @@
+# @package _global_
+
+defaults:
+  - band_price
+  - _self_
+
+algorithm:
+  fixed_branch_cost:
+    controller:
+      rate:
+        target_idm_fraction: 0.5

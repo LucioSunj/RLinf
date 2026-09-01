@@ -27,6 +27,17 @@ from typing import Any, ClassVar, Protocol
 
 from omegaconf import OmegaConf
 
+from rlinf.runners.fastwam_branch_cost_control import (
+    FASTWAM_BRANCH_COST_CONTROL_SCHEMA,
+    DiagnosticBranchCostController,
+    LegacyIDMCostControllerAdapter,
+    append_fastwam_branch_cost_control_jsonl,
+    get_fastwam_branch_cost_controller,
+)
+from rlinf.runners.fastwam_cost_diagnostics import (
+    DiagnosticIDMCostController,
+    build_fastwam_cost_diagnostics,
+)
 from rlinf.runners.fastwam_fair_cost import (
     FASTWAM_FAIR_COST_CONTROL_SCHEMA,
     FastWAMFairCostController,
@@ -835,6 +846,17 @@ class ProjectedDualIDMCostController(LaggedIDMCostControllerBase):
                 "fastwam/idm_cost_control/phase_id": float(
                     next_decision["phase"] == "dual"
                 ),
+                "fastwam/idm_cost_control/budget_slack": (
+                    self.target_fraction - float(observed["feedback_rate"])
+                ),
+                "fastwam/idm_cost_control/budget_violation": max(
+                    float(observed["feedback_rate"]) - self.target_fraction,
+                    0.0,
+                ),
+                "fastwam/idm_cost_control/profile_id": float(
+                    str(self._config.get("profile", "")).lower()
+                    == "upper_bound_zero_init"
+                ),
             }
         )
         fair = record.get("fair_diagnostic")
@@ -941,6 +963,19 @@ def build_fastwam_idm_cost_controller(
         controller = get_fastwam_idm_cost_controller(controller_type)(
             config, branch_cost
         )
+        diagnostic_configs = config.get("diagnostics", ())
+        if diagnostic_configs is None:
+            diagnostic_configs = ()
+        if not isinstance(diagnostic_configs, Sequence) or isinstance(
+            diagnostic_configs, (str, bytes)
+        ):
+            raise TypeError("FastWAM cost diagnostics must be a sequence.")
+        diagnostics = build_fastwam_cost_diagnostics(
+            diagnostic_configs,
+            bootstrap_idm_cost=float(branch_cost.get("idm_cost", 0.0)),
+        )
+        if diagnostics:
+            controller = DiagnosticIDMCostController(controller, diagnostics)
         return controller, True, _canonical_sha256(config)
 
     if not bool(branch_cost.get("enabled", False)):
@@ -978,9 +1013,17 @@ def validate_fastwam_idm_cost_control_config(cfg: Any) -> None:
         )
     if not bool(branch_cost.get("enabled", False)):
         raise ValueError("Explicit FastWAM IDM cost control requires cost shaping.")
-    if float(branch_cost.get("uncond_cost", 0.0)) != 0.0:
+    if (
+        controller_type != "band_price"
+        and float(branch_cost.get("uncond_cost", 0.0)) != 0.0
+    ):
         raise ValueError("FastWAM IDM cost control requires uncond_cost=0.")
-    controller, _, _ = build_fastwam_idm_cost_controller(branch_cost)
+    if controller_type == "band_price":
+        controller = get_fastwam_branch_cost_controller(controller_type)(
+            controller_config
+        )
+    else:
+        controller, _, _ = build_fastwam_idm_cost_controller(branch_cost)
     dynamic = controller.requires_rollout_feedback
     guard = _resolved_mapping(
         OmegaConf.select(cfg, "runner.fastwam_training_guard", default={}),
@@ -1015,7 +1058,11 @@ def validate_fastwam_idm_cost_control_config(cfg: Any) -> None:
             )
 
     charge_scope = str(controller_config.get("charge_scope", "all_valid_idm")).lower()
-    if charge_scope not in {"all_valid_idm", "eligible_nonforced_idm"}:
+    if charge_scope not in {
+        "all_valid_idm",
+        "eligible_nonforced_idm",
+        "eligible_nonforced",
+    }:
         raise ValueError(f"Unsupported FastWAM charge scope {charge_scope!r}.")
     if controller_type == "fixed":
         if charge_scope != "all_valid_idm":
@@ -1036,6 +1083,22 @@ def validate_fastwam_idm_cost_control_config(cfg: Any) -> None:
             raise ValueError(
                 "Legacy fair-cost control requires break_even_guard_enabled=false."
             )
+        return
+    if controller_type == "band_price":
+        _validate_fastwam_band_price_config(
+            cfg=cfg,
+            controller_config=controller_config,
+            actor_epsilon=_finite_float(
+                OmegaConf.select(cfg, "actor.model.gate_epsilon"),
+                name="actor Gate epsilon",
+            ),
+            rollout_epsilon=_finite_float(
+                OmegaConf.select(cfg, "rollout.model.gate_epsilon"),
+                name="rollout Gate epsilon",
+            ),
+            charge_scope=charge_scope,
+        )
+        _validate_fastwam_diagnostic_config(controller_config, cost_audit=cost_audit)
         return
     if controller_type != "budget_dual":
         raise ValueError(
@@ -1086,9 +1149,30 @@ def validate_fastwam_idm_cost_control_config(cfg: Any) -> None:
             "reachable interval."
         )
 
+    _validate_fastwam_diagnostic_config(controller_config, cost_audit=cost_audit)
+
     initializer = _resolved_mapping(
         controller_config.get("initializer"), name="initializer config"
     )
+    if str(controller_config.get("profile", "")).lower() == "upper_bound_zero_init":
+        dual = _resolved_mapping(controller_config.get("dual"), name="dual config")
+        if (
+            str(initializer.get("type", "")).lower() != "constant"
+            or float(initializer.get("idm_cost", math.nan)) != 0.0
+            or float(dual.get("min_idm_cost", math.nan)) != 0.0
+        ):
+            raise ValueError(
+                "upper_bound_zero_init requires constant zero initialization "
+                "and zero lower projection bound."
+            )
+        objective = str(
+            OmegaConf.select(cfg, "routing_objective.type", default="upper_bound")
+        ).lower()
+        if objective not in {"upper_bound", "eval_calibrated_target"}:
+            raise ValueError(
+                "upper_bound_zero_init requires upper_bound or "
+                "eval_calibrated_target routing objective."
+            )
     if str(initializer.get("type", "")).lower() != "break_even_median":
         return
     if not bool(guard.get("enabled", False)) or not bool(
@@ -1112,6 +1196,101 @@ def validate_fastwam_idm_cost_control_config(cfg: Any) -> None:
             "FastWAM fair warm-start requires at least two unique, sorted, "
             "finite, non-negative counterfactual costs beginning at zero."
         )
+
+
+def _validate_fastwam_diagnostic_config(
+    controller_config: Mapping[str, Any],
+    *,
+    cost_audit: Mapping[str, Any],
+) -> None:
+    diagnostics = controller_config.get("diagnostics", ())
+    if diagnostics is None:
+        return
+    if not isinstance(diagnostics, Sequence) or isinstance(diagnostics, (str, bytes)):
+        raise TypeError("FastWAM cost diagnostics must be a sequence.")
+    seen: set[str] = set()
+    for item in diagnostics:
+        if not isinstance(item, Mapping):
+            raise TypeError("FastWAM cost diagnostic entries must be mappings.")
+        if not bool(item.get("enabled", True)):
+            continue
+        diagnostic_type = str(item.get("type", "")).lower()
+        if diagnostic_type in seen:
+            raise ValueError(f"Duplicate FastWAM cost diagnostic {diagnostic_type!r}.")
+        seen.add(diagnostic_type)
+        if diagnostic_type != "fair_break_even":
+            raise ValueError(
+                f"Unsupported FastWAM cost diagnostic {diagnostic_type!r}."
+            )
+        if not bool(item.get("diagnostic_only", True)):
+            raise ValueError("Fair break-even diagnostics must be diagnostic_only.")
+        if int(item.get("window_size", 5)) < 1:
+            raise ValueError("Fair diagnostic window_size must be positive.")
+        if not bool(cost_audit.get("enabled", False)):
+            raise ValueError("Fair break-even diagnostics require the cost audit.")
+        if bool(cost_audit.get("break_even_guard_enabled", True)):
+            raise ValueError(
+                "Fair break-even diagnostics require break_even_guard_enabled=false."
+            )
+        grid = [
+            float(value) for value in cost_audit.get("counterfactual_idm_costs", [])
+        ]
+        if (
+            len(grid) < 2
+            or grid != sorted(set(grid))
+            or grid[0] != 0.0
+            or any(not math.isfinite(value) or value < 0.0 for value in grid)
+        ):
+            raise ValueError(
+                "Fair break-even diagnostics require a valid counterfactual grid."
+            )
+
+
+def _validate_fastwam_band_price_config(
+    *,
+    cfg: Any,
+    controller_config: Mapping[str, Any],
+    actor_epsilon: float,
+    rollout_epsilon: float,
+    charge_scope: str,
+) -> None:
+    if str(controller_config.get("constraint", "")).lower() != "two_sided_band":
+        raise ValueError("FastWAM band-price requires constraint=two_sided_band.")
+    if charge_scope not in {"eligible_nonforced", "eligible_nonforced_idm"}:
+        raise ValueError("FastWAM band-price requires charge_scope=eligible_nonforced.")
+    rate = _resolved_mapping(controller_config.get("rate"), name="band rate config")
+    if str(rate.get("scope", "")).lower() != "eligible_gate_decisions":
+        raise ValueError("FastWAM band-price requires eligible Gate rate scope.")
+    feedback = str(rate.get("feedback", "")).lower()
+    if feedback not in {
+        "expected_behavior_probability",
+        "eligible_expected",
+        "eligible_realized",
+        "realized_gate_decisions",
+    }:
+        raise ValueError("FastWAM band-price rate scope and feedback are incompatible.")
+    if actor_epsilon != rollout_epsilon:
+        raise ValueError("FastWAM actor and rollout Gate epsilon differ.")
+    target = _finite_float(rate.get("target_idm_fraction"), name="band target")
+    half_width = _finite_float(rate.get("half_width"), name="band half-width")
+    if half_width <= 0.0 or not 0.0 <= target - half_width < target + half_width <= 1.0:
+        raise ValueError("FastWAM target-rate band is invalid.")
+    reachable_min = actor_epsilon / 2.0
+    reachable_max = 1.0 - actor_epsilon / 2.0
+    if target - half_width < reachable_min or target + half_width > reachable_max:
+        raise ValueError("FastWAM target-rate band is outside the reachable interval.")
+    signed = _resolved_mapping(
+        controller_config.get("signed_price"), name="signed-price config"
+    )
+    if float(signed.get("initial_value", 0.0)) != 0.0 and not bool(
+        signed.get("allow_nonzero_initial_value", False)
+    ):
+        raise ValueError("FastWAM band-price defaults require zero initial price.")
+    routing_objective = str(
+        OmegaConf.select(cfg, "routing_objective.type", default="train_band_target")
+    ).lower()
+    if routing_objective != "train_band_target":
+        raise ValueError("Band-price training requires train_band_target objective.")
 
 
 def _metric_value(metrics: Mapping[str, Any], key: str, *, worker: int) -> float:
@@ -1311,7 +1490,7 @@ class FastWAMIDMCostControlRuntime:
     def __init__(
         self,
         *,
-        controller: FastWAMIDMCostController,
+        controller: Any,
         explicit: bool,
         config_sha256: str,
         audit_root: Path,
@@ -1325,9 +1504,34 @@ class FastWAMIDMCostControlRuntime:
     def from_config(cls, cfg: Any) -> FastWAMIDMCostControlRuntime:
         algorithm = cfg.get("algorithm", {})
         branch_cost = algorithm.get("fixed_branch_cost", {})
-        controller, explicit, config_sha256 = build_fastwam_idm_cost_controller(
-            branch_cost
+        resolved_branch_cost = _resolved_mapping(
+            branch_cost, name="FastWAM fixed_branch_cost config"
         )
+        controller_config = _resolved_mapping(
+            resolved_branch_cost.get("controller"),
+            name="FastWAM controller config",
+        )
+        controller_type = str(controller_config.get("type", "")).lower()
+        if controller_type == "band_price":
+            controller = get_fastwam_branch_cost_controller(controller_type)(
+                controller_config
+            )
+            diagnostics = build_fastwam_cost_diagnostics(
+                controller_config.get("diagnostics", ()),
+                bootstrap_idm_cost=float(resolved_branch_cost.get("idm_cost", 0.0)),
+            )
+            if diagnostics:
+                controller = DiagnosticBranchCostController(controller, diagnostics)
+            explicit = True
+            config_sha256 = _canonical_sha256(controller_config)
+        else:
+            idm_controller, explicit, config_sha256 = build_fastwam_idm_cost_controller(
+                branch_cost
+            )
+            controller = LegacyIDMCostControllerAdapter(
+                idm_controller,
+                uncond_cost=float(resolved_branch_cost.get("uncond_cost", 0.0)),
+            )
         logger = cfg.runner.get("logger", {})
         audit_root = (
             Path(str(logger.get("log_path", ".")))
@@ -1347,10 +1551,18 @@ class FastWAMIDMCostControlRuntime:
         cfg: Any,
         controller: FastWAMFairCostController,
     ) -> FastWAMIDMCostControlRuntime:
-        wrapped: FastWAMIDMCostController = (
+        wrapped_idm: FastWAMIDMCostController = (
             LegacyFairCostAdapter(controller)
             if controller.enabled
             else _DisabledController()
+        )
+        wrapped = LegacyIDMCostControllerAdapter(
+            wrapped_idm,
+            uncond_cost=float(
+                cfg.get("algorithm", {})
+                .get("fixed_branch_cost", {})
+                .get("uncond_cost", 0.0)
+            ),
         )
         logger = cfg.runner.get("logger", {})
         return cls(
@@ -1374,8 +1586,13 @@ class FastWAMIDMCostControlRuntime:
 
     @property
     def legacy_fair_controller(self) -> FastWAMFairCostController | None:
-        if isinstance(self.controller, LegacyFairCostAdapter):
-            return self.controller.legacy_controller
+        controller = self.controller
+        if isinstance(controller, LegacyIDMCostControllerAdapter):
+            controller = controller.delegate
+        if isinstance(controller, DiagnosticIDMCostController):
+            controller = controller.delegate
+        if isinstance(controller, LegacyFairCostAdapter):
+            return controller.legacy_controller
         return None
 
     @property
@@ -1391,12 +1608,13 @@ class FastWAMIDMCostControlRuntime:
         *,
         actor: Any,
         runner_step: int,
-    ) -> FastWAMIDMCostDecision | None:
+    ) -> Any | None:
         if not self.enabled:
             return None
         decision = self.controller.decision_for_step(runner_step)
-        actor.set_fastwam_idm_cost(
-            decision.applied_idm_cost,
+        actor.set_fastwam_branch_costs(
+            decision.idm_cost,
+            decision.uncond_cost,
             runner_step,
         ).wait()
         return decision
@@ -1423,10 +1641,18 @@ class FastWAMIDMCostControlRuntime:
         metrics = self.controller.record_metrics(record)
         for worker_metrics in actor_rollout_metrics:
             worker_metrics.update(metrics)
-        append_fastwam_idm_cost_control_jsonl(
-            self.audit_root / "idm_cost_control.jsonl",
-            record,
-        )
+        if record.get("schema") == FASTWAM_IDM_COST_CONTROL_SCHEMA:
+            append_fastwam_idm_cost_control_jsonl(
+                self.audit_root / "idm_cost_control.jsonl",
+                record,
+            )
+        elif record.get("schema") == FASTWAM_BRANCH_COST_CONTROL_SCHEMA:
+            append_fastwam_branch_cost_control_jsonl(
+                self.audit_root / "branch_cost_control.jsonl",
+                record,
+            )
+        else:
+            raise ValueError("FastWAM cost-control record schema mismatch.")
         legacy = record.get("legacy_record")
         if isinstance(legacy, Mapping) and (
             legacy.get("schema") == FASTWAM_FAIR_COST_CONTROL_SCHEMA

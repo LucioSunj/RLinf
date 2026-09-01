@@ -1,0 +1,35 @@
+# @package _global_
+
+routing_objective:
+  type: train_band_target
+
+runner:
+  use_training_pipeline: false
+  weight_sync_interval: 1
+  fastwam_training_guard:
+    enabled: true
+
+algorithm:
+  fixed_branch_cost:
+    enabled: true
+    idm_cost: 0.0
+    uncond_cost: 0.0
+    fair_cost:
+      enabled: false
+    controller:
+      type: band_price
+      constraint: two_sided_band
+      rate:
+        scope: eligible_gate_decisions
+        feedback: expected_behavior_probability
+        target_idm_fraction: 0.5
+        half_width: 0.03
+      charge_scope: eligible_nonforced
+      signed_price:
+        # Ablation defaults only; formal gains and band remain uncalibrated.
+        initial_value: 0.0
+        learning_rate: 0.0025
+        ema_beta: 0.0
+        update_interval: 1
+        max_abs_value: 0.1
+        max_delta_per_update: 0.005
