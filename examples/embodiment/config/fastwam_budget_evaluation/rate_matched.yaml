@@ -1,0 +1,64 @@
+# @package _global_
+
+routing_objective:
+  type: eval_calibrated_target
+
+evaluation:
+  budget_matching:
+    enabled: true
+    protocol: closed_loop_calibrated_threshold
+    output_dir: ${oc.env:FASTWAM_BUDGET_EVAL_OUTPUT_DIR,''}
+    backend:
+      type: existing_hydra
+      config_name: libero_10_fastwam_adaptive_eval
+    budget_semantics: target_rate
+    target_idm_fraction: 0.5
+    rate_tolerance: 0.03
+    rate_scope: eligible_gate_decisions
+    checkpoints:
+      - name: step0
+        path: ${oc.env:FASTWAM_STEP0_CHECKPOINT,''}
+      - name: step5
+        path: ${oc.env:FASTWAM_STEP5_CHECKPOINT,''}
+      - name: step10
+        path: ${oc.env:FASTWAM_STEP10_CHECKPOINT,''}
+    calibration:
+      reset_ledger_path: ${oc.env:FASTWAM_CALIBRATION_LEDGER,''}
+      routing_seed: 29001
+      allow_nearest_outside_tolerance: false
+      search:
+        type: coarse_to_fine_grid
+        coarse_candidates: [0.0, 0.025, 0.05, 0.075, 0.1, 0.125, 0.15, 0.2, 0.3, 0.5, 0.7, 0.9, 1.0]
+        refine_top_k: 2
+        refine_points_per_interval: 4
+        maximum_candidate_runs: 25
+      selection:
+        metric: eligible_realized_fraction
+        success_blind: true
+    test:
+      reset_ledger_path: ${oc.env:FASTWAM_TEST_LEDGER,''}
+      routing_seed: 39001
+      run_only_after_calibration_pass: true
+    arms:
+      learned:
+        type: learned_threshold
+        enabled: true
+      independent_random:
+        type: independent_random
+        enabled: true
+        candidates: [0.1, 0.2, 0.25, 0.4, 0.5, 0.6, 0.75, 0.8, 0.9]
+        routing_seed: 101
+        test_routing_seed: 1101
+      autocorr_random:
+        type: autocorrelation_matched_random
+        enabled: true
+        lag1_autocorrelation: -0.2
+        candidates: [0.2, 0.25, 0.4, 0.5, 0.6, 0.75, 0.8]
+        routing_seed: 201
+        test_routing_seed: 1201
+      periodic:
+        type: periodic
+        enabled: true
+        candidates: ['4:1:0', '4:1:1', '2:1:0', '2:1:1', '4:3:0', '4:3:1']
+        routing_seed: 301
+        test_routing_seed: 1301

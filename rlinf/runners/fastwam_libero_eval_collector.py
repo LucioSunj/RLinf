@@ -272,6 +272,9 @@ class FastWAMLiberoEvalCollector:
         idm_threshold: float,
         random_idm_probability: float | None,
         random_lag1_autocorrelation: float | None = None,
+        periodic_period: int | None = None,
+        periodic_on_count: int | None = None,
+        periodic_phase: int | None = None,
         routing_seed: int,
         fixed_idm_cost: float,
         decision_telemetry_enabled: bool = False,
@@ -294,12 +297,18 @@ class FastWAMLiberoEvalCollector:
             idm_threshold=idm_threshold,
             random_idm_probability=random_idm_probability,
             random_lag1_autocorrelation=random_lag1_autocorrelation,
+            periodic_period=periodic_period,
+            periodic_on_count=periodic_on_count,
+            periodic_phase=periodic_phase,
             routing_seed=routing_seed,
         )
         self.routing_mode = routing_config.mode
         self.idm_threshold = routing_config.idm_threshold
         self.random_idm_probability = routing_config.random_idm_probability
         self.random_lag1_autocorrelation = routing_config.random_lag1_autocorrelation
+        self.periodic_period = routing_config.periodic_period
+        self.periodic_on_count = routing_config.periodic_on_count
+        self.periodic_phase = routing_config.periodic_phase
         self.routing_seed = routing_config.routing_seed
         self.fixed_idm_cost = float(fixed_idm_cost)
         if not isinstance(decision_telemetry_enabled, bool):
@@ -403,6 +412,9 @@ class FastWAMLiberoEvalCollector:
             "idm_threshold": self.idm_threshold,
             "random_idm_probability": self.random_idm_probability,
             "random_lag1_autocorrelation": self.random_lag1_autocorrelation,
+            "periodic_period": self.periodic_period,
+            "periodic_on_count": self.periodic_on_count,
+            "periodic_phase": self.periodic_phase,
             "routing_seed": self.routing_seed,
             "fixed_idm_cost": self.fixed_idm_cost,
             "noise_seed_mode": self.noise_seed_mode,

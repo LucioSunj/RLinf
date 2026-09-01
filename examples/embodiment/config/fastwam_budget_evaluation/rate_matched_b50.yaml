@@ -1,0 +1,9 @@
+# @package _global_
+
+defaults:
+  - rate_matched
+  - _self_
+
+evaluation:
+  budget_matching:
+    target_idm_fraction: 0.5

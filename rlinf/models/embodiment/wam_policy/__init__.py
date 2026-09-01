@@ -486,6 +486,17 @@ def get_model(cfg, torch_dtype):
             if cfg.get("eval_random_lag1_autocorrelation") is None
             else float(cfg.eval_random_lag1_autocorrelation)
         ),
+        eval_period=(None if cfg.get("eval_period") is None else int(cfg.eval_period)),
+        eval_periodic_on_count=(
+            None
+            if cfg.get("eval_periodic_on_count") is None
+            else int(cfg.eval_periodic_on_count)
+        ),
+        eval_periodic_phase=(
+            None
+            if cfg.get("eval_periodic_phase") is None
+            else int(cfg.eval_periodic_phase)
+        ),
         eval_routing_seed=cfg.get("eval_routing_seed", 0),
         eval_microbatch_size=int(cfg.get("eval_microbatch_size", 1)),
         eval_timing_cuda_synchronize=bool(

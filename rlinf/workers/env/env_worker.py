@@ -707,6 +707,9 @@ class EnvWorker(Worker):
                 random_lag1_autocorrelation=self.model_cfg.get(
                     "eval_random_lag1_autocorrelation", None
                 ),
+                periodic_period=self.model_cfg.get("eval_period", None),
+                periodic_on_count=self.model_cfg.get("eval_periodic_on_count", None),
+                periodic_phase=self.model_cfg.get("eval_periodic_phase", None),
                 routing_seed=self.model_cfg.eval_routing_seed,
                 decision_telemetry_enabled=bool(
                     self.model_cfg.get("decision_telemetry_enabled", False)

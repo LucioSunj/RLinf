@@ -36,6 +36,7 @@ class EvaluationRoutingMode(str, Enum):
     FORCED_UNCOND = "forced_uncond"
     MATCHED_RANDOM = "matched_random"
     AUTOCORRELATION_MATCHED_RANDOM = "autocorrelation_matched_random"
+    PERIODIC = "periodic"
 
 
 def _finite_probability(value: object, *, field_name: str) -> float:
@@ -85,6 +86,9 @@ class EvaluationRoutingConfig:
     idm_threshold: float = 0.5
     random_idm_probability: float | None = None
     random_lag1_autocorrelation: float | None = None
+    periodic_period: int | None = None
+    periodic_on_count: int | None = None
+    periodic_phase: int | None = None
     routing_seed: int = 0
 
     def __post_init__(self) -> None:
@@ -144,6 +148,26 @@ class EvaluationRoutingConfig:
                 "`eval_random_lag1_autocorrelation` is only valid for "
                 "autocorrelation_matched_random."
             )
+
+        periodic_values = (
+            self.periodic_period,
+            self.periodic_on_count,
+            self.periodic_phase,
+        )
+        if mode is EvaluationRoutingMode.PERIODIC:
+            if any(value is None for value in periodic_values):
+                raise ValueError(
+                    "`periodic` requires eval_period, eval_periodic_on_count, "
+                    "and eval_periodic_phase."
+                )
+            period, on_count, phase = (int(value) for value in periodic_values)
+            if period < 1 or not 0 <= on_count <= period or not 0 <= phase < period:
+                raise ValueError("Periodic evaluation routing pattern is invalid.")
+            object.__setattr__(self, "periodic_period", period)
+            object.__setattr__(self, "periodic_on_count", on_count)
+            object.__setattr__(self, "periodic_phase", phase)
+        elif any(value is not None for value in periodic_values):
+            raise ValueError("Periodic routing fields are only valid for `periodic`.")
 
         if isinstance(self.routing_seed, bool) or not isinstance(
             self.routing_seed,
@@ -483,6 +507,14 @@ def select_evaluation_routes(
                 probability_after_uncond,
             )
         effective = (random_draws < idm_thresholds).to(dtype=torch.long)
+    elif config.mode is EvaluationRoutingMode.PERIODIC:
+        assert config.periodic_period is not None
+        assert config.periodic_on_count is not None
+        assert config.periodic_phase is not None
+        effective = (
+            (source_chunk_ids + config.periodic_phase) % config.periodic_period
+            < config.periodic_on_count
+        ).to(dtype=torch.long)
     else:  # pragma: no cover - enum validation makes this unreachable.
         raise AssertionError(f"Unhandled evaluation routing mode {config.mode}.")
 

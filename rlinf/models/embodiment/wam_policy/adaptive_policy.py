@@ -148,6 +148,9 @@ class FastWAMAdaptivePolicyConfig:
     eval_idm_threshold: float = 0.5
     eval_random_idm_probability: float | None = None
     eval_random_lag1_autocorrelation: float | None = None
+    eval_period: int | None = None
+    eval_periodic_on_count: int | None = None
+    eval_periodic_phase: int | None = None
     eval_routing_seed: int = 0
     eval_microbatch_size: int = 1
     eval_timing_cuda_synchronize: bool = False
@@ -202,6 +205,9 @@ class FastWAMAdaptivePolicyConfig:
             "eval_random_lag1_autocorrelation",
             evaluation.random_lag1_autocorrelation,
         )
+        object.__setattr__(self, "eval_period", evaluation.periodic_period)
+        object.__setattr__(self, "eval_periodic_on_count", evaluation.periodic_on_count)
+        object.__setattr__(self, "eval_periodic_phase", evaluation.periodic_phase)
         object.__setattr__(self, "eval_routing_seed", evaluation.routing_seed)
 
     @property
@@ -213,6 +219,9 @@ class FastWAMAdaptivePolicyConfig:
             idm_threshold=self.eval_idm_threshold,
             random_idm_probability=self.eval_random_idm_probability,
             random_lag1_autocorrelation=(self.eval_random_lag1_autocorrelation),
+            periodic_period=self.eval_period,
+            periodic_on_count=self.eval_periodic_on_count,
+            periodic_phase=self.eval_periodic_phase,
             routing_seed=self.eval_routing_seed,
         )
 
