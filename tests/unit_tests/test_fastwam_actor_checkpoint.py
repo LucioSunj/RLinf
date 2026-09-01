@@ -177,8 +177,12 @@ def _checkpoint_worker() -> Any:
         _checkpoint_cpu_clone = staticmethod(EmbodiedFSDPActor._checkpoint_cpu_clone)
         _fastwam_policy_module = EmbodiedFSDPActor._fastwam_policy_module
         _fastwam_effective_idm_cost = EmbodiedFSDPActor._fastwam_effective_idm_cost
+        _fastwam_effective_branch_costs = (
+            EmbodiedFSDPActor._fastwam_effective_branch_costs
+        )
         bootstrap_fastwam_uncond_lora = EmbodiedFSDPActor.bootstrap_fastwam_uncond_lora
         set_fastwam_idm_cost = EmbodiedFSDPActor.set_fastwam_idm_cost
+        set_fastwam_branch_costs = EmbodiedFSDPActor.set_fastwam_branch_costs
         save_checkpoint = EmbodiedFSDPActor.save_checkpoint
         load_checkpoint = EmbodiedFSDPActor.load_checkpoint
 
@@ -222,9 +226,14 @@ def test_fastwam_actor_uses_only_current_step_runtime_idm_cost() -> None:
     worker.version = 4
     cost_cfg = worker.cfg.algorithm["fixed_branch_cost"]
 
-    worker.set_fastwam_idm_cost(0.0375, 4)
+    published = worker.set_fastwam_idm_cost(0.0375, 4)
 
+    assert published == {"runner_step": 4.0, "idm_cost": 0.0375}
+    assert worker._fastwam_runtime_idm_cost_step == 4
     assert worker._fastwam_effective_idm_cost(cost_cfg) == pytest.approx(0.0375)
+    assert worker._fastwam_effective_branch_costs(cost_cfg) == pytest.approx(
+        (0.0375, 0.0)
+    )
     worker.version = 5
     with pytest.raises(RuntimeError, match="not published.*step 5"):
         worker._fastwam_effective_idm_cost(cost_cfg)

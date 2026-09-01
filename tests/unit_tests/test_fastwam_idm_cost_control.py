@@ -20,6 +20,7 @@ import copy
 
 import pytest
 
+from rlinf.runners.fastwam_cost_diagnostics import DiagnosticIDMCostController
 from rlinf.runners.fastwam_fair_cost import FastWAMFairCostController
 from rlinf.runners.fastwam_idm_cost_control import (
     FastWAMIDMCostObservation,
@@ -27,6 +28,19 @@ from rlinf.runners.fastwam_idm_cost_control import (
     ProjectedDualIDMCostController,
     aggregate_fastwam_idm_cost_observation,
     build_fastwam_idm_cost_controller,
+)
+
+B50_SLACK_RATES = (
+    0.419917,
+    0.461307,
+    0.392830,
+    0.422474,
+    0.413275,
+    0.322959,
+    0.263518,
+    0.218749,
+    0.176070,
+    0.136817,
 )
 
 
@@ -369,3 +383,133 @@ def test_worker_rates_are_count_weighted_and_reconciled() -> None:
     expected_controller.decision_for_step(0)
     with pytest.raises(ValueError, match="unavailable"):
         expected_controller.observe_rollout(observation_without_expected)
+
+
+def _zero_init_diagnostic_branch() -> dict:
+    config = _dual_config(initial=0.0, learning_rate=0.1)
+    config["profile"] = "upper_bound_zero_init"
+    config["rate"]["feedback"] = "expected_behavior_probability"
+    config["dual"]["ema_beta"] = 0.0
+    config["dual"]["deadband"] = 0.0
+    config["diagnostics"] = [
+        {
+            "type": "fair_break_even",
+            "enabled": True,
+            "diagnostic_only": True,
+            "window_size": 5,
+            "bootstrap_value_for_display": 0.03,
+        }
+    ]
+    return {
+        "enabled": True,
+        "idm_cost": 0.015,
+        "uncond_cost": 0.0,
+        "fair_cost": {"enabled": False},
+        "controller": config,
+    }
+
+
+def test_b50_slack_sequence_stays_zero_with_nonzero_fair_diagnostic() -> None:
+    controller, explicit, _ = build_fastwam_idm_cost_controller(
+        _zero_init_diagnostic_branch()
+    )
+    assert explicit
+    for step, rate in enumerate(B50_SLACK_RATES):
+        decision = controller.decision_for_step(step)
+        assert decision.applied_idm_cost == 0.0
+        record = controller.observe_rollout(
+            _observation(step, rate, break_even=0.01 + step * 0.001)
+        )
+        assert record["applied"]["applied_idm_cost"] == 0.0
+        assert record["next"]["applied_idm_cost"] == 0.0
+        metrics = controller.record_metrics(record)
+        assert metrics["fastwam/idm_cost_control/diagnostic_fair_cost"] > 0.0
+        assert metrics["fastwam/idm_cost_control/applied_cost"] == 0.0
+        assert metrics["fastwam/idm_cost_control/dual_multiplier"] == 0.0
+        assert metrics["fastwam/idm_cost_control/applied_minus_dual"] == 0.0
+        assert metrics["fastwam/idm_cost_control/diagnostic_only_fair"] == 1.0
+        assert metrics["fastwam/idm_cost_control/profile_id"] == 1.0
+        assert record["diagnostic_invariants"]["applied_equals_dual"] is True
+
+
+def test_zero_init_positive_violation_branch_and_lag() -> None:
+    config = _dual_config(initial=0.0, learning_rate=0.1, max_delta=0.05)
+    config["rate"]["target_idm_fraction"] = 0.25
+    controller = ProjectedDualIDMCostController(config, bootstrap_idm_cost=0.0)
+    applied = []
+    proposed = []
+    for step, rate in enumerate((0.42, 0.38, 0.31, 0.27, 0.24)):
+        decision = controller.decision_for_step(step)
+        record = controller.observe_rollout(_observation(step, rate))
+        applied.append(decision.applied_idm_cost)
+        proposed.append(record["next"]["applied_idm_cost"])
+    assert applied[0] == 0.0
+    assert applied[1:] == pytest.approx(proposed[:-1])
+    assert proposed[0] > applied[0]
+    assert proposed[1] > proposed[0]
+    assert proposed[-1] < proposed[-2]
+    for step in range(5, 8):
+        _, record = _advance(controller, step, 0.0)
+    assert record["next"]["applied_idm_cost"] == 0.0
+    _, recovery = _advance(controller, 8, 0.5)
+    assert recovery["next"]["applied_idm_cost"] == pytest.approx(0.025)
+
+
+def test_multiple_diagnostics_cannot_change_applied_or_next_cost() -> None:
+    class StaticDiagnostic:
+        def __init__(self, diagnostic_type: str, value: float) -> None:
+            self.diagnostic_type = diagnostic_type
+            self.value = value
+
+        def decision_metadata_for_step(self, runner_step: int) -> dict[str, float]:
+            return {"value": self.value + runner_step}
+
+        def observe_rollout(self, observation) -> dict:
+            return {"value": self.value, "runner_step": observation.runner_step}
+
+        def record_metrics(self, record) -> dict[str, float]:
+            return {f"diagnostic/{self.diagnostic_type}": float(record["value"])}
+
+        def state_dict(self) -> dict:
+            return {"value": self.value}
+
+        def load_state_dict(self, state) -> None:
+            self.value = float(state["value"])
+
+    delegate = ProjectedDualIDMCostController(
+        _dual_config(initial=0.0),
+        bootstrap_idm_cost=0.0,
+    )
+    controller = DiagnosticIDMCostController(
+        delegate,
+        (StaticDiagnostic("first", 0.2), StaticDiagnostic("second", 0.7)),
+    )
+    decision = controller.decision_for_step(0)
+    record = controller.observe_rollout(_observation(0, 0.8))
+    assert decision.applied_idm_cost == 0.0
+    assert record["applied"]["applied_idm_cost"] == 0.0
+    assert record["next"]["applied_idm_cost"] == pytest.approx(0.03)
+
+
+def test_diagnostic_state_round_trip_and_undefined_break_even_not_duplicated() -> None:
+    branch = _zero_init_diagnostic_branch()
+    source, _, _ = build_fastwam_idm_cost_controller(branch)
+    source.decision_for_step(0)
+    source.observe_rollout(_observation(0, 0.4, break_even=0.02))
+    source.decision_for_step(1)
+    source.observe_rollout(_observation(1, 0.4, break_even=None))
+    state = copy.deepcopy(source.state_dict())
+    diagnostic_state = state["diagnostics"]["fair_break_even"]["payload"]
+    assert diagnostic_state["break_even_history"] == [0.02]
+
+    restored, _, _ = build_fastwam_idm_cost_controller(branch)
+    restored.load_state_dict(state)
+    assert restored.state_dict() == state
+    assert restored.decision_for_step(2) == source.decision_for_step(2)
+
+
+def test_duplicate_diagnostic_type_fails_fast() -> None:
+    branch = _zero_init_diagnostic_branch()
+    branch["controller"]["diagnostics"] *= 2
+    with pytest.raises(ValueError, match="Duplicate FastWAM cost diagnostic"):
+        build_fastwam_idm_cost_controller(branch)

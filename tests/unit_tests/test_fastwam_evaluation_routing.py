@@ -71,6 +71,7 @@ def test_routing_modes_are_exact_and_defaults_are_learned_threshold() -> None:
         "forced_uncond",
         "matched_random",
         "autocorrelation_matched_random",
+        "periodic",
     ]
     config = EvaluationRoutingConfig()
     assert config.mode is EvaluationRoutingMode.LEARNED_THRESHOLD
@@ -208,6 +209,21 @@ def test_explicit_nonrandom_modes_preserve_counterfactual_gate_route(
     assert selection.effective_next_route.dtype == torch.long
 
 
+def test_periodic_mode_uses_online_source_chunk_identity() -> None:
+    selection = select_evaluation_routes(
+        EvaluationRoutingConfig(
+            mode="periodic",
+            periodic_period=4,
+            periodic_on_count=2,
+            periodic_phase=1,
+        ),
+        **_inputs(),
+    )
+    assert selection.effective_next_route.tolist() == [1, 1, 0]
+    assert selection.counterfactual_next_route.tolist() == [0, 1, 1]
+    assert selection.random_draws is None
+
+
 @pytest.mark.parametrize(
     ("probability", "expected"),
     [(0.0, [0, 0, 0]), (1.0, [1, 1, 1])],
@@ -326,6 +342,7 @@ def test_route_selection_record_round_trips_cpu_cat_and_chunks() -> None:
         "forced_uncond",
         "matched_random",
         "autocorrelation_matched_random",
+        "periodic",
     ],
 )
 def test_pending_tracker_forces_first_chunk_before_selected_route(mode) -> None:
@@ -341,6 +358,9 @@ def test_pending_tracker_forces_first_chunk_before_selected_route(mode) -> None:
         random_lag1_autocorrelation=(
             -0.2 if mode == "autocorrelation_matched_random" else None
         ),
+        periodic_period=2 if mode == "periodic" else None,
+        periodic_on_count=1 if mode == "periodic" else None,
+        periodic_phase=0 if mode == "periodic" else None,
     )
     tracker = PendingRouteTracker()
     env_ids = torch.tensor([5, 9])
@@ -421,6 +441,9 @@ def _only_eval_config(**model_overrides):
         "eval_idm_threshold": 0.5,
         "eval_random_idm_probability": None,
         "eval_random_lag1_autocorrelation": None,
+        "eval_period": None,
+        "eval_periodic_on_count": None,
+        "eval_periodic_phase": None,
         "eval_routing_seed": 0,
         "critic": {"load_for_eval": False},
     }
@@ -450,6 +473,14 @@ def test_rlinf_only_eval_config_validates_routing_before_critic_return() -> None
         eval_random_lag1_autocorrelation=-0.2,
     )
     _validate_fastwam_adaptive_cfg(autocorrelated, only_eval=True)
+
+    periodic = _only_eval_config(
+        eval_routing_mode="periodic",
+        eval_period=4,
+        eval_periodic_on_count=2,
+        eval_periodic_phase=1,
+    )
+    _validate_fastwam_adaptive_cfg(periodic, only_eval=True)
 
     invalid_cases = [
         (

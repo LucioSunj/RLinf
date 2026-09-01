@@ -57,6 +57,10 @@ class _WorkerGroup:
         self.calls.append(("set_fastwam_idm_cost", idm_cost, runner_step))
         return _Handle()
 
+    def set_fastwam_branch_costs(self, idm_cost, uncond_cost, runner_step):
+        assert uncond_cost == 0.0
+        return self.set_fastwam_idm_cost(idm_cost, runner_step)
+
 
 def _runner_cfg(
     tmp_path: Path,
