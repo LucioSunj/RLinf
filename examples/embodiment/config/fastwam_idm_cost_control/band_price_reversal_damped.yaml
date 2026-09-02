@@ -1,0 +1,17 @@
+# @package _global_
+
+defaults:
+  - band_price
+  - _self_
+
+algorithm:
+  fixed_branch_cost:
+    controller:
+      type: band_price_reversal_damped
+      signed_price:
+        # Explicit target-rate ablation: when the observed band error opposes
+        # the currently applied signed price, release half of that stale price
+        # before applying the normal projected feedback update.
+        reversal:
+          mode: opposing_decay
+          factor: 0.5

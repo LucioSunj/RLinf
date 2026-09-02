@@ -333,6 +333,15 @@ class SignedBandPriceController(LaggedBranchCostControllerBase):
             return float(observation.eligible_realized_fraction)
         return float(observation.executed_realized_fraction)
 
+    def _base_price_for_error(
+        self,
+        error: float,
+    ) -> tuple[float, dict[str, float | bool]]:
+        """Return the price base used by one scheduled controller update."""
+
+        del error
+        return self.signed_price, {}
+
     def _update_after_rollout(self, observation: Any) -> dict[str, Any]:
         feedback_rate = self._feedback_rate(observation)
         self.last_feedback_rate = feedback_rate
@@ -351,10 +360,13 @@ class SignedBandPriceController(LaggedBranchCostControllerBase):
         raw_delta = 0.0
         applied_delta = 0.0
         clipped = False
+        update_metadata: dict[str, float | bool] = {}
         self.updates_since_last_update += 1
         if self.updates_since_last_update >= self.update_interval:
             self.updates_since_last_update = 0
-            raw_delta = self.learning_rate * error
+            base_price, update_metadata = self._base_price_for_error(error)
+            feedback_delta = self.learning_rate * error
+            raw_delta = base_price - self.signed_price + feedback_delta
             delta = min(self.max_delta, max(-self.max_delta, raw_delta))
             if delta != raw_delta:
                 clipped = True
@@ -387,6 +399,7 @@ class SignedBandPriceController(LaggedBranchCostControllerBase):
                 "applied_delta": applied_delta,
                 "clipped": clipped,
                 "inside_band": error == 0.0,
+                **update_metadata,
             },
         }
 
@@ -482,6 +495,90 @@ class SignedBandPriceController(LaggedBranchCostControllerBase):
             state.get("last_applied_delta"), name="restored applied delta"
         )
         self._pending = None
+
+
+class ReversalDampedBandPriceController(SignedBandPriceController):
+    """Release an opposite-sign historical price before applying band feedback."""
+
+    controller_type = "band_price_reversal_damped"
+
+    def __init__(self, config: Mapping[str, Any]) -> None:
+        super().__init__(config)
+        signed = dict(self._config.get("signed_price", {}))
+        reversal = signed.get("reversal")
+        if not isinstance(reversal, Mapping):
+            raise TypeError("Reversal-damped band-price requires reversal config.")
+        self.reversal_mode = str(reversal.get("mode", "")).lower()
+        if self.reversal_mode != "opposing_decay":
+            raise ValueError("Reversal-damped band-price requires mode=opposing_decay.")
+        self.reversal_decay_factor = _finite(
+            reversal.get("factor"),
+            name="opposing signed-price decay factor",
+        )
+        if not 0.0 <= self.reversal_decay_factor < 1.0:
+            raise ValueError("Opposing signed-price decay factor must lie in [0, 1).")
+        self.reversal_decay_count = 0
+
+    def _base_price_for_error(
+        self,
+        error: float,
+    ) -> tuple[float, dict[str, float | bool]]:
+        opposing = error * self.signed_price < 0.0
+        base_price = self.signed_price
+        if opposing:
+            base_price *= self.reversal_decay_factor
+            self.reversal_decay_count += 1
+        return base_price, {
+            "opposing_decay_applied": opposing,
+            "reversal_decay_factor": self.reversal_decay_factor,
+            "pre_decay_signed_price": self.signed_price,
+            "post_decay_signed_price": base_price,
+            "reversal_decay_delta": base_price - self.signed_price,
+            "feedback_delta": self.learning_rate * error,
+        }
+
+    def record_metrics(self, record: Mapping[str, Any]) -> dict[str, float]:
+        metrics = super().record_metrics(record)
+        update = record["update"]
+        metrics.update(
+            {
+                "fastwam/branch_cost_control/opposing_decay_applied": float(
+                    update.get("opposing_decay_applied", False)
+                ),
+                "fastwam/branch_cost_control/reversal_decay_factor": (
+                    self.reversal_decay_factor
+                ),
+                "fastwam/branch_cost_control/reversal_decay_delta": float(
+                    update.get("reversal_decay_delta", 0.0)
+                ),
+                "fastwam/branch_cost_control/reversal_decay_count": float(
+                    self.reversal_decay_count
+                ),
+            }
+        )
+        return metrics
+
+    def state_dict(self) -> dict[str, Any]:
+        state = super().state_dict()
+        state["schema"] = "fastwam-reversal-damped-band-price-controller-state-v1"
+        state["reversal_decay_count"] = self.reversal_decay_count
+        return state
+
+    def load_state_dict(self, state: Mapping[str, Any]) -> None:
+        if (
+            state.get("schema")
+            != "fastwam-reversal-damped-band-price-controller-state-v1"
+        ):
+            raise ValueError(
+                "Reversal-damped band-price controller state schema mismatch."
+            )
+        reversal_decay_count = int(state.get("reversal_decay_count", -1))
+        if reversal_decay_count < 0:
+            raise ValueError("Restored reversal decay count is invalid.")
+        base_state = dict(state)
+        base_state["schema"] = "fastwam-band-price-controller-state-v1"
+        super().load_state_dict(base_state)
+        self.reversal_decay_count = reversal_decay_count
 
 
 class DiagnosticBranchCostController:
@@ -621,6 +718,19 @@ def _build_band_price(config: Mapping[str, Any]) -> FastWAMBranchCostController:
     return SignedBandPriceController(config)
 
 
+@register_fastwam_branch_cost_controller("band_price_reversal_damped")
+def _build_reversal_damped_band_price(
+    config: Mapping[str, Any],
+) -> FastWAMBranchCostController:
+    return ReversalDampedBandPriceController(config)
+
+
+def is_fastwam_branch_cost_controller(name: str) -> bool:
+    """Return whether a native branch-cost controller is registered."""
+
+    return str(name).strip().lower() in _BRANCH_CONTROLLER_REGISTRY
+
+
 def get_fastwam_branch_cost_controller(name: str):
     """Return a registered native branch-cost controller factory."""
 
@@ -656,8 +766,10 @@ __all__ = [
     "FastWAMBranchCostController",
     "FastWAMBranchCostDecision",
     "LegacyIDMCostControllerAdapter",
+    "ReversalDampedBandPriceController",
     "SignedBandPriceController",
     "append_fastwam_branch_cost_control_jsonl",
     "get_fastwam_branch_cost_controller",
+    "is_fastwam_branch_cost_controller",
     "register_fastwam_branch_cost_controller",
 ]

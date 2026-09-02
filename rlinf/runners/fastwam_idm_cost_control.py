@@ -33,6 +33,7 @@ from rlinf.runners.fastwam_branch_cost_control import (
     LegacyIDMCostControllerAdapter,
     append_fastwam_branch_cost_control_jsonl,
     get_fastwam_branch_cost_controller,
+    is_fastwam_branch_cost_controller,
 )
 from rlinf.runners.fastwam_cost_diagnostics import (
     DiagnosticIDMCostController,
@@ -1002,6 +1003,7 @@ def validate_fastwam_idm_cost_control_config(cfg: Any) -> None:
         name="FastWAM IDM cost controller config",
     )
     controller_type = str(controller_config.get("type", "")).lower()
+    is_branch_controller = is_fastwam_branch_cost_controller(controller_type)
     if bool(
         _resolved_mapping(
             branch_cost.get("fair_cost"), name="legacy fair-cost config"
@@ -1013,12 +1015,9 @@ def validate_fastwam_idm_cost_control_config(cfg: Any) -> None:
         )
     if not bool(branch_cost.get("enabled", False)):
         raise ValueError("Explicit FastWAM IDM cost control requires cost shaping.")
-    if (
-        controller_type != "band_price"
-        and float(branch_cost.get("uncond_cost", 0.0)) != 0.0
-    ):
+    if not is_branch_controller and float(branch_cost.get("uncond_cost", 0.0)) != 0.0:
         raise ValueError("FastWAM IDM cost control requires uncond_cost=0.")
-    if controller_type == "band_price":
+    if is_branch_controller:
         controller = get_fastwam_branch_cost_controller(controller_type)(
             controller_config
         )
@@ -1084,7 +1083,7 @@ def validate_fastwam_idm_cost_control_config(cfg: Any) -> None:
                 "Legacy fair-cost control requires break_even_guard_enabled=false."
             )
         return
-    if controller_type == "band_price":
+    if is_branch_controller:
         _validate_fastwam_band_price_config(
             cfg=cfg,
             controller_config=controller_config,
@@ -1512,7 +1511,7 @@ class FastWAMIDMCostControlRuntime:
             name="FastWAM controller config",
         )
         controller_type = str(controller_config.get("type", "")).lower()
-        if controller_type == "band_price":
+        if is_fastwam_branch_cost_controller(controller_type):
             controller = get_fastwam_branch_cost_controller(controller_type)(
                 controller_config
             )

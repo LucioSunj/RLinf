@@ -23,6 +23,7 @@ import pytest
 from rlinf.runners.fastwam_branch_cost_control import (
     DiagnosticBranchCostController,
     LegacyIDMCostControllerAdapter,
+    ReversalDampedBandPriceController,
     SignedBandPriceController,
 )
 from rlinf.runners.fastwam_cost_diagnostics import (
@@ -166,6 +167,108 @@ def test_band_price_checkpoint_round_trip() -> None:
     restored.load_state_dict(state)
     assert restored.state_dict() == state
     assert restored.decision_for_step(1) == source.decision_for_step(1)
+
+
+def _reversal_damped_config(*, factor: float = 0.5) -> dict:
+    config = _config(
+        learning_rate=0.0025,
+        maximum=0.1,
+        max_delta=0.005,
+    )
+    config["type"] = "band_price_reversal_damped"
+    config["signed_price"]["reversal"] = {
+        "mode": "opposing_decay",
+        "factor": factor,
+    }
+    return config
+
+
+def test_reversal_damped_band_price_shortens_observed_b50_reversal() -> None:
+    rates = (
+        0.4199171445074513,
+        0.4763599820993282,
+        0.3918147091455826,
+        0.3940298315592835,
+        0.4562979468058065,
+        0.4197300732277016,
+        0.3859109741708507,
+        0.3906049271046999,
+        0.357391303427389,
+        0.4149045714536265,
+        0.4206437633947166,
+        0.3973774454344286,
+        0.34885239488590924,
+        0.3432205343916175,
+        0.387746275104178,
+        0.4359125170126701,
+        0.5008444109221805,
+        0.591162284415879,
+        0.6397847106447877,
+        0.6671015586558314,
+        0.6396782911575593,
+        0.6724822839791367,
+        0.7211263813151305,
+        0.7615027919765046,
+        0.7220938125271007,
+        0.6792861990783259,
+        0.6983832321265045,
+        0.6556222156474465,
+        0.6486643549339768,
+    )
+    controllers = (
+        SignedBandPriceController(
+            _config(
+                learning_rate=0.0025,
+                maximum=0.1,
+                max_delta=0.005,
+            )
+        ),
+        ReversalDampedBandPriceController(_reversal_damped_config()),
+    )
+    first_positive_steps = []
+    for controller in controllers:
+        first_positive = None
+        for step, rate in enumerate(rates):
+            decision, record = _advance(controller, step, rate)
+            _assert_branch_identity(decision)
+            if decision.idm_cost > 0.0 and first_positive is None:
+                first_positive = step
+            if step == 17 and isinstance(controller, ReversalDampedBandPriceController):
+                assert record["update"]["opposing_decay_applied"] is True
+                assert record["update"]["post_decay_signed_price"] == pytest.approx(
+                    0.5 * record["update"]["pre_decay_signed_price"]
+                )
+        first_positive_steps.append(first_positive)
+    assert first_positive_steps == [25, 20]
+
+
+def test_reversal_damped_band_price_preserves_lag_cap_and_checkpoint() -> None:
+    config = _reversal_damped_config()
+    source = ReversalDampedBandPriceController(config)
+    first, _ = _advance(source, 0, 0.2)
+    second, record = _advance(source, 1, 0.8)
+    assert first.idm_cost == first.uncond_cost == 0.0
+    assert second.uncond_cost > 0.0
+    assert record["update"]["opposing_decay_applied"] is True
+    assert (
+        abs(record["update"]["applied_delta"])
+        <= config["signed_price"]["max_delta_per_update"]
+    )
+    assert record["next"]["idm_cost"] > 0.0
+    assert record["next"]["uncond_cost"] == 0.0
+
+    state = copy.deepcopy(source.state_dict())
+    assert state["reversal_decay_count"] == 1
+    restored = ReversalDampedBandPriceController(config)
+    restored.load_state_dict(state)
+    assert restored.state_dict() == state
+    assert restored.decision_for_step(2) == source.decision_for_step(2)
+
+
+@pytest.mark.parametrize("factor", (-0.1, 1.0))
+def test_reversal_damped_band_price_rejects_invalid_factor(factor: float) -> None:
+    with pytest.raises(ValueError, match="decay factor"):
+        ReversalDampedBandPriceController(_reversal_damped_config(factor=factor))
 
 
 def test_legacy_idm_adapter_preserves_delegate_state_and_decision() -> None:

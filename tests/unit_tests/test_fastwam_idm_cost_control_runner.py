@@ -374,6 +374,11 @@ def test_config_validation_rejects_pipeline_infeasible_target_and_scope_mismatch
         ("band_price_b25", "band_price", 0.25),
         ("band_price_b50", "band_price", 0.5),
         ("band_price_b75", "band_price", 0.75),
+        (
+            "band_price_reversal_damped_b50",
+            "band_price_reversal_damped",
+            0.5,
+        ),
     ),
 )
 def test_hydra_cost_control_group_composes_single_explicit_source(
@@ -397,6 +402,9 @@ def test_hydra_cost_control_group_composes_single_explicit_source(
     assert not cfg.algorithm.fixed_branch_cost.fair_cost.enabled
     if target is not None:
         assert controller.rate.target_idm_fraction == pytest.approx(target)
+    if name == "band_price_reversal_damped_b50":
+        assert controller.signed_price.reversal.mode == "opposing_decay"
+        assert controller.signed_price.reversal.factor == pytest.approx(0.5)
     validate_fastwam_idm_cost_control_config(cfg)
 
 
