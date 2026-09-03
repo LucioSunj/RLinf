@@ -1,0 +1,49 @@
+defaults:
+  - fastwam_pad_frozen
+  - _self_
+
+# Fresh, config-selected Gate. Existing PAD-Frozen checkpoints remain on the
+# parent model profile and cannot satisfy this model's checkpoint contract.
+builder_target: rlinf.models.embodiment.wam_policy.pad_rv.builder.build_pad_route_neutral_model
+config_validator_target: rlinf.models.embodiment.wam_policy.pad_rv.config.validate_pad_route_neutral_training_config
+policy_target: rlinf.models.embodiment.wam_policy.pad_rv.route_neutral_policy.PadRouteNeutralPolicy
+
+gate:
+  current_mode_embedding: false
+  denoise_timestep_embedding: false
+  input_contract:
+    schema: route-neutral-current-step-v1
+    visual:
+      producer: fastwam_value_features
+      canonical_regime: idm_parent
+      sources: [current_frame_video]
+      include_action_kv: false
+      include_generated_future: false
+      include_projected_context_kv: false
+    language:
+      source: pre_action_dit_text_embedding
+    state:
+      source: normalized_proprio
+    physical_history:
+      source: normalized_proprio
+      length_chunks: 4
+      padding: repeat_oldest_or_current
+      positional_encoding: false
+      include_actions: false
+    forbidden:
+      current_mode: false
+      action_kv: false
+      regime_specific_context_kv: false
+      route_history: false
+      budget_count: false
+      chunk_parity: false
+
+critic_warmup:
+  runner_updates: 5
+  route_behavior: independent_random
+  idm_probability: 0.5
+  freeze_gate: true
+  freeze_cost_controller: true
+
+runtime:
+  _target_: rlinf.models.embodiment.wam_policy.pad_rv.route_neutral_runtime.PadRouteNeutralLiberoRuntime

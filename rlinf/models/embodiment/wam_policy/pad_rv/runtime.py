@@ -229,6 +229,43 @@ class PadFrozenLiberoRuntime(LiberoFastWAMRuntime):
             actor_version=actor_version,
         )
 
+    def _critic_features_for_prepared(
+        self,
+        prepared: PreparedRouteContext,
+    ) -> FastWAMValueFeatures | None:
+        """Build legacy PAD critic features behind an overridable boundary."""
+
+        if self.critic_feature_config is None:
+            return None
+        if (
+            isinstance(prepared.gate_features, FastWAMValueFeatures)
+            and self.critic_feature_config == self.gate_feature_config
+        ):
+            return prepared.gate_features
+        return FastWAMValueFeatures.cat(
+            [
+                self._condition_features(condition, config=self.critic_feature_config)
+                for condition in prepared.current_conditions
+            ]
+        )
+
+    def _gate_replay_inputs(
+        self,
+        prepared: PreparedRouteContext,
+    ) -> dict[str, torch.Tensor]:
+        """Serialize the established PAD condition contract by default."""
+
+        if not isinstance(prepared.gate_features, FastWAMValueFeatures):
+            raise TypeError("PAD-Frozen replay requires FastWAMValueFeatures.")
+        return {
+            **serialize_condition_features(
+                prepared.gate_features, prefix="route_condition"
+            ),
+            "fastwam_images": prepared.images,
+            "fastwam_context": prepared.context,
+            "fastwam_context_mask": prepared.context_mask,
+        }
+
     @torch.no_grad()
     def prepare_route_context(self, *, env_obs: dict[str, Any]) -> PreparedRouteContext:
         images, context, context_mask = self._encode_condition(env_obs)
@@ -390,28 +427,8 @@ class PadFrozenLiberoRuntime(LiberoFastWAMRuntime):
             normalized, protocol=self.action_protocol
         )
         actions, trace = self._denormalize_action_stages(executed, env_obs=env_obs)
-        critic_features = None
-        if self.critic_feature_config is not None:
-            critic_features = (
-                prepared.gate_features
-                if self.critic_feature_config == self.gate_feature_config
-                else FastWAMValueFeatures.cat(
-                    [
-                        self._condition_features(
-                            condition, config=self.critic_feature_config
-                        )
-                        for condition in prepared.current_conditions
-                    ]
-                )
-            )
-        replay_inputs = {
-            **serialize_condition_features(
-                prepared.gate_features, prefix="route_condition"
-            ),
-            "fastwam_images": prepared.images,
-            "fastwam_context": prepared.context,
-            "fastwam_context_mask": prepared.context_mask,
-        }
+        critic_features = self._critic_features_for_prepared(prepared)
+        replay_inputs = self._gate_replay_inputs(prepared)
         if (
             isinstance(critic_features, FastWAMValueFeatures)
             and critic_features is not prepared.gate_features

@@ -291,7 +291,13 @@ def test_feature_extraction_uses_frozen_text_projection_and_selected_layers() ->
 
     class _MoT:
         def read_condition_layer_kv(self, **kwargs):
-            events.append(("layer", kwargs["layer_index"]))
+            events.append(
+                (
+                    "layer",
+                    kwargs["layer_index"],
+                    kwargs["action_expert"] is action_expert,
+                )
+            )
             context = kwargs["context"]
             video = torch.full(
                 (context.shape[0], kwargs["current_frame_video_tokens"], 4),
@@ -331,8 +337,8 @@ def test_feature_extraction_uses_frozen_text_projection_and_selected_layers() ->
     assert features.layer_indices == (0, 2)
     assert events == [
         ("enter", PolicyRegime.IDM),
-        ("layer", 0),
-        ("layer", 2),
+        ("layer", 0, True),
+        ("layer", 2, True),
         ("exit", PolicyRegime.IDM),
     ]
     assert not features.layer(0).context.key.requires_grad

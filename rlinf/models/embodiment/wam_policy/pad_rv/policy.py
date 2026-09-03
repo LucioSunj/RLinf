@@ -184,7 +184,7 @@ class PadFrozenPolicy(FastWAMAdaptivePolicy):
                     None if sampling_seeds is None else sampling_seeds["gate"]
                 ),
             )
-            epsilon = torch.full_like(logits, self.config.gate_epsilon)
+            epsilon = self._training_gate_epsilon(logits)
         else:
             routes, base, behavior, logprob, selection = self._evaluation_gate_decision(
                 logits=logits,
@@ -300,6 +300,25 @@ class PadFrozenPolicy(FastWAMAdaptivePolicy):
             result["gate_h2d_seconds"] = torch.zeros_like(gate_latency)
         return sample.actions, result
 
+    def _training_gate_epsilon(self, logits: torch.Tensor) -> torch.Tensor:
+        """Return the replayed epsilon; derived policies may own a warm-up phase."""
+
+        return torch.full_like(logits, self.config.gate_epsilon)
+
+    def _gate_features_from_forward_inputs(
+        self,
+        forward_inputs: Mapping[str, torch.Tensor],
+        *,
+        layer_indices: tuple[int, ...],
+    ):
+        """Restore the legacy condition-K/V Gate payload behind one hook."""
+
+        return deserialize_condition_features(
+            forward_inputs,
+            prefix="route_condition",
+            layer_indices=layer_indices,
+        )
+
     def predict_action_batch(
         self,
         env_obs: dict[str, Any],
@@ -355,10 +374,9 @@ class PadFrozenPolicy(FastWAMAdaptivePolicy):
         layer_indices = getattr(gate_config, "layer_indices", None)
         if layer_indices is None:
             raise TypeError("PAD Gate must expose condition layer indices.")
-        features = deserialize_condition_features(
+        features = self._gate_features_from_forward_inputs(
             forward_inputs,
-            prefix="route_condition",
-            layer_indices=layer_indices,
+            layer_indices=tuple(layer_indices),
         ).to(device=gate_parameter.device)
         logits = self.gate(features)
         if logits.shape != route_info.route_used.shape:

@@ -14,7 +14,19 @@ from typing import Any
 
 
 def build_pad_frozen_model(cfg: Any, torch_dtype):
-    """Construct two immutable ActionDiTs plus fresh Gate/value heads."""
+    """Construct the established PAD-Frozen model without changing its contract."""
+
+    return _build_pad_model(cfg, torch_dtype, route_neutral=False)
+
+
+def build_pad_route_neutral_model(cfg: Any, torch_dtype):
+    """Construct a fresh route-neutral Gate over the same frozen expert pair."""
+
+    return _build_pad_model(cfg, torch_dtype, route_neutral=True)
+
+
+def _build_pad_model(cfg: Any, torch_dtype, *, route_neutral: bool):
+    """Share immutable expert/critic construction across the two Gate profiles."""
 
     import torch
     from fastwam.adapters import load_frozen_uncond_action_artifact, sha256_file
@@ -45,23 +57,45 @@ def build_pad_frozen_model(cfg: Any, torch_dtype):
         Pi05ValueAfterVLMCritic,
     )
 
-    from .config import PAD_FROZEN_POLICY_TARGET, PAD_FROZEN_RUNTIME_TARGET
+    from .config import (
+        PAD_FROZEN_BUILDER_TARGET,
+        PAD_FROZEN_POLICY_TARGET,
+        PAD_FROZEN_RUNTIME_TARGET,
+        PAD_ROUTE_NEUTRAL_BUILDER_TARGET,
+        PAD_ROUTE_NEUTRAL_POLICY_TARGET,
+        PAD_ROUTE_NEUTRAL_RUNTIME_TARGET,
+    )
     from .gate import PadCurrentStepGate
     from .policy import PadFrozenPolicy
 
+    if route_neutral:
+        from .route_neutral_contracts import (
+            PadCriticWarmupConfig,
+            RouteNeutralGateInputContract,
+        )
+        from .route_neutral_gate import (
+            PadRouteNeutralCurrentStepGate,
+            PadRouteNeutralGateConfig,
+        )
+        from .route_neutral_policy import PadRouteNeutralPolicy
+
     if torch_dtype is None:
         raise ValueError("PAD-Frozen requires an explicit model precision.")
-    if str(cfg.get("builder_target", "")) != (
-        "rlinf.models.embodiment.wam_policy.pad_rv.builder.build_pad_frozen_model"
-    ):
-        raise ValueError("PAD-Frozen builder must be selected explicitly by config.")
-    if str(cfg.runtime.get("_target_", "")) != PAD_FROZEN_RUNTIME_TARGET:
-        raise ValueError("PAD-Frozen requires its dedicated runtime target.")
-    if (
-        str(cfg.get("policy_target", PAD_FROZEN_POLICY_TARGET))
-        != PAD_FROZEN_POLICY_TARGET
-    ):
-        raise ValueError("PAD-Frozen policy target changed unexpectedly.")
+    expected_builder = (
+        PAD_ROUTE_NEUTRAL_BUILDER_TARGET if route_neutral else PAD_FROZEN_BUILDER_TARGET
+    )
+    expected_runtime = (
+        PAD_ROUTE_NEUTRAL_RUNTIME_TARGET if route_neutral else PAD_FROZEN_RUNTIME_TARGET
+    )
+    expected_policy = (
+        PAD_ROUTE_NEUTRAL_POLICY_TARGET if route_neutral else PAD_FROZEN_POLICY_TARGET
+    )
+    if str(cfg.get("builder_target", "")) != expected_builder:
+        raise ValueError("PAD builder must be selected explicitly by config.")
+    if str(cfg.runtime.get("_target_", "")) != expected_runtime:
+        raise ValueError("PAD builder/runtime targets disagree.")
+    if str(cfg.get("policy_target", expected_policy)) != expected_policy:
+        raise ValueError("PAD builder/policy targets disagree.")
     flow = cfg.flow_sde
     if bool(flow.get("enabled", False)) or float(flow.get("noise_level", 0.0)) != 0.0:
         raise ValueError("PAD-Frozen disables stochastic Flow-SDE training replay.")
@@ -99,6 +133,7 @@ def build_pad_frozen_model(cfg: Any, torch_dtype):
     layer_taps = LayerTapConfig(**layer_payload)
     gate_payload = OmegaConf.to_container(cfg.gate, resolve=True)
     gate_payload.pop("layer_taps", None)
+    input_contract_payload = gate_payload.pop("input_contract", None)
     action_cfg = cfg.fastwam.action_dit_config
     gate_contract = GateTransformerConfig(
         num_mot_layers=int(action_cfg.num_layers),
@@ -114,7 +149,11 @@ def build_pad_frozen_model(cfg: Any, torch_dtype):
         source_num_heads=gate_contract.source_num_heads,
         source_head_dim=gate_contract.source_head_dim,
         layer_indices=gate_contract.layer_taps.resolve(gate_contract.num_mot_layers),
-        sources=("current_frame_video", "text_state_context"),
+        sources=(
+            ("current_frame_video",)
+            if route_neutral
+            else ("current_frame_video", "text_state_context")
+        ),
         hidden_dim=gate_contract.hidden_dim,
         num_query_tokens=gate_contract.num_query_tokens,
         ffn_multiplier=gate_contract.ffn_multiplier,
@@ -122,6 +161,18 @@ def build_pad_frozen_model(cfg: Any, torch_dtype):
         layer_index_embedding=gate_contract.layer_index_embedding,
         pooling="mean_token",
     )
+    route_neutral_input = None
+    if route_neutral:
+        if input_contract_payload is None:
+            raise ValueError("Route-neutral PAD requires gate.input_contract.")
+        state_dim = int(cfg.fastwam.get("proprio_dim", 0) or 0)
+        route_neutral_input = RouteNeutralGateInputContract.from_mapping(
+            input_contract_payload,
+            state_dim=state_dim,
+        )
+        PadCriticWarmupConfig.from_mapping(cfg.get("critic_warmup"))
+    elif input_contract_payload is not None:
+        raise ValueError("Legacy PAD-Frozen must not define route-neutral inputs.")
     load_critic = _validate_critic_build_config(cfg)
     critic_kind = CriticKind.parse(
         cfg.critic.get("kind", CriticKind.PI0_5_VALUE_AFTER_VLM)
@@ -204,7 +255,17 @@ def build_pad_frozen_model(cfg: Any, torch_dtype):
     )
     uncond_expert.requires_grad_(False)
     uncond_expert.eval()
-    gate = PadCurrentStepGate(gate_features).to(dtype=torch.float32)
+    if route_neutral:
+        gate = PadRouteNeutralCurrentStepGate(
+            PadRouteNeutralGateConfig(
+                visual=gate_features,
+                language_dim=int(action_cfg.text_dim),
+                state_dim=route_neutral_input.state_dim,
+                history_length_chunks=(route_neutral_input.history_length_chunks),
+            )
+        ).to(dtype=torch.float32)
+    else:
+        gate = PadCurrentStepGate(gate_features).to(dtype=torch.float32)
 
     critic = None
     critic_features = None
@@ -241,6 +302,9 @@ def build_pad_frozen_model(cfg: Any, torch_dtype):
                 activation=activation,
                 bias_last=bias_last,
             )
+    runtime_kwargs = {}
+    if route_neutral:
+        runtime_kwargs["gate_input_contract"] = input_contract_payload
     runtime = instantiate(
         cfg.runtime,
         actor=actor,
@@ -253,12 +317,18 @@ def build_pad_frozen_model(cfg: Any, torch_dtype):
         critic_feature_config=critic_features,
         flow_sde_noise_level=0.0,
         flow_sde_ignore_last_transition=False,
+        **runtime_kwargs,
     )
-    return PadFrozenPolicy(
+    policy_cls = PadRouteNeutralPolicy if route_neutral else PadFrozenPolicy
+    policy_kwargs = {}
+    if route_neutral:
+        policy_kwargs["critic_warmup"] = cfg.critic_warmup
+    return policy_cls(
         actor=actor,
         uncond_action_expert=uncond_expert,
         runtime=runtime,
         gate=gate,
         critic=critic,
         config=policy_config,
+        **policy_kwargs,
     )

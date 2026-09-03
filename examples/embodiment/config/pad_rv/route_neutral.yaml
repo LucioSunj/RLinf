@@ -1,0 +1,29 @@
+# @package _global_
+
+defaults:
+  - frozen
+  - _self_
+
+algorithm:
+  # The new path uses the generic signed band controller selected through the
+  # fastwam_idm_cost_control group, rather than PAD's historical projected dual.
+  prediction_budget: null
+  fixed_branch_cost:
+    fair_cost:
+      enabled: false
+      pi:
+        enabled: false
+        # Keep the disabled compatibility subtree resolvable for the complete
+        # checkpoint contract after prediction_budget is removed.
+        target_idm_fraction: ${algorithm.fixed_branch_cost.controller.rate.target_idm_fraction}
+        integral_gain: ${algorithm.fixed_branch_cost.controller.signed_price.learning_rate}
+        proportional_gain: 0.0
+
+pad_rv_implementation:
+  actor_target: rlinf.models.embodiment.wam_policy.pad_rv.route_neutral_actor.PadRouteNeutralFSDPActor
+  runner_target: rlinf.models.embodiment.wam_policy.pad_rv.route_neutral_runner.PadRouteNeutralRunner
+  policy_target: rlinf.models.embodiment.wam_policy.pad_rv.route_neutral_policy.PadRouteNeutralPolicy
+
+runner:
+  # The derived actor automatically audits the first post-warm-up Gate update.
+  pad_rv_action_ownership_audit_updates: []

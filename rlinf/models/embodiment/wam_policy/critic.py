@@ -332,6 +332,7 @@ def extract_fastwam_value_features(
                 current_frame_video_tokens=condition.current_frame_video_tokens,
                 context=context,
                 context_mask=context_mask,
+                action_expert=action_expert,
             )
             for layer_index in config.layer_indices
         )

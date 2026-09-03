@@ -1,0 +1,80 @@
+defaults:
+  - fastwam_adaptive
+  - _self_
+
+builder_target: rlinf.models.embodiment.wam_policy.route_neutral_online.builder.build_route_neutral_online_idm_bc_model
+config_validator_target: rlinf.models.embodiment.wam_policy.route_neutral_online.config.validate_route_neutral_online_idm_bc_training_config
+policy_target: rlinf.models.embodiment.wam_policy.route_neutral_online.policy.RouteNeutralOnlineIDMBCFastWAMPolicy
+
+# The inherited GateTransformer is constructed only inside the reusable base
+# builder and immediately replaced. Keeping these exclusions here also makes
+# the resolved scientific contract explicit.
+gate:
+  current_mode_embedding: false
+  denoise_timestep_embedding: false
+  layer_taps:
+    mode: indices
+    last_n: null
+    indices: [14, 15, 16, 17, 18, 19]
+
+decision_telemetry_enabled: false
+
+# ``recompute`` prevents RLinf from creating a legacy Action-K/V handle store.
+# The derived policy replays only the condition tensors declared below.
+kv_replay:
+  backend: recompute
+  gate_kv_sample_budget: null
+
+route_neutral_online:
+  input_contract:
+    schema: route-neutral-current-step-v1
+    visual:
+      producer: fastwam_value_features
+      canonical_regime: idm_parent
+      sources: [current_frame_video]
+      include_action_kv: false
+      include_generated_future: false
+      include_projected_context_kv: false
+    language:
+      source: pre_action_dit_text_embedding
+    state:
+      source: normalized_proprio
+    physical_history:
+      source: normalized_proprio
+      length_chunks: 4
+      padding: repeat_oldest_or_current
+      positional_encoding: false
+      include_actions: false
+    forbidden:
+      current_mode: false
+      action_kv: false
+      regime_specific_context_kv: false
+      route_history: false
+      budget_count: false
+      chunk_parity: false
+  visual:
+    num_mot_layers: 30
+    source_num_heads: 24
+    source_head_dim: 128
+    layer_indices: [14, 15, 16, 17, 18, 19]
+    sources: [current_frame_video]
+    hidden_dim: 256
+    num_query_tokens: 4
+    ffn_multiplier: 4
+    share_blocks: false
+    layer_index_embedding: true
+    pooling: mean_token
+  critic_warmup:
+    runner_updates: 5
+    route_behavior: independent_random
+    idm_probability: 0.5
+    freeze_gate: true
+    freeze_cost_controller: true
+  online_idm_bc:
+    enabled: true
+    loss_weight: 0.2
+
+runtime:
+  _target_: rlinf.models.embodiment.wam_policy.route_neutral_online.runtime.RouteNeutralOnlineIDMTeacherLiberoRuntime
+  route_neutral_input: ${..route_neutral_online.input_contract}
+  route_neutral_visual: ${..route_neutral_online.visual}

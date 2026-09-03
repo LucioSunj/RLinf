@@ -199,6 +199,29 @@ class PadFrozenFSDPActor(EmbodiedFSDPActor):
             **kwargs,
         )
 
+    def _pad_checkpoint_versions(self, *, step: int) -> dict[str, int]:
+        """Return legacy jointly-updated Gate/critic counters."""
+
+        return build_pad_frozen_versions(
+            step=int(step),
+            optimizer_steps=int(self.optimizer_steps),
+        )
+
+    def _restore_pad_checkpoint_versions(
+        self,
+        payload: Any,
+        *,
+        step: int,
+        optimizer_steps: int,
+    ) -> dict[str, int]:
+        expected = build_pad_frozen_versions(
+            step=step,
+            optimizer_steps=optimizer_steps,
+        )
+        if payload != expected:
+            raise ValueError("PAD-Frozen actor version fields disagree.")
+        return expected
+
     def save_checkpoint(self, save_path: str, step: int = 0) -> None:
         """Save only Stage 1 trainables and their optimizer continuation state."""
 
@@ -216,15 +239,25 @@ class PadFrozenFSDPActor(EmbodiedFSDPActor):
                     raise TypeError("PAD checkpoint requires PadFrozenPolicy.")
                 policy.set_global_step(int(step))
                 self.version = int(step)
+                version_builder = getattr(
+                    self,
+                    "_pad_checkpoint_versions",
+                    None,
+                )
+                versions = (
+                    PadFrozenFSDPActor._pad_checkpoint_versions(
+                        self,
+                        step=int(step),
+                    )
+                    if version_builder is None
+                    else version_builder(step=int(step))
+                )
                 payload = {
                     "schema": PAD_FROZEN_CHECKPOINT_SCHEMA,
                     "owner": "actor",
                     "step": int(step),
                     "optimizer_steps": int(self.optimizer_steps),
-                    "versions": build_pad_frozen_versions(
-                        step=int(step),
-                        optimizer_steps=int(self.optimizer_steps),
-                    ),
+                    "versions": versions,
                     "stage_contract": build_pad_frozen_checkpoint_contract(
                         self.cfg,
                         world_size=int(self._world_size),
@@ -309,12 +342,25 @@ class PadFrozenFSDPActor(EmbodiedFSDPActor):
                 )
                 step = int(payload.get("step", -1))
                 optimizer_steps = int(payload.get("optimizer_steps", -1))
-                expected_versions = build_pad_frozen_versions(
-                    step=step,
-                    optimizer_steps=optimizer_steps,
+                version_restorer = getattr(
+                    self,
+                    "_restore_pad_checkpoint_versions",
+                    None,
                 )
-                if payload.get("versions") != expected_versions:
-                    raise ValueError("PAD-Frozen actor version fields disagree.")
+                restored_versions = (
+                    PadFrozenFSDPActor._restore_pad_checkpoint_versions(
+                        self,
+                        payload.get("versions"),
+                        step=step,
+                        optimizer_steps=optimizer_steps,
+                    )
+                    if version_restorer is None
+                    else version_restorer(
+                        payload.get("versions"),
+                        step=step,
+                        optimizer_steps=optimizer_steps,
+                    )
+                )
 
                 policy = self._fastwam_policy_module()
                 if not isinstance(policy, PadFrozenPolicy):
@@ -363,6 +409,7 @@ class PadFrozenFSDPActor(EmbodiedFSDPActor):
                             "rank": int(self._rank),
                             "step": step,
                             "optimizer_steps": optimizer_steps,
+                            "versions": restored_versions,
                             "actor_version": int(policy.actor_version),
                             "route_state_sha256": restored_route_sha256,
                             "rng_sha256": restored_rng_sha256,
@@ -450,6 +497,27 @@ class PadFrozenFSDPActor(EmbodiedFSDPActor):
         self.grad_scaler.update()
         return grad_norm, [group["lr"] for group in self.optimizer.param_groups]
 
+    def _compute_pad_critic_loss(
+        self,
+        *,
+        micro_batch: dict,
+        output_dict: dict[str, torch.Tensor],
+    ) -> tuple[torch.Tensor, dict[str, Any]]:
+        """Share the unchanged value objective with derived warm-up actors."""
+
+        critic_cfg = self.cfg.algorithm.critic_loss
+        critic_loss, critic_metrics = compute_ppo_critic_loss(
+            values=output_dict["values"].float(),
+            returns=micro_batch["returns"].float(),
+            prev_values=micro_batch["prev_values"].float(),
+            value_clip=float(critic_cfg.value_clip),
+            huber_delta=float(critic_cfg.huber_delta),
+            loss_mask=micro_batch.get("loss_mask"),
+            loss_mask_sum=micro_batch.get("loss_mask_sum"),
+            max_episode_steps=self.cfg.env.train.max_episode_steps,
+        )
+        return float(critic_cfg.get("loss_weight", 1.0)) * critic_loss, critic_metrics
+
     def _compute_fastwam_loss(
         self,
         *,
@@ -500,18 +568,11 @@ class PadFrozenFSDPActor(EmbodiedFSDPActor):
                 reference=policy_loss,
             )
         )
-        critic_cfg = self.cfg.algorithm.critic_loss
-        critic_loss, critic_metrics = compute_ppo_critic_loss(
-            values=output_dict["values"].float(),
-            returns=micro_batch["returns"].float(),
-            prev_values=micro_batch["prev_values"].float(),
-            value_clip=float(critic_cfg.value_clip),
-            huber_delta=float(critic_cfg.huber_delta),
-            loss_mask=micro_batch.get("loss_mask"),
-            loss_mask_sum=micro_batch.get("loss_mask_sum"),
-            max_episode_steps=self.cfg.env.train.max_episode_steps,
+        weighted_critic_loss, critic_metrics = self._compute_pad_critic_loss(
+            micro_batch=micro_batch,
+            output_dict=output_dict,
         )
-        total = policy_loss + float(critic_cfg.get("loss_weight", 1.0)) * critic_loss
+        total = policy_loss + weighted_critic_loss
         metrics.update(critic_metrics)
         metrics.update(
             {
@@ -614,6 +675,14 @@ class PadFrozenFSDPActor(EmbodiedFSDPActor):
             "update_max_abs": max_abs,
         }
 
+    def _pad_ownership_audit_updates(self) -> set[int]:
+        return {
+            int(item)
+            for item in self.cfg.runner.get(
+                "pad_rv_action_ownership_audit_updates", [1]
+            )
+        }
+
     def run_training(
         self,
         kv_request_channel=None,
@@ -622,12 +691,7 @@ class PadFrozenFSDPActor(EmbodiedFSDPActor):
         """Wrap selected updates with exact Stage 1 ownership evidence."""
 
         update = int(self.version) + 1
-        audited_updates = {
-            int(item)
-            for item in self.cfg.runner.get(
-                "pad_rv_action_ownership_audit_updates", [1]
-            )
-        }
+        audited_updates = self._pad_ownership_audit_updates()
         if update not in audited_updates:
             return super().run_training(
                 kv_request_channel=kv_request_channel,

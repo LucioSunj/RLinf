@@ -16,9 +16,6 @@ from hydra.utils import get_class, get_method
 from omegaconf import OmegaConf
 
 from rlinf.config import validate_cfg
-from rlinf.models.embodiment.wam_policy.pad_rv import (
-    validate_pad_frozen_training_config,
-)
 from rlinf.models.embodiment.wam_policy.pad_rv.actor import PadFrozenFSDPActor
 from rlinf.models.embodiment.wam_policy.pad_rv.env import PadFrozenEnvWorker
 from rlinf.models.embodiment.wam_policy.pad_rv.rollout import (
@@ -38,7 +35,8 @@ mp.set_start_method("spawn", force=True)
 )
 def main(cfg) -> None:
     cfg = validate_cfg(cfg)
-    validate_pad_frozen_training_config(cfg)
+    config_validator = get_method(str(cfg.actor.model.config_validator_target))
+    config_validator(cfg)
     if bool(cfg.runner.get("use_training_pipeline", False)):
         raise ValueError("PAD-Frozen does not use the pipeline actor variant.")
     text_cache_preflight = get_method(
@@ -52,17 +50,17 @@ def main(cfg) -> None:
     )
     placement = HybridComponentPlacement(cfg, cluster)
     actor_cls = get_class(str(cfg.pad_rv_implementation.actor_target))
-    if actor_cls is not PadFrozenFSDPActor:
-        raise TypeError("PAD actor target must resolve to PadFrozenFSDPActor.")
+    if not issubclass(actor_cls, PadFrozenFSDPActor):
+        raise TypeError("PAD actor target must derive from PadFrozenFSDPActor.")
     rollout_cls = get_class(str(cfg.pad_rv_implementation.rollout_worker_target))
-    if rollout_cls is not PadFrozenRolloutWorker:
-        raise TypeError("PAD rollout target must resolve to PadFrozenRolloutWorker.")
+    if not issubclass(rollout_cls, PadFrozenRolloutWorker):
+        raise TypeError("PAD rollout target must derive from PadFrozenRolloutWorker.")
     runner_cls = get_class(str(cfg.pad_rv_implementation.runner_target))
-    if runner_cls is not PadFrozenRunner:
-        raise TypeError("PAD runner target must resolve to PadFrozenRunner.")
+    if not issubclass(runner_cls, PadFrozenRunner):
+        raise TypeError("PAD runner target must derive from PadFrozenRunner.")
     env_cls = get_class(str(cfg.pad_rv_implementation.env_worker_target))
-    if env_cls is not PadFrozenEnvWorker:
-        raise TypeError("PAD env target must resolve to PadFrozenEnvWorker.")
+    if not issubclass(env_cls, PadFrozenEnvWorker):
+        raise TypeError("PAD env target must derive from PadFrozenEnvWorker.")
     actor = actor_cls.create_group(cfg).launch(
         cluster,
         name=cfg.actor.group_name,

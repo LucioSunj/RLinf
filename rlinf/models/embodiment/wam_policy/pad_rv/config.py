@@ -18,6 +18,14 @@ from typing import Any
 from omegaconf import OmegaConf
 
 from .budget import PAD_PREDICTION_BUDGET_CONTROLLER_TARGET
+from .route_neutral_budget import (
+    PAD_WARMUP_DAMPED_CONTROLLER_TYPE,
+    PadCriticWarmupReversalDampedController,
+)
+from .route_neutral_contracts import (
+    PadCriticWarmupConfig,
+    RouteNeutralGateInputContract,
+)
 
 PAD_FROZEN_BUILDER_TARGET = (
     "rlinf.models.embodiment.wam_policy.pad_rv.builder.build_pad_frozen_model"
@@ -52,6 +60,25 @@ PAD_FROZEN_TEXT_CACHE_PREFLIGHT_TARGET = (
 )
 PAD_FROZEN_EGL_INSTANTIATION_TARGET = (
     "rlinf.models.embodiment.wam_policy.pad_rv.egl.instantiate_with_physical_egl"
+)
+PAD_ROUTE_NEUTRAL_BUILDER_TARGET = (
+    "rlinf.models.embodiment.wam_policy.pad_rv.builder.build_pad_route_neutral_model"
+)
+PAD_ROUTE_NEUTRAL_RUNTIME_TARGET = (
+    "rlinf.models.embodiment.wam_policy.pad_rv.route_neutral_runtime."
+    "PadRouteNeutralLiberoRuntime"
+)
+PAD_ROUTE_NEUTRAL_POLICY_TARGET = (
+    "rlinf.models.embodiment.wam_policy.pad_rv.route_neutral_policy."
+    "PadRouteNeutralPolicy"
+)
+PAD_ROUTE_NEUTRAL_ACTOR_TARGET = (
+    "rlinf.models.embodiment.wam_policy.pad_rv.route_neutral_actor."
+    "PadRouteNeutralFSDPActor"
+)
+PAD_ROUTE_NEUTRAL_RUNNER_TARGET = (
+    "rlinf.models.embodiment.wam_policy.pad_rv.route_neutral_runner."
+    "PadRouteNeutralRunner"
 )
 
 
@@ -112,20 +139,64 @@ def validate_pad_frozen_training_config(
     *,
     only_eval: bool = False,
 ) -> PadFrozenConfig:
-    """Validate config-selected ownership before any model allocation."""
+    """Validate the established PAD-Frozen profile."""
+
+    return _validate_pad_training_config(
+        cfg,
+        only_eval=only_eval,
+        route_neutral=False,
+    )
+
+
+def validate_pad_route_neutral_training_config(
+    cfg: Any,
+    *,
+    only_eval: bool = False,
+) -> PadFrozenConfig:
+    """Validate the fresh route-neutral Gate and critic warm-up profile."""
+
+    return _validate_pad_training_config(
+        cfg,
+        only_eval=only_eval,
+        route_neutral=True,
+    )
+
+
+def _validate_pad_training_config(
+    cfg: Any,
+    *,
+    only_eval: bool,
+    route_neutral: bool,
+) -> PadFrozenConfig:
+    """Validate profile-specific ownership before any model allocation."""
 
     config = PadFrozenConfig.from_mapping(OmegaConf.select(cfg, "algorithm.pad_rv"))
     if not config.enabled:
         raise ValueError("PAD-Frozen entrypoint requires `enabled: true`.")
+    builder_target = (
+        PAD_ROUTE_NEUTRAL_BUILDER_TARGET if route_neutral else PAD_FROZEN_BUILDER_TARGET
+    )
+    runtime_target = (
+        PAD_ROUTE_NEUTRAL_RUNTIME_TARGET if route_neutral else PAD_FROZEN_RUNTIME_TARGET
+    )
+    policy_target = (
+        PAD_ROUTE_NEUTRAL_POLICY_TARGET if route_neutral else PAD_FROZEN_POLICY_TARGET
+    )
+    actor_target = (
+        PAD_ROUTE_NEUTRAL_ACTOR_TARGET if route_neutral else PAD_FROZEN_ACTOR_TARGET
+    )
+    runner_target = (
+        PAD_ROUTE_NEUTRAL_RUNNER_TARGET if route_neutral else PAD_FROZEN_RUNNER_TARGET
+    )
     expected = {
-        "rollout.model.builder_target": PAD_FROZEN_BUILDER_TARGET,
-        "rollout.model.runtime._target_": PAD_FROZEN_RUNTIME_TARGET,
+        "rollout.model.builder_target": builder_target,
+        "rollout.model.runtime._target_": runtime_target,
         "pad_rv_implementation.rollout_worker_target": PAD_FROZEN_ROLLOUT_TARGET,
         "pad_rv_implementation.env_worker_target": PAD_FROZEN_ENV_TARGET,
         "pad_rv_implementation.text_cache_preflight_target": (
             PAD_FROZEN_TEXT_CACHE_PREFLIGHT_TARGET
         ),
-        "pad_rv_implementation.policy_target": PAD_FROZEN_POLICY_TARGET,
+        "pad_rv_implementation.policy_target": policy_target,
         "pad_rv_implementation.rollout_init_mode": "serial_rank",
         "env.eval.egl_instantiation_target": PAD_FROZEN_EGL_INSTANTIATION_TARGET,
     }
@@ -139,10 +210,10 @@ def validate_pad_frozen_training_config(
     else:
         expected.update(
             {
-                "actor.model.builder_target": PAD_FROZEN_BUILDER_TARGET,
-                "actor.model.runtime._target_": PAD_FROZEN_RUNTIME_TARGET,
-                "pad_rv_implementation.actor_target": PAD_FROZEN_ACTOR_TARGET,
-                "pad_rv_implementation.runner_target": PAD_FROZEN_RUNNER_TARGET,
+                "actor.model.builder_target": builder_target,
+                "actor.model.runtime._target_": runtime_target,
+                "pad_rv_implementation.actor_target": actor_target,
+                "pad_rv_implementation.runner_target": runner_target,
                 "env.train.egl_instantiation_target": (
                     PAD_FROZEN_EGL_INSTANTIATION_TARGET
                 ),
@@ -153,11 +224,11 @@ def validate_pad_frozen_training_config(
         if actual != target:
             raise ValueError(f"PAD-Frozen {field} must be {target}, got {actual}.")
     model_roles = ("rollout",) if only_eval else ("actor", "rollout")
+    route_neutral_contracts = []
+    route_neutral_gate_profiles: list[dict[str, Any]] = []
     for role in model_roles:
         prefix = f"{role}.model"
-        if str(OmegaConf.select(cfg, f"{prefix}.policy_target")) != (
-            PAD_FROZEN_POLICY_TARGET
-        ):
+        if str(OmegaConf.select(cfg, f"{prefix}.policy_target")) != policy_target:
             raise ValueError(f"PAD-Frozen {prefix} must select its policy target.")
         if str(OmegaConf.select(cfg, f"{prefix}.kv_replay.backend")) != "condition":
             raise ValueError(f"PAD-Frozen {prefix} requires condition-only replay.")
@@ -186,6 +257,36 @@ def validate_pad_frozen_training_config(
             OmegaConf.select(cfg, f"{prefix}.runtime.text_embedding_cache_dir")
         ).strip():
             raise ValueError(f"PAD-Frozen {prefix} requires cached text contexts.")
+        if route_neutral:
+            gate = OmegaConf.select(cfg, f"{prefix}.gate")
+            if bool(gate.get("current_mode_embedding", True)) or bool(
+                gate.get("denoise_timestep_embedding", True)
+            ):
+                raise ValueError(
+                    "Route-neutral Gate excludes mode and denoise-timestep embeddings."
+                )
+            state_dim = int(
+                OmegaConf.select(cfg, f"{prefix}.fastwam.proprio_dim", default=0) or 0
+            )
+            input_contract = RouteNeutralGateInputContract.from_mapping(
+                gate.get("input_contract"),
+                state_dim=state_dim,
+            )
+            warmup = PadCriticWarmupConfig.from_mapping(
+                OmegaConf.select(cfg, f"{prefix}.critic_warmup")
+            )
+            route_neutral_contracts.append((input_contract, warmup))
+            resolved_gate = OmegaConf.to_container(gate, resolve=True)
+            if not isinstance(resolved_gate, dict):
+                raise TypeError("Route-neutral Gate config must be a mapping.")
+            route_neutral_gate_profiles.append(resolved_gate)
+    if route_neutral and len(set(route_neutral_contracts)) != 1:
+        raise ValueError("Actor and rollout route-neutral contracts differ.")
+    if route_neutral and any(
+        profile != route_neutral_gate_profiles[0]
+        for profile in route_neutral_gate_profiles[1:]
+    ):
+        raise ValueError("Actor and rollout route-neutral Gate configs differ.")
     if only_eval:
         model_cfg = cfg.rollout.model
         if int(cfg.runner.evaluation_collector.get("ledger_shard_count", 0)) != 7:
@@ -224,34 +325,82 @@ def validate_pad_frozen_training_config(
         )
     if str(OmegaConf.select(cfg, "algorithm.loss_type")) != ("fastwam_gate_only_ppo"):
         raise ValueError("PAD-Frozen requires its dedicated Gate-only loss type.")
-    budget = OmegaConf.select(cfg, "algorithm.prediction_budget")
-    if budget is None or set(budget) != {
-        "enabled",
-        "controller_target",
-        "target_idm_fraction",
-        "dual_lr",
-        "proportional_gain",
-    }:
-        raise ValueError("PAD-Frozen prediction-budget fields changed.")
-    if not bool(budget.enabled):
-        raise ValueError("PAD-Frozen requires the prediction-budget dual.")
-    if str(budget.controller_target) != PAD_PREDICTION_BUDGET_CONTROLLER_TARGET:
-        raise ValueError("PAD-Frozen prediction-budget controller target changed.")
-    if float(budget.proportional_gain) != 0.0:
-        raise ValueError("PAD-Frozen uses the projected dual without a P term.")
-    if (
-        OmegaConf.select(cfg, "algorithm.fixed_branch_cost.controller", default=None)
-        is not None
-    ):
-        raise ValueError(
-            "PAD-Frozen must not compose the generic fastwam_idm_cost_control "
-            "group; algorithm.prediction_budget is its sole controller source."
-        )
+    budget = OmegaConf.select(cfg, "algorithm.prediction_budget", default=None)
     pi = OmegaConf.select(cfg, "algorithm.fixed_branch_cost.fair_cost.pi")
     if pi is None or bool(pi.get("enabled", True)):
         raise ValueError("PAD-Frozen disables the inherited fair-cost PI controller.")
-    if not bool(OmegaConf.select(cfg, "algorithm.fixed_branch_cost.fair_cost.enabled")):
-        raise ValueError("PAD-Frozen prediction-budget controller is disabled.")
+    if route_neutral:
+        if budget is not None:
+            raise ValueError(
+                "Route-neutral PAD uses the generic damped controller, not prediction_budget."
+            )
+        if bool(OmegaConf.select(cfg, "algorithm.fixed_branch_cost.fair_cost.enabled")):
+            raise ValueError(
+                "Route-neutral PAD disables the legacy fair-cost controller."
+            )
+        controller = OmegaConf.select(cfg, "algorithm.fixed_branch_cost.controller")
+        if controller is None or str(controller.get("type", "")) != (
+            PAD_WARMUP_DAMPED_CONTROLLER_TYPE
+        ):
+            raise ValueError(
+                "Route-neutral PAD requires critic-warm-up reversal-damped control."
+            )
+        controller_warmup = PadCriticWarmupConfig.from_mapping(
+            controller.get("critic_warmup")
+        )
+        resolved_controller = OmegaConf.to_container(controller, resolve=True)
+        if not isinstance(resolved_controller, Mapping):
+            raise TypeError("Route-neutral branch controller must be a mapping.")
+        PadCriticWarmupReversalDampedController(resolved_controller)
+        if controller_warmup != route_neutral_contracts[0][1]:
+            raise ValueError("Gate and branch controller warm-up contracts differ.")
+        if int(OmegaConf.select(cfg, "actor.optim.critic_warmup_steps")) != 0:
+            raise ValueError(
+                "Route-neutral PAD uses runner-update warm-up, not optimizer rebuild."
+            )
+        if (
+            int(
+                OmegaConf.select(
+                    cfg,
+                    "algorithm.critic_loss.warmup_steps",
+                    default=0,
+                )
+            )
+            != 0
+        ):
+            raise ValueError(
+                "Route-neutral PAD uses its dedicated critic_warmup contract, "
+                "not critic_loss.warmup_steps."
+            )
+    else:
+        if budget is None or set(budget) != {
+            "enabled",
+            "controller_target",
+            "target_idm_fraction",
+            "dual_lr",
+            "proportional_gain",
+        }:
+            raise ValueError("PAD-Frozen prediction-budget fields changed.")
+        if not bool(budget.enabled):
+            raise ValueError("PAD-Frozen requires the prediction-budget dual.")
+        if str(budget.controller_target) != PAD_PREDICTION_BUDGET_CONTROLLER_TARGET:
+            raise ValueError("PAD-Frozen prediction-budget controller target changed.")
+        if float(budget.proportional_gain) != 0.0:
+            raise ValueError("PAD-Frozen uses the projected dual without a P term.")
+        if (
+            OmegaConf.select(
+                cfg, "algorithm.fixed_branch_cost.controller", default=None
+            )
+            is not None
+        ):
+            raise ValueError(
+                "PAD-Frozen must not compose the generic fastwam_idm_cost_control "
+                "group; algorithm.prediction_budget is its sole controller source."
+            )
+        if not bool(
+            OmegaConf.select(cfg, "algorithm.fixed_branch_cost.fair_cost.enabled")
+        ):
+            raise ValueError("PAD-Frozen prediction-budget controller is disabled.")
     if bool(OmegaConf.select(cfg, "actor.enable_sft_co_train", default=False)):
         raise ValueError("PAD-Frozen does not use SFT co-training.")
     if not bool(

@@ -2049,6 +2049,25 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
 
         return None
 
+    def _consume_rollout_batch_during_train_preparation(self) -> bool:
+        """Whether flatten/shuffle may release the time-major source batch.
+
+        Stored FastWAM replay has always been a one-way handoff, so preserve its
+        existing consuming behavior.  Scheme subclasses may opt in when their
+        non-stored replay payload is likewise never reused after preparation.
+        """
+
+        return (
+            SupportedModel(self.cfg.actor.model.model_type)
+            is SupportedModel.FASTWAM_ADAPTIVE
+            and str(self.cfg.actor.model.kv_replay.backend) == "stored"
+        )
+
+    def _after_rollout_batch_train_preparation(self) -> None:
+        """Optional scheme hook after the old time-major batch is released."""
+
+        return None
+
     def _process_received_rollout_batch(
         self, rollout_batch: dict[str, torch.Tensor]
     ) -> dict[str, torch.Tensor]:
@@ -3754,12 +3773,9 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
             self.rollout_batch = process_nested_dict_for_train(
                 self.rollout_batch,
                 shuffle_id,
-                consume=(
-                    SupportedModel(self.cfg.actor.model.model_type)
-                    is SupportedModel.FASTWAM_ADAPTIVE
-                    and str(self.cfg.actor.model.kv_replay.backend) == "stored"
-                ),
+                consume=self._consume_rollout_batch_during_train_preparation(),
             )
+        self._after_rollout_batch_train_preparation()
         update_epoch = int(self.cfg.algorithm.get("update_epoch", 1))
         gate_gradient_diagnostic_config = (
             self._fastwam_gate_gradient_diagnostic_config()

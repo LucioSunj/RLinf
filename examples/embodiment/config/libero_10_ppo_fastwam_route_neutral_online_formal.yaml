@@ -1,0 +1,94 @@
+defaults:
+  - env/libero_10@env.train
+  - env/libero_10@env.eval
+  - model/fastwam_route_neutral_online@actor.model
+  - model/fastwam_route_neutral_online@rollout.model
+  - hybrid_engines/fsdp@actor.fsdp_config
+  - weight_syncer/patch_syncer@weight_syncer
+  - online_idm_bc: enabled
+  - libero_10_ppo_fastwam_task0_formal_base
+  - fastwam_idm_cost_control: pad_route_neutral_warmup_reversal_damped_b50
+  - override hydra/job_logging: stdout
+  - _self_
+
+hydra:
+  run:
+    dir: .
+  output_subdir: null
+  searchpath:
+    - file://${oc.env:EMBODIED_PATH}/config/
+
+cluster:
+  num_nodes: 1
+  component_placement:
+    actor: "0-0"
+    env: "1-6"
+    rollout: "1-6"
+
+route_neutral_online_implementation:
+  actor_target: rlinf.models.embodiment.wam_policy.route_neutral_online.actor.RouteNeutralOnlineIDMBCFSDPActor
+  policy_target: rlinf.models.embodiment.wam_policy.route_neutral_online.policy.RouteNeutralOnlineIDMBCFastWAMPolicy
+  rollout_worker_target: rlinf.models.embodiment.wam_policy.route_neutral_online.lifecycle.RouteNeutralOnlineRolloutWorker
+  env_worker_target: rlinf.models.embodiment.wam_policy.route_neutral_online.lifecycle.RouteNeutralOnlineEnvWorker
+  runner_target: rlinf.models.embodiment.wam_policy.route_neutral_online.lifecycle.RouteNeutralOnlineRunner
+  rollout_init_mode: serial_rank
+  trajectory_send_mode: serialized
+  release_host_memory_after_rollout_init: true
+  release_host_memory_after_trajectory_send: true
+  release_host_memory_after_trajectory_receive: true
+  release_host_memory_after_train_preparation: true
+  consume_rollout_batch_during_train_preparation: true
+
+runner:
+  logger:
+    project_name: fastwam-route-neutral-online
+    experiment_name: libero_10_ppo_fastwam_route_neutral_online_formal
+  save_interval: 5
+  bootstrap_uncond_lora_sidecar: ${oc.env:FASTWAM_UNCOND_BC_SIDECAR}
+  bootstrap_uncond_lora_sidecar_sha256: ${oc.env:FASTWAM_UNCOND_BC_SIDECAR_SHA256}
+  fastwam_training_guard:
+    gate_parameter_audit_interval_updates: 10
+
+algorithm:
+  uncond_idm_bc:
+    enabled: true
+    loss_weight: 0.2
+  uncond_flow_ppo:
+    loss_weight: 1.0
+  fixed_branch_cost:
+    fair_cost:
+      enabled: false
+
+env:
+  train:
+    total_num_envs: 30
+    rollout_epoch: 1
+    seed: 42
+    egl_instantiation_target: rlinf.models.embodiment.wam_policy.pad_rv.egl.instantiate_with_physical_egl
+  eval:
+    egl_instantiation_target: rlinf.models.embodiment.wam_policy.pad_rv.egl.instantiate_with_physical_egl
+
+actor:
+  global_batch_size: 210
+  micro_batch_size: 1
+  seed: 42
+  model:
+    formal_training_sampling_seed: ${actor.seed}
+    decision_telemetry_enabled: false
+    kv_replay:
+      backend: recompute
+      gate_kv_sample_budget: null
+    runtime:
+      _target_: rlinf.models.embodiment.wam_policy.route_neutral_online.runtime.RouteNeutralOnlineIDMTeacherLiberoRuntime
+      text_embedding_cache_dir: ${oc.env:FASTWAM_TEXT_CACHE}
+
+rollout:
+  model:
+    formal_training_sampling_seed: ${actor.seed}
+    decision_telemetry_enabled: false
+    kv_replay:
+      backend: recompute
+      gate_kv_sample_budget: null
+    runtime:
+      _target_: rlinf.models.embodiment.wam_policy.route_neutral_online.runtime.RouteNeutralOnlineIDMTeacherLiberoRuntime
+      text_embedding_cache_dir: ${oc.env:FASTWAM_TEXT_CACHE}

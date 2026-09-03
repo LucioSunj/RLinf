@@ -19,7 +19,7 @@ from rlinf.models.embodiment.wam_policy.critic import (
     critic_parent_checkpoint_sha256,
 )
 
-from .config import PadRVStage
+from .config import PAD_ROUTE_NEUTRAL_POLICY_TARGET, PadRVStage
 
 PAD_FROZEN_CHECKPOINT_SCHEMA = "fastwam-gate-only-frozen-pair-v1"
 PAD_FROZEN_CONTRACT_SCHEMA = "fastwam-gate-only-frozen-pair-contract-v1"
@@ -131,7 +131,25 @@ def validate_pad_frozen_eval_checkpoint(
     optimizer_steps = int(payload.get("optimizer_steps", -1))
     if step < 1 or optimizer_steps < 1:
         raise ValueError("PAD-Frozen evaluation requires a trained checkpoint.")
-    if payload.get("versions") != build_pad_frozen_versions(
+    versions = payload.get("versions")
+    route_neutral = str(model_cfg.get("policy_target", "")) == (
+        PAD_ROUTE_NEUTRAL_POLICY_TARGET
+    )
+    if route_neutral:
+        if not isinstance(versions, dict) or set(versions) != {
+            "actor",
+            "gate",
+            "critic",
+        }:
+            raise ValueError("Route-neutral evaluation versions are malformed.")
+        versions = {name: int(value) for name, value in versions.items()}
+        if (
+            versions["actor"] != step
+            or versions["critic"] != optimizer_steps
+            or not 0 < versions["gate"] <= versions["critic"]
+        ):
+            raise ValueError("Route-neutral evaluation checkpoint versions disagree.")
+    elif versions != build_pad_frozen_versions(
         step=step,
         optimizer_steps=optimizer_steps,
     ):

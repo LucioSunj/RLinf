@@ -161,6 +161,7 @@ def assert_pad_frozen_update_resolution(
     optimizer: torch.optim.Optimizer,
     *,
     minimum_half_ulp_ratio: float,
+    group_names: Iterable[str] = PAD_FROZEN_GROUP_NAMES,
 ) -> dict[str, dict[str, float | int | str]]:
     """Audit the next AdamW step before it mutates parameters or state."""
 
@@ -173,8 +174,14 @@ def assert_pad_frozen_update_resolution(
     groups = {str(group.get("name", "")): group for group in optimizer.param_groups}
     if set(groups) != set(PAD_FROZEN_GROUP_NAMES):
         raise RuntimeError(f"PAD optimizer groups changed: {sorted(groups)}.")
+    selected_names = tuple(str(name) for name in group_names)
+    if not selected_names or len(set(selected_names)) != len(selected_names):
+        raise ValueError("PAD update-resolution group selection is empty or repeated.")
+    unknown_names = sorted(set(selected_names) - set(PAD_FROZEN_GROUP_NAMES))
+    if unknown_names:
+        raise ValueError(f"Unknown PAD update-resolution groups: {unknown_names}.")
     report: dict[str, dict[str, float | int | str]] = {}
-    for name in PAD_FROZEN_GROUP_NAMES:
+    for name in selected_names:
         group = groups[name]
         parameters = list(group["params"])
         if not parameters:

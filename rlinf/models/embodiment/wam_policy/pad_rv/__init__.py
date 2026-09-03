@@ -8,11 +8,18 @@
 
 """Config-selected PAD-RV policies built without changing legacy semantics."""
 
-from .config import PadFrozenConfig, validate_pad_frozen_training_config
+from .config import (
+    PadFrozenConfig,
+    validate_pad_frozen_training_config,
+    validate_pad_route_neutral_training_config,
+)
 from .policy import PadFrozenPolicy
+from .route_neutral_policy import PadRouteNeutralPolicy
 
 __all__ = [
     "PadFrozenConfig",
     "PadFrozenPolicy",
+    "PadRouteNeutralPolicy",
     "validate_pad_frozen_training_config",
+    "validate_pad_route_neutral_training_config",
 ]

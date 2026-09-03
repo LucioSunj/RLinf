@@ -1,0 +1,16 @@
+# @package _global_
+
+defaults:
+  - band_price_reversal_damped_b50
+  - _self_
+
+algorithm:
+  fixed_branch_cost:
+    controller:
+      type: pad_critic_warmup_reversal_damped
+      critic_warmup:
+        runner_updates: 5
+        route_behavior: independent_random
+        idm_probability: 0.5
+        freeze_gate: true
+        freeze_cost_controller: true
