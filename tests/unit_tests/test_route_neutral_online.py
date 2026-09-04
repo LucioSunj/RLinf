@@ -420,17 +420,17 @@ def test_mb4_compaction_keeps_union_and_minimal_padding() -> None:
 
     compacted, metrics = actor._prepare_train_global_batch_for_microbatches(batch)
 
-    assert compacted["prev_logprobs"].reshape(-1).tolist() == [0.0, 2.0, 5.0, 1.0]
+    assert compacted["prev_logprobs"].reshape(-1).tolist() == [0.0, 1.0, 2.0, 5.0]
     assert compacted["forward_inputs"]["payload"].reshape(-1).tolist() == [
         0.0,
+        1.0,
         2.0,
         5.0,
-        1.0,
     ]
     assert compacted["route_info"].route_used.tolist() == [
         WAMRoute.IDM,
-        WAMRoute.UNCOND,
         WAMRoute.IDM,
+        WAMRoute.UNCOND,
         WAMRoute.IDM,
     ]
     assert metrics["perf/actor_rows_original"] == 8.0

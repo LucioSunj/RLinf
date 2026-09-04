@@ -271,9 +271,10 @@ class RouteNeutralOnlineIDMBCFSDPActor(OnlineIDMBCFSDPActor):
             padding = (-active_count) % micro_batch_size
             if padding:
                 inactive_indices = (~active).nonzero(as_tuple=False).reshape(-1)
-                selected_indices = torch.cat(
-                    (active_indices, inactive_indices[:padding]),
-                    dim=0,
+                selected_indices = (
+                    torch.cat((active_indices, inactive_indices[:padding]), dim=0)
+                    .sort()
+                    .values
                 )
             else:
                 selected_indices = active_indices
