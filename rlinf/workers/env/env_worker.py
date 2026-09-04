@@ -484,7 +484,7 @@ def _mark_terminal_gate_unused(
     rollout_result: RolloutResult,
     dones: torch.Tensor | np.ndarray,
 ) -> RolloutResult:
-    """Invalidate emitted decisions that cannot control a terminal next chunk."""
+    """Invalidate terminal-unused next-step decisions, preserving same-step ones."""
 
     emitted = rollout_result.emitted_gate
     if emitted is None:
@@ -497,9 +497,8 @@ def _mark_terminal_gate_unused(
             f"{tuple(done_tensor.shape)} and {tuple(emitted.next_route.shape)}."
         )
     terminal = done_tensor.reshape(batch_size, -1).any(dim=1)
-    if rollout_result.route_info is not None and (
-        rollout_result.route_info.route_used.shape != emitted.next_route.shape
-    ):
+    route = rollout_result.route_info
+    if route is not None and route.route_used.shape != emitted.next_route.shape:
         raise ValueError("Executed routes and emitted Gate decisions are misaligned.")
     if rollout_result.actions is not None and (
         int(rollout_result.actions.shape[0]) != batch_size
@@ -513,9 +512,15 @@ def _mark_terminal_gate_unused(
             "Evaluation selections and emitted Gate decisions are misaligned."
         )
     terminal = terminal.to(device=emitted.valid.device)
+    current_step = torch.zeros_like(terminal)
+    if route is not None:
+        current_step = ~route.route_was_forced.to(device=terminal.device) & (
+            route.route_source_chunk_ids.to(device=terminal.device)
+            == route.chunk_ids.to(device=terminal.device)
+        )
     aligned_gate = replace(
         emitted,
-        valid=emitted.valid & ~terminal,
+        valid=emitted.valid & ~(terminal & ~current_step),
     )
     return replace(rollout_result, emitted_gate=aligned_gate)
 

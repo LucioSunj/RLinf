@@ -106,6 +106,23 @@ def _sha256_file(path: Path) -> str:
     return digest.hexdigest()
 
 
+def _tensor_sha256(tensor: torch.Tensor) -> str:
+    """Digest a tensor exactly without persisting the potentially large payload."""
+
+    canonical = tensor.detach().cpu().contiguous()
+    digest = hashlib.sha256()
+    digest.update(
+        _canonical_bytes(
+            {
+                "dtype": str(canonical.dtype),
+                "shape": list(canonical.shape),
+            }
+        )
+    )
+    digest.update(canonical.view(torch.uint8).numpy().tobytes(order="C"))
+    return digest.hexdigest()
+
+
 def _valid_sha256(value: str | None) -> bool:
     return (
         isinstance(value, str)
@@ -850,10 +867,15 @@ class FastWAMLiberoEvalCollector:
             if terminal != (success or truncated):
                 raise ValueError("Done, termination, and truncation outcomes disagree.")
             valid = bool(emitted.valid[index])
-            if valid == terminal:
+            current_step = bool(
+                not route.route_was_forced[index]
+                and route.route_source_chunk_ids[index] == route.chunk_ids[index]
+            )
+            expected_valid = current_step or not terminal
+            if valid != expected_valid:
                 raise ValueError(
-                    "Terminal Gate emissions must be discarded and nonterminal "
-                    "emissions must remain eligible."
+                    "Gate decision validity disagrees with its current-step or "
+                    "next-step routing semantics."
                 )
             probability = float(emitted.base_probability[index])
             if not math.isfinite(probability):
@@ -872,6 +894,7 @@ class FastWAMLiberoEvalCollector:
             )
             action_min = float(actions.min().item()) if actions.numel() else None
             action_max = float(actions.max().item()) if actions.numel() else None
+            policy_action_sha256 = _tensor_sha256(actions) if actions.numel() else None
             entry = state.entry
             identity = str(entry["episode_identity"])
             decision_telemetry = None
@@ -968,6 +991,7 @@ class FastWAMLiberoEvalCollector:
                 "environment_latency_seconds": float(environment_latency_seconds),
                 "action_min": action_min,
                 "action_max": action_max,
+                "policy_action_tensor_sha256": policy_action_sha256,
                 "action_contract_sha256": (snapshot.action_contract.canonical_sha256),
                 "action_trace": action_trace.record_for_batch_index(index),
             }
@@ -1111,6 +1135,12 @@ class FastWAMLiberoEvalCollector:
             final_stage = action_trace.stages[-1]
             action_min = float(final_stage.minimum[index].min().item())
             action_max = float(final_stage.maximum[index].max().item())
+            actions = (
+                rollout_result.actions[index]
+                if rollout_result.actions is not None
+                else torch.empty(0)
+            )
+            policy_action_sha256 = _tensor_sha256(actions) if actions.numel() else None
             record = {
                 "schema": CHUNK_SCHEMA,
                 "run_id": self.run_id,
@@ -1172,6 +1202,7 @@ class FastWAMLiberoEvalCollector:
                 "environment_latency_seconds": float(environment_latency_seconds),
                 "action_min": action_min,
                 "action_max": action_max,
+                "policy_action_tensor_sha256": policy_action_sha256,
                 "action_contract_sha256": (snapshot.action_contract.canonical_sha256),
                 "action_trace": action_trace.record_for_batch_index(index),
             }

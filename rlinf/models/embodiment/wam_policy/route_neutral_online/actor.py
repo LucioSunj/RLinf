@@ -109,6 +109,22 @@ class RouteNeutralOnlineIDMBCFSDPActor(OnlineIDMBCFSDPActor):
             )
         return model
 
+    def load_checkpoint(self, load_path: str) -> int | None:
+        """Do not repeat the native first-joint-update audit after a resume."""
+
+        loaded_step = super().load_checkpoint(load_path)
+        if (
+            loaded_step is not None
+            and int(loaded_step) > self.critic_warmup.runner_updates
+            and int(self.optimizer_steps) > 0
+        ):
+            self._fastwam_update_resolution_checked = True
+            self._logger.info(
+                "[FSDP] Preserving completed first joint route-neutral update "
+                f"resolution audit from resumed step {int(loaded_step)}."
+            )
+        return loaded_step
+
     def _uses_fastwam_handle_replay(self) -> bool:
         """Gate replay is serialized neutral condition data, never Action K/V."""
 

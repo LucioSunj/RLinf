@@ -390,6 +390,11 @@ def test_collector_records_aligned_chunks_episode_and_atomic_shards(tmp_path) ->
     assert chunks[0]["route_was_forced"] is True
     assert chunks[0]["emitted_decision_consumed"] is True
     assert chunks[0]["gate_temperature"] == 1.0
+    assert len(chunks[0]["policy_action_tensor_sha256"]) == 64
+    assert (
+        chunks[0]["policy_action_tensor_sha256"]
+        == chunks[1]["policy_action_tensor_sha256"]
+    )
     assert "decision_telemetry" not in chunks[0]
     assert chunks[1]["route"] == "uncond"
     assert chunks[1]["emitted_decision_discarded"] is True

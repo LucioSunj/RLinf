@@ -10,8 +10,10 @@ from __future__ import annotations
 from collections.abc import Mapping
 from typing import Any
 
-from omegaconf import OmegaConf
+from omegaconf import OmegaConf, open_dict
 
+from rlinf.config_contracts import validate_libero_terminal_reward_config
+from rlinf.models.embodiment.wam_policy.evaluation import EvaluationRoutingConfig
 from rlinf.models.embodiment.wam_policy.online_idm_bc.config import OnlineIDMBCConfig
 from rlinf.models.embodiment.wam_policy.pad_rv.route_neutral_budget import (
     PAD_WARMUP_DAMPED_CONTROLLER_TYPE,
@@ -60,7 +62,89 @@ def validate_route_neutral_online_idm_bc_training_config(
     """Validate the additive profile before allocating pretrained parents."""
 
     if only_eval:
-        raise NotImplementedError("This profile currently defines training only.")
+        model = OmegaConf.select(cfg, "rollout.model")
+        expected = {
+            "builder_target": BUILDER_TARGET,
+            "policy_target": POLICY_TARGET,
+            "runtime._target_": RUNTIME_TARGET,
+        }
+        for field, value in expected.items():
+            actual = str(OmegaConf.select(model, field))
+            if actual != value:
+                raise ValueError(
+                    f"Route-neutral rollout.model.{field} must be {value}, "
+                    f"got {actual}."
+                )
+        profile = OmegaConf.to_container(
+            OmegaConf.select(model, "route_neutral_online"), resolve=True
+        )
+        if not isinstance(profile, Mapping):
+            raise TypeError("Route-neutral model profile must resolve to a mapping.")
+        RouteNeutralGateInputContract.from_mapping(
+            profile["input_contract"],
+            state_dim=int(OmegaConf.select(model, "fastwam.proprio_dim")),
+        )
+        visual = profile["visual"]
+        if tuple(visual.get("sources", ())) != ("current_frame_video",):
+            raise ValueError("Route-neutral visual sources changed.")
+        layer_indices = tuple(int(v) for v in visual.get("layer_indices", ()))
+        if layer_indices != (14, 15, 16, 17, 18, 19):
+            raise ValueError("Route-neutral Gate must use MoT layers 15--20.")
+        if bool(model.gate.current_mode_embedding) or bool(
+            model.gate.denoise_timestep_embedding
+        ):
+            raise ValueError("Route-neutral Gate excludes mode/timestep embeddings.")
+        if bool(model.get("decision_telemetry_enabled", False)):
+            raise ValueError("Route-neutral Gate disables legacy mode-flip telemetry.")
+        if str(model.kv_replay.backend) != "recompute":
+            raise ValueError(
+                "Route-neutral orchestration requires no K/V handle store."
+            )
+        if model.kv_replay.get("gate_kv_sample_budget") is not None:
+            raise ValueError("Route-neutral replay cannot sample Action K/V.")
+        if model.get("uncond_lora") is None:
+            raise ValueError("Trainable UNCOND requires a dynamic LoRA adapter.")
+
+        random_probability = model.get("eval_random_idm_probability", None)
+        random_autocorrelation = model.get("eval_random_lag1_autocorrelation", None)
+        EvaluationRoutingConfig(
+            mode=str(model.get("eval_routing_mode", "learned_threshold")),
+            idm_threshold=float(model.get("eval_idm_threshold", 0.5)),
+            random_idm_probability=(
+                None if random_probability is None else float(random_probability)
+            ),
+            random_lag1_autocorrelation=(
+                None
+                if random_autocorrelation is None
+                else float(random_autocorrelation)
+            ),
+            periodic_period=model.get("eval_period", None),
+            periodic_on_count=model.get("eval_periodic_on_count", None),
+            periodic_phase=model.get("eval_periodic_phase", None),
+            routing_seed=model.get("eval_routing_seed", 0),
+        )
+        from rlinf.runners.fastwam_budget_calibration import (
+            validate_fastwam_budget_evaluation_config,
+        )
+
+        validate_fastwam_budget_evaluation_config(cfg)
+        for split_name in ("train", "eval"):
+            split_cfg = cfg.env.get(split_name, None)
+            if split_cfg is not None:
+                validate_libero_terminal_reward_config(
+                    ignore_terminations=bool(
+                        split_cfg.get("ignore_terminations", False)
+                    ),
+                    use_rel_reward=bool(split_cfg.get("use_rel_reward", True)),
+                )
+        load_for_eval = bool(model.critic.get("load_for_eval", False))
+        if load_for_eval:
+            raise ValueError(
+                "Route-neutral Plus evaluation does not load the training critic."
+            )
+        with open_dict(model):
+            model.eval_without_critic = True
+        return OnlineIDMBCConfig.from_mapping(profile["online_idm_bc"])
     online = OnlineIDMBCConfig.from_mapping(
         OmegaConf.select(cfg, "algorithm.uncond_idm_bc")
     )

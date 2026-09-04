@@ -67,6 +67,7 @@ def _inputs():
 def test_routing_modes_are_exact_and_defaults_are_learned_threshold() -> None:
     assert [mode.value for mode in EvaluationRoutingMode] == [
         "learned_threshold",
+        "stochastic_keyed",
         "forced_idm",
         "forced_uncond",
         "matched_random",
@@ -281,6 +282,29 @@ def test_matched_random_is_stateless_and_batch_order_invariant() -> None:
         assert single.random_draws.item() == baseline.random_draws[index].item()
 
 
+def test_stochastic_keyed_uses_gate_probability_and_is_batch_order_invariant() -> None:
+    config = EvaluationRoutingConfig(mode="stochastic_keyed", routing_seed=20260903)
+    inputs = _inputs()
+    baseline = select_evaluation_routes(config, **inputs)
+    permutation = torch.tensor([2, 0, 1])
+    permuted = select_evaluation_routes(
+        config,
+        **{name: value[permutation] for name, value in inputs.items()},
+    )
+    inverse = torch.argsort(permutation)
+
+    assert baseline.random_draws is not None
+    assert torch.equal(
+        baseline.effective_next_route,
+        (baseline.random_draws < inputs["gate_idm_probabilities"]).to(torch.long),
+    )
+    assert torch.equal(
+        baseline.effective_next_route,
+        permuted.effective_next_route[inverse],
+    )
+    assert torch.equal(baseline.random_draws, permuted.random_draws[inverse])
+
+
 def test_matched_random_key_uses_every_declared_identity_field() -> None:
     config = EvaluationRoutingConfig(
         mode="matched_random",
@@ -338,6 +362,7 @@ def test_route_selection_record_round_trips_cpu_cat_and_chunks() -> None:
     "mode",
     [
         "learned_threshold",
+        "stochastic_keyed",
         "forced_idm",
         "forced_uncond",
         "matched_random",

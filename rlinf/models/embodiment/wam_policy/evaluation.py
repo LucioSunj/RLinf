@@ -32,6 +32,7 @@ class EvaluationRoutingMode(str, Enum):
     """Supported formal-evaluation route controls."""
 
     LEARNED_THRESHOLD = "learned_threshold"
+    STOCHASTIC_KEYED = "stochastic_keyed"
     FORCED_IDM = "forced_idm"
     FORCED_UNCOND = "forced_uncond"
     MATCHED_RANDOM = "matched_random"
@@ -120,11 +121,14 @@ class EvaluationRoutingConfig:
                 "random_idm_probability",
                 random_probability,
             )
-        random_modes = {
+        random_modes_requiring_fixed_probability = {
             EvaluationRoutingMode.MATCHED_RANDOM,
             EvaluationRoutingMode.AUTOCORRELATION_MATCHED_RANDOM,
         }
-        if mode in random_modes and random_probability is None:
+        if (
+            mode in random_modes_requiring_fixed_probability
+            and random_probability is None
+        ):
             raise ValueError(f"`{mode.value}` requires eval_random_idm_probability.")
 
         autocorrelation = self.random_lag1_autocorrelation
@@ -254,6 +258,7 @@ class EvaluationRouteSelection:
                 raise ValueError(f"`{name}` contains an invalid route.")
 
         random_modes = {
+            EvaluationRoutingMode.STOCHASTIC_KEYED,
             EvaluationRoutingMode.MATCHED_RANDOM,
             EvaluationRoutingMode.AUTOCORRELATION_MATCHED_RANDOM,
         }
@@ -469,6 +474,7 @@ def select_evaluation_routes(
     elif config.mode is EvaluationRoutingMode.FORCED_UNCOND:
         effective = torch.full_like(counterfactual, int(WAMRoute.UNCOND))
     elif config.mode in {
+        EvaluationRoutingMode.STOCHASTIC_KEYED,
         EvaluationRoutingMode.MATCHED_RANDOM,
         EvaluationRoutingMode.AUTOCORRELATION_MATCHED_RANDOM,
     }:
@@ -490,7 +496,9 @@ def select_evaluation_routes(
             dtype=torch.float64,
             device=gate_idm_probabilities.device,
         )
-        if config.mode is EvaluationRoutingMode.MATCHED_RANDOM:
+        if config.mode is EvaluationRoutingMode.STOCHASTIC_KEYED:
+            idm_thresholds = gate_idm_probabilities.to(dtype=torch.float64)
+        elif config.mode is EvaluationRoutingMode.MATCHED_RANDOM:
             idm_thresholds: float | torch.Tensor = float(config.random_idm_probability)
         else:
             probability_after_idm, probability_after_uncond = (

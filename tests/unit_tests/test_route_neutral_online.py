@@ -15,6 +15,9 @@ from rlinf.models.embodiment.wam_policy.contracts import (
     WAMRoute,
 )
 from rlinf.models.embodiment.wam_policy.kv_replay import GateKVReplayBackend
+from rlinf.models.embodiment.wam_policy.online_idm_bc.actor import (
+    OnlineIDMBCFSDPActor,
+)
 from rlinf.models.embodiment.wam_policy.pad_rv.route_neutral_runner import (
     PadRouteNeutralRunner,
 )
@@ -27,6 +30,9 @@ from rlinf.models.embodiment.wam_policy.route_neutral_online.config import (
 )
 from rlinf.models.embodiment.wam_policy.route_neutral_online.lifecycle import (
     RouteNeutralOnlineRunner,
+)
+from rlinf.models.embodiment.wam_policy.route_neutral_online.policy import (
+    RouteNeutralOnlineIDMBCFastWAMPolicy,
 )
 
 
@@ -47,6 +53,29 @@ def _compose(monkeypatch):
         monkeypatch.setenv(name, value)
     with initialize_config_dir(version_base="1.1", config_dir=str(config_dir)):
         return compose(config_name="libero_10_ppo_fastwam_route_neutral_online_formal")
+
+
+def _compose_eval(monkeypatch):
+    config_dir = Path(__file__).parents[2]
+    environment = {
+        "EMBODIED_PATH": str(config_dir / "examples" / "embodiment"),
+        "FASTWAM_CHECKPOINT": "/parent.pt",
+        "FASTWAM_CHECKPOINT_SHA256": "a" * 64,
+        "FASTWAM_DATASET_STATS": "/stats.json",
+        "FASTWAM_TEXT_CACHE": "/text-cache",
+        "PI05_CRITIC_CHECKPOINT": "/critic",
+        "PI05_CRITIC_CHECKPOINT_SHA256": "c" * 64,
+        "FASTWAM_EVAL_OUTPUT_DIR": "/output",
+        "FASTWAM_EVAL_RUN_ID": "route-neutral-eval-test",
+        "FASTWAM_EVAL_LEDGER": "/ledger.json",
+        "FASTWAM_PROJECT_CHECKPOINT": "/project-checkpoint.pt",
+    }
+    for name, value in environment.items():
+        monkeypatch.setenv(name, value)
+    with initialize_config_dir(
+        version_base="1.1", config_dir=str(config_dir / "evaluations" / "libero")
+    ):
+        return compose(config_name="libero_plus_long_fastwam_route_neutral_online_eval")
 
 
 def test_config_selects_bc_initialized_trainable_uncond(monkeypatch) -> None:
@@ -72,6 +101,97 @@ def test_config_selects_bc_initialized_trainable_uncond(monkeypatch) -> None:
         is True
     )
     assert issubclass(RouteNeutralOnlineRunner, PadRouteNeutralRunner)
+
+
+def test_resume_preserves_completed_first_joint_update_audit(monkeypatch) -> None:
+    def _load_checkpoint(actor, _load_path):
+        actor.optimizer_steps = 300
+        return 30
+
+    monkeypatch.setattr(OnlineIDMBCFSDPActor, "load_checkpoint", _load_checkpoint)
+    actor = object.__new__(RouteNeutralOnlineIDMBCFSDPActor)
+    actor.optimizer_steps = 0
+    actor.critic_warmup = SimpleNamespace(runner_updates=5)
+    actor._fastwam_update_resolution_checked = False
+    messages = []
+    actor._logger = SimpleNamespace(info=messages.append)
+
+    assert actor.load_checkpoint("/checkpoint/global_step_30") == 30
+    assert actor._fastwam_update_resolution_checked is True
+    assert messages == [
+        "[FSDP] Preserving completed first joint route-neutral update "
+        "resolution audit from resumed step 30."
+    ]
+
+
+def test_warmup_boundary_resume_keeps_first_joint_update_audit_due(monkeypatch) -> None:
+    def _load_checkpoint(actor, _load_path):
+        actor.optimizer_steps = 50
+        return 5
+
+    monkeypatch.setattr(OnlineIDMBCFSDPActor, "load_checkpoint", _load_checkpoint)
+    actor = object.__new__(RouteNeutralOnlineIDMBCFSDPActor)
+    actor.optimizer_steps = 0
+    actor.critic_warmup = SimpleNamespace(runner_updates=5)
+    actor._fastwam_update_resolution_checked = False
+    actor._logger = SimpleNamespace(info=lambda _message: None)
+
+    assert actor.load_checkpoint("/checkpoint/global_step_5") == 5
+    assert actor._fastwam_update_resolution_checked is False
+
+
+def test_eval_config_selects_current_step_gate_without_critic(monkeypatch) -> None:
+    cfg = _compose_eval(monkeypatch)
+    online = validate_route_neutral_online_idm_bc_training_config(cfg, only_eval=True)
+
+    assert online.enabled is True
+    assert cfg.rollout.model.eval_routing_mode == "learned_threshold"
+    assert cfg.rollout.model.formal_training_sampling_seed == 42
+    assert cfg.rollout.model.eval_without_critic is True
+    assert cfg.rollout.model.fastwam.load_text_encoder is False
+    assert cfg.rollout.model.route_neutral_online.visual.layer_indices == [
+        14,
+        15,
+        16,
+        17,
+        18,
+        19,
+    ]
+
+
+def test_eval_prediction_disables_value_computation(monkeypatch) -> None:
+    policy = object.__new__(RouteNeutralOnlineIDMBCFastWAMPolicy)
+    policy.config = SimpleNamespace(
+        training_rollout_microbatch_size=None,
+        decision_telemetry_enabled=False,
+    )
+    observed = {}
+    monkeypatch.setattr(
+        RouteNeutralOnlineIDMBCFastWAMPolicy,
+        "_routing_metadata",
+        lambda _self, _env_obs, batch_size, device: (
+            torch.arange(batch_size, device=device),
+            torch.ones(batch_size, device=device, dtype=torch.bool),
+        ),
+    )
+
+    def _predict_current_step(_self, **kwargs):
+        observed.update(kwargs)
+        return torch.zeros(2, 1), {}
+
+    monkeypatch.setattr(
+        RouteNeutralOnlineIDMBCFastWAMPolicy,
+        "_predict_current_step",
+        _predict_current_step,
+    )
+
+    policy.predict_action_batch(
+        {"states": torch.zeros(2, 1)},
+        mode="eval",
+        compute_values=True,
+    )
+
+    assert observed["compute_values"] is False
 
 
 def test_recompute_backend_enum_preserves_runtime_boundary() -> None:

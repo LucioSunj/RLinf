@@ -15,6 +15,7 @@
 from __future__ import annotations
 
 import asyncio
+from dataclasses import replace
 
 import numpy as np
 import pytest
@@ -350,6 +351,25 @@ def test_terminal_emission_is_retained_but_marked_unused() -> None:
         aligned.evaluation_selection.effective_next_route,
         selection.effective_next_route,
     )
+
+
+def test_terminal_current_step_gate_remains_consumed() -> None:
+    route, emitted, selection = _records()
+    route = replace(
+        route,
+        route_was_forced=torch.tensor([False, False]),
+        route_source_chunk_ids=route.chunk_ids.clone(),
+    )
+    result = RolloutResult(
+        actions=torch.ones(2, 3),
+        route_info=route,
+        emitted_gate=emitted,
+        evaluation_selection=selection,
+    )
+
+    aligned = _mark_terminal_gate_unused(result, torch.tensor([False, True]))
+
+    assert aligned.emitted_gate.valid.tolist() == [True, True]
 
 
 class _EvalEnv:

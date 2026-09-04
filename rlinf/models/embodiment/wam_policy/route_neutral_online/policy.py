@@ -310,6 +310,8 @@ class RouteNeutralOnlineIDMBCFastWAMPolicy(OnlineIDMBCFastWAMPolicy):
     ) -> tuple[torch.Tensor, dict[str, Any]]:
         if mode not in {"train", "eval"}:
             raise ValueError(f"Unsupported route-neutral mode {mode!r}.")
+        if mode == "eval":
+            compute_values = False
         batch_size = int(env_obs["states"].shape[0])
         microbatch = self.config.training_rollout_microbatch_size
         if mode == "train" and microbatch is not None and batch_size > microbatch:
