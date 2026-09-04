@@ -1,0 +1,30 @@
+# @package _global_
+
+cluster:
+  component_placement:
+    actor: "0-0"
+    env: "1-7"
+    rollout: "1-7"
+
+runner:
+  max_epochs: 50
+  max_steps: 50
+  logger:
+    experiment_name: libero_10_ppo_fastwam_route_neutral_online_task6_perfopt28
+
+algorithm:
+  regularization:
+    base_uncond_kl:
+      enabled: false
+      coefficient: 0.0
+      log_metric: false
+
+env:
+  train:
+    task_id_filter: [6]
+    total_num_envs: 28
+
+actor:
+  global_batch_size: 196
+  micro_batch_size: 4
+

@@ -21,6 +21,7 @@ from rlinf.algorithms.fastwam_dual_ppo import (
     compute_fastwam_dual_ppo_loss,
 )
 from rlinf.algorithms.losses import compute_ppo_critic_loss
+from rlinf.models.embodiment.wam_policy.contracts import WAMRoute
 from rlinf.models.embodiment.wam_policy.online_idm_bc.actor import (
     OnlineIDMBCFSDPActor,
 )
@@ -35,6 +36,7 @@ from rlinf.models.embodiment.wam_policy.pad_rv.memory import release_pad_host_me
 from rlinf.models.embodiment.wam_policy.pad_rv.route_neutral_contracts import (
     PadCriticWarmupConfig,
 )
+from rlinf.utils.nested_dict_process import map_nested_tensors
 from rlinf.workers.actor.fsdp_actor_worker import (
     EmbodiedFSDPActor,
     fastwam_effective_gate_kv_mask,
@@ -195,6 +197,126 @@ class RouteNeutralOnlineIDMBCFSDPActor(OnlineIDMBCFSDPActor):
             flush=True,
         )
 
+    @staticmethod
+    def _active_rows(mask: torch.Tensor, *, batch_size: int, name: str) -> torch.Tensor:
+        if not isinstance(mask, torch.Tensor) or mask.shape[0] != batch_size:
+            raise ValueError(
+                f"Route-neutral {name} must begin with batch size {batch_size}."
+            )
+        return mask.bool().reshape(batch_size, -1).any(dim=1)
+
+    def _prepare_train_global_batch_for_microbatches(
+        self,
+        train_global_batch: dict[str, Any],
+    ) -> tuple[dict[str, Any], dict[str, float]]:
+        """Remove rows with zero contribution while preserving global divisors."""
+
+        reference = self._training_batch_reference(train_global_batch)
+        batch_size = int(reference.shape[0])
+        micro_batch_size = int(self.cfg.actor.micro_batch_size)
+        if micro_batch_size not in {1, 4}:
+            raise ValueError("Route-neutral actor microbatch must be 1 or 4.")
+        route_info = train_global_batch.get("route_info")
+        if route_info is None:
+            raise KeyError("Route-neutral compaction requires route_info.")
+        gate_rows = self._active_rows(
+            fastwam_effective_gate_kv_mask(
+                train_global_batch["gate_valid_mask"],
+                train_global_batch.get("gate_kv_sample_mask"),
+            ),
+            batch_size=batch_size,
+            name="effective Gate mask",
+        )
+        flow_rows = self._active_rows(
+            train_global_batch["flow_valid_mask"].bool()
+            & (route_info.route_used == int(WAMRoute.UNCOND)),
+            batch_size=batch_size,
+            name="effective Flow mask",
+        )
+        loss_mask = train_global_batch.get("loss_mask")
+        if loss_mask is None:
+            raise KeyError("Route-neutral compaction requires critic loss_mask.")
+        critic_rows = self._active_rows(
+            loss_mask,
+            batch_size=batch_size,
+            name="critic loss mask",
+        )
+        active = gate_rows | flow_rows | critic_rows
+        active_indices = active.nonzero(as_tuple=False).reshape(-1)
+        active_count = int(active_indices.numel())
+
+        if micro_batch_size == 1:
+            return train_global_batch, {
+                "perf/actor_rows_original": float(batch_size),
+                "perf/actor_rows_active": float(active_count),
+                "perf/actor_rows_padded": 0.0,
+                "perf/actor_rows_forwarded": float(batch_size),
+                "perf/actor_rows_saved_fraction": 0.0,
+                "perf/actor_microbatches_executed": float(batch_size),
+            }
+
+        if active_count == 0:
+            selected_indices = torch.arange(
+                micro_batch_size,
+                device=active.device,
+                dtype=torch.long,
+            )
+        else:
+            padding = (-active_count) % micro_batch_size
+            if padding:
+                inactive_indices = (~active).nonzero(as_tuple=False).reshape(-1)
+                selected_indices = torch.cat(
+                    (active_indices, inactive_indices[:padding]),
+                    dim=0,
+                )
+            else:
+                selected_indices = active_indices
+        forwarded_count = int(selected_indices.numel())
+        padded_count = forwarded_count - active_count
+
+        def _select_rows(tensor: torch.Tensor) -> torch.Tensor:
+            if tensor.ndim < 1 or tensor.shape[0] != batch_size:
+                raise ValueError(
+                    "Route-neutral flattened replay tensors must all begin with "
+                    f"batch size {batch_size}, got {tuple(tensor.shape)}."
+                )
+            return tensor.index_select(
+                0,
+                selected_indices.to(tensor.device),
+            )
+
+        compacted = map_nested_tensors(train_global_batch, _select_rows)
+        return compacted, {
+            "perf/actor_rows_original": float(batch_size),
+            "perf/actor_rows_active": float(active_count),
+            "perf/actor_rows_padded": float(padded_count),
+            "perf/actor_rows_forwarded": float(forwarded_count),
+            "perf/actor_rows_saved_fraction": float(
+                (batch_size - forwarded_count) / batch_size
+            ),
+            "perf/actor_microbatches_executed": float(
+                forwarded_count // micro_batch_size
+            ),
+        }
+
+    @staticmethod
+    def _append_route_neutral_perf_metrics(
+        metrics: dict[str, float],
+        output_dict: dict[str, torch.Tensor],
+    ) -> None:
+        for name in (
+            "perf/rollout_idm_batch_size",
+            "perf/rollout_uncond_batch_size",
+            "perf/teacher_batch_size",
+        ):
+            value = output_dict.get(name)
+            if isinstance(value, torch.Tensor):
+                metrics[name] = float(value.detach().item())
+        if "critic/value_clip_ratio" in metrics:
+            metrics["critic/value_clip_ratio_compacted"] = metrics[
+                "critic/value_clip_ratio"
+            ]
+
     def _warmup_batch(self, micro_batch: dict[str, Any]) -> bool:
         route = micro_batch.get("route_info")
         versions = getattr(route, "actor_versions", None)
@@ -238,11 +360,13 @@ class RouteNeutralOnlineIDMBCFSDPActor(OnlineIDMBCFSDPActor):
         warmup = self._warmup_batch(micro_batch)
         self._route_neutral_warmup_active = warmup
         if not warmup:
-            return super()._compute_fastwam_loss(
+            loss, metrics = super()._compute_fastwam_loss(
                 micro_batch=micro_batch,
                 output_dict=output_dict,
                 selected_loss_scales=selected_loss_scales,
             )
+            self._append_route_neutral_perf_metrics(metrics, output_dict)
+            return loss, metrics
 
         gate_cfg = self.cfg.algorithm.gate_ppo
         flow_cfg = self.cfg.algorithm.uncond_flow_ppo
@@ -317,10 +441,12 @@ class RouteNeutralOnlineIDMBCFSDPActor(OnlineIDMBCFSDPActor):
                 ),
             }
         )
-        return loss, {
+        scalar_metrics = {
             key: value.detach().item() if isinstance(value, torch.Tensor) else value
             for key, value in metrics.items()
         }
+        self._append_route_neutral_perf_metrics(scalar_metrics, output_dict)
+        return loss, scalar_metrics
 
     def optimizer_step(self) -> tuple[float, list[float]]:
         """Step critic alone in warm-up and all three owners afterwards."""

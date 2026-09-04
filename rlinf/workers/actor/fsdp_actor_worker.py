@@ -2068,6 +2068,14 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
 
         return None
 
+    def _prepare_train_global_batch_for_microbatches(
+        self,
+        train_global_batch: dict[str, Any],
+    ) -> tuple[dict[str, Any], dict[str, float]]:
+        """Optionally compact one global batch before microbatch splitting."""
+
+        return train_global_batch, {}
+
     def _process_received_rollout_batch(
         self, rollout_batch: dict[str, torch.Tensor]
     ) -> dict[str, torch.Tensor]:
@@ -3835,9 +3843,23 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
                     f"{train_global_batch_size=}, {self.cfg.actor.micro_batch_size}"
                 )
 
+                train_global_batch, preparation_metrics = (
+                    self._prepare_train_global_batch_for_microbatches(
+                        train_global_batch
+                    )
+                )
+                if preparation_metrics:
+                    append_to_dict(metrics, preparation_metrics)
+                forwarded_batch_size = self._training_batch_reference(
+                    train_global_batch
+                ).shape[0]
+                assert forwarded_batch_size % self.cfg.actor.micro_batch_size == 0, (
+                    f"{forwarded_batch_size=}, {self.cfg.actor.micro_batch_size}"
+                )
+
                 train_micro_batch = split_dict_to_chunk(
                     train_global_batch,
-                    train_global_batch_size // self.cfg.actor.micro_batch_size,
+                    forwarded_batch_size // self.cfg.actor.micro_batch_size,
                 )
                 selected_loss_scales = None
                 counts = None
@@ -3928,7 +3950,7 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
                     self.train_micro_batch(
                         micro_batch=batch,
                         metrics=metrics,
-                        is_last=(idx + 1) == self.gradient_accumulation,
+                        is_last=(idx + 1) == len(train_micro_batch),
                         selected_loss_scales=selected_loss_scales,
                     )
                     if consumed_handles:

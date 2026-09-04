@@ -279,11 +279,32 @@ def validate_route_neutral_online_idm_bc_training_config(
         )
     rollout_size = total_num_envs * (rollout_steps // execution_horizon)
     global_batch_size = int(OmegaConf.select(cfg, "actor.global_batch_size"))
+    micro_batch_size = int(OmegaConf.select(cfg, "actor.micro_batch_size"))
+    if micro_batch_size not in {1, 4}:
+        raise ValueError("Route-neutral actor microbatch must be either 1 or 4.")
+    if global_batch_size % micro_batch_size != 0:
+        raise ValueError(
+            "Route-neutral global batch size must be divisible by actor microbatch."
+        )
     if rollout_size % global_batch_size != 0:
         raise ValueError(
             f"Route-neutral rollout size {rollout_size} must be divisible by "
             f"actor global batch size {global_batch_size}."
         )
+    if micro_batch_size == 4:
+        base_kl = OmegaConf.select(
+            cfg,
+            "algorithm.regularization.base_uncond_kl",
+        )
+        if (
+            bool(base_kl.get("enabled", False))
+            or float(base_kl.get("coefficient", 0.0)) != 0.0
+            or bool(base_kl.get("log_metric", False))
+        ):
+            raise ValueError(
+                "Optimized route-neutral training requires disabled base UNCOND KL "
+                "loss and logging."
+            )
     return online
 
 
