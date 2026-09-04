@@ -35,7 +35,12 @@ from rlinf.models.embodiment.wam_policy.pad_rv.route_neutral_policy import (
     RouteNeutralRoutingState,
 )
 
-from .runtime import RouteNeutralOnlineIDMTeacherLiberoRuntime
+from .runtime import (
+    ROUTE_NEUTRAL_ROLLOUT_IDM_BATCH_SIZE,
+    ROUTE_NEUTRAL_ROLLOUT_UNCOND_BATCH_SIZE,
+    ROUTE_NEUTRAL_TEACHER_BATCH_SIZE,
+    RouteNeutralOnlineIDMTeacherLiberoRuntime,
+)
 
 
 class RouteNeutralOnlineIDMBCFastWAMPolicy(OnlineIDMBCFastWAMPolicy):
@@ -161,9 +166,14 @@ class RouteNeutralOnlineIDMBCFastWAMPolicy(OnlineIDMBCFastWAMPolicy):
                 )
             runtime_obs = {**env_obs, **seed_fields}
 
-        gate_features = self.runtime.prepare_route_neutral_gate_features(
-            env_obs=runtime_obs
+        prepared = self.runtime.prepare_route_neutral_step(
+            env_obs=runtime_obs,
+            include_critic_features=(
+                compute_values
+                and self._critic_kind() is CriticKind.FASTWAM_CURRENT_FRAME_VALUE
+            ),
         )
+        gate_features = prepared.gate_features
         gate_parameter = next(self.gate.parameters())
         measure_latency = self.config.eval_timing_cuda_synchronize and mode == "eval"
         if measure_latency and gate_parameter.device.type == "cuda":
@@ -209,6 +219,7 @@ class RouteNeutralOnlineIDMBCFastWAMPolicy(OnlineIDMBCFastWAMPolicy):
             mode=mode,
             actor_version=self.actor_version,
             collect_replay=mode == "train",
+            prepared=prepared,
         )
         emitted = GateDecisionRecord(
             next_route=route_info.route_used,
@@ -416,6 +427,16 @@ class RouteNeutralOnlineIDMBCFastWAMPolicy(OnlineIDMBCFastWAMPolicy):
             route_info=route_info,
         )
         result.update(online_bc.as_forward_outputs())
+        for forward_key, metric_name in (
+            (ROUTE_NEUTRAL_ROLLOUT_IDM_BATCH_SIZE, "perf/rollout_idm_batch_size"),
+            (
+                ROUTE_NEUTRAL_ROLLOUT_UNCOND_BATCH_SIZE,
+                "perf/rollout_uncond_batch_size",
+            ),
+            (ROUTE_NEUTRAL_TEACHER_BATCH_SIZE, "perf/teacher_batch_size"),
+        ):
+            if forward_key in forward_inputs:
+                result[metric_name] = forward_inputs[forward_key].float().max()
         return result
 
     def load_eval_checkpoint(self, *args, **kwargs) -> int:

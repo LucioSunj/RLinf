@@ -622,6 +622,11 @@ class LiberoFastWAMRuntime:
         idm_initial_latents: torch.Tensor | None = None,
         idm_noise_seed: int | None = None,
     ) -> tuple[CachedActionCondition, torch.Tensor | None]:
+        batch_size = int(image.shape[0])
+        if batch_size < 1:
+            raise ValueError("FastWAM action conditions require a non-empty batch.")
+        if context.shape[0] != batch_size or context_mask.shape[0] != batch_size:
+            raise ValueError("FastWAM image, context, and mask batches must agree.")
         first_frame = self.actor._encode_input_image_latents_tensor(
             image,
             tiled=self.tiled_vae,
@@ -638,7 +643,7 @@ class LiberoFastWAMRuntime:
             latent_h = image.shape[-2] // self.actor.vae.upsampling_factor
             latent_w = image.shape[-1] // self.actor.vae.upsampling_factor
             expected_shape = (
-                1,
+                batch_size,
                 self.actor.vae.model.z_dim,
                 latent_t,
                 latent_h,
@@ -649,6 +654,11 @@ class LiberoFastWAMRuntime:
                     "Specify either injected IDM latents or an IDM seed, not both."
                 )
             if idm_initial_latents is None:
+                if idm_noise_seed is not None and batch_size != 1:
+                    raise ValueError(
+                        "A scalar IDM seed can prepare only one sample; inject "
+                        "pre-sampled latents for a batched IDM condition."
+                    )
                 video_latents = (
                     torch.randn(
                         expected_shape,
@@ -685,7 +695,7 @@ class LiberoFastWAMRuntime:
                 )
             )
             for timestep, delta in zip(video_timesteps, video_deltas):
-                timestep_batch = timestep.expand(1).to(dtype=self.dtype)
+                timestep_batch = timestep.expand(batch_size).to(dtype=self.dtype)
                 velocity = self.actor._video_denoise_step_compiled(
                     latents_video=video_latents,
                     timestep_video=timestep_batch,
@@ -702,7 +712,11 @@ class LiberoFastWAMRuntime:
 
         video_pre = self.actor.video_expert.pre_dit(
             x=video_latents,
-            timestep=torch.zeros(1, device=self.device, dtype=self.dtype),
+            timestep=torch.zeros(
+                batch_size,
+                device=self.device,
+                dtype=self.dtype,
+            ),
             context=context,
             context_mask=context_mask,
             action=None,
