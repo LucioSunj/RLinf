@@ -44,6 +44,8 @@ from rlinf.workers.actor.fsdp_actor_worker import (
 
 from .policy import RouteNeutralOnlineIDMBCFastWAMPolicy
 
+_COMPACTION_METRIC_PREFIX = "_route_neutral_compaction/"
+
 
 def align_current_step_trainable_advantages(
     *,
@@ -98,6 +100,7 @@ class RouteNeutralOnlineIDMBCFSDPActor(OnlineIDMBCFSDPActor):
             cfg.actor.model.route_neutral_online.critic_warmup
         )
         self._route_neutral_warmup_active = True
+        self._route_neutral_metric_global_batch = -1
         super().__init__(cfg)
 
     def model_provider_func(self) -> RouteNeutralOnlineIDMBCFastWAMPolicy:
@@ -216,6 +219,9 @@ class RouteNeutralOnlineIDMBCFSDPActor(OnlineIDMBCFSDPActor):
         micro_batch_size = int(self.cfg.actor.micro_batch_size)
         if micro_batch_size not in {1, 4}:
             raise ValueError("Route-neutral actor microbatch must be 1 or 4.")
+        self._route_neutral_metric_global_batch = (
+            int(getattr(self, "_route_neutral_metric_global_batch", -1)) + 1
+        )
         route_info = train_global_batch.get("route_info")
         if route_info is None:
             raise KeyError("Route-neutral compaction requires route_info.")
@@ -317,6 +323,264 @@ class RouteNeutralOnlineIDMBCFSDPActor(OnlineIDMBCFSDPActor):
                 "critic/value_clip_ratio"
             ]
 
+    def _append_route_neutral_metric_numerators(
+        self,
+        metrics: dict[str, float],
+        output_dict: dict[str, torch.Tensor],
+    ) -> None:
+        """Retain additive metric state before skipped zero rows disappear."""
+
+        def scalar(value: Any) -> float:
+            if isinstance(value, torch.Tensor):
+                return float(value.detach().item())
+            return float(value)
+
+        def record(name: str, value: Any) -> None:
+            metrics[f"{_COMPACTION_METRIC_PREFIX}{name}"] = scalar(value)
+
+        record("global_batch", self._route_neutral_metric_global_batch)
+        for name in (
+            "critic/value_loss",
+            "fastwam/regularized_policy_loss",
+            "fastwam/total_loss",
+        ):
+            if name in metrics:
+                record(f"loss/{name}", metrics[name])
+        micro_batch_size = int(self.cfg.actor.micro_batch_size)
+        for prefix in ("gate", "uncond_flow", "online_idm_bc"):
+            key = f"{prefix}/selected_loss_scale"
+            if key not in metrics:
+                continue
+            actual = scalar(metrics[key])
+            record(f"scale/{prefix}", actual)
+            metrics[f"{key}_compacted"] = actual
+            metrics[key] = actual * micro_batch_size
+
+        if "online_idm_bc/raw_loss" not in metrics:
+            return
+        selected = scalar(output_dict["online_idm_bc_selected_count"])
+        record("online/selected", selected)
+        for output_name, metric_name in (
+            ("online_idm_bc_loss_sum", "loss_sum"),
+            ("online_idm_bc_expected_count", "expected"),
+            ("online_idm_bc_present_count", "present"),
+            ("online_idm_bc_valid_action_count", "valid_action_count"),
+            ("online_idm_bc_teacher_seconds_sum", "teacher_seconds"),
+            ("online_idm_bc_teacher_bytes_sum", "teacher_bytes"),
+        ):
+            record(f"online/{metric_name}", output_dict[output_name])
+        for output_name, metric_name in (
+            ("online_idm_bc_mse_pose", "mse_pose"),
+            ("online_idm_bc_mse_gripper", "mse_gripper"),
+            ("online_idm_bc_full_action_mse", "full_action_mse"),
+            ("online_idm_bc_executed_prefix_mse", "executed_prefix_mse"),
+        ):
+            record(
+                f"online/{metric_name}_sum", scalar(output_dict[output_name]) * selected
+            )
+        for index, value in enumerate(
+            output_dict["online_idm_bc_mse_per_dimension"].reshape(-1)
+        ):
+            record(f"online/mse_dimension_sum_{index}", scalar(value) * selected)
+        bin_mse = output_dict["online_idm_bc_mse_by_timestep_bin"].reshape(-1)
+        bin_counts = output_dict["online_idm_bc_timestep_bin_count"].reshape(-1)
+        for index, (mse, count) in enumerate(zip(bin_mse, bin_counts, strict=True)):
+            count_value = scalar(count)
+            record(f"online/timestep_count_{index}", count_value)
+            record(
+                f"online/timestep_mse_sum_{index}",
+                scalar(mse) * count_value,
+            )
+
+    def _finalize_train_metrics_before_reduction(
+        self,
+        metrics: dict[str, list[float]],
+    ) -> None:
+        """Restore MB1 metric denominators without forwarding inactive rows."""
+
+        prefix = _COMPACTION_METRIC_PREFIX
+        batch_ids = [int(value) for value in metrics.pop(f"{prefix}global_batch", [])]
+        if not batch_ids:
+            return
+        groups = {
+            batch_id: [
+                index for index, value in enumerate(batch_ids) if value == batch_id
+            ]
+            for batch_id in sorted(set(batch_ids))
+        }
+        group_count = len(groups)
+        gradient_accumulation = float(self.gradient_accumulation)
+        original_rows = float(
+            int(self.cfg.actor.global_batch_size) // int(self._world_size)
+        )
+        micro_batch_size = float(self.cfg.actor.micro_batch_size)
+
+        def take(name: str) -> list[float]:
+            values = [float(value) for value in metrics.pop(f"{prefix}{name}", [])]
+            if values and len(values) != len(batch_ids):
+                raise ValueError(f"Compaction metric {name!r} lost a microbatch value.")
+            return values
+
+        def group_sums(values: list[float]) -> list[float]:
+            return [
+                sum(values[index] for index in indices) for indices in groups.values()
+            ]
+
+        for metric_name in (
+            "critic/value_loss",
+            "fastwam/regularized_policy_loss",
+            "fastwam/total_loss",
+        ):
+            values = take(f"loss/{metric_name}")
+            if values:
+                metrics[metric_name] = [
+                    sum(group_sums(values)) / gradient_accumulation / group_count
+                ]
+
+        actor_total = [float(value) for value in metrics.get("actor/total_loss", [])]
+        if actor_total:
+            if len(actor_total) != len(batch_ids):
+                raise ValueError("Actor total-loss metrics lost a microbatch value.")
+            metrics["actor/total_loss"] = [
+                sum(group_sums(actor_total)) / original_rows / group_count
+            ]
+
+        for owner in ("gate", "uncond_flow", "online_idm_bc"):
+            values = take(f"scale/{owner}")
+            if not values:
+                continue
+            compacted = []
+            for indices in groups.values():
+                group_values = {values[index] for index in indices}
+                if len(group_values) != 1:
+                    raise ValueError(
+                        f"{owner} selected scale changed within one global batch."
+                    )
+                compacted.append(group_values.pop())
+            metrics[f"{owner}/selected_loss_scale_compacted"] = [
+                sum(compacted) / group_count
+            ]
+            metrics[f"{owner}/selected_loss_scale"] = [
+                sum(value * micro_batch_size for value in compacted) / group_count
+            ]
+
+        selected_values = take("online/selected")
+        if selected_values:
+            self._finalize_online_bc_compaction_metrics(
+                metrics=metrics,
+                take=take,
+                group_sums=group_sums,
+                selected_values=selected_values,
+                group_count=group_count,
+            )
+        leftovers = sorted(name for name in metrics if name.startswith(prefix))
+        if leftovers:
+            raise RuntimeError(f"Unconsumed compaction metrics: {leftovers}.")
+
+    @staticmethod
+    def _finalize_online_bc_compaction_metrics(
+        *,
+        metrics: dict[str, list[float]],
+        take,
+        group_sums,
+        selected_values: list[float],
+        group_count: int,
+    ) -> None:
+        """Recover the historical per-global-batch and selected-row means."""
+
+        selected_by_group = group_sums(selected_values)
+        loss_by_group = group_sums(take("online/loss_sum"))
+        raw_loss = (
+            sum(
+                loss / selected if selected > 0.0 else 0.0
+                for loss, selected in zip(loss_by_group, selected_by_group, strict=True)
+            )
+            / group_count
+        )
+        loss_weight = float(metrics.get("online_idm_bc/loss_weight", [0.0])[0])
+        metrics["online_idm_bc/raw_loss"] = [raw_loss]
+        metrics["online_idm_bc/weighted_loss"] = [loss_weight * raw_loss]
+
+        expected_by_group = group_sums(take("online/expected"))
+        present_values = take("online/present")
+        present_by_group = group_sums(present_values)
+        teacher_seconds = take("online/teacher_seconds")
+        teacher_bytes = take("online/teacher_bytes")
+        metrics["online_idm_bc/expected_count"] = [sum(expected_by_group) / group_count]
+        metrics["online_idm_bc/selected_count"] = [sum(selected_by_group) / group_count]
+        metrics["online_idm_bc/teacher_call_count"] = [
+            sum(present_by_group) / group_count
+        ]
+        metrics["online_idm_bc/teacher_seconds"] = [
+            sum(group_sums(teacher_seconds)) / group_count
+        ]
+        metrics["online_idm_bc/transported_bytes"] = [
+            sum(group_sums(teacher_bytes)) / group_count
+        ]
+        metrics["online_idm_bc/globally_normalized_count"] = [
+            sum(selected_by_group) / group_count
+        ]
+
+        total_selected = sum(selected_values)
+        total_present = sum(present_values)
+        if total_present > 0.0:
+            metrics["online_idm_bc/teacher_seconds_per_call"] = [
+                sum(teacher_seconds) / total_present
+            ]
+            metrics["online_idm_bc/teacher_bytes_per_call"] = [
+                sum(teacher_bytes) / total_present
+            ]
+        detailed_values = {
+            metric_name: take(f"online/{hidden_name}")
+            for hidden_name, metric_name in (
+                ("valid_action_count", "valid_action_count"),
+                ("mse_pose_sum", "mse_pose"),
+                ("mse_gripper_sum", "mse_gripper"),
+                ("full_action_mse_sum", "full_action_mse"),
+                ("executed_prefix_mse_sum", "executed_prefix_mse"),
+            )
+        }
+        dimension_values = [
+            take(f"online/mse_dimension_sum_{index}") for index in range(7)
+        ]
+        timestep_values = [
+            (
+                take(f"online/timestep_count_{index}"),
+                take(f"online/timestep_mse_sum_{index}"),
+            )
+            for index in range(10)
+        ]
+        if total_selected <= 0.0:
+            return
+        for metric_name, values in detailed_values.items():
+            metrics[f"online_idm_bc/{metric_name}"] = [sum(values) / total_selected]
+        for index, values in enumerate(dimension_values):
+            metrics[f"online_idm_bc/mse_dimension_{index}"] = [
+                sum(values) / total_selected
+            ]
+        for index, (count_values, mse_values) in enumerate(timestep_values):
+            count = sum(count_values)
+            mse_sum = sum(mse_values)
+            if count > 0.0:
+                metrics[f"online_idm_bc/mse_timestep_bin_{index}"] = [mse_sum / count]
+                metrics[f"online_idm_bc/timestep_bin_count_{index}"] = [1.0]
+                metrics[
+                    f"online_idm_bc/timestep_bin_selected_count_compacted_{index}"
+                ] = [count / group_count]
+
+    def _finalize_train_metrics_after_reduction(
+        self,
+        metrics: dict[str, float],
+    ) -> None:
+        """Recompute a ratio whose two final operands use restored denominators."""
+
+        weighted = metrics.get("online_idm_bc/weighted_loss")
+        flow = metrics.get("uncond_flow/total_loss")
+        if weighted is not None and flow is not None:
+            metrics["online_idm_bc/weighted_to_flow_loss_ratio"] = abs(
+                float(weighted)
+            ) / max(abs(float(flow)), 1.0e-12)
+
     def _warmup_batch(self, micro_batch: dict[str, Any]) -> bool:
         route = micro_batch.get("route_info")
         versions = getattr(route, "actor_versions", None)
@@ -366,6 +630,7 @@ class RouteNeutralOnlineIDMBCFSDPActor(OnlineIDMBCFSDPActor):
                 selected_loss_scales=selected_loss_scales,
             )
             self._append_route_neutral_perf_metrics(metrics, output_dict)
+            self._append_route_neutral_metric_numerators(metrics, output_dict)
             return loss, metrics
 
         gate_cfg = self.cfg.algorithm.gate_ppo
@@ -446,6 +711,10 @@ class RouteNeutralOnlineIDMBCFSDPActor(OnlineIDMBCFSDPActor):
             for key, value in metrics.items()
         }
         self._append_route_neutral_perf_metrics(scalar_metrics, output_dict)
+        self._append_route_neutral_metric_numerators(
+            scalar_metrics,
+            output_dict,
+        )
         return loss, scalar_metrics
 
     def optimizer_step(self) -> tuple[float, list[float]]:

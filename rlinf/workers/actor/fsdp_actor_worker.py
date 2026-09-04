@@ -2076,6 +2076,22 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
 
         return train_global_batch, {}
 
+    def _finalize_train_metrics_before_reduction(
+        self,
+        metrics: dict[str, list[float]],
+    ) -> None:
+        """Allow a scheme to restore metric denominators after compaction."""
+
+        return None
+
+    def _finalize_train_metrics_after_reduction(
+        self,
+        metrics: dict[str, float],
+    ) -> None:
+        """Allow a scheme to derive metrics from globally reduced values."""
+
+        return None
+
     def _process_received_rollout_batch(
         self, rollout_batch: dict[str, torch.Tensor]
     ) -> dict[str, torch.Tensor]:
@@ -4070,6 +4086,7 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
             kv_metrics = self._stop_fastwam_handle_replay()
             append_to_dict(metrics, kv_metrics)
         clear_memory()
+        self._finalize_train_metrics_before_reduction(metrics)
         explained_variance_stats = pop_critic_explained_variance_stats(metrics)
         weighted_sums = {}
         weighted_maxima = {}
@@ -4110,6 +4127,7 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
                 + float(self.cfg.algorithm.uncond_flow_ppo.get("loss_weight", 1.0))
                 * mean_metric_dict["uncond_flow/total_loss"]
             )
+        self._finalize_train_metrics_after_reduction(mean_metric_dict)
 
         return mean_metric_dict
 

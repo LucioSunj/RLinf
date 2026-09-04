@@ -931,3 +931,135 @@ def test_mb4_compaction_preserves_original_global_batch_denominator() -> None:
     assert metrics["perf/actor_rows_padded"] == 1.0
     assert metrics["perf/actor_rows_forwarded"] == 68.0
     assert metrics["perf/actor_microbatches_executed"] == 17.0
+
+
+def test_mb4_compaction_restores_mb1_metric_denominators() -> None:
+    prefix = "_route_neutral_compaction/"
+    actor = SimpleNamespace(
+        cfg=SimpleNamespace(
+            actor=SimpleNamespace(global_batch_size=8, micro_batch_size=4)
+        ),
+        gradient_accumulation=2,
+        _world_size=1,
+        _finalize_online_bc_compaction_metrics=(
+            RouteNeutralOnlineIDMBCFSDPActor._finalize_online_bc_compaction_metrics
+        ),
+    )
+    metrics = {
+        f"{prefix}global_batch": [0.0, 0.0, 1.0],
+        f"{prefix}loss/critic/value_loss": [2.0, 4.0, 6.0],
+        f"{prefix}loss/fastwam/regularized_policy_loss": [1.0, 3.0, 4.0],
+        f"{prefix}loss/fastwam/total_loss": [3.0, 7.0, 10.0],
+        "actor/total_loss": [0.5, 1.0, 1.5],
+        f"{prefix}scale/gate": [7.0, 7.0, 9.0],
+        f"{prefix}scale/uncond_flow": [2.0, 2.0, 4.0],
+        f"{prefix}scale/online_idm_bc": [5.0, 5.0, 7.0],
+        f"{prefix}online/selected": [1.0, 1.0, 2.0],
+        f"{prefix}online/loss_sum": [2.0, 4.0, 10.0],
+        f"{prefix}online/expected": [1.0, 1.0, 2.0],
+        f"{prefix}online/present": [1.0, 0.0, 1.0],
+        f"{prefix}online/valid_action_count": [3.0, 5.0, 8.0],
+        f"{prefix}online/teacher_seconds": [0.1, 0.2, 0.3],
+        f"{prefix}online/teacher_bytes": [10.0, 20.0, 30.0],
+        f"{prefix}online/mse_pose_sum": [1.0, 3.0, 8.0],
+        f"{prefix}online/mse_gripper_sum": [2.0, 2.0, 4.0],
+        f"{prefix}online/full_action_mse_sum": [4.0, 4.0, 8.0],
+        f"{prefix}online/executed_prefix_mse_sum": [5.0, 3.0, 8.0],
+        "online_idm_bc/loss_weight": [0.2],
+    }
+    for index in range(7):
+        value = float(index + 1)
+        metrics[f"{prefix}online/mse_dimension_sum_{index}"] = [
+            value,
+            value,
+            2.0 * value,
+        ]
+    for index in range(10):
+        metrics[f"{prefix}online/timestep_count_{index}"] = (
+            [1.0, 0.0, 2.0] if index == 0 else [0.0, 0.0, 0.0]
+        )
+        metrics[f"{prefix}online/timestep_mse_sum_{index}"] = (
+            [2.0, 0.0, 8.0] if index == 0 else [0.0, 0.0, 0.0]
+        )
+
+    RouteNeutralOnlineIDMBCFSDPActor._finalize_train_metrics_before_reduction(
+        actor,
+        metrics,
+    )
+
+    assert metrics["critic/value_loss"] == pytest.approx([3.0])
+    assert metrics["fastwam/regularized_policy_loss"] == pytest.approx([2.0])
+    assert metrics["fastwam/total_loss"] == pytest.approx([5.0])
+    assert metrics["actor/total_loss"] == pytest.approx([0.1875])
+    assert metrics["gate/selected_loss_scale_compacted"] == pytest.approx([8.0])
+    assert metrics["gate/selected_loss_scale"] == pytest.approx([32.0])
+    assert metrics["uncond_flow/selected_loss_scale"] == pytest.approx([12.0])
+    assert metrics["online_idm_bc/selected_loss_scale"] == pytest.approx([24.0])
+    assert metrics["online_idm_bc/raw_loss"] == pytest.approx([4.0])
+    assert metrics["online_idm_bc/weighted_loss"] == pytest.approx([0.8])
+    assert metrics["online_idm_bc/selected_count"] == pytest.approx([2.0])
+    assert metrics["online_idm_bc/teacher_call_count"] == pytest.approx([1.0])
+    assert metrics["online_idm_bc/teacher_seconds_per_call"] == pytest.approx([0.3])
+    assert metrics["online_idm_bc/teacher_bytes_per_call"] == pytest.approx([30.0])
+    assert metrics["online_idm_bc/valid_action_count"] == pytest.approx([4.0])
+    assert metrics["online_idm_bc/mse_pose"] == pytest.approx([3.0])
+    assert metrics["online_idm_bc/mse_timestep_bin_0"] == pytest.approx([10.0 / 3.0])
+    assert metrics["online_idm_bc/timestep_bin_count_0"] == [1.0]
+    assert metrics[
+        "online_idm_bc/timestep_bin_selected_count_compacted_0"
+    ] == pytest.approx([1.5])
+    assert all(not key.startswith(prefix) for key in metrics)
+
+    reduced = {
+        "online_idm_bc/weighted_loss": metrics["online_idm_bc/weighted_loss"][0],
+        "uncond_flow/total_loss": 0.5,
+    }
+    RouteNeutralOnlineIDMBCFSDPActor._finalize_train_metrics_after_reduction(
+        actor,
+        reduced,
+    )
+    assert reduced["online_idm_bc/weighted_to_flow_loss_ratio"] == pytest.approx(1.6)
+
+
+def test_mb4_dummy_batch_consumes_zero_selected_metric_state() -> None:
+    prefix = "_route_neutral_compaction/"
+    actor = SimpleNamespace(
+        cfg=SimpleNamespace(
+            actor=SimpleNamespace(global_batch_size=196, micro_batch_size=4)
+        ),
+        gradient_accumulation=49,
+        _world_size=1,
+        _finalize_online_bc_compaction_metrics=(
+            RouteNeutralOnlineIDMBCFSDPActor._finalize_online_bc_compaction_metrics
+        ),
+    )
+    metrics = {
+        f"{prefix}global_batch": [0.0],
+        f"{prefix}online/selected": [0.0],
+        f"{prefix}online/loss_sum": [0.0],
+        f"{prefix}online/expected": [0.0],
+        f"{prefix}online/present": [0.0],
+        f"{prefix}online/valid_action_count": [0.0],
+        f"{prefix}online/teacher_seconds": [0.0],
+        f"{prefix}online/teacher_bytes": [0.0],
+        f"{prefix}online/mse_pose_sum": [0.0],
+        f"{prefix}online/mse_gripper_sum": [0.0],
+        f"{prefix}online/full_action_mse_sum": [0.0],
+        f"{prefix}online/executed_prefix_mse_sum": [0.0],
+        "online_idm_bc/loss_weight": [0.2],
+    }
+    for index in range(7):
+        metrics[f"{prefix}online/mse_dimension_sum_{index}"] = [0.0]
+    for index in range(10):
+        metrics[f"{prefix}online/timestep_count_{index}"] = [0.0]
+        metrics[f"{prefix}online/timestep_mse_sum_{index}"] = [0.0]
+
+    RouteNeutralOnlineIDMBCFSDPActor._finalize_train_metrics_before_reduction(
+        actor,
+        metrics,
+    )
+
+    assert metrics["online_idm_bc/raw_loss"] == [0.0]
+    assert metrics["online_idm_bc/selected_count"] == [0.0]
+    assert "online_idm_bc/mse_pose" not in metrics
+    assert all(not key.startswith(prefix) for key in metrics)
