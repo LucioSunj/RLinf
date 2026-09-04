@@ -17,6 +17,7 @@ from fastwam.models.wan22.schedulers.scheduler_continuous import (
 )
 from hydra import compose, initialize_config_dir
 
+from rlinf.algorithms.losses import compute_ppo_critic_loss
 from rlinf.envs.libero.action_protocol import LiberoActionProtocol
 from rlinf.models.embodiment.wam_policy.contracts import (
     ChunkRouteRecord,
@@ -448,11 +449,27 @@ def test_mb4_compaction_keeps_one_dummy_microbatch_when_all_rows_inactive() -> N
         "gate_valid_mask": torch.zeros(8, dtype=torch.bool),
         "flow_valid_mask": torch.zeros(8, dtype=torch.bool),
         "loss_mask": torch.zeros(8, 1, dtype=torch.bool),
+        "loss_mask_sum": torch.zeros(8, 1, dtype=torch.long),
     }
 
     compacted, metrics = actor._prepare_train_global_batch_for_microbatches(batch)
 
     assert compacted["prev_logprobs"].reshape(-1).tolist() == [0.0, 1.0, 2.0, 3.0]
+    assert torch.equal(compacted["loss_mask_sum"], torch.ones(4, 1, dtype=torch.long))
+    values = torch.ones(4, 1, requires_grad=True)
+    critic_loss, _ = compute_ppo_critic_loss(
+        values=values,
+        returns=torch.zeros_like(values),
+        prev_values=torch.zeros_like(values),
+        value_clip=0.2,
+        huber_delta=10.0,
+        loss_mask=compacted["loss_mask"],
+        loss_mask_sum=compacted["loss_mask_sum"],
+        max_episode_steps=700,
+    )
+    critic_loss.backward()
+    assert critic_loss.item() == 0.0
+    assert torch.equal(values.grad, torch.zeros_like(values))
     assert metrics["perf/actor_rows_active"] == 0.0
     assert metrics["perf/actor_rows_padded"] == 4.0
     assert metrics["perf/actor_rows_forwarded"] == 4.0

@@ -292,6 +292,12 @@ class RouteNeutralOnlineIDMBCFSDPActor(OnlineIDMBCFSDPActor):
             )
 
         compacted = map_nested_tensors(train_global_batch, _select_rows)
+        loss_mask_sum = compacted.get("loss_mask_sum")
+        if isinstance(loss_mask_sum, torch.Tensor):
+            # ``masked_mean_ratio`` divides before applying the boolean mask.
+            # A dummy or padding row therefore needs a finite, nonzero divisor
+            # even though its masked contribution remains exactly zero.
+            compacted["loss_mask_sum"] = loss_mask_sum.clamp_min(1)
         return compacted, {
             "perf/actor_rows_original": float(batch_size),
             "perf/actor_rows_active": float(active_count),
