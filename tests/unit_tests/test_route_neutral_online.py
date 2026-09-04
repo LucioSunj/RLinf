@@ -6,6 +6,7 @@
 from pathlib import Path
 from types import SimpleNamespace
 
+import pytest
 import torch
 from hydra import compose, initialize_config_dir
 
@@ -101,6 +102,47 @@ def test_config_selects_bc_initialized_trainable_uncond(monkeypatch) -> None:
         is True
     )
     assert issubclass(RouteNeutralOnlineRunner, PadRouteNeutralRunner)
+
+
+def test_config_accepts_five_rollout_rank_training_placement(monkeypatch) -> None:
+    cfg = _compose(monkeypatch)
+    cfg.cluster.component_placement.env = "1-5"
+    cfg.cluster.component_placement.rollout = "1-5"
+
+    validate_route_neutral_online_idm_bc_training_config(cfg)
+
+    assert cfg.cluster.component_placement.actor == "0-0"
+    assert cfg.cluster.component_placement.env == "1-5"
+    assert cfg.cluster.component_placement.rollout == "1-5"
+
+
+def test_config_accepts_seven_rollout_rank_training_placement(monkeypatch) -> None:
+    cfg = _compose(monkeypatch)
+    cfg.cluster.component_placement.env = "1-7"
+    cfg.cluster.component_placement.rollout = "1-7"
+    cfg.env.train.total_num_envs = 28
+    cfg.actor.global_batch_size = 196
+
+    validate_route_neutral_online_idm_bc_training_config(cfg)
+
+    assert cfg.cluster.component_placement.actor == "0-0"
+    assert cfg.cluster.component_placement.env == "1-7"
+    assert cfg.cluster.component_placement.rollout == "1-7"
+
+
+def test_config_rejects_rollout_size_not_divisible_by_global_batch(
+    monkeypatch,
+) -> None:
+    cfg = _compose(monkeypatch)
+    cfg.cluster.component_placement.env = "1-7"
+    cfg.cluster.component_placement.rollout = "1-7"
+    cfg.env.train.total_num_envs = 28
+
+    with pytest.raises(
+        ValueError,
+        match="rollout size 1960 must be divisible by actor global batch size 210",
+    ):
+        validate_route_neutral_online_idm_bc_training_config(cfg)
 
 
 def test_resume_preserves_completed_first_joint_update_audit(monkeypatch) -> None:

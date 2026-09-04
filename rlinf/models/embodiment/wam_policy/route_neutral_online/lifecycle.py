@@ -3,7 +3,7 @@
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
 
-"""Bounded host-memory lifecycle for the seven-GPU online profile."""
+"""Bounded host-memory lifecycle for the multi-rank online profile."""
 
 from __future__ import annotations
 

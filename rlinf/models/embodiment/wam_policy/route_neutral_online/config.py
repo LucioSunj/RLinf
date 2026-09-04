@@ -258,10 +258,31 @@ def validate_route_neutral_online_idm_bc_training_config(
     placement = OmegaConf.to_container(
         OmegaConf.select(cfg, "cluster.component_placement"), resolve=True
     )
-    expected_placement = {"actor": "0-0", "env": "1-6", "rollout": "1-6"}
-    if placement != expected_placement:
+    supported_placements = (
+        {"actor": "0-0", "env": "1-5", "rollout": "1-5"},
+        {"actor": "0-0", "env": "1-6", "rollout": "1-6"},
+        {"actor": "0-0", "env": "1-7", "rollout": "1-7"},
+    )
+    if placement not in supported_placements:
         raise ValueError(
-            f"Route-neutral seven-GPU placement must be {expected_placement}."
+            "Route-neutral training placement must be one of "
+            f"{supported_placements}, got {placement}."
+        )
+    total_num_envs = int(OmegaConf.select(cfg, "env.train.total_num_envs"))
+    rollout_steps = int(OmegaConf.select(cfg, "env.train.max_steps_per_rollout_epoch"))
+    execution_horizon = int(
+        OmegaConf.select(cfg, "actor.model.runtime.execution_horizon")
+    )
+    if rollout_steps % execution_horizon != 0:
+        raise ValueError(
+            "Route-neutral rollout steps must be divisible by the execution horizon."
+        )
+    rollout_size = total_num_envs * (rollout_steps // execution_horizon)
+    global_batch_size = int(OmegaConf.select(cfg, "actor.global_batch_size"))
+    if rollout_size % global_batch_size != 0:
+        raise ValueError(
+            f"Route-neutral rollout size {rollout_size} must be divisible by "
+            f"actor global batch size {global_batch_size}."
         )
     return online
 
