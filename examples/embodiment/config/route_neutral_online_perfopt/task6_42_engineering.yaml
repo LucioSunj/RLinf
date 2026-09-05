@@ -7,12 +7,18 @@ cluster:
     rollout: "1-7"
 
 runner:
-  max_epochs: 50
-  max_steps: 50
+  # The engineering launcher resumes the immutable step-five copy.
+  max_epochs: 6
+  max_steps: 6
   logger:
     experiment_name: libero_10_ppo_fastwam_route_neutral_online_task6_perfopt42_engineering
 
 algorithm:
+  fixed_branch_cost:
+    controller:
+      signed_price:
+        reversal:
+          factor: 0.0
   regularization:
     base_uncond_kl:
       enabled: false
@@ -27,4 +33,3 @@ env:
 actor:
   global_batch_size: 196
   micro_batch_size: 4
-

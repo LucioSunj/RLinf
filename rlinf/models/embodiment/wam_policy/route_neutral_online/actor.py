@@ -250,9 +250,33 @@ class RouteNeutralOnlineIDMBCFSDPActor(OnlineIDMBCFSDPActor):
         active = gate_rows | flow_rows | critic_rows
         active_indices = active.nonzero(as_tuple=False).reshape(-1)
         active_count = int(active_indices.numel())
+        preparation_metrics = {}
+        forward = train_global_batch.get("forward_inputs", {})
+        # These describe work already performed during rollout, including rows
+        # that later became inactive. Account for them before removing rows.
+        for field, metric in (
+            ("route_neutral_rollout_idm_batch_size", "perf/rollout_idm_batch_size"),
+            (
+                "route_neutral_rollout_uncond_batch_size",
+                "perf/rollout_uncond_batch_size",
+            ),
+            ("route_neutral_teacher_batch_size", "perf/teacher_batch_size"),
+        ):
+            if field in forward:
+                preparation_metrics[metric] = float(forward[field].float().mean())
+        for field, name in (
+            ("online_idm_bc_teacher_present", "count"),
+            ("online_idm_bc_teacher_seconds", "seconds"),
+            ("online_idm_bc_teacher_bytes", "bytes"),
+        ):
+            if field in forward:
+                preparation_metrics[
+                    f"{_COMPACTION_METRIC_PREFIX}rollout_teacher/{name}"
+                ] = float(forward[field].double().sum())
 
         if micro_batch_size == 1:
             return train_global_batch, {
+                **preparation_metrics,
                 "perf/actor_rows_original": float(batch_size),
                 "perf/actor_rows_active": float(active_count),
                 "perf/actor_rows_padded": 0.0,
@@ -300,6 +324,7 @@ class RouteNeutralOnlineIDMBCFSDPActor(OnlineIDMBCFSDPActor):
             # even though its masked contribution remains exactly zero.
             compacted["loss_mask_sum"] = loss_mask_sum.clamp_min(1)
         return compacted, {
+            **preparation_metrics,
             "perf/actor_rows_original": float(batch_size),
             "perf/actor_rows_active": float(active_count),
             "perf/actor_rows_padded": float(padded_count),
@@ -317,14 +342,6 @@ class RouteNeutralOnlineIDMBCFSDPActor(OnlineIDMBCFSDPActor):
         metrics: dict[str, float],
         output_dict: dict[str, torch.Tensor],
     ) -> None:
-        for name in (
-            "perf/rollout_idm_batch_size",
-            "perf/rollout_uncond_batch_size",
-            "perf/teacher_batch_size",
-        ):
-            value = output_dict.get(name)
-            if isinstance(value, torch.Tensor):
-                metrics[name] = float(value.detach().item())
         if "critic/value_clip_ratio" in metrics:
             metrics["critic/value_clip_ratio_compacted"] = metrics[
                 "critic/value_clip_ratio"
@@ -406,6 +423,10 @@ class RouteNeutralOnlineIDMBCFSDPActor(OnlineIDMBCFSDPActor):
         """Restore MB1 metric denominators without forwarding inactive rows."""
 
         prefix = _COMPACTION_METRIC_PREFIX
+        rollout_teacher = {
+            name: metrics.pop(f"{prefix}rollout_teacher/{name}", [])
+            for name in ("count", "seconds", "bytes")
+        }
         batch_ids = [int(value) for value in metrics.pop(f"{prefix}global_batch", [])]
         if not batch_ids:
             return
@@ -480,6 +501,23 @@ class RouteNeutralOnlineIDMBCFSDPActor(OnlineIDMBCFSDPActor):
                 selected_values=selected_values,
                 group_count=group_count,
             )
+        if rollout_teacher["count"] and "online_idm_bc/teacher_call_count" in metrics:
+            for name, metric in (
+                ("count", "teacher_call_count"),
+                ("seconds", "teacher_seconds"),
+                ("bytes", "transported_bytes"),
+            ):
+                key = f"online_idm_bc/{metric}"
+                metrics[f"{key}_compacted"] = metrics[key]
+                metrics[key] = [sum(rollout_teacher[name]) / group_count]
+            total_count = sum(rollout_teacher["count"])
+            if total_count:
+                metrics["online_idm_bc/teacher_seconds_per_call"] = [
+                    sum(rollout_teacher["seconds"]) / total_count
+                ]
+                metrics["online_idm_bc/teacher_bytes_per_call"] = [
+                    sum(rollout_teacher["bytes"]) / total_count
+                ]
         leftovers = sorted(name for name in metrics if name.startswith(prefix))
         if leftovers:
             raise RuntimeError(f"Unconsumed compaction metrics: {leftovers}.")

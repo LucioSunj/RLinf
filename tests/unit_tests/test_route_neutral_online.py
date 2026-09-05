@@ -252,6 +252,10 @@ def test_perfopt_configs_select_mb4_geometry(
     assert cfg.algorithm.regularization.base_uncond_kl.enabled is False
     assert cfg.algorithm.regularization.base_uncond_kl.coefficient == 0.0
     assert cfg.algorithm.regularization.base_uncond_kl.log_metric is False
+    assert (
+        cfg.algorithm.fixed_branch_cost.controller.signed_price.reversal.factor == 0.0
+    )
+    assert cfg.runner.max_steps == (6 if total_envs == 42 else 50)
 
 
 def test_perfopt_config_rejects_hot_path_base_kl_logging(monkeypatch) -> None:
@@ -720,6 +724,42 @@ def test_seeded_route_runtime_batches_each_branch_and_teacher_once() -> None:
         (PolicyRegime.IDM, 2),
         (PolicyRegime.IDM, 2),
     ]
+    serial = []
+    for index in range(batch_size):
+        serial.append(
+            runtime._sample_seeded_training_batch(
+                env_obs={
+                    name: value[index : index + 1] for name, value in env_obs.items()
+                },
+                routes=routes[index : index + 1],
+                actor_version=7,
+                prepared=RouteNeutralPreparedStep(
+                    images=prepared.images[index : index + 1],
+                    context=prepared.context[index : index + 1],
+                    context_mask=prepared.context_mask[index : index + 1],
+                    current_condition=prepared.current_condition.index_select(
+                        torch.tensor([index])
+                    ),
+                    gate_features=None,
+                    critic_features=None,
+                ),
+            )
+        )
+    for name in ("actions", "flow_chains", "old_flow_logprobs", "denoise_indices"):
+        torch.testing.assert_close(
+            getattr(first, name),
+            torch.cat([getattr(sample, name) for sample in serial]),
+            rtol=0,
+            atol=0,
+        )
+    torch.testing.assert_close(
+        first.forward_inputs[ONLINE_IDM_BC_TEACHER_ACTIONS],
+        torch.cat(
+            [sample.forward_inputs[ONLINE_IDM_BC_TEACHER_ACTIONS] for sample in serial]
+        ),
+        rtol=0,
+        atol=0,
+    )
 
 
 def test_batched_online_bc_matches_serial_loss_and_gradient() -> None:
@@ -950,7 +990,8 @@ def test_mb4_compaction_preserves_original_global_batch_denominator() -> None:
     assert metrics["perf/actor_microbatches_executed"] == 17.0
 
 
-def test_mb4_compaction_restores_mb1_metric_denominators() -> None:
+@pytest.mark.parametrize("full_teacher_metrics", [False, True])
+def test_mb4_compaction_restores_mb1_metric_denominators(full_teacher_metrics) -> None:
     prefix = "_route_neutral_compaction/"
     actor = SimpleNamespace(
         cfg=SimpleNamespace(
@@ -984,6 +1025,14 @@ def test_mb4_compaction_restores_mb1_metric_denominators() -> None:
         f"{prefix}online/executed_prefix_mse_sum": [5.0, 3.0, 8.0],
         "online_idm_bc/loss_weight": [0.2],
     }
+    if full_teacher_metrics:
+        metrics.update(
+            {
+                f"{prefix}rollout_teacher/count": [3.0, 3.0],
+                f"{prefix}rollout_teacher/seconds": [0.7, 1.1],
+                f"{prefix}rollout_teacher/bytes": [300.0, 300.0],
+            }
+        )
     for index in range(7):
         value = float(index + 1)
         metrics[f"{prefix}online/mse_dimension_sum_{index}"] = [
@@ -1015,9 +1064,13 @@ def test_mb4_compaction_restores_mb1_metric_denominators() -> None:
     assert metrics["online_idm_bc/raw_loss"] == pytest.approx([4.0])
     assert metrics["online_idm_bc/weighted_loss"] == pytest.approx([0.8])
     assert metrics["online_idm_bc/selected_count"] == pytest.approx([2.0])
-    assert metrics["online_idm_bc/teacher_call_count"] == pytest.approx([1.0])
+    assert metrics["online_idm_bc/teacher_call_count"] == pytest.approx(
+        [3.0 if full_teacher_metrics else 1.0]
+    )
     assert metrics["online_idm_bc/teacher_seconds_per_call"] == pytest.approx([0.3])
-    assert metrics["online_idm_bc/teacher_bytes_per_call"] == pytest.approx([30.0])
+    assert metrics["online_idm_bc/teacher_bytes_per_call"] == pytest.approx(
+        [100.0 if full_teacher_metrics else 30.0]
+    )
     assert metrics["online_idm_bc/valid_action_count"] == pytest.approx([4.0])
     assert metrics["online_idm_bc/mse_pose"] == pytest.approx([3.0])
     assert metrics["online_idm_bc/mse_timestep_bin_0"] == pytest.approx([10.0 / 3.0])

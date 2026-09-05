@@ -296,6 +296,13 @@ class RouteNeutralOnlineIDMTeacherLiberoRuntime(OnlineIDMTeacherLiberoRuntime):
     ) -> tuple[torch.Tensor, float]:
         """Run one deterministic IDM teacher batch and return device time."""
 
+        start_event = end_event = None
+        if self.device.type == "cuda":
+            start_event = torch.cuda.Event(enable_timing=True)
+            end_event = torch.cuda.Event(enable_timing=True)
+            start_event.record(torch.cuda.current_stream(self.device))
+        else:
+            started = time.perf_counter()
         selected_images = prepared.images.index_select(
             0,
             indices.to(prepared.images.device),
@@ -314,14 +321,6 @@ class RouteNeutralOnlineIDMTeacherLiberoRuntime(OnlineIDMTeacherLiberoRuntime):
             seeds=selected_seeds,
         )
 
-        start_event = end_event = None
-        if self.device.type == "cuda":
-            start_event = torch.cuda.Event(enable_timing=True)
-            end_event = torch.cuda.Event(enable_timing=True)
-            stream = torch.cuda.current_stream(self.device)
-            start_event.record(stream)
-        else:
-            started = time.perf_counter()
         condition, _ = self._prepare_action_condition(
             image=selected_images,
             context=selected_context,

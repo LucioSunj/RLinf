@@ -13,6 +13,11 @@ runner:
     experiment_name: libero_10_ppo_fastwam_route_neutral_online_task6_perfopt28
 
 algorithm:
+  fixed_branch_cost:
+    controller:
+      signed_price:
+        reversal:
+          factor: 0.0
   regularization:
     base_uncond_kl:
       enabled: false
@@ -27,4 +32,3 @@ env:
 actor:
   global_batch_size: 196
   micro_batch_size: 4
-
