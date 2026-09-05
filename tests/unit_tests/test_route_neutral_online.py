@@ -990,6 +990,52 @@ def test_mb4_compaction_preserves_original_global_batch_denominator() -> None:
     assert metrics["perf/actor_microbatches_executed"] == 17.0
 
 
+def test_mb4_compaction_reports_original_rollout_batch_means() -> None:
+    actor = object.__new__(RouteNeutralOnlineIDMBCFSDPActor)
+    actor.cfg = SimpleNamespace(
+        actor=SimpleNamespace(global_batch_size=8, micro_batch_size=4)
+    )
+    actor._world_size = 1
+    actor.gradient_accumulation = 2
+    batch = {
+        "prev_logprobs": torch.zeros(8, 1),
+        "route_info": _route_record(torch.full((8,), int(WAMRoute.UNCOND))),
+        "gate_valid_mask": torch.ones(8, dtype=torch.bool),
+        "flow_valid_mask": torch.ones(8, dtype=torch.bool),
+        "loss_mask": torch.ones(8, 1, dtype=torch.bool),
+        "forward_inputs": {
+            ROUTE_NEUTRAL_ROLLOUT_IDM_BATCH_SIZE: torch.tensor(
+                [1.0, 1.0, 1.0, 1.0, 3.0, 3.0, 3.0, 3.0]
+            ),
+            ROUTE_NEUTRAL_ROLLOUT_UNCOND_BATCH_SIZE: torch.tensor(
+                [3.0, 3.0, 3.0, 3.0, 1.0, 1.0, 1.0, 1.0]
+            ),
+            ROUTE_NEUTRAL_TEACHER_BATCH_SIZE: torch.tensor(
+                [3.0, 3.0, 3.0, 3.0, 1.0, 1.0, 1.0, 1.0]
+            ),
+        },
+    }
+
+    _, preparation_metrics = actor._prepare_train_global_batch_for_microbatches(batch)
+    metrics = {name: [value] for name, value in preparation_metrics.items()}
+    for idm_max, uncond_max in ((4.0, 3.0), (3.0, 4.0)):
+        microbatch_metrics = {
+            "perf/rollout_idm_batch_size": idm_max,
+            "perf/rollout_uncond_batch_size": uncond_max,
+            "perf/teacher_batch_size": uncond_max,
+        }
+        actor._append_route_neutral_metric_numerators(microbatch_metrics, {})
+        for name, value in microbatch_metrics.items():
+            metrics.setdefault(name, []).append(value)
+
+    actor._finalize_train_metrics_before_reduction(metrics)
+
+    assert metrics["perf/rollout_idm_batch_size"] == [2.0]
+    assert metrics["perf/rollout_uncond_batch_size"] == [2.0]
+    assert metrics["perf/teacher_batch_size"] == [2.0]
+    assert all(not name.startswith("_route_neutral_compaction/") for name in metrics)
+
+
 @pytest.mark.parametrize("full_teacher_metrics", [False, True])
 def test_mb4_compaction_restores_mb1_metric_denominators(full_teacher_metrics) -> None:
     prefix = "_route_neutral_compaction/"

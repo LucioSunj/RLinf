@@ -263,7 +263,9 @@ class RouteNeutralOnlineIDMBCFSDPActor(OnlineIDMBCFSDPActor):
             ("route_neutral_teacher_batch_size", "perf/teacher_batch_size"),
         ):
             if field in forward:
-                preparation_metrics[metric] = float(forward[field].float().mean())
+                preparation_metrics[
+                    f"{_COMPACTION_METRIC_PREFIX}rollout_batch_size/{metric}"
+                ] = float(forward[field].float().mean())
         for field, name in (
             ("online_idm_bc_teacher_present", "count"),
             ("online_idm_bc_teacher_seconds", "seconds"),
@@ -449,10 +451,27 @@ class RouteNeutralOnlineIDMBCFSDPActor(OnlineIDMBCFSDPActor):
                 raise ValueError(f"Compaction metric {name!r} lost a microbatch value.")
             return values
 
+        def take_global_batch(name: str) -> list[float]:
+            values = [float(value) for value in metrics.pop(f"{prefix}{name}", [])]
+            if values and len(values) != group_count:
+                raise ValueError(
+                    f"Compaction metric {name!r} lost a global-batch value."
+                )
+            return values
+
         def group_sums(values: list[float]) -> list[float]:
             return [
                 sum(values[index] for index in indices) for indices in groups.values()
             ]
+
+        for metric_name in (
+            "perf/rollout_idm_batch_size",
+            "perf/rollout_uncond_batch_size",
+            "perf/teacher_batch_size",
+        ):
+            values = take_global_batch(f"rollout_batch_size/{metric_name}")
+            if values:
+                metrics[metric_name] = [sum(values) / group_count]
 
         for metric_name in (
             "critic/value_loss",
