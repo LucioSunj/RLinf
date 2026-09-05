@@ -12,11 +12,14 @@ import torch
 from fastwam.adapters import PolicyRegime
 from fastwam.models.wan22.adaptive_action import CachedActionCondition
 from fastwam.models.wan22.adaptive_sampler import VelocityOutput
+from fastwam.models.wan22.gate_transformer import epsilon_mixture_bernoulli
+from fastwam.models.wan22.kv_tap import KeyValueBank, KVSource
 from fastwam.models.wan22.schedulers.scheduler_continuous import (
     WanContinuousFlowMatchScheduler,
 )
 from hydra import compose, initialize_config_dir
 
+from rlinf.algorithms.fastwam_dual_ppo import compute_gate_ppo_loss
 from rlinf.algorithms.losses import compute_ppo_critic_loss
 from rlinf.envs.libero.action_protocol import LiberoActionProtocol
 from rlinf.models.embodiment.wam_policy.contracts import (
@@ -36,8 +39,17 @@ from rlinf.models.embodiment.wam_policy.online_idm_bc.config import (
     ONLINE_IDM_BC_TEACHER_PRESENT,
     ONLINE_IDM_BC_TEACHER_SECONDS,
 )
+from rlinf.models.embodiment.wam_policy.online_idm_bc.policy import (
+    OnlineIDMBCFastWAMPolicy,
+)
 from rlinf.models.embodiment.wam_policy.online_idm_bc.runtime import (
     OnlineIDMTeacherLiberoRuntime,
+)
+from rlinf.models.embodiment.wam_policy.pad_rv.route_neutral_gate import (
+    RouteNeutralGateFeatures,
+    RouteNeutralVisualFeatures,
+    RouteNeutralVisualLayer,
+    serialize_route_neutral_features,
 )
 from rlinf.models.embodiment.wam_policy.pad_rv.route_neutral_runner import (
     PadRouteNeutralRunner,
@@ -162,6 +174,107 @@ class _RowwiseReplayCritic(torch.nn.Module):
             self.head_batch_sizes.append(int(row.shape[0]))
             values.append(self.value_head(row)[:, 0])
         return torch.cat(values)
+
+
+def _replay_gate_features(batch_size: int) -> RouteNeutralGateFeatures:
+    rows = torch.arange(batch_size, dtype=torch.float32)
+    return RouteNeutralGateFeatures(
+        visual=RouteNeutralVisualFeatures(
+            (
+                RouteNeutralVisualLayer(
+                    layer_index=14,
+                    current_frame_video=KeyValueBank(
+                        source=KVSource.CURRENT_FRAME_VIDEO,
+                        key=rows[:, None, None].expand(-1, 2, 4),
+                        value=(rows + 10)[:, None, None].expand(-1, 2, 4),
+                        valid_mask=torch.ones(batch_size, 2, dtype=torch.bool),
+                        contains_generated_future_video=False,
+                    ),
+                ),
+            )
+        ),
+        language=(rows + 20)[:, None, None].expand(-1, 3, 5),
+        language_mask=torch.ones(batch_size, 3, dtype=torch.bool),
+        state=(rows + 30)[:, None].expand(-1, 2),
+        physical_history=(rows + 40)[:, None, None].expand(-1, 2, 2),
+    )
+
+
+class _RecordingReplayGate(torch.nn.Module):
+    def __init__(self) -> None:
+        super().__init__()
+        self.scale = torch.nn.Parameter(torch.ones(()))
+        self.rows = []
+
+    def forward(self, features: RouteNeutralGateFeatures) -> torch.Tensor:
+        self.rows.append(serialize_route_neutral_features(features))
+        return (features.state[:, 0] - 30.0) * self.scale
+
+
+def test_route_neutral_replay_gate_hook_is_subclass_only() -> None:
+    assert "_replay_gate_logits" not in OnlineIDMBCFastWAMPolicy.__dict__
+    assert "_replay_gate_logits" in RouteNeutralOnlineIDMBCFastWAMPolicy.__dict__
+
+
+@pytest.mark.parametrize("batch_size", [1, 4])
+def test_route_neutral_replay_gate_preserves_complete_b1_rows(batch_size) -> None:
+    features = _replay_gate_features(batch_size)
+    gate = _RecordingReplayGate()
+    policy = SimpleNamespace(gate=gate)
+
+    logits = RouteNeutralOnlineIDMBCFastWAMPolicy._replay_gate_logits(
+        policy,
+        features,
+    )
+
+    assert torch.equal(logits, features.state[:, 0] - 30.0)
+    assert len(gate.rows) == batch_size
+    expected = serialize_route_neutral_features(features)
+    for index, row in enumerate(gate.rows):
+        assert set(row) == set(expected)
+        for name, value in row.items():
+            assert torch.equal(value, expected[name][index : index + 1])
+
+
+@pytest.mark.parametrize("all_inactive", [False, True])
+def test_route_neutral_replay_gate_padding_keeps_valid_gradient(
+    all_inactive,
+) -> None:
+    features = _replay_gate_features(4)
+    gate = _RecordingReplayGate()
+    policy = SimpleNamespace(gate=gate)
+    logits = RouteNeutralOnlineIDMBCFastWAMPolicy._replay_gate_logits(
+        policy,
+        features,
+    )
+    routes = torch.zeros(4, dtype=torch.long)
+    behavior = epsilon_mixture_bernoulli(
+        logits,
+        temperature=1.0,
+        epsilon=0.1,
+    )
+    valid = torch.zeros(4, dtype=torch.bool)
+    if not all_inactive:
+        valid[:3] = True
+    loss, _ = compute_gate_ppo_loss(
+        logprobs=behavior.log_prob(routes),
+        old_logprobs=torch.zeros(4),
+        advantages=torch.ones(4),
+        valid_mask=valid,
+        clip_ratio_low=0.2,
+        clip_ratio_high=0.2,
+        selected_loss_scale=(1.0 / 3.0 if not all_inactive else 0.0),
+    )
+    loss.backward()
+
+    assert len(gate.rows) == 4
+    assert torch.isfinite(gate.scale.grad)
+    if all_inactive:
+        assert loss.item() == 0.0
+        assert gate.scale.grad.item() == 0.0
+    else:
+        assert loss.item() != 0.0
+        assert gate.scale.grad.item() != 0.0
 
 
 def test_config_selects_bc_initialized_trainable_uncond(monkeypatch) -> None:

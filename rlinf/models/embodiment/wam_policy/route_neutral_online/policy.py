@@ -144,6 +144,23 @@ class RouteNeutralOnlineIDMBCFastWAMPolicy(OnlineIDMBCFastWAMPolicy):
             return critic.value_from_features(prefix)
         return critic.value_from_prefix(prefix)
 
+    def _replay_gate_logits(self, features) -> torch.Tensor:
+        """Evaluate complete replay Gate rows in their original B1 order."""
+
+        serialized = serialize_route_neutral_features(features)
+        logits = []
+        for index in range(features.batch_size):
+            row = {name: value[index : index + 1] for name, value in serialized.items()}
+            logits.append(
+                self.gate(
+                    deserialize_route_neutral_features(
+                        row,
+                        layer_indices=features.visual.layer_indices,
+                    )
+                )
+            )
+        return torch.cat(logits, dim=0)
+
     def _predict_current_step(
         self,
         *,
@@ -380,7 +397,7 @@ class RouteNeutralOnlineIDMBCFastWAMPolicy(OnlineIDMBCFastWAMPolicy):
         features = self._gate_features_from_forward_inputs(forward_inputs).to(
             device=gate_parameter.device
         )
-        logits = self.gate(features)
+        logits = self._replay_gate_logits(features)
         routes = route_info.route_used.to(logits.device)
         if not torch.equal(routes, emitted_gate.next_route.to(logits.device)):
             raise ValueError("Current-step replay route differs from executed route.")
