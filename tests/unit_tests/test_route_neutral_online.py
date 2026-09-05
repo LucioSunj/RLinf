@@ -146,6 +146,24 @@ def _route_record(routes: torch.Tensor) -> ChunkRouteRecord:
     )
 
 
+class _RowwiseReplayCritic(torch.nn.Module):
+    def __init__(self) -> None:
+        super().__init__()
+        self.value_head = torch.nn.Linear(1, 1, bias=False)
+        self.value_head.weight.data.fill_(2.0)
+        self.head_batch_sizes = []
+
+    def value_from_features_rowwise_head(
+        self,
+        prefix: torch.Tensor,
+    ) -> torch.Tensor:
+        values = []
+        for row in prefix.split(1, dim=0):
+            self.head_batch_sizes.append(int(row.shape[0]))
+            values.append(self.value_head(row)[:, 0])
+        return torch.cat(values)
+
+
 def test_config_selects_bc_initialized_trainable_uncond(monkeypatch) -> None:
     cfg = _compose(monkeypatch)
     validate_route_neutral_online_idm_bc_training_config(cfg)
@@ -478,6 +496,61 @@ def test_mb4_compaction_keeps_one_dummy_microbatch_when_all_rows_inactive() -> N
     assert metrics["perf/actor_rows_padded"] == 4.0
     assert metrics["perf/actor_rows_forwarded"] == 4.0
     assert metrics["perf/actor_microbatches_executed"] == 1.0
+
+
+@pytest.mark.parametrize("all_inactive", [False, True])
+def test_mb4_compacted_rowwise_critic_padding_has_valid_zero_gradient(
+    all_inactive,
+) -> None:
+    actor = object.__new__(RouteNeutralOnlineIDMBCFSDPActor)
+    actor.cfg = SimpleNamespace(actor=SimpleNamespace(micro_batch_size=4))
+    gate_valid = torch.zeros(8, dtype=torch.bool)
+    loss_mask = torch.zeros(8, 1, dtype=torch.bool)
+    if not all_inactive:
+        gate_valid[:3] = True
+        loss_mask[2] = True
+    batch = {
+        "prev_logprobs": torch.zeros(8, 1),
+        "route_info": _route_record(torch.full((8,), int(WAMRoute.IDM))),
+        "gate_valid_mask": gate_valid,
+        "flow_valid_mask": torch.zeros(8, dtype=torch.bool),
+        "loss_mask": loss_mask,
+        "loss_mask_sum": torch.zeros(8, 1, dtype=torch.long),
+        "returns": torch.zeros(8, 1),
+        "prev_values": torch.zeros(8, 1),
+        "forward_inputs": {
+            "critic_prefix": torch.arange(8, dtype=torch.float32).reshape(8, 1)
+        },
+    }
+
+    compacted, metrics = actor._prepare_train_global_batch_for_microbatches(batch)
+    critic = _RowwiseReplayCritic()
+    values = RouteNeutralOnlineIDMBCFastWAMPolicy._critic_replay_values(
+        critic,
+        compacted["forward_inputs"]["critic_prefix"],
+    ).reshape(-1, 1)
+    critic_loss, _ = compute_ppo_critic_loss(
+        values=values,
+        returns=compacted["returns"],
+        prev_values=compacted["prev_values"],
+        value_clip=0.2,
+        huber_delta=10.0,
+        loss_mask=compacted["loss_mask"],
+        loss_mask_sum=compacted["loss_mask_sum"],
+        max_episode_steps=700,
+    )
+    critic_loss.backward()
+
+    assert critic.head_batch_sizes == [1, 1, 1, 1]
+    assert metrics["perf/actor_rows_padded"] == (4.0 if all_inactive else 1.0)
+    assert critic_loss.item() == (0.0 if all_inactive else 1400.0)
+    if all_inactive:
+        assert torch.equal(
+            critic.value_head.weight.grad,
+            torch.zeros_like(critic.value_head.weight),
+        )
+    else:
+        assert critic.value_head.weight.grad.item() != 0.0
 
 
 def test_actor_syncs_on_actual_final_compacted_microbatch() -> None:

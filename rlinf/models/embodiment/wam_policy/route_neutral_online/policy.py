@@ -130,6 +130,20 @@ class RouteNeutralOnlineIDMBCFastWAMPolicy(OnlineIDMBCFastWAMPolicy):
             layer_indices=self.runtime.route_neutral_visual.layer_indices,
         )
 
+    @staticmethod
+    def _critic_replay_values(
+        critic: torch.nn.Module,
+        prefix: torch.Tensor,
+    ) -> torch.Tensor:
+        """Keep only the route-neutral replay value head on its B1 path."""
+
+        rowwise_head = getattr(critic, "value_from_features_rowwise_head", None)
+        if callable(rowwise_head):
+            return rowwise_head(prefix)
+        if hasattr(critic, "value_from_features"):
+            return critic.value_from_features(prefix)
+        return critic.value_from_prefix(prefix)
+
     def _predict_current_step(
         self,
         *,
@@ -393,11 +407,7 @@ class RouteNeutralOnlineIDMBCFastWAMPolicy(OnlineIDMBCFastWAMPolicy):
                 replay_key = getattr(critic, "replay_feature_key", "critic_prefix")
                 if replay_key in forward_inputs:
                     prefix = forward_inputs[replay_key]
-                    values = (
-                        critic.value_from_features(prefix)
-                        if hasattr(critic, "value_from_features")
-                        else critic.value_from_prefix(prefix)
-                    )
+                    values = self._critic_replay_values(critic, prefix)
                 else:
                     values = critic.predict_value_batch(
                         self.runtime.critic_observation(forward_inputs=forward_inputs)

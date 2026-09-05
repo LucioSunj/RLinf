@@ -150,6 +150,32 @@ class Pi05ValueAfterVLMCritic(nn.Module):
 
         return self.value_from_prefix(prefix_output)
 
+    def value_from_features_rowwise_head(
+        self,
+        prefix_output: torch.Tensor,
+    ) -> torch.Tensor:
+        """Pool a replay batch together, then evaluate its value head by row."""
+
+        config = self.backbone.config
+        if (
+            "pi05_" not in str(config.config_name)
+            or config.value_vlm_mode != "mean_token"
+        ):
+            raise ValueError(
+                "Rowwise replay requires the pi0.5 mean-token critic contract."
+            )
+        prefix_mask = (
+            [True] * 256 * int(config.num_images_in_input)
+            + [False] * 256 * (3 - int(config.num_images_in_input))
+            + [True] * 200
+        )
+        pooled = prefix_output.detach()[:, prefix_mask, :].mean(dim=1)
+        pooled = pooled.to(dtype=torch.float32)
+        return torch.cat(
+            [self.value_head(row)[:, 0] for row in pooled.split(1, dim=0)],
+            dim=0,
+        )
+
     def encode_features(self, env_obs: dict[str, Any]) -> torch.Tensor:
         """Run exact pi0.5 preprocessing and return detached prefix features."""
 

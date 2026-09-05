@@ -20,6 +20,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from types import SimpleNamespace
 
+import pytest
 import torch
 import torch.nn as nn
 
@@ -86,6 +87,28 @@ class _FrozenConfigDummyPi05(_DummyPi05):
     def __init__(self) -> None:
         super().__init__()
         self.config = _FrozenPi05Config()
+
+
+class _MeanTokenDummyPi05(_DummyPi05):
+    def get_value_from_vlm(self, prefix_output):
+        prefix_mask = (
+            [True] * 256 * self.config.num_images_in_input
+            + [False] * 256 * (3 - self.config.num_images_in_input)
+            + [True] * 200
+        )
+        pooled = prefix_output[:, prefix_mask, :].mean(dim=1).float()
+        return self.value_head(pooled)[:, 0]
+
+
+class _RecordingHead(nn.Module):
+    def __init__(self, head: nn.Module) -> None:
+        super().__init__()
+        self.head = head
+        self.batch_sizes = []
+
+    def forward(self, features: torch.Tensor) -> torch.Tensor:
+        self.batch_sizes.append(int(features.shape[0]))
+        return self.head(features)
 
 
 def test_filter_pretrained_value_head_removes_nested_keys():
@@ -174,6 +197,50 @@ def test_value_head_hook_matches_live_parameter_dtype():
     values = critic.value_from_prefix(torch.randn(2, 5, 4, dtype=torch.float32))
 
     assert values.dtype == torch.float64
+
+
+@pytest.mark.parametrize("batch_size", [1, 4])
+def test_rowwise_replay_value_head_preserves_b1_order(batch_size):
+    critic = Pi05ValueAfterVLMCritic(
+        _MeanTokenDummyPi05(),
+        input_dim=4,
+        hidden_sizes=(3, 2),
+    )
+    recording_head = _RecordingHead(critic.value_head)
+    critic.backbone.value_head = recording_head
+    prefix = torch.randn(
+        batch_size,
+        968,
+        4,
+        dtype=torch.bfloat16,
+        generator=torch.Generator().manual_seed(11),
+    )
+
+    values = critic.value_from_features_rowwise_head(prefix)
+    rowwise_batch_sizes = recording_head.batch_sizes.copy()
+    recording_head.batch_sizes.clear()
+    expected = torch.cat(
+        [critic.value_from_prefix(row) for row in prefix.split(1, dim=0)]
+    )
+
+    assert torch.equal(values, expected)
+    assert rowwise_batch_sizes == [1] * batch_size
+    assert recording_head.batch_sizes == [1] * batch_size
+
+
+def test_default_replay_value_head_remains_batched():
+    critic = Pi05ValueAfterVLMCritic(
+        _MeanTokenDummyPi05(),
+        input_dim=4,
+        hidden_sizes=(3, 2),
+    )
+    recording_head = _RecordingHead(critic.value_head)
+    critic.backbone.value_head = recording_head
+
+    values = critic.value_from_features(torch.randn(4, 968, 4))
+
+    assert values.shape == (4,)
+    assert recording_head.batch_sizes == [4]
 
 
 def test_non_pi05_backbone_is_rejected():
