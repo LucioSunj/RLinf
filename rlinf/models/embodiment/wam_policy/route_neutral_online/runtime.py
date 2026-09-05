@@ -14,12 +14,16 @@ from typing import Any, Literal
 
 import torch
 from fastwam.adapters import PolicyRegime
-from fastwam.models.wan22.adaptive_action import CachedActionCondition
+from fastwam.models.wan22.adaptive_action import (
+    CachedActionCondition,
+    CachedActionVelocity,
+)
 from fastwam.models.wan22.adaptive_sampler import (
     replay_action_flow_sde_transition,
     sample_action_flow_sde,
     sample_denoise_indices,
 )
+from fastwam.models.wan22.batch_linear import install_batch_invariant_linears
 from fastwam.uncond_bc import (
     compute_action_flow_matching_bc_loss,
     stateless_validation_flow_inputs,
@@ -138,6 +142,7 @@ class RouteNeutralOnlineIDMTeacherLiberoRuntime(OnlineIDMTeacherLiberoRuntime):
             gate_replay_backend=GateKVReplayBackend.STORED,
             **kwargs,
         )
+        self.batch_linear_context = install_batch_invariant_linears(self.actor)
         state_dim = int(getattr(self.actor, "proprio_dim", 0) or 0)
         self.route_neutral_input = RouteNeutralGateInputContract.from_mapping(
             route_neutral_input,
@@ -153,6 +158,44 @@ class RouteNeutralOnlineIDMTeacherLiberoRuntime(OnlineIDMTeacherLiberoRuntime):
         if getattr(self.actor, "proprio_encoder", None) is None:
             raise ValueError("Route-neutral runtime requires FastWAM proprio encoding.")
         self.physical_history = PhysicalStateHistoryTracker(self.route_neutral_input)
+
+    @torch.no_grad()
+    def _prepare_action_condition(
+        self,
+        *,
+        image: torch.Tensor,
+        context: torch.Tensor,
+        context_mask: torch.Tensor,
+        regime: PolicyRegime,
+        idm_initial_latents: torch.Tensor | None = None,
+        idm_noise_seed: int | None = None,
+    ) -> tuple[CachedActionCondition, torch.Tensor | None]:
+        with self.batch_linear_context.use(int(image.shape[0])):
+            return super()._prepare_action_condition(
+                image=image,
+                context=context,
+                context_mask=context_mask,
+                regime=regime,
+                idm_initial_latents=idm_initial_latents,
+                idm_noise_seed=idm_noise_seed,
+            )
+
+    def _velocity(
+        self,
+        condition: CachedActionCondition,
+        *,
+        regime: PolicyRegime,
+        capture_gate_kv: bool,
+        actor_version: int,
+    ) -> CachedActionVelocity:
+        velocity = super()._velocity(
+            condition,
+            regime=regime,
+            capture_gate_kv=capture_gate_kv,
+            actor_version=actor_version,
+        )
+        velocity.batch_linear_context = self.batch_linear_context
+        return velocity
 
     @staticmethod
     def _history_metadata(
