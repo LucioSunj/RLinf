@@ -264,7 +264,7 @@ def validate_route_neutral_online_idm_bc_training_config(
         {"actor": "0-0", "env": "1-7", "rollout": "1-7"},
     )
     shared_rank = lifecycle.get("shared_gpu_rollout_rank")
-    shared_placement = {"actor": "0-0", "env": "0-6", "rollout": "0-6"}
+    shared_placement = {"actor": "0-0", "env": "0-3,5-7", "rollout": "0-3,5-7"}
     if shared_rank is not None:
         if (
             isinstance(shared_rank, bool)
@@ -280,7 +280,7 @@ def validate_route_neutral_online_idm_bc_training_config(
         ):
             raise ValueError(
                 "Shared-GPU route-neutral training requires actor=0-0, "
-                "env=rollout=0-6, shared rollout rank 0, actor offload, "
+                "env=rollout=0-3,5-7, shared rollout rank 0, actor offload, "
                 "rank-local rollout offload, synchronous 28-env/global-batch-196 "
                 "training without environment bootstrap overlap."
             )
@@ -306,6 +306,31 @@ def validate_route_neutral_online_idm_bc_training_config(
             f"actor global batch size {global_batch_size}."
         )
     return online
+
+
+def validate_shared_gpu_device_plan(
+    cfg: Any, cluster: Any, placement: Any
+) -> dict | None:
+    """Check actual physical worker assignments before launching model workers."""
+
+    if cfg.route_neutral_online_implementation.get("shared_gpu_rollout_rank") is None:
+        return None
+    healthy_devices = [0, 1, 2, 3, 5, 6, 7]
+    report = {"schema": "route-neutral-shared-gpu-device-plan-v1", "status": "PASS"}
+    for component in ("actor", "rollout", "env"):
+        planned = placement.get_strategy(component).get_placement(cluster)
+        expected = [0] if component == "actor" else healthy_devices
+        actual = [
+            (item.rank, item.cluster_node_rank, item.visible_accelerators)
+            for item in planned
+        ]
+        required = [(rank, 0, [str(device)]) for rank, device in enumerate(expected)]
+        if actual != required:
+            raise ValueError(
+                f"Shared-GPU physical {component} placement changed: {actual}."
+            )
+        report[component] = actual
+    return report
 
 
 __all__ = [

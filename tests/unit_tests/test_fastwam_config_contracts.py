@@ -159,8 +159,8 @@ def test_route_neutral_shared_gpu_resume_changes_only_residency(owner, world_siz
     cfg.actor.global_batch_size = 196
     source = MODULE.build_fastwam_checkpoint_contract(cfg, world_size=world_size)
     cfg.route_neutral_online_implementation = {"shared_gpu_rollout_rank": 0}
-    cfg.cluster.component_placement.env = "0-6"
-    cfg.cluster.component_placement.rollout = "0-6"
+    cfg.cluster.component_placement.env = "0-3,5-7"
+    cfg.cluster.component_placement.rollout = "0-3,5-7"
     cfg.actor.enable_offload = True
     target = MODULE.build_fastwam_checkpoint_contract(cfg, world_size=world_size)
     kwargs = {"owner": owner, "allow_n4_to_three_rollout_expansion": False}

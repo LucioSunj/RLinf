@@ -152,8 +152,8 @@ def test_shared_gpu_config_and_rank_local_offload(monkeypatch) -> None:
     from rlinf.workers.rollout.hf.huggingface_worker import MultiStepRolloutWorker
 
     cfg = _compose(monkeypatch)
-    cfg.cluster.component_placement.env = "0-6"
-    cfg.cluster.component_placement.rollout = "0-6"
+    cfg.cluster.component_placement.env = "0-3,5-7"
+    cfg.cluster.component_placement.rollout = "0-3,5-7"
     cfg.env.train.total_num_envs = 28
     cfg.actor.global_batch_size = 196
     cfg.actor.enable_offload = True

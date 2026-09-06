@@ -487,7 +487,7 @@ def validate_fastwam_training_checkpoint_contract(
     # sampling/optimization fields. Only placement and idle-model residency move.
     if live.get("route_neutral_shared_gpu") == {"rollout_rank": 0}:
         source_placement = {"actor": "0-0", "env": "1-7", "rollout": "1-7"}
-        target_placement = {"actor": "0-0", "env": "0-6", "rollout": "0-6"}
+        target_placement = {"actor": "0-0", "env": "0-3,5-7", "rollout": "0-3,5-7"}
         expected_world_size = {"actor": 1, "rollout": 7}.get(owner)
         source_actor = checkpoint.get("actor", {})
         target_actor = live.get("actor", {})

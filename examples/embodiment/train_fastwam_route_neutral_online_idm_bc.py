@@ -18,6 +18,7 @@ from rlinf.models.embodiment.wam_policy.route_neutral_online.actor import (
 )
 from rlinf.models.embodiment.wam_policy.route_neutral_online.config import (
     validate_route_neutral_online_idm_bc_training_config,
+    validate_shared_gpu_device_plan,
 )
 from rlinf.models.embodiment.wam_policy.route_neutral_online.lifecycle import (
     RouteNeutralOnlineEnvWorker,
@@ -49,6 +50,12 @@ def main(cfg) -> None:
         distributed_log_dir=cfg.runner.per_worker_log_path,
     )
     placement = HybridComponentPlacement(cfg, cluster)
+    device_plan = validate_shared_gpu_device_plan(cfg, cluster, placement)
+    if device_plan is not None:
+        print(
+            "ROUTE_NEUTRAL_SHARED_GPU_DEVICE_PLAN=" + json.dumps(device_plan),
+            flush=True,
+        )
     actor_cls = get_class(str(cfg.route_neutral_online_implementation.actor_target))
     if actor_cls is not RouteNeutralOnlineIDMBCFSDPActor:
         raise TypeError("Route-neutral actor target changed.")
