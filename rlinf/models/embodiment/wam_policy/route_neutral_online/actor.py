@@ -109,6 +109,35 @@ class RouteNeutralOnlineIDMBCFSDPActor(OnlineIDMBCFSDPActor):
             )
         return model
 
+    def audit_shared_gpu_roundtrip(self) -> dict[str, Any]:
+        """Check restored FSDP weights, Adam state and RNG across residency."""
+
+        from .shared_gpu import audit_residency_roundtrip
+
+        def onload() -> None:
+            self.load_param_and_grad(self.device, True)
+            self.load_optimizer(self.device)
+
+        def offload() -> None:
+            self.offload_optimizer()
+            self.offload_param_and_grad(True)
+
+        report = audit_residency_roundtrip(
+            model=self.model,
+            onload=onload,
+            offload=offload,
+            device=self.device,
+            state=lambda: {
+                "optimizer": self.optimizer.state_dict(),
+                "scheduler": self.lr_scheduler.state_dict(),
+                "scaler": self.grad_scaler.state_dict(),
+                "optimizer_steps": self.optimizer_steps,
+                "version": self.version,
+            },
+        )
+        self.log_info("ROUTE_NEUTRAL_SHARED_GPU_ROUNDTRIP=" + json.dumps(report))
+        return report
+
     def load_checkpoint(self, load_path: str) -> int | None:
         """Do not repeat the native first-joint-update audit after a resume."""
 

@@ -385,7 +385,7 @@ def build_fastwam_checkpoint_contract(cfg: Any, *, world_size: int) -> dict[str,
         env_train["libero_variant"] = str(
             OmegaConf.select(cfg.env.train, "libero_variant", default="standard")
         )
-    return {
+    contract = {
         "schema": "fastwam-adaptive-checkpoint-contract-v2",
         "model": _resolved_checkpoint_value(cfg.actor.model),
         "algorithm": _resolved_checkpoint_value(cfg.algorithm),
@@ -399,6 +399,12 @@ def build_fastwam_checkpoint_contract(cfg: Any, *, world_size: int) -> dict[str,
         ),
         "world_size": int(world_size),
     }
+    shared_rank = OmegaConf.select(
+        cfg, "route_neutral_online_implementation.shared_gpu_rollout_rank"
+    )
+    if shared_rank is not None:
+        contract["route_neutral_shared_gpu"] = {"rollout_rank": int(shared_rank)}
+    return contract
 
 
 FASTWAM_RESUME_MODE_EXACT = "exact"
@@ -476,6 +482,42 @@ def validate_fastwam_training_checkpoint_contract(
             "source_world_size": int(checkpoint.get("world_size", -1)),
             "target_world_size": int(live.get("world_size", -1)),
         }
+
+    # The seven-rollout hardware relocation keeps every rank's state and all
+    # sampling/optimization fields. Only placement and idle-model residency move.
+    if live.get("route_neutral_shared_gpu") == {"rollout_rank": 0}:
+        source_placement = {"actor": "0-0", "env": "1-7", "rollout": "1-7"}
+        target_placement = {"actor": "0-0", "env": "0-6", "rollout": "0-6"}
+        expected_world_size = {"actor": 1, "rollout": 7}.get(owner)
+        source_actor = checkpoint.get("actor", {})
+        target_actor = live.get("actor", {})
+        if (
+            checkpoint.get("component_placement") == source_placement
+            and live.get("component_placement") == target_placement
+            and checkpoint.get("world_size") == expected_world_size
+            and live.get("world_size") == expected_world_size
+            and source_actor.get("enable_offload") is False
+            and target_actor.get("enable_offload") is True
+            and checkpoint.get("env_train", {}).get("total_num_envs") == 28
+            and source_actor.get("global_batch_size") == 196
+            and live.get("rollout", {}).get("enable_offload") is False
+            and live.get("runner", {}).get("use_training_pipeline") is False
+            and live.get("runner", {}).get("overlap_env_bootstrap") is False
+            and "route_neutral_shared_gpu" not in checkpoint
+            and str(live.get("model", {}).get("policy_target", "")).endswith(
+                ".RouteNeutralOnlineIDMBCFastWAMPolicy"
+            )
+        ):
+            relocated = dict(checkpoint)
+            relocated["component_placement"] = target_placement
+            relocated["actor"] = {**source_actor, "enable_offload": True}
+            relocated["route_neutral_shared_gpu"] = {"rollout_rank": 0}
+            if relocated == live:
+                return {
+                    "mode": "route_neutral_shared_gpu",
+                    "source_world_size": expected_world_size,
+                    "target_world_size": expected_world_size,
+                }
 
     difference_paths, difference_descriptions = _contract_difference_paths(
         checkpoint,

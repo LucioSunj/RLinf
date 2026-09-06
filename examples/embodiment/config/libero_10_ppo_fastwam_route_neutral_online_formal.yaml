@@ -38,6 +38,7 @@ route_neutral_online_implementation:
   release_host_memory_after_trajectory_receive: true
   release_host_memory_after_train_preparation: true
   consume_rollout_batch_during_train_preparation: true
+  shared_gpu_rollout_rank: null
 
 runner:
   logger:

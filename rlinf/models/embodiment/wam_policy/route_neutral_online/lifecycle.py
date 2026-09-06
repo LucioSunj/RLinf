@@ -3,7 +3,7 @@
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
 
-"""Bounded host-memory lifecycle for the seven-GPU online profile."""
+"""Bounded host-memory lifecycle for the multi-rank online profile."""
 
 from __future__ import annotations
 
@@ -40,6 +40,32 @@ def _lifecycle_cfg(cfg: Any) -> Any:
 
 class RouteNeutralOnlineRolloutWorker(MultiStepRolloutWorker):
     """Retain standard trainable replay while releasing build temporaries."""
+
+    def __init__(self, cfg) -> None:
+        super().__init__(cfg)
+        shared_rank = cfg.route_neutral_online_implementation.get(
+            "shared_gpu_rollout_rank"
+        )
+        if shared_rank is not None:
+            self.enable_offload = int(self._rank) == int(shared_rank)
+
+    def audit_shared_gpu_roundtrip(self) -> dict[str, Any]:
+        """Validate the shared replica's first restored CPU/GPU/CPU cycle."""
+
+        from .shared_gpu import audit_residency_roundtrip
+
+        report = audit_residency_roundtrip(
+            model=self.hf_model,
+            onload=self.reload_model,
+            offload=self.offload_model,
+            device=self.device,
+            state=lambda: {
+                "version": self.version,
+                "runtime": self.hf_model.rollout_runtime_state_dict(),
+            },
+        )
+        self.log_info("ROUTE_NEUTRAL_SHARED_GPU_ROUNDTRIP=" + json.dumps(report))
+        return report
 
     def init_worker(self) -> None:
         super().init_worker()
@@ -135,6 +161,24 @@ class RouteNeutralOnlineEnvWorker(EnvWorker):
 
 class RouteNeutralOnlineRunner(PadRouteNeutralRunner):
     """Reuse generic damped control with rank-serial rollout initialization."""
+
+    def init_workers(self) -> None:
+        super().init_workers()
+        shared_rank = self.cfg.route_neutral_online_implementation.get(
+            "shared_gpu_rollout_rank"
+        )
+        if shared_rank is not None:
+            actor_report = self.actor.audit_shared_gpu_roundtrip().wait()
+            rollout_report = (
+                self.rollout.execute_on(int(shared_rank))
+                .audit_shared_gpu_roundtrip()
+                .wait()
+            )
+            self.logger.info(
+                "Shared GPU residency round trips passed: actor=%s rollout=%s",
+                actor_report,
+                rollout_report,
+            )
 
     def _init_rollout_workers_serially(self) -> None:
         profile = _lifecycle_cfg(self.cfg)

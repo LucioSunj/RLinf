@@ -147,6 +147,38 @@ def test_checkpoint_contract_covers_continuation_semantics_not_run_length() -> N
     assert MODULE.build_fastwam_checkpoint_contract(cfg, world_size=2) != baseline
 
 
+@pytest.mark.parametrize("owner,world_size", [("actor", 1), ("rollout", 7)])
+def test_route_neutral_shared_gpu_resume_changes_only_residency(owner, world_size):
+    cfg = _checkpoint_cfg()
+    cfg.actor.model.policy_target = (
+        "rlinf.models.embodiment.wam_policy.route_neutral_online.policy."
+        "RouteNeutralOnlineIDMBCFastWAMPolicy"
+    )
+    cfg.cluster.component_placement = {"actor": "0-0", "env": "1-7", "rollout": "1-7"}
+    cfg.env.train.total_num_envs = 28
+    cfg.actor.global_batch_size = 196
+    source = MODULE.build_fastwam_checkpoint_contract(cfg, world_size=world_size)
+    cfg.route_neutral_online_implementation = {"shared_gpu_rollout_rank": 0}
+    cfg.cluster.component_placement.env = "0-6"
+    cfg.cluster.component_placement.rollout = "0-6"
+    cfg.actor.enable_offload = True
+    target = MODULE.build_fastwam_checkpoint_contract(cfg, world_size=world_size)
+    kwargs = {"owner": owner, "allow_n4_to_three_rollout_expansion": False}
+    result = MODULE.validate_fastwam_training_checkpoint_contract(
+        source, target, **kwargs
+    )
+    assert result["mode"] == "route_neutral_shared_gpu"
+    assert (
+        MODULE.validate_fastwam_training_checkpoint_contract(target, target, **kwargs)[
+            "mode"
+        ]
+        == "exact"
+    )
+    target["actor"]["seed"] = 43
+    with pytest.raises(ValueError, match="contract mismatch"):
+        MODULE.validate_fastwam_training_checkpoint_contract(source, target, **kwargs)
+
+
 def test_checkpoint_contract_binds_explicit_training_task_filter() -> None:
     cfg = _checkpoint_cfg()
     unfiltered = MODULE.build_fastwam_checkpoint_contract(cfg, world_size=2)
