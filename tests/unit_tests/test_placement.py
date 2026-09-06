@@ -29,6 +29,36 @@ from rlinf.utils.placement import (
 )
 
 
+def test_route_neutral_healthy_physical_placement_skips_gpu4():
+    from rlinf.models.embodiment.wam_policy.route_neutral_online.config import (
+        validate_shared_gpu_device_plan,
+    )
+
+    cfg = OmegaConf.create(
+        {
+            "cluster": {
+                "component_placement": {
+                    "actor": "0-0",
+                    "rollout": "0-3,5-7",
+                    "env": "0-3,5-7",
+                }
+            },
+            "route_neutral_online_implementation": {"shared_gpu_rollout_rank": 0},
+        }
+    )
+    cluster = create_fake_cluster(num_nodes=1, accelerators_per_node=8)
+    placement = HybridComponentPlacement(cfg, cluster)
+    report = validate_shared_gpu_device_plan(cfg, cluster, placement)
+    assert report["rollout"] == [
+        (rank, 0, [str(device)]) for rank, device in enumerate([0, 1, 2, 3, 5, 6, 7])
+    ]
+    cfg.cluster.component_placement.rollout = "0-6"
+    with pytest.raises(ValueError, match="physical rollout placement changed"):
+        validate_shared_gpu_device_plan(
+            cfg, cluster, HybridComponentPlacement(cfg, cluster)
+        )
+
+
 class FakeCluster:
     """Minimal Cluster stub exposing just the APIs placement strategies rely on."""
 
