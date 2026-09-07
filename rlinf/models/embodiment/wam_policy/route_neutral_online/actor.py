@@ -774,16 +774,21 @@ class RouteNeutralOnlineIDMBCFSDPActor(OnlineIDMBCFSDPActor):
                 self.cfg.algorithm.gate_ppo.get("entropy_loss_source", "behavior")
                 == "base"
             ):
-                loss = loss + base_entropy_loss_correction(
+                correction = base_entropy_loss_correction(
                     base=output_dict["gate_base_probabilities"],
                     behavior=output_dict["gate_behavior_probabilities"],
                     valid=fastwam_effective_gate_kv_mask(
                         micro_batch["gate_valid_mask"],
                         micro_batch.get("gate_kv_sample_mask"),
                     ),
-                    coefficient=float(self.cfg.algorithm.gate_ppo.entropy_coefficient),
+                    coefficient=(
+                        float(self.cfg.algorithm.gate_ppo.entropy_coefficient)
+                        * float(self.cfg.algorithm.gate_ppo.loss_weight)
+                    ),
                     selected_loss_scale=(selected_loss_scales or {}).get("gate"),
                 )
+                loss = loss + correction
+                metrics["fastwam/regularized_policy_loss"] += float(correction.detach())
                 metrics["fastwam/total_loss"] = float(loss.detach())
             self._append_route_neutral_perf_metrics(metrics, output_dict)
             self._append_route_neutral_metric_numerators(metrics, output_dict)

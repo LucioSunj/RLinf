@@ -346,6 +346,40 @@ def test_contract_failure_reset_changes_only_rejected_slot_identity() -> None:
     assert infos["_final_info"].tolist() == [False, True, False]
 
 
+def test_balanced_contract_failure_keeps_identity_and_failed_outcome_through_padding():
+    env = _libero_env()
+    env.cfg.task_sampling = "global_balanced"
+    env.reset_state_ids = np.asarray([101, 450, 302])
+    env.task_ids = np.asarray([2, 9, 6])
+    env.trial_ids = np.asarray([1, 0, 2])
+    env._generator = np.random.default_rng(42)
+    rng_before = env._generator.bit_generator.state
+    env.success_once[0] = True
+    actions = np.zeros((3, 2, 7), dtype=np.float32)
+    actions[1, :, 0] = 1.125
+
+    result, submitted = env.chunk_step_with_action_trace(
+        actions,
+        _contract(),
+        contract_failure_mask=torch.tensor([False, True, False]),
+    )
+    assert result[2][1].tolist() == [False, True]
+    assert submitted.total_value_count[1].eq(0).all()
+    assert env.reset_state_ids.tolist() == [101, 450, 302]
+    assert env.task_ids.tolist() == [2, 9, 6]
+    assert env.trial_ids.tolist() == [1, 0, 2]
+    assert env._generator.bit_generator.state == rng_before
+    assert env.fail_once.tolist() == [False, True, False]
+
+    # Existing padding may continue the simulator, but cannot rewrite the
+    # already-terminal failure or its return as a subsequent success.
+    metrics = env._record_metrics(np.ones(3), np.ones(3, dtype=bool), {})
+    assert metrics["episode"]["success_once"].tolist() == [True, False, True]
+    assert env.returns[1] == 0
+    env._reset_metrics(np.arange(3))
+    assert not env.fail_once.any()
+
+
 def test_contract_violation_abort_resets_without_submitting_an_action() -> None:
     env = _libero_env()
     env.is_eval = True

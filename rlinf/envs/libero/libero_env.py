@@ -986,8 +986,14 @@ class LiberoEnv(gym.Env):
 
     def _record_metrics(self, step_reward, terminations, infos):
         episode_info = {}
+        metric_active = ~self.success_once
+        if self.cfg.get("task_sampling") == "global_balanced":
+            # Padding after a rejected Action belongs to the failed episode.
+            # It cannot later turn that episode into a reported success.
+            metric_active &= ~self.fail_once
+            terminations = terminations & ~self.fail_once
         # Only accumulate returns while not yet succeeded
-        self.returns += step_reward * (~self.success_once)
+        self.returns += step_reward * metric_active
         # Record episode_len at first success
         new_success_mask = terminations & ~self.success_once
         if new_success_mask.any():
@@ -1470,14 +1476,20 @@ class LiberoEnv(gym.Env):
         return obs, infos, None
 
     def _handle_contract_failure_reset(self, failures, _final_obs, infos):
-        """Reset only pre-submission failure slots in non-auto-reset training."""
+        """End rejected episodes, retaining fixed balanced slots until next update."""
 
         if getattr(self, "is_eval", False):
             raise RuntimeError("Contract-failure episode outcomes are training-only.")
         final_obs = copy.deepcopy(_final_obs)
         env_idx = np.arange(0, self.num_envs)[failures]
         final_info = copy.deepcopy(infos)
-        if self.use_fixed_reset_state_ids:
+        if self.cfg.get("task_sampling") == "global_balanced":
+            # The global plan owns the only episode start for this update.
+            # Keep the normal post-terminal padding path, without drawing a
+            # replacement identity or clearing the failed episode's metrics.
+            self.fail_once |= np.asarray(failures, dtype=bool) & ~self.success_once
+            obs, reset_infos = _final_obs, copy.deepcopy(infos)
+        elif self.use_fixed_reset_state_ids:
             if self.stage_invariant_fixed_reset_ids:
                 reset_state_ids = self._get_stage_invariant_reset_state_ids()[env_idx]
             elif self.cfg.use_ordered_reset_state_ids:
