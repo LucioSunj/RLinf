@@ -16,7 +16,7 @@ import copy
 import os
 import pathlib
 import time
-from functools import partial
+from functools import cache, partial
 from typing import OrderedDict
 
 import gymnasium as gym
@@ -33,6 +33,9 @@ from rlinf.scheduler import WorkerInfo
 
 class RealWorldEnv(gym.Env):
     def __init__(self, cfg, num_envs, seed_offset, total_num_processes, worker_info):
+        # Importing the direct Franka/WebSocket driver must leave existing ROS
+        # processes alone. Keep legacy node setup at environment construction.
+        self.realworld_setup()
         assert num_envs == 1, (
             f"Currently, only 1 realworld env can be started per worker, but {num_envs=} is received."
         )
@@ -82,14 +85,15 @@ class RealWorldEnv(gym.Env):
         return env
 
     @staticmethod
+    @cache
     def realworld_setup():
-        """Setup RealWorld environment upon env class import.
+        """Set up legacy Ray RealWorld environments once per process.
 
         This is for any node-level setup required by RealWorld environments. For example, ROS
         requires a single roscore instance per node, so we ensure that any existing roscore
         processes are terminated before starting a new one.
 
-        This function is called once when the RealWorldEnv class is first imported.
+        This function is called by RealWorldEnv construction, not by driver imports.
         """
         # Concurrency control is needed for multiple processes on the same node
         node_lock_file = "/tmp/.realworld.lock"

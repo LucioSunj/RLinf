@@ -81,6 +81,7 @@ _FASTWAM_EVAL_RUNTIME_ONLY_PATHS = (
     "init_device",
     "fastwam.load_text_encoder",
     "runtime.text_embedding_cache_dir",
+    "runtime.eval_video_recording_dir",
     "gate_epsilon",
     "eval_routing_mode",
     "eval_idm_threshold",

@@ -106,6 +106,11 @@ def _register_builtin_models():
 
         return get_model(cfg, torch_dtype)
 
+    def _build_lingbot_va_route_neutral(cfg: DictConfig, torch_dtype):
+        from rlinf.models.embodiment.lingbot_va_route_neutral import get_model
+
+        return get_model(cfg, torch_dtype)
+
     def _build_abot_m0(cfg: DictConfig, torch_dtype):
         from rlinf.models.embodiment.abot_m0 import get_model
 
@@ -220,6 +225,12 @@ def _register_builtin_models():
     register_model(
         SupportedModel.LINGBOTVLA.value,
         _build_lingbotvla,
+        category="embodied",
+        force=True,
+    )
+    register_model(
+        SupportedModel.LINGBOT_VA_ROUTE_NEUTRAL.value,
+        _build_lingbot_va_route_neutral,
         category="embodied",
         force=True,
     )

@@ -471,6 +471,17 @@ def test_eval_model_contract_rejects_structural_differences(path, value) -> None
         )
 
 
+def test_eval_video_output_is_not_a_model_change_but_prediction_settings_are() -> None:
+    saved = _eval_model_cfg()
+    live = copy.deepcopy(saved)
+    live.runtime.eval_video_recording_dir = "/recorded/run"
+    MODULE.validate_fastwam_eval_model_contract(saved, live, load_critic=False)
+    assert "eval_video_recording_dir" not in saved.runtime
+    live.runtime.num_video_frames = 13
+    with pytest.raises(ValueError, match="runtime.num_video_frames"):
+        MODULE.validate_fastwam_eval_model_contract(saved, live, load_critic=False)
+
+
 def test_eval_model_contract_includes_critic_when_requested() -> None:
     saved = _eval_model_cfg()
     live = OmegaConf.create(OmegaConf.to_container(saved, resolve=True))

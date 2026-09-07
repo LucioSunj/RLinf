@@ -1293,6 +1293,7 @@ class EnvWorker(Worker):
             action_execution_trace = ActionExecutionTrace(
                 stages=(prepared_statistics, submitted_statistics)
             )
+            self.evaluation_collector.record_step_observations(stage_id, chunk_result)
         else:
             if active_mask is None:
                 chunk_result = eval_env.chunk_step(chunk_actions)

@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import copy
 import os
+import time
 from collections.abc import Callable
 from typing import Any
 
@@ -79,11 +80,20 @@ def audit_residency_roundtrip(
     saved_state = cpu_clone(state())
     rng = cpu_clone(get_rng_state())
     del initial
+    transfer_seconds = {}
     for move, expected_device in (
         (onload, torch.device(device)),
         (offload, torch.device("cpu")),
     ):
+        if torch.device(device).type == "cuda":
+            torch.cuda.synchronize(device)
+        started = time.perf_counter()
         move()
+        if torch.device(device).type == "cuda":
+            torch.cuda.synchronize(device)
+        transfer_seconds["onload" if move is onload else "offload"] = (
+            time.perf_counter() - started
+        )
         current = tensors()
         if any(value.device != expected_device for value in current.values()):
             raise RuntimeError(
@@ -101,6 +111,10 @@ def audit_residency_roundtrip(
         "cuda_visible_devices": os.environ.get("CUDA_VISIBLE_DEVICES"),
         "model_tensors": len(weights),
         "model_values": sum(value.numel() for value in weights.values()),
+        "model_bytes": sum(
+            value.numel() * value.element_size() for value in weights.values()
+        ),
+        "transfer_seconds": transfer_seconds,
         "weights_dtypes_state_rng_unchanged": True,
         "final_model_device": "cpu",
         "cuda_allocated_bytes": torch.cuda.memory_allocated(device),

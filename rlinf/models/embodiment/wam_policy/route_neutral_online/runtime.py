@@ -73,6 +73,7 @@ class RouteNeutralOnlineIDMTeacherLiberoRuntime(OnlineIDMTeacherLiberoRuntime):
         route_neutral_input,
         route_neutral_visual,
         gate_replay_backend="recompute",
+        eval_video_recording_dir: str | None = None,
         **kwargs: Any,
     ) -> None:
         # The orchestration-level backend is ``recompute`` so RLinf creates no
@@ -104,6 +105,29 @@ class RouteNeutralOnlineIDMTeacherLiberoRuntime(OnlineIDMTeacherLiberoRuntime):
         if getattr(self.actor, "proprio_encoder", None) is None:
             raise ValueError("Route-neutral runtime requires FastWAM proprio encoding.")
         self.physical_history = PhysicalStateHistoryTracker(self.route_neutral_input)
+        self.prediction_recorder = None
+        if eval_video_recording_dir is not None:
+            from rlinf.models.embodiment.wam_policy.evaluation_video import (
+                EvaluationPredictionRecorder,
+            )
+
+            if (self.camera_height, self.camera_width, self.camera_concat) != (
+                224,
+                224,
+                "horizontal",
+            ) or self.num_video_frames != 9:
+                raise ValueError(
+                    "Recorded evaluation requires the native 2-camera/9-frame protocol."
+                )
+            self.prediction_recorder = EvaluationPredictionRecorder(
+                eval_video_recording_dir
+            )
+
+    def _observe_idm_prediction(self, video_latents: torch.Tensor) -> None:
+        """Observe only the selected branch's actual final prediction latents."""
+
+        if self.prediction_recorder is not None:
+            self.prediction_recorder.observe(video_latents)
 
     @staticmethod
     def _history_metadata(
@@ -194,6 +218,10 @@ class RouteNeutralOnlineIDMTeacherLiberoRuntime(OnlineIDMTeacherLiberoRuntime):
     ) -> RouteNeutralTrainableChunkSample:
         """Reuse Flow-SDE/teacher execution and seal legacy Gate snapshots."""
 
+        if self.prediction_recorder is not None:
+            if mode != "eval" or collect_replay:
+                raise ValueError("Prediction video recording is evaluation-only.")
+            self.prediction_recorder.begin(env_obs=env_obs, routes=routes)
         sample = super().sample_action_batch(
             env_obs=env_obs,
             routes=routes,
@@ -201,6 +229,10 @@ class RouteNeutralOnlineIDMTeacherLiberoRuntime(OnlineIDMTeacherLiberoRuntime):
             actor_version=actor_version,
             collect_replay=collect_replay,
         )
+        if self.prediction_recorder is not None:
+            self.prediction_recorder.finish(
+                actor=self.actor, actor_version=actor_version, tiled=self.tiled_vae
+            )
         return RouteNeutralTrainableChunkSample.without_route_snapshot(sample)
 
 

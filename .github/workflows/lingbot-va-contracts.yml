@@ -1,0 +1,36 @@
+name: LingBot-VA single-robot contracts
+
+on:
+  workflow_dispatch:
+    inputs:
+      lingbot_va_path:
+        description: Local patched LingBot-VA source on the embodied runner
+        required: true
+      fastwam_path:
+        description: Local FastWAM source containing the shared Gate/Flow math
+        required: true
+
+jobs:
+  cpu-contracts:
+    runs-on: embodied
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v5
+      - name: Create isolated model environment
+        env:
+          LINGBOT_VA_PATH: ${{ inputs.lingbot_va_path }}
+          FASTWAM_PATH: ${{ inputs.fastwam_path }}
+        run: bash requirements/install.sh --no-root embodied --model lingbot_va_route_neutral --env dummy
+      - name: Native tiny-model and WebSocket round tests
+        env:
+          CUDA_VISIBLE_DEVICES: ""
+          OMP_NUM_THREADS: "2"
+        run: |
+          source .venv/bin/activate
+          PYTHONPATH="$PWD" python -m pytest tests/unit_tests/test_lingbot_va_route_neutral.py -q
+      - name: CLI entry smoke test
+        env:
+          CUDA_VISIBLE_DEVICES: ""
+        run: |
+          source .venv/bin/activate
+          PYTHONPATH="$PWD" python examples/embodiment/lingbot_va/run.py --help

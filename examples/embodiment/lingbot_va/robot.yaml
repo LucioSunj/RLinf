@@ -1,0 +1,32 @@
+# Copy the calibrated values from the robot's existing Franka configuration.
+# Run on the CPU controller machine, attached to its dedicated Ray runtime.
+cluster:
+  num_nodes: 1
+  distributed_logging: false
+hardware:
+  node_rank: 0
+  robot_ip: ???
+  camera_serials: ???
+  camera_type: realsense
+  gripper_type: franka
+  gripper_connection: null
+camera_names: [external, wrist]
+frame_color: BGR  # FrankaEnv already converts its RGB camera frames to BGR.
+gripper_open: 0.08  # metres; replace with calibrated endpoint widths if different
+gripper_closed: 0.0
+environment:
+  camera_names: ???  # {"external_camera_serial": external, "wrist_camera_serial": wrist}
+  step_frequency: 20
+  max_num_steps: 10000
+  action_scale: ???
+  target_ee_pose: ???  # xyz + Euler xyz, as required by the existing environment
+  reset_ee_pose: ???
+  ee_pose_limit_min: ???
+  ee_pose_limit_max: ???
+  compliance_param: ???
+  precision_param: ???
+  enable_random_reset: false
+  use_dense_reward: false
+  enable_gripper_penalty: false
+  enable_camera_player: true
+  end_effector_type: franka_gripper

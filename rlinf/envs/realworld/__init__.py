@@ -31,8 +31,6 @@ from .realworld_env import RealWorldEnv
 from .xsquare import Turtle2Env, Turtle2RobotConfig, Turtle2RobotState
 from .xsquare import tasks as xsquare_tasks
 
-RealWorldEnv.realworld_setup()
-
 __all__ = [
     "DualFrankaEnv",
     "DualFrankaJointEnv",

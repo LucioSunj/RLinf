@@ -107,6 +107,9 @@ SupportedModel.CNN_POLICY = SupportedModel.register("cnn_policy", force=True)
 SupportedModel.FLOW_POLICY = SupportedModel.register("flow_policy", force=True)
 SupportedModel.CMA_POLICY = SupportedModel.register("cma", force=True)
 SupportedModel.LINGBOTVLA = SupportedModel.register("lingbotvla", force=True)
+SupportedModel.LINGBOT_VA_ROUTE_NEUTRAL = SupportedModel.register(
+    "lingbot_va_route_neutral", force=True
+)
 SupportedModel.ABOT_M0 = SupportedModel.register("abot_m0", force=True)
 SupportedModel.RESNET_REWARD = SupportedModel.register("resnet", force=True)
 SupportedModel.CFG_MODEL = SupportedModel.register("cfg_model", force=True)
@@ -143,6 +146,7 @@ EMBODIED_MODEL = set(
         SupportedModel.FLOW_POLICY,
         SupportedModel.CMA_POLICY,
         SupportedModel.LINGBOTVLA,
+        SupportedModel.LINGBOT_VA_ROUTE_NEUTRAL,
         SupportedModel.ABOT_M0,
         SupportedModel.RESNET_REWARD,
         SupportedModel.GR00T_N1D6,

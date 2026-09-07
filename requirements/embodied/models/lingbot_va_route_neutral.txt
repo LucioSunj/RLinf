@@ -1,0 +1,27 @@
+# Native LingBot-VA stack. FlashAttention is unnecessary for torch/flex backends.
+torch==2.9.0
+torchvision==0.24.0
+torchaudio==2.9.0
+diffusers==0.36.0
+# Keep the existing Pi0.5 prefix's required Transformers replacement. Native
+# Wan uses T5EncoderModel; its CPU parity/encoding tests cover this combination.
+transformers==4.53.2
+numpy==1.26.4
+# OpenPI dependencies are installed first, then this native Torch2.9 stack.
+# LeRobot0.3.3 pins older Torch in metadata and is added with --no-deps.
+accelerate
+einops
+easydict
+imageio[ffmpeg]
+websockets>=14
+msgpack
+opencv-python
+ftfy
+safetensors
+Pillow
+scipy
+sentencepiece
+av>=14.2,<15
+deepdiff>=7.0.1,<9
+rerun-sdk>=0.21,<0.23
+pyserial>=3.5

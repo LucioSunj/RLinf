@@ -80,7 +80,7 @@ GITHUB_PREFIX=""
 NO_ROOT=0
 NO_INSTALL_RLINF_CMD="--no-install-project"
 SUPPORTED_TARGETS=("embodied" "agentic" "docs")
-SUPPORTED_MODELS=("openvla" "openvla-oft" "openpi" "gr00t" "gr00t_n1d6" "gr00t_n1d7" "dexbotic" "starvla" "lingbotvla" "dreamzero" "qwen3_vl" "abot_m0")
+SUPPORTED_MODELS=("openvla" "openvla-oft" "openpi" "gr00t" "gr00t_n1d6" "gr00t_n1d7" "dexbotic" "starvla" "lingbotvla" "lingbot_va_route_neutral" "dreamzero" "qwen3_vl" "abot_m0")
 SUPPORTED_ENVS=("behavior" "maniskill_libero" "libero" "metaworld" "calvin" "isaaclab" "robocasa" "robocasa365" "franka" "franka-dexhand" "franka-franky" "frankasim" "robotwin" "habitat" "opensora" "wan" "genesis" "xsquare_turtle2" "liberopro" "liberoplus" "roboverse" "embodichain" "d4rl" "dosw1" "gim_arm" "dummy" "polaris")
 
 #=======================Utility Functions=======================
@@ -1414,6 +1414,41 @@ EOF
     uv pip uninstall pynvml || true
 }
 
+install_lingbot_va_route_neutral_model() {
+    # The model server and preprocessing environment are separate from ROS.
+    if [ "$ENV_NAME" != "dummy" ]; then
+        echo "LingBot-VA inference/training uses --env dummy; install the robot client with the existing Franka target." >&2
+        exit 1
+    fi
+    local lingbot_va_source="${LINGBOT_VA_PATH:-${SCRIPT_DIR}/../../lingbot-va}"
+    local fastwam_source="${FASTWAM_PATH:-${SCRIPT_DIR}/../../FastWAM}"
+    if [ ! -f "$lingbot_va_source/wan_va/modules/model.py" ] || [ ! -f "$fastwam_source/src/fastwam/models/wan22/flow_sde.py" ]; then
+        echo "Set LINGBOT_VA_PATH and FASTWAM_PATH to the experiment's local source checkouts (including its shared math extensions)." >&2
+        exit 1
+    fi
+    PYTHON_VERSION="3.10"
+    TORCH_VERSION="2.9.0"
+    create_and_sync_venv
+    install_common_embodied_deps
+    # Install OpenPI's other dependencies before replacing its pinned Torch.
+    uv pip install "git+${GITHUB_PREFIX}https://github.com/RLinf/openpi"
+    uv pip install -r "$SCRIPT_DIR/embodied/models/lingbot_va_route_neutral.txt"
+    uv pip install --no-deps lerobot==0.3.3
+    python - "$lingbot_va_source" "$fastwam_source/src" <<'PY'
+import pathlib
+import importlib.util
+import shutil
+import site
+import sys
+
+openpi_dir = pathlib.Path(importlib.util.find_spec("openpi").origin).parent
+transformers_dir = pathlib.Path(importlib.util.find_spec("transformers").origin).parent
+shutil.copytree(openpi_dir / "models_pytorch/transformers_replace", transformers_dir, dirs_exist_ok=True)
+paths = [str(pathlib.Path(p).resolve()) for p in sys.argv[1:]]
+pathlib.Path(site.getsitepackages()[0], "lingbot_va_sources.pth").write_text("\n".join(paths) + "\n")
+PY
+}
+
 install_starvla_model() {
     case "$ENV_NAME" in
         maniskill_libero|libero)
@@ -2350,6 +2385,9 @@ main() {
                     ;;
                 lingbotvla)                  
                     install_lingbot_vla_model 
+                    ;;
+                lingbot_va_route_neutral)
+                    install_lingbot_va_route_neutral_model
                     ;;
                 abot_m0)
                     install_abot_m0_model

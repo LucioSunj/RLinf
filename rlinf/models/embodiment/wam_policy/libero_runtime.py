@@ -700,6 +700,8 @@ class LiberoFastWAMRuntime:
                 )
                 video_latents[:, :, :1] = first_frame
 
+            self._observe_idm_prediction(video_latents)
+
         video_pre = self.actor.video_expert.pre_dit(
             x=video_latents,
             timestep=torch.zeros(1, device=self.device, dtype=self.dtype),
@@ -738,6 +740,9 @@ class LiberoFastWAMRuntime:
             ),
             replay_initial_latents,
         )
+
+    def _observe_idm_prediction(self, video_latents: torch.Tensor) -> None:
+        """Optional read-only evaluation capture; default execution does no work."""
 
     def _critic_features_from_condition(
         self,

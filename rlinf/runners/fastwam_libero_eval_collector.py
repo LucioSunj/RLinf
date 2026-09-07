@@ -742,6 +742,9 @@ class FastWAMLiberoEvalCollector:
         completed = {episode["episode_identity"] for episode in self._episodes}
         return completed == expected
 
+    def record_step_observations(self, stage_id: int, chunk_result: tuple) -> None:
+        """Optional video hook; the standard collector retains no RGB frames."""
+
     def build_rollout_stop_control(
         self, *, logical_batch_size: int
     ) -> EvaluationRolloutControl:
