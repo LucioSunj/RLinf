@@ -746,6 +746,14 @@ class LiberoEnv(gym.Env):
             )
 
     def update_reset_state_ids(self):
+        if self.cfg.get("task_sampling") == "global_balanced":
+            # The runner replaces this initialization-only selection before the
+            # first episode. End-of-rollout cleanup must not draw another plan.
+            if not hasattr(self, "reset_state_ids"):
+                self.reset_state_ids = self._valid_reset_state_ids[
+                    np.arange(self.num_envs) % len(self._valid_reset_state_ids)
+                ].copy()
+            return
         if self.stage_invariant_fixed_reset_ids:
             reset_state_ids = self._get_stage_invariant_reset_state_ids()
         elif self.is_eval or self.cfg.use_ordered_reset_state_ids:
@@ -753,6 +761,30 @@ class LiberoEnv(gym.Env):
         else:
             reset_state_ids = self._get_random_reset_state_ids(self.num_group)
         self.reset_state_ids = reset_state_ids.repeat(self.group_size)
+
+    def set_global_task_plan(self, slots: list[dict], runner_step: int) -> None:
+        """Apply this rank's share of the runner's global episode plan."""
+
+        if self.cfg.get("task_sampling") != "global_balanced":
+            raise ValueError("An external task plan requires global_balanced sampling.")
+        if len(slots) != self.num_envs:
+            raise ValueError(
+                "Global task plan does not match the rank's environment count."
+            )
+        reset_ids = np.asarray(
+            [slot["reset_state_id"] for slot in slots], dtype=np.int64
+        )
+        task_ids, trial_ids = self._get_task_and_trial_ids_from_reset_state_ids(
+            reset_ids
+        )
+        if not np.array_equal(
+            task_ids, [slot["task_id"] for slot in slots]
+        ) or not np.array_equal(trial_ids, [slot["trial_id"] for slot in slots]):
+            raise ValueError(
+                "Task/reset identities disagree with LIBERO's fixed pools."
+            )
+        self.reset_state_ids = reset_ids
+        self.formal_runner_step = int(runner_step)
 
     def set_formal_runner_step(self, runner_step: int) -> None:
         """Select the deterministic reset identities for one formal runner step."""

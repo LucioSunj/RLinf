@@ -4,6 +4,7 @@
 # you may not use this file except in compliance with the License.
 
 import inspect
+from dataclasses import replace
 from pathlib import Path
 from types import MethodType, SimpleNamespace
 
@@ -1038,10 +1039,12 @@ def test_batched_online_bc_matches_serial_loss_and_gradient() -> None:
     def _prepare(_self, *, image, context, context_mask, regime, **_kwargs):
         del context_mask, regime
         prepare_batch_sizes.append(int(image.shape[0]))
-        return _cached_condition(
+        condition = _cached_condition(
             int(image.shape[0]),
             context_dim=int(context.shape[-1]),
-        ), None
+        )
+        condition = replace(condition, context=context)
+        return condition, None
 
     runtime._prepare_action_condition = MethodType(_prepare, runtime)
 
@@ -1053,9 +1056,11 @@ def test_batched_online_bc_matches_serial_loss_and_gradient() -> None:
         capture_gate_kv,
         actor_version,
     ):
-        del condition, regime, capture_gate_kv, actor_version
+        del regime, capture_gate_kv, actor_version
         return lambda action, timestep: VelocityOutput(
-            velocity=action * lora_parameter + timestep.reshape(-1, 1, 1) / 1000.0
+            velocity=action * lora_parameter
+            + timestep.reshape(-1, 1, 1) / 1000.0
+            + condition.context[:, 0, 0].reshape(-1, 1, 1) * lora_parameter
         )
 
     runtime._velocity = MethodType(_velocity, runtime)
@@ -1074,7 +1079,8 @@ def test_batched_online_bc_matches_serial_loss_and_gradient() -> None:
         ONLINE_IDM_BC_TEACHER_BYTES: torch.tensor([42, 0, 42, 42]),
         "flow_chains": torch.zeros(4, 2, 3, 7),
         "fastwam_images": torch.zeros(4, 3, 8, 8),
-        "fastwam_context": torch.zeros(4, 2, 3),
+        "fastwam_context": torch.arange(4).float().reshape(4, 1, 1).expand(-1, 2, 3),
+        "multitask_task_id": torch.arange(4),
         "fastwam_context_mask": torch.ones(4, 2, dtype=torch.bool),
     }
 
@@ -1112,6 +1118,10 @@ def test_batched_online_bc_matches_serial_loss_and_gradient() -> None:
     assert batched.selected_count.item() == 2.0
     assert batched.expected_count.item() == 2.0
     assert batched.present_count.item() == 3.0
+    assert batched.per_sample_loss is not None
+    torch.testing.assert_close(batched.per_sample_loss.sum(), batched.loss_sum.detach())
+    assert torch.count_nonzero(batched.per_sample_loss[[1, 3]]) == 0
+    assert not batched.per_sample_loss.requires_grad
 
 
 def test_route_replay_batches_all_uncond_rows_once() -> None:
@@ -1150,10 +1160,11 @@ def test_route_replay_batches_all_uncond_rows_once() -> None:
     def _prepare(_self, *, image, context, context_mask, regime, **_kwargs):
         del context_mask, regime
         prepare_batch_sizes.append(int(image.shape[0]))
-        return _cached_condition(
+        condition = _cached_condition(
             int(image.shape[0]),
             context_dim=int(context.shape[-1]),
-        ), None
+        )
+        return replace(condition, context=context), None
 
     runtime._prepare_action_condition = MethodType(_prepare, runtime)
     replay_parameter = torch.nn.Parameter(torch.tensor(0.2))
@@ -1169,6 +1180,7 @@ def test_route_replay_batches_all_uncond_rows_once() -> None:
     ):
         del regime, capture_gate_kv, actor_version
         velocity_batch_sizes.append(int(condition.context.shape[0]))
+        assert torch.equal(condition.context[:, 0, 0], torch.tensor([0.0, 2.0]))
         return lambda action, timestep: VelocityOutput(
             action * replay_parameter
             + timestep.reshape(-1, 1, 1).to(action.dtype) / 1000.0
@@ -1183,7 +1195,7 @@ def test_route_replay_batches_all_uncond_rows_once() -> None:
         "flow_chains": chains,
         "denoise_indices": torch.tensor([0, -1, 1, -1]),
         "fastwam_images": torch.zeros(4, 3, 8, 8),
-        "fastwam_context": torch.zeros(4, 2, 3),
+        "fastwam_context": torch.arange(4).float().reshape(4, 1, 1).expand(-1, 2, 3),
         "fastwam_context_mask": torch.ones(4, 2, dtype=torch.bool),
     }
 

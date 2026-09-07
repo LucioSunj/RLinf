@@ -374,6 +374,9 @@ def build_fastwam_checkpoint_contract(cfg: Any, *, world_size: int) -> dict[str,
     )
     if task_id_filter is not None:
         env_train["task_id_filter"] = _resolved_checkpoint_value(task_id_filter)
+    task_sampling = OmegaConf.select(cfg.env.train, "task_sampling", default=None)
+    if task_sampling is not None:
+        env_train["task_sampling"] = str(task_sampling)
     if formal_execution_profile is not None:
         env_train["stage_invariant_fixed_reset_ids"] = bool(
             OmegaConf.select(

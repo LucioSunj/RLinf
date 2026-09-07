@@ -57,7 +57,18 @@ class PadCriticWarmupReversalDampedController(ReversalDampedBandPriceController)
 
     def _update_after_rollout(self, observation: Any) -> dict[str, Any]:
         if not self._warmup_active(observation.runner_step):
-            return super()._update_after_rollout(observation)
+            old_price = self.signed_price
+            result = super()._update_after_rollout(observation)
+            update = result["update"]
+            update["old_signed_price"] = old_price
+            update["new_signed_price"] = self.signed_price
+            update["reset_incomplete_due_to_total_delta_clip"] = bool(
+                update.get("opposing_decay_applied", False)
+                and self.reversal_decay_factor == 0.0
+                and update["raw_delta"] != update["applied_delta"]
+                and old_price * self.signed_price > 0.0
+            )
+            return result
         feedback_rate = self._feedback_rate(observation)
         return {
             "observed": {

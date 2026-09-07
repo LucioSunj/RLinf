@@ -917,6 +917,11 @@ class RouteNeutralOnlineIDMTeacherLiberoRuntime(OnlineIDMTeacherLiberoRuntime):
             dtype=torch.long,
         )
         zero_action_count = torch.zeros((), device=self.device, dtype=torch.long)
+        per_sample_loss = (
+            torch.zeros(batch_size, device=self.device, dtype=torch.float32)
+            if "multitask_task_id" in forward_inputs
+            else None
+        )
 
         if selected_indices.numel():
             action = teacher_actions.index_select(0, selected_indices).to(
@@ -983,6 +988,19 @@ class RouteNeutralOnlineIDMTeacherLiberoRuntime(OnlineIDMTeacherLiberoRuntime):
                 timestep_bins=timestep_bins,
             )
             loss_sum = bc_result.loss_action_bc * selected_count
+            if per_sample_loss is not None:
+                # Record the same full-action, scheduler-weighted row objective.
+                # This detached diagnostic does not change the trained reduction.
+                with torch.no_grad():
+                    row_mse = (
+                        prediction.float() - velocity_target.float()
+                    ).square().mean(dim=2).sum(dim=1) / prediction.shape[1]
+                    per_sample_loss[selected_indices] = (
+                        row_mse
+                        * self.actor.train_action_scheduler.training_weight(
+                            timestep
+                        ).float()
+                    )
             raw_loss = bc_result.loss_action_bc.detach()
             mse_per_dimension = bc_result.mse_per_dimension.detach()
             mse_pose = bc_result.mse_pose.detach()
@@ -1032,6 +1050,7 @@ class RouteNeutralOnlineIDMTeacherLiberoRuntime(OnlineIDMTeacherLiberoRuntime):
             teacher_bytes_sum=teacher_bytes[present.to(teacher_bytes.device)]
             .sum()
             .to(self.device),
+            per_sample_loss=per_sample_loss,
         )
 
 

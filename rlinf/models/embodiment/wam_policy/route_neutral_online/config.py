@@ -265,18 +265,61 @@ def validate_route_neutral_online_idm_bc_training_config(
     )
     shared_rank = lifecycle.get("shared_gpu_rollout_rank")
     shared_placement = {"actor": "0-0", "env": "0-3,5-7", "rollout": "0-3,5-7"}
+    balanced_tasks = cfg.env.train.get("task_sampling") == "global_balanced"
+    if cfg.algorithm.gate_ppo.get("entropy_loss_source", "behavior") not in {
+        "base",
+        "behavior",
+    }:
+        raise ValueError("Gate entropy loss source must be base or behavior.")
+    balanced_placement = {"actor": "0-0", "env": "0-6", "rollout": "0-6"}
+    total_envs = int(cfg.env.train.total_num_envs)
+    batch_size = int(cfg.actor.global_batch_size)
+    balanced_geometry = (
+        balanced_tasks
+        and placement == balanced_placement
+        and total_envs >= 42
+        and total_envs % 42 == 0
+        and batch_size == 196 * (total_envs // 42)
+        and int(cfg.actor.micro_batch_size) == 4
+    )
+    if balanced_tasks:
+        if not balanced_geometry or shared_rank != 0:
+            raise ValueError(
+                "Balanced ten-task training requires shared GPU0, env=rollout=0-6, "
+                "N a positive multiple of 42, global batch 196*N/42 and microbatch 4."
+            )
+        train = cfg.env.train
+        if (
+            str(train.task_suite_name) != "libero_10"
+            or list(train.task_id_filter) != list(range(10))
+            or int(train.group_size) != 1
+            or bool(train.auto_reset)
+            or bool(train.ignore_terminations)
+            or not bool(train.use_fixed_reset_state_ids)
+            or bool(train.use_ordered_reset_state_ids)
+            or train.get("specific_reset_id") is not None
+            or bool(train.get("stage_invariant_fixed_reset_ids", False))
+            or int(train.max_episode_steps) != 700
+            or int(train.max_steps_per_rollout_epoch) != 700
+            or int(train.reset_wait_steps) != 30
+            or int(train.seed) != 42
+            or int(cfg.algorithm.rollout_epoch) != 1
+            or int(cfg.algorithm.update_epoch) != 1
+        ):
+            raise ValueError(
+                "Balanced ten-task sampling requires the fixed episode protocol."
+            )
     if shared_rank is not None:
         if (
             isinstance(shared_rank, bool)
             or shared_rank != 0
-            or placement != shared_placement
+            or (placement != shared_placement and not balanced_geometry)
             or not bool(cfg.actor.enable_offload)
             or bool(cfg.rollout.enable_offload)
             or bool(cfg.runner.get("use_training_pipeline", False))
             or bool(cfg.runner.get("overlap_env_bootstrap", False))
             or int(cfg.rollout.pipeline_stage_num) != 1
-            or int(cfg.env.train.total_num_envs) != 28
-            or int(cfg.actor.global_batch_size) != 196
+            or (not balanced_geometry and (total_envs != 28 or batch_size != 196))
         ):
             raise ValueError(
                 "Shared-GPU route-neutral training requires actor=0-0, "
@@ -336,7 +379,11 @@ def validate_shared_gpu_device_plan(
 
     if cfg.route_neutral_online_implementation.get("shared_gpu_rollout_rank") is None:
         return None
-    healthy_devices = [0, 1, 2, 3, 5, 6, 7]
+    healthy_devices = (
+        list(range(7))
+        if str(cfg.cluster.component_placement.env) == "0-6"
+        else [0, 1, 2, 3, 5, 6, 7]
+    )
     report = {"schema": "route-neutral-shared-gpu-device-plan-v1", "status": "PASS"}
     for component in ("actor", "rollout", "env"):
         planned = placement.get_strategy(component).get_placement(cluster)

@@ -3793,7 +3793,7 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
         g.manual_seed(self.cfg.actor.seed + self._rank)
         shuffle_id = torch.randperm(rollout_size, generator=g)
 
-        with torch.no_grad():
+        with self.worker_timer("train_preparation"), torch.no_grad():
             self.rollout_batch = process_nested_dict_for_train(
                 self.rollout_batch,
                 shuffle_id,

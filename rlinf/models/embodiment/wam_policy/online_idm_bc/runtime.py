@@ -62,11 +62,12 @@ class OnlineIDMBCLossBatch:
     executed_prefix_mse: torch.Tensor
     teacher_seconds_sum: torch.Tensor
     teacher_bytes_sum: torch.Tensor
+    per_sample_loss: torch.Tensor | None = None
 
     def as_forward_outputs(self) -> dict[str, torch.Tensor]:
         """Return stable actor-forward keys without detaching the loss."""
 
-        return {
+        outputs = {
             "online_idm_bc_loss_sum": self.loss_sum,
             "online_idm_bc_raw_loss": self.raw_loss,
             "online_idm_bc_selected_count": self.selected_count,
@@ -83,6 +84,9 @@ class OnlineIDMBCLossBatch:
             "online_idm_bc_teacher_seconds_sum": self.teacher_seconds_sum,
             "online_idm_bc_teacher_bytes_sum": self.teacher_bytes_sum,
         }
+        if self.per_sample_loss is not None:
+            outputs["online_idm_bc_per_sample_loss"] = self.per_sample_loss
+        return outputs
 
 
 def _batch_long_tensor(value: Any, *, batch_size: int, name: str) -> torch.Tensor:

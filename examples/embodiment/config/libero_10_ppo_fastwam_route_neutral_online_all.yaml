@@ -1,0 +1,129 @@
+# One shared model, globally balanced LIBERO-Long episode starts.
+defaults:
+  - env/libero_10@env.train
+  - env/libero_10@env.eval
+  - model/fastwam_route_neutral_online@actor.model
+  - model/fastwam_route_neutral_online@rollout.model
+  - hybrid_engines/fsdp@actor.fsdp_config
+  - weight_syncer/patch_syncer@weight_syncer
+  - online_idm_bc: enabled
+  - libero_10_ppo_fastwam_task0_formal_base
+  - fastwam_idm_cost_control: pad_route_neutral_warmup_reversal_damped_b50
+  - override hydra/job_logging: stdout
+  - _self_
+
+hydra:
+  run:
+    dir: .
+  output_subdir: null
+  searchpath:
+    - file://${oc.env:EMBODIED_PATH}/config/
+
+cluster:
+  component_placement:
+    actor: "0-0"
+    env: "0-6"
+    rollout: "0-6"
+
+route_neutral_online_implementation:
+  actor_target: rlinf.models.embodiment.wam_policy.route_neutral_online.actor.RouteNeutralOnlineIDMBCFSDPActor
+  policy_target: rlinf.models.embodiment.wam_policy.route_neutral_online.policy.RouteNeutralOnlineIDMBCFastWAMPolicy
+  rollout_worker_target: rlinf.models.embodiment.wam_policy.route_neutral_online.lifecycle.RouteNeutralOnlineRolloutWorker
+  env_worker_target: rlinf.models.embodiment.wam_policy.route_neutral_online.lifecycle.RouteNeutralOnlineEnvWorker
+  runner_target: rlinf.models.embodiment.wam_policy.route_neutral_online.lifecycle.RouteNeutralOnlineRunner
+  rollout_init_mode: serial_rank
+  trajectory_send_mode: serialized
+  release_host_memory_after_rollout_init: true
+  release_host_memory_after_trajectory_send: true
+  release_host_memory_after_trajectory_receive: true
+  release_host_memory_after_train_preparation: true
+  consume_rollout_batch_during_train_preparation: true
+  shared_gpu_rollout_rank: 0
+
+runner:
+  bootstrap_uncond_lora_sidecar: ${oc.env:FASTWAM_UNCOND_BC_SIDECAR}
+  bootstrap_uncond_lora_sidecar_sha256: ${oc.env:FASTWAM_UNCOND_BC_SIDECAR_SHA256}
+  max_steps: 200
+  max_epochs: 200
+  save_interval: 5
+  val_check_interval: -1
+  use_training_pipeline: false
+  overlap_env_bootstrap: false
+  logger:
+    experiment_name: libero10_all_N42_seed42_w10_b50_reset0_200updates_perfopt_mb4
+  fastwam_training_guard:
+    zero_success_patience: 201
+
+algorithm:
+  gate_ppo:
+    entropy_loss_source: base
+  rollout_epoch: 1
+  update_epoch: 1
+  critic_loss:
+    warmup_steps: 0
+  fixed_branch_cost:
+    controller:
+      critic_warmup:
+        runner_updates: 10
+      signed_price:
+        reversal:
+          factor: 0.0
+  regularization:
+    base_uncond_kl:
+      enabled: false
+      coefficient: 0.0
+      log_metric: false
+
+env:
+  train:
+    egl_instantiation_target: rlinf.models.embodiment.wam_policy.pad_rv.egl.instantiate_with_physical_egl
+    task_id_filter: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9]
+    task_sampling: global_balanced
+    rollout_epoch: 1
+    total_num_envs: 42
+    group_size: 1
+    auto_reset: false
+    ignore_terminations: false
+    use_fixed_reset_state_ids: true
+    use_ordered_reset_state_ids: false
+    seed: 42
+  eval:
+    egl_instantiation_target: rlinf.models.embodiment.wam_policy.pad_rv.egl.instantiate_with_physical_egl
+
+actor:
+  enable_offload: true
+  global_batch_size: 196
+  micro_batch_size: 4
+  seed: 42
+  model:
+    formal_training_sampling_seed: ${actor.seed}
+    decision_telemetry_enabled: false
+    kv_replay:
+      backend: recompute
+      gate_kv_sample_budget: null
+    runtime:
+      _target_: rlinf.models.embodiment.wam_policy.route_neutral_online.runtime.RouteNeutralOnlineIDMTeacherLiberoRuntime
+      text_embedding_cache_dir: ${oc.env:FASTWAM_TEXT_CACHE}
+    route_neutral_online:
+      critic_warmup:
+        runner_updates: 10
+  optim:
+    critic_warmup_steps: 0
+    total_training_steps: 3000
+    min_lr_rate: 0.1
+
+rollout:
+  enable_offload: false
+  pipeline_stage_num: 1
+  model:
+    formal_training_sampling_seed: ${actor.seed}
+    decision_telemetry_enabled: false
+    kv_replay:
+      backend: recompute
+      gate_kv_sample_budget: null
+    runtime:
+      _target_: rlinf.models.embodiment.wam_policy.route_neutral_online.runtime.RouteNeutralOnlineIDMTeacherLiberoRuntime
+      text_embedding_cache_dir: ${oc.env:FASTWAM_TEXT_CACHE}
+    route_neutral_online:
+      critic_warmup:
+        runner_updates: 10

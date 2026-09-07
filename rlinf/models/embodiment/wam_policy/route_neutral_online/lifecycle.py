@@ -15,7 +15,12 @@ import time
 from pathlib import Path
 from typing import Any
 
+import numpy as np
+import torch
+
 from rlinf.data.embodied_io_struct import EmbodiedRolloutResult
+from rlinf.envs.libero.task_sampler import BalancedLiberoTaskSampler
+from rlinf.envs.utils import get_env_attr
 from rlinf.models.embodiment.wam_policy.pad_rv.memory import release_pad_host_memory
 from rlinf.models.embodiment.wam_policy.pad_rv.route_neutral_runner import (
     PadRouteNeutralRunner,
@@ -85,6 +90,84 @@ class RouteNeutralOnlineRolloutWorker(MultiStepRolloutWorker):
 class RouteNeutralOnlineEnvWorker(EnvWorker):
     """Serialize large rank payloads and release them after channel transfer."""
 
+    def describe_task_pools(self) -> dict[str, Any]:
+        """Expose actual reset-pool sizes and language labels to the sampler."""
+
+        environment = self.env_list[0]
+        bins = np.asarray(get_env_attr(environment, "cumsum_trial_id_bins"))
+        suite = get_env_attr(environment, "task_suite")
+        return {
+            "reset_pool_sizes": np.diff(np.concatenate(([0], bins))).tolist(),
+            "task_names": [suite.get_task(i).language for i in range(10)],
+        }
+
+    def set_global_task_plan(self, plan: dict[str, Any]) -> None:
+        """Receive one globally generated plan; workers never draw task quotas."""
+
+        if (
+            self.stage_num != 1
+            or self.cfg.env.train.get("task_sampling") != "global_balanced"
+        ):
+            raise ValueError(
+                "Global task plans require the synchronous balanced profile."
+            )
+        slots = plan["ranks"][int(self._rank)]
+        setter = get_env_attr(self.env_list[0], "set_global_task_plan")
+        setter(slots, plan["runner_step"])
+        self._global_task_plan = plan
+
+    def _attach_task_metadata(
+        self, result: EmbodiedRolloutResult, stage_id: int
+    ) -> None:
+        """Attach episode identity after inference, without adding policy features."""
+
+        if self.cfg.env.train.get("task_sampling") != "global_balanced":
+            return
+        slots = self._global_task_plan["ranks"][int(self._rank)]
+        environment = self.env_list[stage_id]
+        actual_tasks = torch.as_tensor(
+            get_env_attr(environment, "task_ids"), dtype=torch.long
+        )
+        expected_tasks = torch.tensor([slot["task_id"] for slot in slots])
+        actual_trials = torch.as_tensor(
+            get_env_attr(environment, "trial_ids"), dtype=torch.long
+        )
+        if not torch.equal(actual_tasks, expected_tasks) or not torch.equal(
+            actual_trials, torch.tensor([slot["trial_id"] for slot in slots])
+        ):
+            raise ValueError(
+                "Executed task/reset identities differ from the global plan."
+            )
+        success = torch.as_tensor(
+            get_env_attr(environment, "success_once"), dtype=torch.bool
+        ).reshape(-1)
+        terminated = (
+            torch.stack(result.terminations)
+            .reshape(-1, len(slots), self.model_cfg.num_action_chunks)
+            .any(dim=(0, 2))
+        )
+        truncated = (
+            torch.stack(result.truncations)
+            .reshape(-1, len(slots), self.model_cfg.num_action_chunks)
+            .any(dim=(0, 2))
+        )
+        metadata = {
+            "multitask_task_id": expected_tasks,
+            "multitask_reset_state_id": torch.tensor(
+                [slot["reset_state_id"] for slot in slots]
+            ),
+            "multitask_episode_slot_id": torch.tensor(
+                [slot["episode_slot_id"] for slot in slots]
+            ),
+            "multitask_episode_success": success,
+            "multitask_episode_failed": terminated & ~success,
+            "multitask_episode_truncated": truncated & ~success,
+        }
+        for forward_inputs in result.forward_inputs:
+            forward_inputs.update(
+                {key: value.clone() for key, value in metadata.items()}
+            )
+
     async def send_rollout_trajectories(
         self,
         rollout_result: EmbodiedRolloutResult,
@@ -92,6 +175,7 @@ class RouteNeutralOnlineEnvWorker(EnvWorker):
         *,
         stage_id: int,
     ) -> None:
+        self._attach_task_metadata(rollout_result, stage_id)
         profile = _lifecycle_cfg(self.cfg)
         mode = str(profile.trajectory_send_mode)
         if mode == "concurrent":
@@ -164,6 +248,30 @@ class RouteNeutralOnlineRunner(PadRouteNeutralRunner):
 
     def init_workers(self) -> None:
         super().init_workers()
+        if self.cfg.env.train.get("task_sampling") == "global_balanced":
+            descriptions = self.env.describe_task_pools().wait()
+            if any(item != descriptions[0] for item in descriptions):
+                raise ValueError("LIBERO task/reset pools differ across ranks.")
+            self.task_sampler = BalancedLiberoTaskSampler(
+                total_envs=int(self.cfg.env.train.total_num_envs),
+                reset_pool_sizes=descriptions[0]["reset_pool_sizes"],
+                seed=int(self.cfg.env.train.seed),
+            )
+            self.task_names = descriptions[0]["task_names"]
+            resume_dir = self.cfg.runner.get("resume_dir")
+            if resume_dir is not None:
+                self.task_sampler.load_state_dict(
+                    json.loads((Path(resume_dir) / "task_sampler.json").read_text()),
+                    runner_step=self.global_step,
+                )
+            self._task_audit_dir.mkdir(parents=True, exist_ok=True)
+            (self._task_audit_dir / "task_definition.json").write_text(
+                json.dumps(
+                    {**descriptions[0], "sampler": self.task_sampler.state_dict()},
+                    indent=2,
+                )
+                + "\n"
+            )
         shared_rank = self.cfg.route_neutral_online_implementation.get(
             "shared_gpu_rollout_rank"
         )
@@ -179,6 +287,62 @@ class RouteNeutralOnlineRunner(PadRouteNeutralRunner):
                 actor_report,
                 rollout_report,
             )
+
+    @property
+    def _task_audit_dir(self) -> Path:
+        return (
+            Path(self.cfg.runner.logger.log_path)
+            / self.cfg.runner.logger.experiment_name
+            / "audits"
+        )
+
+    def _set_worker_global_step(self) -> None:
+        self._complete_update_started = time.perf_counter()
+        self._checkpoint_seconds = 0.0
+        if hasattr(self, "task_sampler"):
+            plan = self.task_sampler.next_plan(self.global_step)
+            self.env.set_global_task_plan(plan).wait()
+            with (self._task_audit_dir / "task_plans.jsonl").open("a") as stream:
+                stream.write(json.dumps(plan) + "\n")
+        super()._set_worker_global_step()
+
+    def _save_checkpoint(self) -> None:
+        started = time.perf_counter()
+        super()._save_checkpoint()
+        if hasattr(self, "task_sampler"):
+            directory = (
+                self._task_audit_dir.parent
+                / "checkpoints"
+                / f"global_step_{self.global_step}"
+            )
+            temporary = directory / ".task_sampler.json.tmp"
+            temporary.write_text(
+                json.dumps(self.task_sampler.state_dict(), indent=2) + "\n"
+            )
+            temporary.replace(directory / "task_sampler.json")
+        self._checkpoint_seconds = time.perf_counter() - started
+
+    def _log_step_metrics(self, **kwargs) -> None:
+        if hasattr(self, "task_sampler"):
+            duration = time.perf_counter() - self._complete_update_started
+            checkpoint_seconds = self._checkpoint_seconds
+            metrics = {
+                "time/complete_update": duration,
+                "time/checkpoint": checkpoint_seconds,
+                "time/update_without_checkpoint": duration - checkpoint_seconds,
+            }
+            self.metric_logger.log(data=metrics, step=kwargs["step"])
+            report = {
+                "runner_step": self.global_step,
+                "timing": metrics,
+                "rollout": kwargs["actor_rollout_metrics"],
+                "training": kwargs["actor_training_metrics"],
+            }
+            with (self._task_audit_dir / "multitask_updates.jsonl").open("a") as stream:
+                stream.write(
+                    json.dumps(report, default=lambda value: float(value)) + "\n"
+                )
+        super()._log_step_metrics(**kwargs)
 
     def _init_rollout_workers_serially(self) -> None:
         profile = _lifecycle_cfg(self.cfg)

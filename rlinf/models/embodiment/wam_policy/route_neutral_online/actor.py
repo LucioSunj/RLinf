@@ -8,6 +8,7 @@
 from __future__ import annotations
 
 import json
+from pathlib import Path
 from typing import Any
 
 import torch
@@ -17,6 +18,7 @@ from rlinf.algorithms.advantages import (
     summarize_fastwam_counterfactual_costs,
 )
 from rlinf.algorithms.fastwam_dual_ppo import (
+    _bernoulli_entropy,
     compute_base_uncond_kl_loss,
     compute_fastwam_dual_ppo_loss,
 )
@@ -43,8 +45,35 @@ from rlinf.workers.actor.fsdp_actor_worker import (
 )
 
 from .policy import RouteNeutralOnlineIDMBCFastWAMPolicy
+from .task_metrics import (
+    accumulate_task_losses,
+    finalize_task_losses,
+    summarize_task_rollout,
+)
 
 _COMPACTION_METRIC_PREFIX = "_route_neutral_compaction/"
+
+
+def base_entropy_loss_correction(
+    *,
+    base: torch.Tensor,
+    behavior: torch.Tensor,
+    valid: torch.Tensor,
+    coefficient: float,
+    selected_loss_scale: float | None,
+) -> torch.Tensor:
+    """Replace the inherited H(q) regularizer with the requested H(p)."""
+
+    difference = _bernoulli_entropy(
+        base.float(), name="Gate base probabilities"
+    ) - _bernoulli_entropy(behavior.float(), name="Gate behavior probabilities")
+    selected = difference[valid.bool().reshape_as(difference)]
+    scale = (
+        selected_loss_scale
+        if selected_loss_scale is not None
+        else 1.0 / max(selected.numel(), 1)
+    )
+    return -coefficient * selected.sum() * scale
 
 
 def align_current_step_trainable_advantages(
@@ -277,6 +306,12 @@ class RouteNeutralOnlineIDMBCFSDPActor(OnlineIDMBCFSDPActor):
             name="critic loss mask",
         )
         active = gate_rows | flow_rows | critic_rows
+        if "multitask_task_id" in train_global_batch.get("forward_inputs", {}):
+            self._task_owner_counts = {
+                "gate": int(gate_rows.sum()),
+                "uncond_lora": int(flow_rows.sum()),
+                "value_head": int(critic_rows.sum()),
+            }
         active_indices = active.nonzero(as_tuple=False).reshape(-1)
         active_count = int(active_indices.numel())
         preparation_metrics = {}
@@ -673,6 +708,15 @@ class RouteNeutralOnlineIDMBCFSDPActor(OnlineIDMBCFSDPActor):
             metrics["online_idm_bc/weighted_to_flow_loss_ratio"] = abs(
                 float(weighted)
             ) / max(abs(float(flow)), 1.0e-12)
+        if getattr(self, "_task_loss_totals", None) is not None:
+            metrics.update(finalize_task_losses(self._task_loss_totals))
+
+    def compute_advantages_and_returns(self) -> dict[str, Any]:
+        metrics = super().compute_advantages_and_returns()
+        if "multitask_task_id" in self.rollout_batch.get("forward_inputs", {}):
+            metrics.update(summarize_task_rollout(self.rollout_batch))
+            self._task_loss_totals = {}
+        return metrics
 
     def _warmup_batch(self, micro_batch: dict[str, Any]) -> bool:
         route = micro_batch.get("route_info")
@@ -716,12 +760,31 @@ class RouteNeutralOnlineIDMBCFSDPActor(OnlineIDMBCFSDPActor):
     ) -> tuple[torch.Tensor, dict[str, float]]:
         warmup = self._warmup_batch(micro_batch)
         self._route_neutral_warmup_active = warmup
+        if "multitask_task_id" in micro_batch.get("forward_inputs", {}):
+            accumulate_task_losses(
+                self._task_loss_totals, micro_batch, output_dict, self.cfg
+            )
         if not warmup:
             loss, metrics = super()._compute_fastwam_loss(
                 micro_batch=micro_batch,
                 output_dict=output_dict,
                 selected_loss_scales=selected_loss_scales,
             )
+            if (
+                self.cfg.algorithm.gate_ppo.get("entropy_loss_source", "behavior")
+                == "base"
+            ):
+                loss = loss + base_entropy_loss_correction(
+                    base=output_dict["gate_base_probabilities"],
+                    behavior=output_dict["gate_behavior_probabilities"],
+                    valid=fastwam_effective_gate_kv_mask(
+                        micro_batch["gate_valid_mask"],
+                        micro_batch.get("gate_kv_sample_mask"),
+                    ),
+                    coefficient=float(self.cfg.algorithm.gate_ppo.entropy_coefficient),
+                    selected_loss_scale=(selected_loss_scales or {}).get("gate"),
+                )
+                metrics["fastwam/total_loss"] = float(loss.detach())
             self._append_route_neutral_perf_metrics(metrics, output_dict)
             self._append_route_neutral_metric_numerators(metrics, output_dict)
             return loss, metrics
@@ -819,7 +882,36 @@ class RouteNeutralOnlineIDMBCFSDPActor(OnlineIDMBCFSDPActor):
         self._fastwam_last_gradient_norms = fastwam_optimizer_gradient_norms(
             self.optimizer
         )
+        owner_records = []
+        owner_counts = getattr(self, "_task_owner_counts", None)
+        if owner_counts is not None:
+            for group in self.optimizer.param_groups:
+                name = str(group["name"])
+                reason = (
+                    "critic_warmup"
+                    if self._route_neutral_warmup_active and name != "value_head"
+                    else "no_effective_samples"
+                    if owner_counts[name] == 0
+                    else None
+                )
+                if owner_counts[name] == 0:
+                    for parameter in group["params"]:
+                        parameter.grad = None
+                owner_records.append(
+                    {
+                        "owner": name,
+                        "effective_samples": owner_counts[name],
+                        "skip_reason": reason,
+                        "step_before": float(
+                            self.optimizer.state[group["params"][0]].get("step", 0)
+                        ),
+                    }
+                )
         if not torch.isfinite(torch.as_tensor(grad_norm)):
+            if owner_counts is not None:
+                raise RuntimeError(
+                    f"Non-finite balanced LIBERO gradient norm {grad_norm}."
+                )
             self._logger.warning(
                 f"[FSDP] Non-finite route-neutral grad norm {grad_norm}; skipping."
             )
@@ -837,7 +929,9 @@ class RouteNeutralOnlineIDMBCFSDPActor(OnlineIDMBCFSDPActor):
                     )
                     for parameter in group["params"]:
                         parameter.grad = None
-            elif not self._fastwam_update_resolution_checked:
+            elif not self._fastwam_update_resolution_checked and (
+                owner_counts is None or all(owner_counts.values())
+            ):
                 resolution = assert_fastwam_optimizer_update_resolution(
                     self.optimizer,
                     minimum_half_ulp_ratio=float(
@@ -851,6 +945,30 @@ class RouteNeutralOnlineIDMBCFSDPActor(OnlineIDMBCFSDPActor):
                 )
             self.grad_scaler.step(optimizer=self.optimizer)
         self.grad_scaler.update()
+        if owner_records:
+            for record, group in zip(
+                owner_records, self.optimizer.param_groups, strict=True
+            ):
+                record["step_after"] = float(
+                    self.optimizer.state[group["params"][0]].get("step", 0)
+                )
+            directory = (
+                Path(self.cfg.runner.logger.log_path)
+                / self.cfg.runner.logger.experiment_name
+                / "audits"
+            )
+            directory.mkdir(parents=True, exist_ok=True)
+            with (directory / "owner_steps.jsonl").open("a") as stream:
+                stream.write(
+                    json.dumps(
+                        {
+                            "runner_step": int(self.version) + 1,
+                            "optimizer_opportunity": self.optimizer_steps,
+                            "owners": owner_records,
+                        }
+                    )
+                    + "\n"
+                )
 
         if self._route_neutral_warmup_active:
             self._online_idm_bc_audit_micro_batch = None
