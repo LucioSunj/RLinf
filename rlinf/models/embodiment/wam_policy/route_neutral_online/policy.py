@@ -35,7 +35,12 @@ from rlinf.models.embodiment.wam_policy.pad_rv.route_neutral_policy import (
     RouteNeutralRoutingState,
 )
 
-from .runtime import RouteNeutralOnlineIDMTeacherLiberoRuntime
+from .runtime import (
+    ROUTE_NEUTRAL_ROLLOUT_IDM_BATCH_SIZE,
+    ROUTE_NEUTRAL_ROLLOUT_UNCOND_BATCH_SIZE,
+    ROUTE_NEUTRAL_TEACHER_BATCH_SIZE,
+    RouteNeutralOnlineIDMTeacherLiberoRuntime,
+)
 
 
 class RouteNeutralOnlineIDMBCFastWAMPolicy(OnlineIDMBCFastWAMPolicy):
@@ -125,6 +130,37 @@ class RouteNeutralOnlineIDMBCFastWAMPolicy(OnlineIDMBCFastWAMPolicy):
             layer_indices=self.runtime.route_neutral_visual.layer_indices,
         )
 
+    @staticmethod
+    def _critic_replay_values(
+        critic: torch.nn.Module,
+        prefix: torch.Tensor,
+    ) -> torch.Tensor:
+        """Keep only the route-neutral replay value head on its B1 path."""
+
+        rowwise_head = getattr(critic, "value_from_features_rowwise_head", None)
+        if callable(rowwise_head):
+            return rowwise_head(prefix)
+        if hasattr(critic, "value_from_features"):
+            return critic.value_from_features(prefix)
+        return critic.value_from_prefix(prefix)
+
+    def _replay_gate_logits(self, features) -> torch.Tensor:
+        """Evaluate complete replay Gate rows in their original B1 order."""
+
+        serialized = serialize_route_neutral_features(features)
+        logits = []
+        for index in range(features.batch_size):
+            row = {name: value[index : index + 1] for name, value in serialized.items()}
+            logits.append(
+                self.gate(
+                    deserialize_route_neutral_features(
+                        row,
+                        layer_indices=features.visual.layer_indices,
+                    )
+                )
+            )
+        return torch.cat(logits, dim=0)
+
     def _predict_current_step(
         self,
         *,
@@ -161,9 +197,14 @@ class RouteNeutralOnlineIDMBCFastWAMPolicy(OnlineIDMBCFastWAMPolicy):
                 )
             runtime_obs = {**env_obs, **seed_fields}
 
-        gate_features = self.runtime.prepare_route_neutral_gate_features(
-            env_obs=runtime_obs
+        prepared = self.runtime.prepare_route_neutral_step(
+            env_obs=runtime_obs,
+            include_critic_features=(
+                compute_values
+                and self._critic_kind() is CriticKind.FASTWAM_CURRENT_FRAME_VALUE
+            ),
         )
+        gate_features = prepared.gate_features
         gate_parameter = next(self.gate.parameters())
         measure_latency = self.config.eval_timing_cuda_synchronize and mode == "eval"
         if measure_latency and gate_parameter.device.type == "cuda":
@@ -209,6 +250,7 @@ class RouteNeutralOnlineIDMBCFastWAMPolicy(OnlineIDMBCFastWAMPolicy):
             mode=mode,
             actor_version=self.actor_version,
             collect_replay=mode == "train",
+            prepared=prepared,
         )
         emitted = GateDecisionRecord(
             next_route=route_info.route_used,
@@ -355,7 +397,7 @@ class RouteNeutralOnlineIDMBCFastWAMPolicy(OnlineIDMBCFastWAMPolicy):
         features = self._gate_features_from_forward_inputs(forward_inputs).to(
             device=gate_parameter.device
         )
-        logits = self.gate(features)
+        logits = self._replay_gate_logits(features)
         routes = route_info.route_used.to(logits.device)
         if not torch.equal(routes, emitted_gate.next_route.to(logits.device)):
             raise ValueError("Current-step replay route differs from executed route.")
@@ -382,11 +424,7 @@ class RouteNeutralOnlineIDMBCFastWAMPolicy(OnlineIDMBCFastWAMPolicy):
                 replay_key = getattr(critic, "replay_feature_key", "critic_prefix")
                 if replay_key in forward_inputs:
                     prefix = forward_inputs[replay_key]
-                    values = (
-                        critic.value_from_features(prefix)
-                        if hasattr(critic, "value_from_features")
-                        else critic.value_from_prefix(prefix)
-                    )
+                    values = self._critic_replay_values(critic, prefix)
                 else:
                     values = critic.predict_value_batch(
                         self.runtime.critic_observation(forward_inputs=forward_inputs)
@@ -416,6 +454,16 @@ class RouteNeutralOnlineIDMBCFastWAMPolicy(OnlineIDMBCFastWAMPolicy):
             route_info=route_info,
         )
         result.update(online_bc.as_forward_outputs())
+        for forward_key, metric_name in (
+            (ROUTE_NEUTRAL_ROLLOUT_IDM_BATCH_SIZE, "perf/rollout_idm_batch_size"),
+            (
+                ROUTE_NEUTRAL_ROLLOUT_UNCOND_BATCH_SIZE,
+                "perf/rollout_uncond_batch_size",
+            ),
+            (ROUTE_NEUTRAL_TEACHER_BATCH_SIZE, "perf/teacher_batch_size"),
+        ):
+            if forward_key in forward_inputs:
+                result[metric_name] = forward_inputs[forward_key].float().max()
         return result
 
     def load_eval_checkpoint(self, *args, **kwargs) -> int:

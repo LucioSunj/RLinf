@@ -3,13 +3,25 @@
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
 
+import inspect
 from pathlib import Path
-from types import SimpleNamespace
+from types import MethodType, SimpleNamespace
 
 import pytest
 import torch
+from fastwam.adapters import PolicyRegime
+from fastwam.models.wan22.adaptive_action import CachedActionCondition
+from fastwam.models.wan22.adaptive_sampler import VelocityOutput
+from fastwam.models.wan22.gate_transformer import epsilon_mixture_bernoulli
+from fastwam.models.wan22.kv_tap import KeyValueBank, KVSource
+from fastwam.models.wan22.schedulers.scheduler_continuous import (
+    WanContinuousFlowMatchScheduler,
+)
 from hydra import compose, initialize_config_dir
 
+from rlinf.algorithms.fastwam_dual_ppo import compute_gate_ppo_loss
+from rlinf.algorithms.losses import compute_ppo_critic_loss
+from rlinf.envs.libero.action_protocol import LiberoActionProtocol
 from rlinf.models.embodiment.wam_policy.contracts import (
     ChunkRouteRecord,
     GateDecisionRecord,
@@ -18,6 +30,26 @@ from rlinf.models.embodiment.wam_policy.contracts import (
 from rlinf.models.embodiment.wam_policy.kv_replay import GateKVReplayBackend
 from rlinf.models.embodiment.wam_policy.online_idm_bc.actor import (
     OnlineIDMBCFSDPActor,
+)
+from rlinf.models.embodiment.wam_policy.online_idm_bc.config import (
+    ONLINE_IDM_BC_FLOW_VALID,
+    ONLINE_IDM_BC_SAMPLE_IDENTITIES,
+    ONLINE_IDM_BC_TEACHER_ACTIONS,
+    ONLINE_IDM_BC_TEACHER_BYTES,
+    ONLINE_IDM_BC_TEACHER_PRESENT,
+    ONLINE_IDM_BC_TEACHER_SECONDS,
+)
+from rlinf.models.embodiment.wam_policy.online_idm_bc.policy import (
+    OnlineIDMBCFastWAMPolicy,
+)
+from rlinf.models.embodiment.wam_policy.online_idm_bc.runtime import (
+    OnlineIDMTeacherLiberoRuntime,
+)
+from rlinf.models.embodiment.wam_policy.pad_rv.route_neutral_gate import (
+    RouteNeutralGateFeatures,
+    RouteNeutralVisualFeatures,
+    RouteNeutralVisualLayer,
+    serialize_route_neutral_features,
 )
 from rlinf.models.embodiment.wam_policy.pad_rv.route_neutral_runner import (
     PadRouteNeutralRunner,
@@ -35,9 +67,21 @@ from rlinf.models.embodiment.wam_policy.route_neutral_online.lifecycle import (
 from rlinf.models.embodiment.wam_policy.route_neutral_online.policy import (
     RouteNeutralOnlineIDMBCFastWAMPolicy,
 )
+from rlinf.models.embodiment.wam_policy.route_neutral_online.runtime import (
+    ROUTE_NEUTRAL_ROLLOUT_IDM_BATCH_SIZE,
+    ROUTE_NEUTRAL_ROLLOUT_UNCOND_BATCH_SIZE,
+    ROUTE_NEUTRAL_TEACHER_BATCH_SIZE,
+    RouteNeutralOnlineIDMTeacherLiberoRuntime,
+    RouteNeutralPreparedStep,
+)
+from rlinf.workers.actor.fsdp_actor_worker import EmbodiedFSDPActor
 
 
-def _compose(monkeypatch):
+def _compose(
+    monkeypatch,
+    config_name="libero_10_ppo_fastwam_route_neutral_online_formal",
+    overrides=None,
+):
     config_dir = Path(__file__).parents[2] / "examples" / "embodiment" / "config"
     environment = {
         "EMBODIED_PATH": str(config_dir.parent),
@@ -53,7 +97,7 @@ def _compose(monkeypatch):
     for name, value in environment.items():
         monkeypatch.setenv(name, value)
     with initialize_config_dir(version_base="1.1", config_dir=str(config_dir)):
-        return compose(config_name="libero_10_ppo_fastwam_route_neutral_online_formal")
+        return compose(config_name=config_name, overrides=overrides or [])
 
 
 def _compose_eval(monkeypatch):
@@ -77,6 +121,160 @@ def _compose_eval(monkeypatch):
         version_base="1.1", config_dir=str(config_dir / "evaluations" / "libero")
     ):
         return compose(config_name="libero_plus_long_fastwam_route_neutral_online_eval")
+
+
+def _cached_condition(
+    batch_size: int, *, context_dim: int = 3
+) -> CachedActionCondition:
+    return CachedActionCondition(
+        context=torch.arange(batch_size * 2 * context_dim, dtype=torch.float32).reshape(
+            batch_size,
+            2,
+            context_dim,
+        ),
+        context_mask=torch.ones(batch_size, 2, dtype=torch.bool),
+        video_kv_cache=[
+            {
+                "k": torch.zeros(batch_size, 1, 2),
+                "v": torch.ones(batch_size, 1, 2),
+            }
+        ],
+        attention_mask=torch.ones(3, 3, dtype=torch.bool),
+        video_seq_len=1,
+        current_frame_video_tokens=1,
+    )
+
+
+def _route_record(routes: torch.Tensor) -> ChunkRouteRecord:
+    batch_size = int(routes.numel())
+    chunk_ids = torch.arange(batch_size)
+    return ChunkRouteRecord(
+        route_used=routes,
+        route_was_forced=torch.zeros(batch_size, dtype=torch.bool),
+        chunk_ids=chunk_ids,
+        episode_ids=torch.zeros(batch_size, dtype=torch.long),
+        route_source_chunk_ids=chunk_ids,
+        actor_versions=torch.zeros(batch_size, dtype=torch.long),
+    )
+
+
+class _RowwiseReplayCritic(torch.nn.Module):
+    def __init__(self) -> None:
+        super().__init__()
+        self.value_head = torch.nn.Linear(1, 1, bias=False)
+        self.value_head.weight.data.fill_(2.0)
+        self.head_batch_sizes = []
+
+    def value_from_features_rowwise_head(
+        self,
+        prefix: torch.Tensor,
+    ) -> torch.Tensor:
+        values = []
+        for row in prefix.split(1, dim=0):
+            self.head_batch_sizes.append(int(row.shape[0]))
+            values.append(self.value_head(row)[:, 0])
+        return torch.cat(values)
+
+
+def _replay_gate_features(batch_size: int) -> RouteNeutralGateFeatures:
+    rows = torch.arange(batch_size, dtype=torch.float32)
+    return RouteNeutralGateFeatures(
+        visual=RouteNeutralVisualFeatures(
+            (
+                RouteNeutralVisualLayer(
+                    layer_index=14,
+                    current_frame_video=KeyValueBank(
+                        source=KVSource.CURRENT_FRAME_VIDEO,
+                        key=rows[:, None, None].expand(-1, 2, 4),
+                        value=(rows + 10)[:, None, None].expand(-1, 2, 4),
+                        valid_mask=torch.ones(batch_size, 2, dtype=torch.bool),
+                        contains_generated_future_video=False,
+                    ),
+                ),
+            )
+        ),
+        language=(rows + 20)[:, None, None].expand(-1, 3, 5),
+        language_mask=torch.ones(batch_size, 3, dtype=torch.bool),
+        state=(rows + 30)[:, None].expand(-1, 2),
+        physical_history=(rows + 40)[:, None, None].expand(-1, 2, 2),
+    )
+
+
+class _RecordingReplayGate(torch.nn.Module):
+    def __init__(self) -> None:
+        super().__init__()
+        self.scale = torch.nn.Parameter(torch.ones(()))
+        self.rows = []
+
+    def forward(self, features: RouteNeutralGateFeatures) -> torch.Tensor:
+        self.rows.append(serialize_route_neutral_features(features))
+        return (features.state[:, 0] - 30.0) * self.scale
+
+
+def test_route_neutral_replay_gate_hook_is_subclass_only() -> None:
+    assert "_replay_gate_logits" not in OnlineIDMBCFastWAMPolicy.__dict__
+    assert "_replay_gate_logits" in RouteNeutralOnlineIDMBCFastWAMPolicy.__dict__
+
+
+@pytest.mark.parametrize("batch_size", [1, 4])
+def test_route_neutral_replay_gate_preserves_complete_b1_rows(batch_size) -> None:
+    features = _replay_gate_features(batch_size)
+    gate = _RecordingReplayGate()
+    policy = SimpleNamespace(gate=gate)
+
+    logits = RouteNeutralOnlineIDMBCFastWAMPolicy._replay_gate_logits(
+        policy,
+        features,
+    )
+
+    assert torch.equal(logits, features.state[:, 0] - 30.0)
+    assert len(gate.rows) == batch_size
+    expected = serialize_route_neutral_features(features)
+    for index, row in enumerate(gate.rows):
+        assert set(row) == set(expected)
+        for name, value in row.items():
+            assert torch.equal(value, expected[name][index : index + 1])
+
+
+@pytest.mark.parametrize("all_inactive", [False, True])
+def test_route_neutral_replay_gate_padding_keeps_valid_gradient(
+    all_inactive,
+) -> None:
+    features = _replay_gate_features(4)
+    gate = _RecordingReplayGate()
+    policy = SimpleNamespace(gate=gate)
+    logits = RouteNeutralOnlineIDMBCFastWAMPolicy._replay_gate_logits(
+        policy,
+        features,
+    )
+    routes = torch.zeros(4, dtype=torch.long)
+    behavior = epsilon_mixture_bernoulli(
+        logits,
+        temperature=1.0,
+        epsilon=0.1,
+    )
+    valid = torch.zeros(4, dtype=torch.bool)
+    if not all_inactive:
+        valid[:3] = True
+    loss, _ = compute_gate_ppo_loss(
+        logprobs=behavior.log_prob(routes),
+        old_logprobs=torch.zeros(4),
+        advantages=torch.ones(4),
+        valid_mask=valid,
+        clip_ratio_low=0.2,
+        clip_ratio_high=0.2,
+        selected_loss_scale=(1.0 / 3.0 if not all_inactive else 0.0),
+    )
+    loss.backward()
+
+    assert len(gate.rows) == 4
+    assert torch.isfinite(gate.scale.grad)
+    if all_inactive:
+        assert loss.item() == 0.0
+        assert gate.scale.grad.item() == 0.0
+    else:
+        assert loss.item() != 0.0
+        assert gate.scale.grad.item() != 0.0
 
 
 def test_config_selects_bc_initialized_trainable_uncond(monkeypatch) -> None:
@@ -145,7 +343,10 @@ def test_config_rejects_rollout_size_not_divisible_by_global_batch(
         validate_route_neutral_online_idm_bc_training_config(cfg)
 
 
-def test_shared_gpu_config_and_rank_local_offload(monkeypatch) -> None:
+@pytest.mark.parametrize("micro_batch_size", [1, 4])
+def test_shared_gpu_config_and_rank_local_offload(
+    monkeypatch, micro_batch_size
+) -> None:
     from rlinf.models.embodiment.wam_policy.route_neutral_online.lifecycle import (
         RouteNeutralOnlineRolloutWorker,
     )
@@ -156,6 +357,11 @@ def test_shared_gpu_config_and_rank_local_offload(monkeypatch) -> None:
     cfg.cluster.component_placement.rollout = "0-3,5-7"
     cfg.env.train.total_num_envs = 28
     cfg.actor.global_batch_size = 196
+    cfg.actor.micro_batch_size = micro_batch_size
+    if micro_batch_size == 4:
+        cfg.algorithm.regularization.base_uncond_kl.enabled = False
+        cfg.algorithm.regularization.base_uncond_kl.coefficient = 0.0
+        cfg.algorithm.regularization.base_uncond_kl.log_metric = False
     cfg.actor.enable_offload = True
     cfg.route_neutral_online_implementation.shared_gpu_rollout_rank = 0
     validate_route_neutral_online_idm_bc_training_config(cfg)
@@ -196,6 +402,74 @@ def test_shared_gpu_roundtrip_detects_changed_state(monkeypatch) -> None:
         shared_gpu.assert_same_state(torch.ones(2), torch.zeros(2))
     with pytest.raises(RuntimeError, match="residency changed"):
         shared_gpu.assert_same_state(torch.ones(2), torch.ones(2, dtype=torch.bfloat16))
+
+
+@pytest.mark.parametrize(
+    ("overlay", "total_envs", "optimizer_minibatches"),
+    [
+        (
+            "task6_28",
+            28,
+            10,
+        ),
+        (
+            "task6_42_engineering",
+            42,
+            15,
+        ),
+    ],
+)
+def test_perfopt_configs_select_mb4_geometry(
+    monkeypatch,
+    overlay,
+    total_envs,
+    optimizer_minibatches,
+) -> None:
+    cfg = _compose(
+        monkeypatch,
+        overrides=[f"+route_neutral_online_perfopt={overlay}"],
+    )
+
+    validate_route_neutral_online_idm_bc_training_config(cfg)
+
+    rollout_size = cfg.env.train.total_num_envs * (
+        cfg.env.train.max_steps_per_rollout_epoch
+        // cfg.actor.model.runtime.execution_horizon
+    )
+    assert cfg.env.train.task_id_filter == [6]
+    assert cfg.env.train.total_num_envs == total_envs
+    assert cfg.actor.global_batch_size == 196
+    assert cfg.actor.micro_batch_size == 4
+    assert rollout_size // cfg.actor.global_batch_size == optimizer_minibatches
+    assert cfg.algorithm.regularization.base_uncond_kl.enabled is False
+    assert cfg.algorithm.regularization.base_uncond_kl.coefficient == 0.0
+    assert cfg.algorithm.regularization.base_uncond_kl.log_metric is False
+    assert (
+        cfg.algorithm.fixed_branch_cost.controller.signed_price.reversal.factor == 0.0
+    )
+    assert cfg.runner.max_steps == (6 if total_envs == 42 else 50)
+
+
+def test_perfopt_config_rejects_hot_path_base_kl_logging(monkeypatch) -> None:
+    cfg = _compose(
+        monkeypatch,
+        overrides=["+route_neutral_online_perfopt=task6_28"],
+    )
+    cfg.algorithm.regularization.base_uncond_kl.log_metric = True
+
+    with pytest.raises(ValueError, match="disabled base UNCOND KL"):
+        validate_route_neutral_online_idm_bc_training_config(cfg)
+
+
+def test_perfopt_config_rejects_non_divisible_35_env_geometry(monkeypatch) -> None:
+    cfg = _compose(
+        monkeypatch,
+        overrides=["+route_neutral_online_perfopt=task6_28"],
+    )
+    cfg.env.train.total_num_envs = 35
+
+    with pytest.raises(ValueError, match="rollout size 2450"):
+        validate_route_neutral_online_idm_bc_training_config(cfg)
 
 
 def test_resume_preserves_completed_first_joint_update_audit(monkeypatch) -> None:
@@ -308,6 +582,157 @@ def test_route_neutral_train_preparation_consumes_recompute_replay() -> None:
     assert actor._consume_rollout_batch_during_train_preparation() is True
 
 
+def test_mb4_compaction_keeps_union_and_minimal_padding() -> None:
+    actor = object.__new__(RouteNeutralOnlineIDMBCFSDPActor)
+    actor.cfg = SimpleNamespace(actor=SimpleNamespace(micro_batch_size=4))
+    routes = torch.tensor(
+        [
+            WAMRoute.IDM,
+            WAMRoute.IDM,
+            WAMRoute.UNCOND,
+            WAMRoute.IDM,
+            WAMRoute.IDM,
+            WAMRoute.IDM,
+            WAMRoute.IDM,
+            WAMRoute.IDM,
+        ]
+    )
+    gate_valid = torch.zeros(8, dtype=torch.bool)
+    gate_valid[0] = True
+    flow_valid = torch.zeros(8, dtype=torch.bool)
+    flow_valid[2] = True
+    loss_mask = torch.zeros(8, 2, dtype=torch.bool)
+    loss_mask[5, 0] = True
+    batch = {
+        "prev_logprobs": torch.arange(8, dtype=torch.float32).reshape(8, 1),
+        "route_info": _route_record(routes),
+        "gate_valid_mask": gate_valid,
+        "flow_valid_mask": flow_valid,
+        "loss_mask": loss_mask,
+        "forward_inputs": {
+            "payload": torch.arange(8, dtype=torch.float32).reshape(8, 1)
+        },
+    }
+
+    compacted, metrics = actor._prepare_train_global_batch_for_microbatches(batch)
+
+    assert compacted["prev_logprobs"].reshape(-1).tolist() == [0.0, 1.0, 2.0, 5.0]
+    assert compacted["forward_inputs"]["payload"].reshape(-1).tolist() == [
+        0.0,
+        1.0,
+        2.0,
+        5.0,
+    ]
+    assert compacted["route_info"].route_used.tolist() == [
+        WAMRoute.IDM,
+        WAMRoute.IDM,
+        WAMRoute.UNCOND,
+        WAMRoute.IDM,
+    ]
+    assert metrics["perf/actor_rows_original"] == 8.0
+    assert metrics["perf/actor_rows_active"] == 3.0
+    assert metrics["perf/actor_rows_padded"] == 1.0
+    assert metrics["perf/actor_rows_forwarded"] == 4.0
+    assert metrics["perf/actor_microbatches_executed"] == 1.0
+
+
+def test_mb4_compaction_keeps_one_dummy_microbatch_when_all_rows_inactive() -> None:
+    actor = object.__new__(RouteNeutralOnlineIDMBCFSDPActor)
+    actor.cfg = SimpleNamespace(actor=SimpleNamespace(micro_batch_size=4))
+    batch = {
+        "prev_logprobs": torch.arange(8, dtype=torch.float32).reshape(8, 1),
+        "route_info": _route_record(torch.full((8,), int(WAMRoute.IDM))),
+        "gate_valid_mask": torch.zeros(8, dtype=torch.bool),
+        "flow_valid_mask": torch.zeros(8, dtype=torch.bool),
+        "loss_mask": torch.zeros(8, 1, dtype=torch.bool),
+        "loss_mask_sum": torch.zeros(8, 1, dtype=torch.long),
+    }
+
+    compacted, metrics = actor._prepare_train_global_batch_for_microbatches(batch)
+
+    assert compacted["prev_logprobs"].reshape(-1).tolist() == [0.0, 1.0, 2.0, 3.0]
+    assert torch.equal(compacted["loss_mask_sum"], torch.ones(4, 1, dtype=torch.long))
+    values = torch.ones(4, 1, requires_grad=True)
+    critic_loss, _ = compute_ppo_critic_loss(
+        values=values,
+        returns=torch.zeros_like(values),
+        prev_values=torch.zeros_like(values),
+        value_clip=0.2,
+        huber_delta=10.0,
+        loss_mask=compacted["loss_mask"],
+        loss_mask_sum=compacted["loss_mask_sum"],
+        max_episode_steps=700,
+    )
+    critic_loss.backward()
+    assert critic_loss.item() == 0.0
+    assert torch.equal(values.grad, torch.zeros_like(values))
+    assert metrics["perf/actor_rows_active"] == 0.0
+    assert metrics["perf/actor_rows_padded"] == 4.0
+    assert metrics["perf/actor_rows_forwarded"] == 4.0
+    assert metrics["perf/actor_microbatches_executed"] == 1.0
+
+
+@pytest.mark.parametrize("all_inactive", [False, True])
+def test_mb4_compacted_rowwise_critic_padding_has_valid_zero_gradient(
+    all_inactive,
+) -> None:
+    actor = object.__new__(RouteNeutralOnlineIDMBCFSDPActor)
+    actor.cfg = SimpleNamespace(actor=SimpleNamespace(micro_batch_size=4))
+    gate_valid = torch.zeros(8, dtype=torch.bool)
+    loss_mask = torch.zeros(8, 1, dtype=torch.bool)
+    if not all_inactive:
+        gate_valid[:3] = True
+        loss_mask[2] = True
+    batch = {
+        "prev_logprobs": torch.zeros(8, 1),
+        "route_info": _route_record(torch.full((8,), int(WAMRoute.IDM))),
+        "gate_valid_mask": gate_valid,
+        "flow_valid_mask": torch.zeros(8, dtype=torch.bool),
+        "loss_mask": loss_mask,
+        "loss_mask_sum": torch.zeros(8, 1, dtype=torch.long),
+        "returns": torch.zeros(8, 1),
+        "prev_values": torch.zeros(8, 1),
+        "forward_inputs": {
+            "critic_prefix": torch.arange(8, dtype=torch.float32).reshape(8, 1)
+        },
+    }
+
+    compacted, metrics = actor._prepare_train_global_batch_for_microbatches(batch)
+    critic = _RowwiseReplayCritic()
+    values = RouteNeutralOnlineIDMBCFastWAMPolicy._critic_replay_values(
+        critic,
+        compacted["forward_inputs"]["critic_prefix"],
+    ).reshape(-1, 1)
+    critic_loss, _ = compute_ppo_critic_loss(
+        values=values,
+        returns=compacted["returns"],
+        prev_values=compacted["prev_values"],
+        value_clip=0.2,
+        huber_delta=10.0,
+        loss_mask=compacted["loss_mask"],
+        loss_mask_sum=compacted["loss_mask_sum"],
+        max_episode_steps=700,
+    )
+    critic_loss.backward()
+
+    assert critic.head_batch_sizes == [1, 1, 1, 1]
+    assert metrics["perf/actor_rows_padded"] == (4.0 if all_inactive else 1.0)
+    assert critic_loss.item() == (0.0 if all_inactive else 1400.0)
+    if all_inactive:
+        assert torch.equal(
+            critic.value_head.weight.grad,
+            torch.zeros_like(critic.value_head.weight),
+        )
+    else:
+        assert critic.value_head.weight.grad.item() != 0.0
+
+
+def test_actor_syncs_on_actual_final_compacted_microbatch() -> None:
+    source = inspect.getsource(EmbodiedFSDPActor.run_training)
+
+    assert "is_last=(idx + 1) == len(train_micro_batch)" in source
+
+
 def test_current_step_alignment_preserves_flow_and_gate_credit() -> None:
     route = ChunkRouteRecord(
         route_used=torch.tensor(
@@ -404,3 +829,600 @@ def test_warmup_optimizer_does_not_create_gate_or_lora_adam_state() -> None:
     assert lora not in optimizer.state
     assert value in optimizer.state
     assert actor.optimizer_steps == 1
+
+
+def test_seeded_route_runtime_batches_each_branch_and_teacher_once() -> None:
+    runtime = object.__new__(RouteNeutralOnlineIDMTeacherLiberoRuntime)
+    runtime.seeded_noise_device = "cpu"
+    runtime.flow_sde_noise_level = 0.5
+    runtime.flow_sde_ignore_last_transition = False
+    runtime.gate_denoise_last_n = 1
+    runtime.action_protocol = LiberoActionProtocol(
+        generation_horizon=3,
+        execution_horizon=2,
+        prediction_video_frames=3,
+        reset_wait_steps=0,
+        max_episode_steps=6,
+    )
+    runtime.actor = torch.nn.Module()
+    runtime.actor.register_parameter(
+        "anchor",
+        torch.nn.Parameter(torch.zeros(()), requires_grad=False),
+    )
+    runtime.actor.action_expert = SimpleNamespace(action_dim=3)
+    runtime.actor.infer_action_scheduler = SimpleNamespace(num_train_timesteps=1000)
+    scheduler = WanContinuousFlowMatchScheduler(
+        num_train_timesteps=1000,
+        shift=5.0,
+    )
+    timesteps, deltas = scheduler.build_inference_schedule(
+        num_inference_steps=3,
+        device=torch.device("cpu"),
+        dtype=torch.float32,
+    )
+    runtime._action_schedule = MethodType(
+        lambda _self: (timesteps, deltas),
+        runtime,
+    )
+    runtime._seeded_idm_latents = MethodType(
+        lambda _self, *, images, seeds: torch.zeros(
+            images.shape[0],
+            1,
+            1,
+            1,
+            1,
+        ),
+        runtime,
+    )
+    condition_calls = []
+
+    def _prepare(_self, *, image, context, context_mask, regime, **_kwargs):
+        condition_calls.append((regime, int(image.shape[0])))
+        return _cached_condition(
+            int(image.shape[0]),
+            context_dim=int(context.shape[-1]),
+        ), None
+
+    runtime._prepare_action_condition = MethodType(_prepare, runtime)
+    velocity_calls = []
+
+    def _velocity(
+        _self,
+        condition,
+        *,
+        regime,
+        capture_gate_kv,
+        actor_version,
+    ):
+        del capture_gate_kv, actor_version
+        velocity_calls.append((regime, int(condition.context.shape[0])))
+        scale = 0.125 if regime is PolicyRegime.UNCOND else 0.25
+        return lambda action, timestep: action * scale
+
+    runtime._velocity = MethodType(_velocity, runtime)
+    runtime._denormalize_action_stages = MethodType(
+        lambda _self, actions, *, env_obs: (actions, None),
+        runtime,
+    )
+    batch_size = 4
+    prepared = RouteNeutralPreparedStep(
+        images=torch.zeros(batch_size, 3, 8, 8),
+        context=torch.zeros(batch_size, 2, 3),
+        context_mask=torch.ones(batch_size, 2, dtype=torch.bool),
+        current_condition=_cached_condition(batch_size),
+        gate_features=None,
+        critic_features=None,
+    )
+    routes = torch.tensor(
+        [WAMRoute.IDM, WAMRoute.UNCOND, WAMRoute.IDM, WAMRoute.UNCOND]
+    )
+    env_obs = {
+        "_fastwam_action_noise_seeds": torch.tensor([101, 102, 103, 104]),
+        "_fastwam_idm_noise_seeds": torch.tensor([201, 202, 203, 204]),
+    }
+
+    first = runtime._sample_seeded_training_batch(
+        env_obs=env_obs,
+        routes=routes,
+        actor_version=7,
+        prepared=prepared,
+    )
+    second = runtime._sample_seeded_training_batch(
+        env_obs=env_obs,
+        routes=routes,
+        actor_version=7,
+        prepared=prepared,
+    )
+
+    torch.testing.assert_close(first.actions, second.actions, rtol=0, atol=0)
+    torch.testing.assert_close(first.flow_chains, second.flow_chains, rtol=0, atol=0)
+    torch.testing.assert_close(
+        first.old_flow_logprobs,
+        second.old_flow_logprobs,
+        rtol=0,
+        atol=0,
+    )
+    assert first.actions.shape == (batch_size, 2, 3)
+    assert first.flow_chains.shape == (batch_size, 4, 3, 3)
+    assert first.forward_inputs[ONLINE_IDM_BC_TEACHER_PRESENT].tolist() == [
+        False,
+        True,
+        False,
+        True,
+    ]
+    assert (
+        first.forward_inputs[ROUTE_NEUTRAL_ROLLOUT_IDM_BATCH_SIZE].tolist()
+        == [2.0] * batch_size
+    )
+    assert (
+        first.forward_inputs[ROUTE_NEUTRAL_ROLLOUT_UNCOND_BATCH_SIZE].tolist()
+        == [2.0] * batch_size
+    )
+    assert (
+        first.forward_inputs[ROUTE_NEUTRAL_TEACHER_BATCH_SIZE].tolist()
+        == [2.0] * batch_size
+    )
+    assert velocity_calls[:3] == [
+        (PolicyRegime.UNCOND, 2),
+        (PolicyRegime.IDM, 2),
+        (PolicyRegime.IDM, 2),
+    ]
+    assert condition_calls[:2] == [
+        (PolicyRegime.IDM, 2),
+        (PolicyRegime.IDM, 2),
+    ]
+    serial = []
+    for index in range(batch_size):
+        serial.append(
+            runtime._sample_seeded_training_batch(
+                env_obs={
+                    name: value[index : index + 1] for name, value in env_obs.items()
+                },
+                routes=routes[index : index + 1],
+                actor_version=7,
+                prepared=RouteNeutralPreparedStep(
+                    images=prepared.images[index : index + 1],
+                    context=prepared.context[index : index + 1],
+                    context_mask=prepared.context_mask[index : index + 1],
+                    current_condition=prepared.current_condition.index_select(
+                        torch.tensor([index])
+                    ),
+                    gate_features=None,
+                    critic_features=None,
+                ),
+            )
+        )
+    for name in ("actions", "flow_chains", "old_flow_logprobs", "denoise_indices"):
+        torch.testing.assert_close(
+            getattr(first, name),
+            torch.cat([getattr(sample, name) for sample in serial]),
+            rtol=0,
+            atol=0,
+        )
+    torch.testing.assert_close(
+        first.forward_inputs[ONLINE_IDM_BC_TEACHER_ACTIONS],
+        torch.cat(
+            [sample.forward_inputs[ONLINE_IDM_BC_TEACHER_ACTIONS] for sample in serial]
+        ),
+        rtol=0,
+        atol=0,
+    )
+
+
+def test_batched_online_bc_matches_serial_loss_and_gradient() -> None:
+    runtime = object.__new__(RouteNeutralOnlineIDMTeacherLiberoRuntime)
+    runtime.action_protocol = LiberoActionProtocol(
+        generation_horizon=3,
+        execution_horizon=2,
+        prediction_video_frames=3,
+        reset_wait_steps=0,
+        max_episode_steps=6,
+    )
+    train_scheduler = WanContinuousFlowMatchScheduler(
+        num_train_timesteps=1000,
+        shift=5.0,
+    )
+    runtime.actor = torch.nn.Module()
+    runtime.actor.register_parameter(
+        "anchor",
+        torch.nn.Parameter(torch.zeros(()), requires_grad=False),
+    )
+    runtime.actor.action_expert = SimpleNamespace(action_dim=7)
+    runtime.actor.train_action_scheduler = train_scheduler
+    lora_parameter = torch.nn.Parameter(torch.tensor(0.125))
+    runtime.lora_adapter = SimpleNamespace(
+        lora_parameters=lambda: iter((lora_parameter,))
+    )
+    prepare_batch_sizes = []
+
+    def _prepare(_self, *, image, context, context_mask, regime, **_kwargs):
+        del context_mask, regime
+        prepare_batch_sizes.append(int(image.shape[0]))
+        return _cached_condition(
+            int(image.shape[0]),
+            context_dim=int(context.shape[-1]),
+        ), None
+
+    runtime._prepare_action_condition = MethodType(_prepare, runtime)
+
+    def _velocity(
+        _self,
+        condition,
+        *,
+        regime,
+        capture_gate_kv,
+        actor_version,
+    ):
+        del condition, regime, capture_gate_kv, actor_version
+        return lambda action, timestep: VelocityOutput(
+            velocity=action * lora_parameter + timestep.reshape(-1, 1, 1) / 1000.0
+        )
+
+    runtime._velocity = MethodType(_velocity, runtime)
+    routes = torch.tensor(
+        [WAMRoute.UNCOND, WAMRoute.IDM, WAMRoute.UNCOND, WAMRoute.UNCOND]
+    )
+    route_info = _route_record(routes)
+    teacher_actions = torch.linspace(-1.0, 1.0, 4 * 3 * 7).reshape(4, 3, 7)
+    teacher_present = torch.tensor([True, False, True, True])
+    forward_inputs = {
+        ONLINE_IDM_BC_FLOW_VALID: torch.tensor([True, True, True, False]),
+        ONLINE_IDM_BC_TEACHER_ACTIONS: teacher_actions.to(torch.bfloat16),
+        ONLINE_IDM_BC_TEACHER_PRESENT: teacher_present,
+        ONLINE_IDM_BC_SAMPLE_IDENTITIES: torch.tensor([11, 12, 13, 14]),
+        ONLINE_IDM_BC_TEACHER_SECONDS: torch.tensor([0.1, 0.0, 0.2, 0.3]),
+        ONLINE_IDM_BC_TEACHER_BYTES: torch.tensor([42, 0, 42, 42]),
+        "flow_chains": torch.zeros(4, 2, 3, 7),
+        "fastwam_images": torch.zeros(4, 3, 8, 8),
+        "fastwam_context": torch.zeros(4, 2, 3),
+        "fastwam_context_mask": torch.ones(4, 2, dtype=torch.bool),
+    }
+
+    serial = OnlineIDMTeacherLiberoRuntime.compute_online_idm_bc_loss(
+        runtime,
+        forward_inputs=forward_inputs,
+        route_info=route_info,
+    )
+    serial_gradient = torch.autograd.grad(
+        serial.loss_sum,
+        lora_parameter,
+        retain_graph=True,
+    )[0]
+    assert prepare_batch_sizes == [1, 1]
+    prepare_batch_sizes.clear()
+
+    batched = runtime.compute_online_idm_bc_loss(
+        forward_inputs=forward_inputs,
+        route_info=route_info,
+    )
+    batched_gradient = torch.autograd.grad(batched.loss_sum, lora_parameter)[0]
+
+    assert prepare_batch_sizes == [2]
+    torch.testing.assert_close(batched.loss_sum, serial.loss_sum)
+    torch.testing.assert_close(batched.raw_loss, serial.raw_loss)
+    torch.testing.assert_close(
+        batched.mse_per_dimension,
+        serial.mse_per_dimension,
+    )
+    torch.testing.assert_close(
+        batched.mse_by_timestep_bin,
+        serial.mse_by_timestep_bin,
+    )
+    torch.testing.assert_close(batched_gradient, serial_gradient)
+    assert batched.selected_count.item() == 2.0
+    assert batched.expected_count.item() == 2.0
+    assert batched.present_count.item() == 3.0
+
+
+def test_route_replay_batches_all_uncond_rows_once() -> None:
+    runtime = object.__new__(RouteNeutralOnlineIDMTeacherLiberoRuntime)
+    runtime.flow_sde_noise_level = 0.5
+    runtime.action_protocol = LiberoActionProtocol(
+        generation_horizon=3,
+        execution_horizon=2,
+        prediction_video_frames=3,
+        reset_wait_steps=0,
+        max_episode_steps=6,
+    )
+    runtime.actor = torch.nn.Module()
+    runtime.actor.register_parameter(
+        "anchor",
+        torch.nn.Parameter(torch.zeros(()), requires_grad=False),
+    )
+    runtime.actor.action_expert = SimpleNamespace(action_dim=3)
+    runtime.actor.infer_action_scheduler = SimpleNamespace(num_train_timesteps=1000)
+    runtime.critic_feature_config = None
+    scheduler = WanContinuousFlowMatchScheduler(
+        num_train_timesteps=1000,
+        shift=5.0,
+    )
+    timesteps, deltas = scheduler.build_inference_schedule(
+        num_inference_steps=3,
+        device=torch.device("cpu"),
+        dtype=torch.float32,
+    )
+    runtime._action_schedule = MethodType(
+        lambda _self: (timesteps, deltas),
+        runtime,
+    )
+    prepare_batch_sizes = []
+
+    def _prepare(_self, *, image, context, context_mask, regime, **_kwargs):
+        del context_mask, regime
+        prepare_batch_sizes.append(int(image.shape[0]))
+        return _cached_condition(
+            int(image.shape[0]),
+            context_dim=int(context.shape[-1]),
+        ), None
+
+    runtime._prepare_action_condition = MethodType(_prepare, runtime)
+    replay_parameter = torch.nn.Parameter(torch.tensor(0.2))
+    velocity_batch_sizes = []
+
+    def _velocity(
+        _self,
+        condition,
+        *,
+        regime,
+        capture_gate_kv,
+        actor_version,
+    ):
+        del regime, capture_gate_kv, actor_version
+        velocity_batch_sizes.append(int(condition.context.shape[0]))
+        return lambda action, timestep: VelocityOutput(
+            action * replay_parameter
+            + timestep.reshape(-1, 1, 1).to(action.dtype) / 1000.0
+        )
+
+    runtime._velocity = MethodType(_velocity, runtime)
+    routes = torch.tensor(
+        [WAMRoute.UNCOND, WAMRoute.IDM, WAMRoute.UNCOND, WAMRoute.IDM]
+    )
+    chains = torch.randn(4, 4, 3, 3, generator=torch.Generator().manual_seed(9))
+    forward_inputs = {
+        "flow_chains": chains,
+        "denoise_indices": torch.tensor([0, -1, 1, -1]),
+        "fastwam_images": torch.zeros(4, 3, 8, 8),
+        "fastwam_context": torch.zeros(4, 2, 3),
+        "fastwam_context_mask": torch.ones(4, 2, dtype=torch.bool),
+    }
+
+    replay = runtime.replay_action_batch(
+        forward_inputs=forward_inputs,
+        route_info=_route_record(routes),
+    )
+
+    assert prepare_batch_sizes == [4]
+    assert velocity_batch_sizes == [2]
+    assert replay["flow_logprobs"].shape == (4, 2, 3)
+    assert replay["flow_entropy"].shape == (4, 2, 3)
+    assert torch.count_nonzero(replay["flow_logprobs"][[1, 3]]) == 0
+    gradient = torch.autograd.grad(
+        replay["flow_logprobs"].sum(),
+        replay_parameter,
+    )[0]
+    assert torch.isfinite(gradient)
+    assert gradient != 0
+
+
+def test_mb4_compaction_preserves_original_global_batch_denominator() -> None:
+    actor = object.__new__(RouteNeutralOnlineIDMBCFSDPActor)
+    actor.cfg = SimpleNamespace(actor=SimpleNamespace(micro_batch_size=4))
+    batch_size = 196
+    active_count = 67
+    gate_valid = torch.zeros(batch_size, dtype=torch.bool)
+    gate_valid[:active_count] = True
+    row_loss = torch.linspace(0.25, 2.0, batch_size)
+    batch = {
+        "prev_logprobs": row_loss.reshape(batch_size, 1),
+        "route_info": _route_record(torch.full((batch_size,), int(WAMRoute.IDM))),
+        "gate_valid_mask": gate_valid,
+        "flow_valid_mask": torch.zeros(batch_size, dtype=torch.bool),
+        "loss_mask": torch.zeros(batch_size, 1, dtype=torch.bool),
+        "forward_inputs": {"row_loss": row_loss.reshape(batch_size, 1)},
+    }
+
+    compacted, metrics = actor._prepare_train_global_batch_for_microbatches(batch)
+    compacted_loss = compacted["forward_inputs"]["row_loss"].reshape(-1)
+    compacted_mask = compacted["gate_valid_mask"].float().reshape(-1)
+    baseline = (row_loss * gate_valid.float()).sum() / float(batch_size)
+    accumulated_mb4 = (compacted_loss * compacted_mask).reshape(-1, 4).mean(
+        dim=1
+    ).sum() / 49.0
+
+    torch.testing.assert_close(accumulated_mb4, baseline)
+    assert metrics["perf/actor_rows_active"] == 67.0
+    assert metrics["perf/actor_rows_padded"] == 1.0
+    assert metrics["perf/actor_rows_forwarded"] == 68.0
+    assert metrics["perf/actor_microbatches_executed"] == 17.0
+
+
+def test_mb4_compaction_reports_original_rollout_batch_means() -> None:
+    actor = object.__new__(RouteNeutralOnlineIDMBCFSDPActor)
+    actor.cfg = SimpleNamespace(
+        actor=SimpleNamespace(global_batch_size=8, micro_batch_size=4)
+    )
+    actor._world_size = 1
+    actor.gradient_accumulation = 2
+    batch = {
+        "prev_logprobs": torch.zeros(8, 1),
+        "route_info": _route_record(torch.full((8,), int(WAMRoute.UNCOND))),
+        "gate_valid_mask": torch.ones(8, dtype=torch.bool),
+        "flow_valid_mask": torch.ones(8, dtype=torch.bool),
+        "loss_mask": torch.ones(8, 1, dtype=torch.bool),
+        "forward_inputs": {
+            ROUTE_NEUTRAL_ROLLOUT_IDM_BATCH_SIZE: torch.tensor(
+                [1.0, 1.0, 1.0, 1.0, 3.0, 3.0, 3.0, 3.0]
+            ),
+            ROUTE_NEUTRAL_ROLLOUT_UNCOND_BATCH_SIZE: torch.tensor(
+                [3.0, 3.0, 3.0, 3.0, 1.0, 1.0, 1.0, 1.0]
+            ),
+            ROUTE_NEUTRAL_TEACHER_BATCH_SIZE: torch.tensor(
+                [3.0, 3.0, 3.0, 3.0, 1.0, 1.0, 1.0, 1.0]
+            ),
+        },
+    }
+
+    _, preparation_metrics = actor._prepare_train_global_batch_for_microbatches(batch)
+    metrics = {name: [value] for name, value in preparation_metrics.items()}
+    for idm_max, uncond_max in ((4.0, 3.0), (3.0, 4.0)):
+        microbatch_metrics = {
+            "perf/rollout_idm_batch_size": idm_max,
+            "perf/rollout_uncond_batch_size": uncond_max,
+            "perf/teacher_batch_size": uncond_max,
+        }
+        actor._append_route_neutral_metric_numerators(microbatch_metrics, {})
+        for name, value in microbatch_metrics.items():
+            metrics.setdefault(name, []).append(value)
+
+    actor._finalize_train_metrics_before_reduction(metrics)
+
+    assert metrics["perf/rollout_idm_batch_size"] == [2.0]
+    assert metrics["perf/rollout_uncond_batch_size"] == [2.0]
+    assert metrics["perf/teacher_batch_size"] == [2.0]
+    assert all(not name.startswith("_route_neutral_compaction/") for name in metrics)
+
+
+@pytest.mark.parametrize("full_teacher_metrics", [False, True])
+def test_mb4_compaction_restores_mb1_metric_denominators(full_teacher_metrics) -> None:
+    prefix = "_route_neutral_compaction/"
+    actor = SimpleNamespace(
+        cfg=SimpleNamespace(
+            actor=SimpleNamespace(global_batch_size=8, micro_batch_size=4)
+        ),
+        gradient_accumulation=2,
+        _world_size=1,
+        _finalize_online_bc_compaction_metrics=(
+            RouteNeutralOnlineIDMBCFSDPActor._finalize_online_bc_compaction_metrics
+        ),
+    )
+    metrics = {
+        f"{prefix}global_batch": [0.0, 0.0, 1.0],
+        f"{prefix}loss/critic/value_loss": [2.0, 4.0, 6.0],
+        f"{prefix}loss/fastwam/regularized_policy_loss": [1.0, 3.0, 4.0],
+        f"{prefix}loss/fastwam/total_loss": [3.0, 7.0, 10.0],
+        "actor/total_loss": [0.5, 1.0, 1.5],
+        f"{prefix}scale/gate": [7.0, 7.0, 9.0],
+        f"{prefix}scale/uncond_flow": [2.0, 2.0, 4.0],
+        f"{prefix}scale/online_idm_bc": [5.0, 5.0, 7.0],
+        f"{prefix}online/selected": [1.0, 1.0, 2.0],
+        f"{prefix}online/loss_sum": [2.0, 4.0, 10.0],
+        f"{prefix}online/expected": [1.0, 1.0, 2.0],
+        f"{prefix}online/present": [1.0, 0.0, 1.0],
+        f"{prefix}online/valid_action_count": [3.0, 5.0, 8.0],
+        f"{prefix}online/teacher_seconds": [0.1, 0.2, 0.3],
+        f"{prefix}online/teacher_bytes": [10.0, 20.0, 30.0],
+        f"{prefix}online/mse_pose_sum": [1.0, 3.0, 8.0],
+        f"{prefix}online/mse_gripper_sum": [2.0, 2.0, 4.0],
+        f"{prefix}online/full_action_mse_sum": [4.0, 4.0, 8.0],
+        f"{prefix}online/executed_prefix_mse_sum": [5.0, 3.0, 8.0],
+        "online_idm_bc/loss_weight": [0.2],
+    }
+    if full_teacher_metrics:
+        metrics.update(
+            {
+                f"{prefix}rollout_teacher/count": [3.0, 3.0],
+                f"{prefix}rollout_teacher/seconds": [0.7, 1.1],
+                f"{prefix}rollout_teacher/bytes": [300.0, 300.0],
+            }
+        )
+    for index in range(7):
+        value = float(index + 1)
+        metrics[f"{prefix}online/mse_dimension_sum_{index}"] = [
+            value,
+            value,
+            2.0 * value,
+        ]
+    for index in range(10):
+        metrics[f"{prefix}online/timestep_count_{index}"] = (
+            [1.0, 0.0, 2.0] if index == 0 else [0.0, 0.0, 0.0]
+        )
+        metrics[f"{prefix}online/timestep_mse_sum_{index}"] = (
+            [2.0, 0.0, 8.0] if index == 0 else [0.0, 0.0, 0.0]
+        )
+
+    RouteNeutralOnlineIDMBCFSDPActor._finalize_train_metrics_before_reduction(
+        actor,
+        metrics,
+    )
+
+    assert metrics["critic/value_loss"] == pytest.approx([3.0])
+    assert metrics["fastwam/regularized_policy_loss"] == pytest.approx([2.0])
+    assert metrics["fastwam/total_loss"] == pytest.approx([5.0])
+    assert metrics["actor/total_loss"] == pytest.approx([0.1875])
+    assert metrics["gate/selected_loss_scale_compacted"] == pytest.approx([8.0])
+    assert metrics["gate/selected_loss_scale"] == pytest.approx([32.0])
+    assert metrics["uncond_flow/selected_loss_scale"] == pytest.approx([12.0])
+    assert metrics["online_idm_bc/selected_loss_scale"] == pytest.approx([24.0])
+    assert metrics["online_idm_bc/raw_loss"] == pytest.approx([4.0])
+    assert metrics["online_idm_bc/weighted_loss"] == pytest.approx([0.8])
+    assert metrics["online_idm_bc/selected_count"] == pytest.approx([2.0])
+    assert metrics["online_idm_bc/teacher_call_count"] == pytest.approx(
+        [3.0 if full_teacher_metrics else 1.0]
+    )
+    assert metrics["online_idm_bc/teacher_seconds_per_call"] == pytest.approx([0.3])
+    assert metrics["online_idm_bc/teacher_bytes_per_call"] == pytest.approx(
+        [100.0 if full_teacher_metrics else 30.0]
+    )
+    assert metrics["online_idm_bc/valid_action_count"] == pytest.approx([4.0])
+    assert metrics["online_idm_bc/mse_pose"] == pytest.approx([3.0])
+    assert metrics["online_idm_bc/mse_timestep_bin_0"] == pytest.approx([10.0 / 3.0])
+    assert metrics["online_idm_bc/timestep_bin_count_0"] == [1.0]
+    assert metrics[
+        "online_idm_bc/timestep_bin_selected_count_compacted_0"
+    ] == pytest.approx([1.5])
+    assert all(not key.startswith(prefix) for key in metrics)
+
+    reduced = {
+        "online_idm_bc/weighted_loss": metrics["online_idm_bc/weighted_loss"][0],
+        "uncond_flow/total_loss": 0.5,
+    }
+    RouteNeutralOnlineIDMBCFSDPActor._finalize_train_metrics_after_reduction(
+        actor,
+        reduced,
+    )
+    assert reduced["online_idm_bc/weighted_to_flow_loss_ratio"] == pytest.approx(1.6)
+
+
+def test_mb4_dummy_batch_consumes_zero_selected_metric_state() -> None:
+    prefix = "_route_neutral_compaction/"
+    actor = SimpleNamespace(
+        cfg=SimpleNamespace(
+            actor=SimpleNamespace(global_batch_size=196, micro_batch_size=4)
+        ),
+        gradient_accumulation=49,
+        _world_size=1,
+        _finalize_online_bc_compaction_metrics=(
+            RouteNeutralOnlineIDMBCFSDPActor._finalize_online_bc_compaction_metrics
+        ),
+    )
+    metrics = {
+        f"{prefix}global_batch": [0.0],
+        f"{prefix}online/selected": [0.0],
+        f"{prefix}online/loss_sum": [0.0],
+        f"{prefix}online/expected": [0.0],
+        f"{prefix}online/present": [0.0],
+        f"{prefix}online/valid_action_count": [0.0],
+        f"{prefix}online/teacher_seconds": [0.0],
+        f"{prefix}online/teacher_bytes": [0.0],
+        f"{prefix}online/mse_pose_sum": [0.0],
+        f"{prefix}online/mse_gripper_sum": [0.0],
+        f"{prefix}online/full_action_mse_sum": [0.0],
+        f"{prefix}online/executed_prefix_mse_sum": [0.0],
+        "online_idm_bc/loss_weight": [0.2],
+    }
+    for index in range(7):
+        metrics[f"{prefix}online/mse_dimension_sum_{index}"] = [0.0]
+    for index in range(10):
+        metrics[f"{prefix}online/timestep_count_{index}"] = [0.0]
+        metrics[f"{prefix}online/timestep_mse_sum_{index}"] = [0.0]
+
+    RouteNeutralOnlineIDMBCFSDPActor._finalize_train_metrics_before_reduction(
+        actor,
+        metrics,
+    )
+
+    assert metrics["online_idm_bc/raw_loss"] == [0.0]
+    assert metrics["online_idm_bc/selected_count"] == [0.0]
+    assert "online_idm_bc/mse_pose" not in metrics
+    assert all(not key.startswith(prefix) for key in metrics)

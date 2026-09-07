@@ -1,0 +1,35 @@
+# @package _global_
+
+cluster:
+  component_placement:
+    actor: "0-0"
+    env: "1-7"
+    rollout: "1-7"
+
+runner:
+  # The engineering launcher resumes the immutable step-five copy.
+  max_epochs: 6
+  max_steps: 6
+  logger:
+    experiment_name: libero_10_ppo_fastwam_route_neutral_online_task6_perfopt42_engineering
+
+algorithm:
+  fixed_branch_cost:
+    controller:
+      signed_price:
+        reversal:
+          factor: 0.0
+  regularization:
+    base_uncond_kl:
+      enabled: false
+      coefficient: 0.0
+      log_metric: false
+
+env:
+  train:
+    task_id_filter: [6]
+    total_num_envs: 42
+
+actor:
+  global_batch_size: 196
+  micro_batch_size: 4

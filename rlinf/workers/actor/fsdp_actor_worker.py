@@ -2068,6 +2068,30 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
 
         return None
 
+    def _prepare_train_global_batch_for_microbatches(
+        self,
+        train_global_batch: dict[str, Any],
+    ) -> tuple[dict[str, Any], dict[str, float]]:
+        """Optionally compact one global batch before microbatch splitting."""
+
+        return train_global_batch, {}
+
+    def _finalize_train_metrics_before_reduction(
+        self,
+        metrics: dict[str, list[float]],
+    ) -> None:
+        """Allow a scheme to restore metric denominators after compaction."""
+
+        return None
+
+    def _finalize_train_metrics_after_reduction(
+        self,
+        metrics: dict[str, float],
+    ) -> None:
+        """Allow a scheme to derive metrics from globally reduced values."""
+
+        return None
+
     def _process_received_rollout_batch(
         self, rollout_batch: dict[str, torch.Tensor]
     ) -> dict[str, torch.Tensor]:
@@ -3835,9 +3859,23 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
                     f"{train_global_batch_size=}, {self.cfg.actor.micro_batch_size}"
                 )
 
+                train_global_batch, preparation_metrics = (
+                    self._prepare_train_global_batch_for_microbatches(
+                        train_global_batch
+                    )
+                )
+                if preparation_metrics:
+                    append_to_dict(metrics, preparation_metrics)
+                forwarded_batch_size = self._training_batch_reference(
+                    train_global_batch
+                ).shape[0]
+                assert forwarded_batch_size % self.cfg.actor.micro_batch_size == 0, (
+                    f"{forwarded_batch_size=}, {self.cfg.actor.micro_batch_size}"
+                )
+
                 train_micro_batch = split_dict_to_chunk(
                     train_global_batch,
-                    train_global_batch_size // self.cfg.actor.micro_batch_size,
+                    forwarded_batch_size // self.cfg.actor.micro_batch_size,
                 )
                 selected_loss_scales = None
                 counts = None
@@ -3928,7 +3966,7 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
                     self.train_micro_batch(
                         micro_batch=batch,
                         metrics=metrics,
-                        is_last=(idx + 1) == self.gradient_accumulation,
+                        is_last=(idx + 1) == len(train_micro_batch),
                         selected_loss_scales=selected_loss_scales,
                     )
                     if consumed_handles:
@@ -4048,6 +4086,7 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
             kv_metrics = self._stop_fastwam_handle_replay()
             append_to_dict(metrics, kv_metrics)
         clear_memory()
+        self._finalize_train_metrics_before_reduction(metrics)
         explained_variance_stats = pop_critic_explained_variance_stats(metrics)
         weighted_sums = {}
         weighted_maxima = {}
@@ -4088,6 +4127,7 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
                 + float(self.cfg.algorithm.uncond_flow_ppo.get("loss_weight", 1.0))
                 * mean_metric_dict["uncond_flow/total_loss"]
             )
+        self._finalize_train_metrics_after_reduction(mean_metric_dict)
 
         return mean_metric_dict
 
