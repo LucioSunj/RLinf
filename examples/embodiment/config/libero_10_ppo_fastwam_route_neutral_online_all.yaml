@@ -1,4 +1,14 @@
 # One shared model, globally balanced LIBERO-Long episode starts.
+# The audited N42 run can resume on eight dedicated devices with these overrides:
+#   cluster.component_placement.env=1-7
+#   cluster.component_placement.rollout=1-7
+#   route_neutral_online_implementation.shared_gpu_rollout_rank=null
+#   actor.enable_offload=false
+#   runner.ckpt_path=null
+#   runner.resume_dir=<complete checkpoint directory>
+# Keep all seven logical rollout ranks, N42/B196/MB4, sampler/RNG and optimizer
+# state. The resume contract permits only this placement/residency transition;
+# it does not permit scientific changes or import a fresh step-zero bootstrap.
 defaults:
   - env/libero_10@env.train
   - env/libero_10@env.eval

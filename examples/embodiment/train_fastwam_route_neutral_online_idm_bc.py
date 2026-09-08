@@ -52,8 +52,14 @@ def main(cfg) -> None:
     placement = HybridComponentPlacement(cfg, cluster)
     device_plan = validate_shared_gpu_device_plan(cfg, cluster, placement)
     if device_plan is not None:
+        label = (
+            "ROUTE_NEUTRAL_SHARED_GPU_DEVICE_PLAN"
+            if cfg.route_neutral_online_implementation.shared_gpu_rollout_rank
+            is not None
+            else "ROUTE_NEUTRAL_DEDICATED_GPU_DEVICE_PLAN"
+        )
         print(
-            "ROUTE_NEUTRAL_SHARED_GPU_DEVICE_PLAN=" + json.dumps(device_plan),
+            label + "=" + json.dumps(device_plan),
             flush=True,
         )
     actor_cls = get_class(str(cfg.route_neutral_online_implementation.actor_target))

@@ -199,6 +199,81 @@ def test_checkpoint_contract_binds_explicit_training_task_filter() -> None:
         )
 
 
+def _balanced_dedicated_contracts(world_size):
+    cfg = _checkpoint_cfg()
+    cfg.actor.model.policy_target = (
+        "rlinf.models.embodiment.wam_policy.route_neutral_online.policy."
+        "RouteNeutralOnlineIDMBCFastWAMPolicy"
+    )
+    cfg.actor.enable_offload = True
+    cfg.actor.global_batch_size = 196
+    cfg.actor.micro_batch_size = 4
+    cfg.env.train.total_num_envs = 42
+    cfg.env.train.task_id_filter = list(range(10))
+    cfg.env.train.task_sampling = "global_balanced"
+    cfg.env.train.auto_reset = False
+    cfg.env.train.max_episode_steps = 700
+    cfg.env.train.max_steps_per_rollout_epoch = 700
+    cfg.env.train.seed = 42
+    cfg.route_neutral_online_implementation = {"shared_gpu_rollout_rank": 0}
+    cfg.cluster.component_placement = {"actor": "0-0", "env": "0-6", "rollout": "0-6"}
+    source = MODULE.build_fastwam_checkpoint_contract(cfg, world_size=world_size)
+    cfg.actor.enable_offload = False
+    cfg.route_neutral_online_implementation.shared_gpu_rollout_rank = None
+    cfg.cluster.component_placement.env = "1-7"
+    cfg.cluster.component_placement.rollout = "1-7"
+    target = MODULE.build_fastwam_checkpoint_contract(cfg, world_size=world_size)
+    return source, target
+
+
+@pytest.mark.parametrize("owner,world_size", [("actor", 1), ("rollout", 7)])
+def test_balanced_resume_moves_to_dedicated_gpus_without_new_ranks(owner, world_size):
+    source, target = _balanced_dedicated_contracts(world_size)
+    kwargs = {"owner": owner, "allow_n4_to_three_rollout_expansion": False}
+    result = MODULE.validate_fastwam_training_checkpoint_contract(
+        source, target, **kwargs
+    )
+    assert result == {
+        "mode": "route_neutral_balanced_dedicated_gpu",
+        "source_world_size": world_size,
+        "target_world_size": world_size,
+    }
+    assert (
+        MODULE.validate_fastwam_training_checkpoint_contract(target, target, **kwargs)[
+            "mode"
+        ]
+        == "exact"
+    )
+
+
+@pytest.mark.parametrize(
+    "section,key,value",
+    [
+        ("actor", "seed", 43),
+        ("actor", "micro_batch_size", 1),
+        ("actor", "global_batch_size", 392),
+        ("env_train", "task_id_filter", [8]),
+        ("algorithm", "loss_type", "other_loss"),
+    ],
+)
+def test_balanced_dedicated_resume_rejects_scientific_changes(section, key, value):
+    source, target = _balanced_dedicated_contracts(1)
+    target[section][key] = value
+    with pytest.raises(ValueError, match="contract mismatch"):
+        MODULE.validate_fastwam_training_checkpoint_contract(
+            source, target, owner="actor", allow_n4_to_three_rollout_expansion=False
+        )
+
+
+def test_balanced_dedicated_resume_rejects_changed_logical_world_size():
+    source, target = _balanced_dedicated_contracts(7)
+    target["world_size"] = 8
+    with pytest.raises(ValueError, match="contract mismatch"):
+        MODULE.validate_fastwam_training_checkpoint_contract(
+            source, target, owner="rollout", allow_n4_to_three_rollout_expansion=False
+        )
+
+
 def test_checkpoint_contract_normalizes_validate_cfg_inserted_defaults() -> None:
     unvalidated = _checkpoint_cfg()
     del unvalidated.runner.weight_sync_interval

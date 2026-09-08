@@ -14,6 +14,7 @@ from test_route_neutral_online import _compose
 from rlinf.envs.libero.task_sampler import BalancedLiberoTaskSampler
 from rlinf.models.embodiment.wam_policy.route_neutral_online.config import (
     validate_route_neutral_online_idm_bc_training_config,
+    validate_shared_gpu_device_plan,
 )
 from rlinf.models.embodiment.wam_policy.route_neutral_online.task_metrics import (
     summarize_task_rollout,
@@ -115,6 +116,82 @@ def test_rejects_unvalidated_balanced_geometry(monkeypatch, override):
     )
     with pytest.raises(ValueError):
         validate_route_neutral_online_idm_bc_training_config(cfg)
+
+
+def _dedicated_balanced_config(monkeypatch):
+    return _compose(
+        monkeypatch,
+        "libero_10_ppo_fastwam_route_neutral_online_all",
+        [
+            "cluster.component_placement.env=1-7",
+            "cluster.component_placement.rollout=1-7",
+            "route_neutral_online_implementation.shared_gpu_rollout_rank=null",
+            "actor.enable_offload=false",
+        ],
+    )
+
+
+def test_dedicated_eight_gpu_balanced_configuration_preserves_scientific_geometry(
+    monkeypatch,
+):
+    cfg = _dedicated_balanced_config(monkeypatch)
+    validate_route_neutral_online_idm_bc_training_config(cfg)
+    assert cfg.env.train.total_num_envs == 42
+    assert cfg.actor.global_batch_size == 196
+    assert cfg.actor.micro_batch_size == 4
+    assert cfg.actor.enable_offload is False
+    assert cfg.rollout.enable_offload is False
+
+
+@pytest.mark.parametrize(
+    "field,value",
+    [
+        ("actor.enable_offload", True),
+        ("rollout.enable_offload", True),
+        ("route_neutral_online_implementation.shared_gpu_rollout_rank", 0),
+        ("runner.overlap_env_bootstrap", True),
+        ("env.train.total_num_envs", 84),
+    ],
+)
+def test_dedicated_balanced_configuration_rejects_incompatible_lifecycle(
+    monkeypatch, field, value
+):
+    from omegaconf import OmegaConf
+
+    cfg = _dedicated_balanced_config(monkeypatch)
+    OmegaConf.update(cfg, field, value)
+    with pytest.raises(ValueError):
+        validate_route_neutral_online_idm_bc_training_config(cfg)
+
+
+@pytest.mark.parametrize("wrong_physical_plan", [False, True])
+def test_dedicated_balanced_device_plan_preserves_physical_indices(
+    monkeypatch, wrong_physical_plan
+):
+    cfg = _dedicated_balanced_config(monkeypatch)
+    devices = {"actor": [0], "env": list(range(1, 8)), "rollout": list(range(1, 8))}
+    if wrong_physical_plan:
+        devices["rollout"] = list(range(7))
+
+    def strategy(component):
+        return SimpleNamespace(
+            get_placement=lambda cluster: [
+                SimpleNamespace(
+                    rank=rank, cluster_node_rank=0, visible_accelerators=[str(device)]
+                )
+                for rank, device in enumerate(devices[component])
+            ]
+        )
+
+    placement = SimpleNamespace(get_strategy=strategy)
+    if wrong_physical_plan:
+        with pytest.raises(ValueError, match="physical rollout placement"):
+            validate_shared_gpu_device_plan(cfg, None, placement)
+    else:
+        report = validate_shared_gpu_device_plan(cfg, None, placement)
+        assert report["schema"] == "route-neutral-dedicated-gpu-device-plan-v1"
+        assert report["rollout"][0] == (0, 0, ["1"])
+        assert report["rollout"][-1] == (6, 0, ["7"])
 
 
 def test_task_identity_stays_with_language_and_trajectory_after_flatten_shuffle():

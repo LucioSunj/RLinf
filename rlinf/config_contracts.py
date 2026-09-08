@@ -522,6 +522,46 @@ def validate_fastwam_training_checkpoint_contract(
                     "target_world_size": expected_world_size,
                 }
 
+    # Resume the balanced N42 run on eight devices without changing logical ranks
+    # or any scientific field. The actor becomes resident on its dedicated GPU0.
+    if checkpoint.get("route_neutral_shared_gpu") == {"rollout_rank": 0}:
+        source_placement = {"actor": "0-0", "env": "0-6", "rollout": "0-6"}
+        target_placement = {"actor": "0-0", "env": "1-7", "rollout": "1-7"}
+        expected_world_size = {"actor": 1, "rollout": 7}.get(owner)
+        source_actor = checkpoint.get("actor", {})
+        target_actor = live.get("actor", {})
+        source_env = checkpoint.get("env_train", {})
+        if (
+            checkpoint.get("component_placement") == source_placement
+            and live.get("component_placement") == target_placement
+            and checkpoint.get("world_size") == expected_world_size
+            and live.get("world_size") == expected_world_size
+            and source_actor.get("enable_offload") is True
+            and target_actor.get("enable_offload") is False
+            and source_actor.get("global_batch_size") == 196
+            and source_actor.get("micro_batch_size") == 4
+            and source_env.get("total_num_envs") == 42
+            and source_env.get("task_sampling") == "global_balanced"
+            and source_env.get("task_id_filter") == list(range(10))
+            and live.get("rollout", {}).get("enable_offload") is False
+            and live.get("runner", {}).get("use_training_pipeline") is False
+            and live.get("runner", {}).get("overlap_env_bootstrap") is False
+            and "route_neutral_shared_gpu" not in live
+            and str(live.get("model", {}).get("policy_target", "")).endswith(
+                ".RouteNeutralOnlineIDMBCFastWAMPolicy"
+            )
+        ):
+            relocated = dict(checkpoint)
+            relocated["component_placement"] = target_placement
+            relocated["actor"] = {**source_actor, "enable_offload": False}
+            del relocated["route_neutral_shared_gpu"]
+            if relocated == live:
+                return {
+                    "mode": "route_neutral_balanced_dedicated_gpu",
+                    "source_world_size": expected_world_size,
+                    "target_world_size": expected_world_size,
+                }
+
     difference_paths, difference_descriptions = _contract_difference_paths(
         checkpoint,
         live,

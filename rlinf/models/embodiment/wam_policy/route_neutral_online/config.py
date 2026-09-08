@@ -282,11 +282,28 @@ def validate_route_neutral_online_idm_bc_training_config(
         and batch_size == 196 * (total_envs // 42)
         and int(cfg.actor.micro_batch_size) == 4
     )
+    balanced_dedicated_geometry = (
+        balanced_tasks
+        and placement == {"actor": "0-0", "env": "1-7", "rollout": "1-7"}
+        and shared_rank is None
+        and total_envs == 42
+        and batch_size == 196
+        and int(cfg.actor.micro_batch_size) == 4
+        and not bool(cfg.actor.enable_offload)
+        and not bool(cfg.rollout.enable_offload)
+        and not bool(cfg.runner.get("use_training_pipeline", False))
+        and not bool(cfg.runner.get("overlap_env_bootstrap", False))
+        and int(cfg.rollout.pipeline_stage_num) == 1
+    )
     if balanced_tasks:
-        if not balanced_geometry or shared_rank != 0:
+        if not (
+            (balanced_geometry and shared_rank == 0) or balanced_dedicated_geometry
+        ):
             raise ValueError(
-                "Balanced ten-task training requires shared GPU0, env=rollout=0-6, "
-                "N a positive multiple of 42, global batch 196*N/42 and microbatch 4."
+                "Balanced ten-task training requires the shared GPU0 geometry "
+                "with N a positive multiple of 42 and global batch 196*N/42, "
+                "or resident actor GPU0 with env=rollout=1-7 at N42/global batch "
+                "196. Both use microbatch 4 and synchronous execution."
             )
         train = cfg.env.train
         if (
@@ -377,14 +394,20 @@ def validate_shared_gpu_device_plan(
 ) -> dict | None:
     """Check actual physical worker assignments before launching model workers."""
 
-    if cfg.route_neutral_online_implementation.get("shared_gpu_rollout_rank") is None:
-        return None
-    healthy_devices = (
-        list(range(7))
-        if str(cfg.cluster.component_placement.env) == "0-6"
-        else [0, 1, 2, 3, 5, 6, 7]
-    )
-    report = {"schema": "route-neutral-shared-gpu-device-plan-v1", "status": "PASS"}
+    shared_rank = cfg.route_neutral_online_implementation.get("shared_gpu_rollout_rank")
+    if shared_rank is None:
+        if cfg.env.train.get("task_sampling") != "global_balanced":
+            return None
+        healthy_devices = list(range(1, 8))
+        schema = "route-neutral-dedicated-gpu-device-plan-v1"
+    else:
+        healthy_devices = (
+            list(range(7))
+            if str(cfg.cluster.component_placement.env) == "0-6"
+            else [0, 1, 2, 3, 5, 6, 7]
+        )
+        schema = "route-neutral-shared-gpu-device-plan-v1"
+    report = {"schema": schema, "status": "PASS"}
     for component in ("actor", "rollout", "env"):
         planned = placement.get_strategy(component).get_placement(cluster)
         expected = [0] if component == "actor" else healthy_devices
@@ -395,7 +418,7 @@ def validate_shared_gpu_device_plan(
         required = [(rank, 0, [str(device)]) for rank, device in enumerate(expected)]
         if actual != required:
             raise ValueError(
-                f"Shared-GPU physical {component} placement changed: {actual}."
+                f"Route-neutral physical {component} placement changed: {actual}."
             )
         report[component] = actual
     return report
