@@ -45,6 +45,7 @@ class RouteNeutralTrainableChunkSample:
     forward_inputs: dict[str, torch.Tensor]
     critic_features: FastWAMValueFeatures | torch.Tensor | None
     action_execution_trace: ActionExecutionTrace | None
+    normalized_actions: torch.Tensor | None = None
 
     @classmethod
     def without_route_snapshot(

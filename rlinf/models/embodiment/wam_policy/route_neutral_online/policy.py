@@ -411,12 +411,17 @@ class RouteNeutralOnlineIDMBCFastWAMPolicy(OnlineIDMBCFastWAMPolicy):
             if "base_uncond_kl" not in replay:
                 raise KeyError("UNCOND replay did not return base KL.")
             result["base_uncond_kl"] = replay["base_uncond_kl"]
-        online_bc = self.runtime.compute_online_idm_bc_loss(
-            forward_inputs=forward_inputs,
-            route_info=route_info,
-        )
-        result.update(online_bc.as_forward_outputs())
+        if self._compute_online_bc_for_batch(route_info):
+            online_bc = self.runtime.compute_online_idm_bc_loss(
+                forward_inputs=forward_inputs,
+                route_info=route_info,
+            )
+            result.update(online_bc.as_forward_outputs())
         return result
+
+    def _compute_online_bc_for_batch(self, route_info: ChunkRouteRecord) -> bool:
+        """Keep inline profiles unchanged; physical warm-up can omit teachers."""
+        return True
 
     def load_eval_checkpoint(self, *args, **kwargs) -> int:
         version = super().load_eval_checkpoint(*args, **kwargs)

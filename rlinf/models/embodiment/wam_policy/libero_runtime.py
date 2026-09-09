@@ -363,6 +363,8 @@ def _action_contract_metadata(
 class LiberoFastWAMRuntime:
     """Correctness-first mixed-route runtime using the checked-out FastWAM."""
 
+    capture_action_gate_snapshots = True
+
     def __init__(
         self,
         *,
@@ -375,6 +377,7 @@ class LiberoFastWAMRuntime:
         num_video_frames: int = 9,
         reset_wait_steps: int = 30,
         max_episode_steps: int = 700,
+        action_protocol: Any | None = None,
         num_inference_steps: int = 10,
         seeded_noise_device: str = "cpu",
         sigma_shift: float | None = None,
@@ -401,7 +404,7 @@ class LiberoFastWAMRuntime:
         self.num_video_frames = int(num_video_frames)
         self.num_inference_steps = int(num_inference_steps)
         self.seeded_noise_device = str(seeded_noise_device)
-        self.action_protocol = LiberoActionProtocol(
+        self.action_protocol = action_protocol or LiberoActionProtocol(
             generation_horizon=generation_horizon,
             execution_horizon=execution_horizon,
             prediction_video_frames=num_video_frames,
@@ -951,7 +954,7 @@ class LiberoFastWAMRuntime:
                 velocity_fn=self._velocity(
                     condition,
                     regime=regime,
-                    capture_gate_kv=True,
+                    capture_gate_kv=self.capture_action_gate_snapshots,
                     actor_version=actor_version,
                 ),
                 timesteps=timesteps,
@@ -970,7 +973,9 @@ class LiberoFastWAMRuntime:
 
         gate_snapshots = tuple(
             _cat_snapshots([rollout.gate_taps[tap_index] for rollout in rollouts])
-            for tap_index in range(self.gate_denoise_last_n)
+            for tap_index in range(
+                self.gate_denoise_last_n if self.capture_action_gate_snapshots else 0
+            )
         )
         normalized_actions = torch.cat(
             [rollout.actions for rollout in rollouts],
@@ -996,7 +1001,8 @@ class LiberoFastWAMRuntime:
                 idm_initial_latents,
                 dim=0,
             ).detach()
-        return FastWAMChunkSample(
+        return self._make_chunk_sample(
+            normalized_actions=normalized_actions.detach(),
             actions=processed_actions,
             old_flow_logprobs=select_executed_flow_statistics(
                 torch.cat(
@@ -1019,6 +1025,10 @@ class LiberoFastWAMRuntime:
             ),
             action_execution_trace=action_execution_trace,
         )
+
+    def _make_chunk_sample(self, *, normalized_actions, **kwargs):
+        """Allow physical adapters to retain the full sample without legacy taps."""
+        return FastWAMChunkSample(**kwargs)
 
     @torch.no_grad()
     def critic_features(self, *, env_obs: dict[str, Any]) -> FastWAMValueFeatures:

@@ -159,6 +159,25 @@ class OnlineIDMTeacherLiberoRuntime(LiberoFastWAMRuntime):
         if mode != "train" or not collect_replay:
             return sample
 
+        return self.materialize_idm_teacher(
+            sample=sample, env_obs=env_obs, routes=routes, actor_version=actor_version
+        )
+
+    @torch.no_grad()
+    def materialize_idm_teacher(
+        self,
+        *,
+        sample,
+        env_obs: dict[str, Any],
+        routes: torch.Tensor,
+        actor_version: int,
+    ):
+        """Fill same-snapshot teacher fields for inline or deferred callers.
+
+        Only saved processed conditions, the original action noise and explicit
+        IDM seeds are consumed. No observation or route-history API is invoked.
+        """
+
         batch_size = int(routes.numel())
         action_seeds = _batch_long_tensor(
             env_obs.get("_fastwam_action_noise_seeds"),

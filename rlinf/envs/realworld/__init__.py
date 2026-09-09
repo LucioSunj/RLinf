@@ -12,48 +12,56 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from .dosw1 import DOSW1Config, DOSW1Env
-from .dosw1 import tasks as dosw1_tasks
-from .franka import FrankaEnv, FrankaRobotConfig, FrankaRobotState
-from .franka import tasks as franka_tasks
-from .franka.dual_franka_env import DualFrankaEnv, DualFrankaRobotConfig
-from .franka.tasks.dual_franka_joint_env import (
-    DualFrankaJointEnv,
-    DualFrankaJointRobotConfig,
-)
-from .franka.tasks.dual_franka_tcp_env import (
-    DualFrankaTCPEnv,
-    DualFrankaTCPRobotConfig,
-)
-from .gim_arm import GimArmEnv, GimArmRobotConfig, GimArmRobotState
-from .gim_arm import tasks as gim_arm_tasks
-from .realworld_env import RealWorldEnv
-from .xsquare import Turtle2Env, Turtle2RobotConfig, Turtle2RobotState
-from .xsquare import tasks as xsquare_tasks
+"""Lazy realworld exports; imports do not connect devices or manage processes."""
 
-RealWorldEnv.realworld_setup()
+from importlib import import_module
 
-__all__ = [
-    "DualFrankaEnv",
-    "DualFrankaJointEnv",
-    "DualFrankaJointRobotConfig",
-    "DualFrankaTCPEnv",
-    "DualFrankaTCPRobotConfig",
-    "DualFrankaRobotConfig",
-    "DOSW1Config",
-    "DOSW1Env",
-    "dosw1_tasks",
-    "FrankaEnv",
-    "FrankaRobotConfig",
-    "FrankaRobotState",
-    "franka_tasks",
-    "GimArmEnv",
-    "GimArmRobotConfig",
-    "GimArmRobotState",
-    "gim_arm_tasks",
-    "Turtle2Env",
-    "Turtle2RobotConfig",
-    "Turtle2RobotState",
-    "xsquare_tasks",
-    "RealWorldEnv",
-]
+_EXPORTS = {
+    "RealWorldEnv": ("realworld_env", "RealWorldEnv"),
+    "FrankaEnv": ("franka", "FrankaEnv"),
+    "FrankaRobotConfig": ("franka", "FrankaRobotConfig"),
+    "FrankaRobotState": ("franka", "FrankaRobotState"),
+    "DualFrankaEnv": ("franka.dual_franka_env", "DualFrankaEnv"),
+    "DualFrankaRobotConfig": ("franka.dual_franka_env", "DualFrankaRobotConfig"),
+    "DualFrankaJointEnv": ("franka.tasks.dual_franka_joint_env", "DualFrankaJointEnv"),
+    "DualFrankaJointRobotConfig": (
+        "franka.tasks.dual_franka_joint_env",
+        "DualFrankaJointRobotConfig",
+    ),
+    "DualFrankaTCPEnv": ("franka.tasks.dual_franka_tcp_env", "DualFrankaTCPEnv"),
+    "DualFrankaTCPRobotConfig": (
+        "franka.tasks.dual_franka_tcp_env",
+        "DualFrankaTCPRobotConfig",
+    ),
+    "DOSW1Config": ("dosw1", "DOSW1Config"),
+    "DOSW1Env": ("dosw1", "DOSW1Env"),
+    "GimArmEnv": ("gim_arm", "GimArmEnv"),
+    "GimArmRobotConfig": ("gim_arm", "GimArmRobotConfig"),
+    "GimArmRobotState": ("gim_arm", "GimArmRobotState"),
+    "Turtle2Env": ("xsquare", "Turtle2Env"),
+    "Turtle2RobotConfig": ("xsquare", "Turtle2RobotConfig"),
+    "Turtle2RobotState": ("xsquare", "Turtle2RobotState"),
+    "franka_tasks": ("franka.tasks", None),
+    "dosw1_tasks": ("dosw1.tasks", None),
+    "gim_arm_tasks": ("gim_arm.tasks", None),
+    "xsquare_tasks": ("xsquare.tasks", None),
+}
+
+
+def __getattr__(name: str):
+    if name not in _EXPORTS:
+        raise AttributeError(name)
+    module, symbol = _EXPORTS[name]
+    loaded = import_module(f"{__name__}.{module}")
+    result = loaded if symbol is None else getattr(loaded, symbol)
+    globals()[name] = result
+    return result
+
+
+def register_realworld_tasks() -> None:
+    """Register existing Gym tasks at explicit environment construction time."""
+    for name in ("franka.tasks", "dosw1.tasks", "gim_arm.tasks", "xsquare.tasks"):
+        import_module(f"{__name__}.{name}")
+
+
+__all__ = list(_EXPORTS) + ["register_realworld_tasks"]

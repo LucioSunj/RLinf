@@ -13,17 +13,12 @@
 # limitations under the License.
 
 import copy
-import os
-import pathlib
-import time
 from functools import partial
 from typing import OrderedDict
 
 import gymnasium as gym
 import numpy as np
-import psutil
 import torch
-from filelock import FileLock
 from omegaconf import OmegaConf
 
 from rlinf.envs.realworld.venv import NoAutoResetSyncVectorEnv
@@ -83,29 +78,13 @@ class RealWorldEnv(gym.Env):
 
     @staticmethod
     def realworld_setup():
-        """Setup RealWorld environment upon env class import.
+        """Register tasks explicitly, without killing another job's ROS processes."""
+        from rlinf.envs.realworld import register_realworld_tasks
 
-        This is for any node-level setup required by RealWorld environments. For example, ROS
-        requires a single roscore instance per node, so we ensure that any existing roscore
-        processes are terminated before starting a new one.
-
-        This function is called once when the RealWorldEnv class is first imported.
-        """
-        # Concurrency control is needed for multiple processes on the same node
-        node_lock_file = "/tmp/.realworld.lock"
-        # Check if the path is valid
-        if not os.path.exists(os.path.dirname(node_lock_file)):
-            node_lock_file = os.path.join(pathlib.Path.home(), ".realworld.lock")
-        node_lock = FileLock(node_lock_file)
-
-        with node_lock:
-            ros_proc_names = ["roscore", "rosmaster", "rosout"]
-            for proc in psutil.process_iter():
-                if proc.name() in ros_proc_names:
-                    proc.kill()
-                    time.sleep(0.5)
+        register_realworld_tasks()
 
     def _init_env(self):
+        self.realworld_setup()
         env_fns = [
             partial(self._create_env, env_idx=env_idx)
             for env_idx in range(self.num_envs)
