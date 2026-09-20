@@ -1,141 +1,49 @@
-# Reference: Example RST Template and Index Snippets
+# Example placement and source guidance
 
-## Minimal RST template for a new example
+## Placement and navigation
 
-```rst
-RL with [Benchmark Name] / RL on [Model Name]
-=============================================
+Both language trees use
+`docs/source-<en|zh>/rst_source/examples/<category>/<name>.rst`.
+Choose the owning index by the reader's starting point:
 
-.. |huggingface| image:: /_static/svg/hf-logo.svg
-   :width: 16px
-   :height: 16px
-   :class: inline-icon
+| Example | Category | Owning index under `examples/` |
+|---|---|---|
+| Simulator or benchmark | `embodied` | `simulators_index.rst` |
+| Physical robot | `embodied` | `real_world_index.rst` |
+| Model or policy family | `embodied` | `vla_wam_index.rst` |
+| Training method | `embodied` | `methods_index.rst` |
+| SFT recipe | `embodied` | `sft_index.rst` |
+| Agent/reasoning example | `agentic` | `agentic/index.rst` |
+| System/placement example | `system` | `system/index.rst` |
 
-This document provides a guide to [model] training in the [environment] using RLinf.
+The embodied gallery indexes live directly under `examples/`; an entry is
+`embodied/<name>`. Entries in `agentic/index.rst` or `system/index.rst` are
+relative to that category. The top-level `examples/index.rst` routes to galleries
+and usually does not change for a single new example.
 
-Environment
------------
+Use the current category index's hidden toctree plus visible cards/table. Register
+the page once in its owning gallery, with the same placement and order in EN/ZH.
+For Franka variants, use the existing nested Franka hierarchy rather than adding
+another top-level robot category.
 
-**[Environment Name]**
+Page anatomy and gallery card schemas are maintained in
+[docs/STYLE_GUIDE.md](../../../docs/STYLE_GUIDE.md#example--recipe-page-requirements).
+Use that guide and a current sibling such as
+[LIBERO](../../../docs/source-en/rst_source/examples/embodied/libero.rst);
+do not reuse the obsolete Environment/Algorithm/Quick Start template.
 
-- **Environment**: [one line]
-- **Task**: [one line]
-- **Observation**: [image size, state dims]
-- **Action Space**: [dim and description]
+## Sources and links
 
-**Task Description Format**
+For embodied training, inspect `examples/embodiment/run_embodiment.sh` and the
+selected YAML before documenting its invocation. Reasoning, async, and SFT
+recipes use their own entrypoints. Verify the actual config name and source path.
 
-.. code-block:: text
+Standalone benchmark evaluation belongs in `rst_source/evaluations/`; link to
+the appropriate guide. Use relative `:doc:` references from the page's actual
+directory. Technical tokens and metric values stay identical in the EN/ZH pair.
 
-   [In/Out format if applicable]
-
-**Data Structure**
-
-- **Images**: shape ``[batch_size, H, W, 3]``
-- **Task Descriptions**: Natural-language instructions
-- **Actions** / **Rewards**: as applicable
-
-Algorithm
----------
-
-**Core Algorithm Components**
-
-1. **PPO** (or GRPO, etc.) — bullet points
-2. **Model** — short note
-
-Dependency Installation
------------------------
-
-1. Clone and install (see existing examples for Docker vs pip blocks).
-
-Quick Start
------------
-
-**Training**
-
-.. code-block:: bash
-
-   bash examples/embodiment/train_embodiment.sh <config_name>
-
-**Key config**: mention main YAML and important keys (e.g. ``rollout.model.model_path``, ``env.*``).
-
-Evaluation (optional)
----------------------
-
-.. code-block:: bash
-
-   bash evaluations/run_eval.sh <benchmark> <eval_config_name>
-```
-
-## Index toctree entry
-
-In `docs/source-en/rst_source/examples/index.rst`, add the module name (no `.rst`) to the toctree:
-
-```rst
-.. toctree::
-   :hidden:
-   :maxdepth: 2
-
-   ...
-   <name>   # e.g. dexbotic
-```
-
-## Gallery card (optional)
-
-Same HTML block pattern as existing cards; one card:
-
-```html
-<div style="flex: 1 1 30%; max-width: 300px; text-align: center;">
-  <img src="https://..." style="width: 100%; height: 200px; object-fit: cover; border-radius: 8px; box-shadow: 0 2px 6px rgba(0,0,0,0.15);" />
-  <p style="margin-top: 8px; font-size: 14px; line-height: 1.4;">
-    <a href="https://rlinf.readthedocs.io/en/latest/rst_source/examples/<name>.html" target="_blank" style="text-decoration: underline; color: blue;">
-      <b>Display Title</b>
-    </a><br>
-    Short description
-  </p>
-</div>
-```
-
-Place inside an existing `.. raw:: html` block in the right section (Embodied Intelligence / Reasoning / Agent).
-
-## README updates (required)
-
-Update both READMEs so the new example is visible on the repo front page.
-
-**What's NEW! / 最新动态** — Add a new bullet at the **top** of the list (below the section heading):
-
-- **README.md** (English):  
-  `- [YYYY/MM] 🔥 RLinf supports ... [Project Name](https://github.com/...). Doc: [Display Title](https://rlinf.readthedocs.io/en/latest/rst_source/examples/<name>.html).`
-- **README.zh-CN.md** (Chinese):  
-  Same content in Chinese; doc URL must use `https://rlinf.readthedocs.io/zh-cn/latest/rst_source/examples/<name>.html`.
-
-Use the current year/month for the date. Match the tone of existing bullets (e.g. "RLinf supports reinforcement learning fine-tuning for [X]" / "基于[X]的强化学习微调已经上线！文档：...").
-
-**Key Features / 核心特性 table** — If the example is a simulator, model, or real-world platform, add it to the matching list in the Embodied AI / 具身智能 table:
-
-- **Simulators / 模拟器**: `<li><a href=".../examples/<name>.html">Display Name</a> ✅</li>` (README.md uses `/en/`, README.zh-CN.md uses `/zh-cn/` in the base URL).
-- **Models / 模型** (VLA, World Model, etc.): add under the appropriate sub-list.
-- **Real-world / 真机**: add if the example is real-robot.
-
-Place the new `<li>...</li>` above the "More..." / "更多..." item when present.
-
-## Evaluation section entry
-
-```rst
-:doc:`Display Name <../examples/<category>/<name>>`
-```
-
-## Chinese documentation (required)
-
-Add a matching RST and index entry for Chinese:
-
-- **RST**: `docs/source-zh/rst_source/examples/<name>.rst` — same structure as the English file; mirror sections and adapt links (e.g. `/en/` → `/zh/` in doc URLs if applicable).
-- **Index**: `docs/source-zh/rst_source/examples/index.rst` — add `<name>` to the toctree; add a gallery card in the same category if one was added for English.
-- **Evaluation**: If the example is an embodied eval environment, update the matching Chinese page under `docs/source-zh/rst_source/evaluations/`.
-
-Use existing en/zh pairs (e.g. `docs/source-en/rst_source/examples/libero.rst` and `docs/source-zh/rst_source/examples/libero.rst`) as reference.
-
-## Existing examples to copy from
-
-- **English**: `docs/source-en/rst_source/examples/` — e.g. `libero.rst`, `maniskill.rst`, `pi0.rst`, `gr00t.rst`
-- **Chinese**: `docs/source-zh/rst_source/examples/` — same filenames; use as pairs with the English versions
+For new supported capabilities, update both README announcement/feature entries.
+README links are public URLs, for example
+`https://rlinf.readthedocs.io/en/latest/rst_source/examples/embodied/<name>.html`
+and its `/zh-cn/` counterpart. Include the category segment. Use the supported
+capability's actual announcement date; a new doc page alone is not a new release.

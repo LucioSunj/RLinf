@@ -268,8 +268,15 @@ def test_v3_checkpoint_round_trip_preserves_next_decision(tmp_path: Path) -> Non
         changed._load_fastwam_training_guard(str(checkpoint))
 
 
-def test_band_price_v3_checkpoint_round_trip(tmp_path: Path) -> None:
+@pytest.mark.parametrize("in_band_factor", (None, 0.0, 0.2))
+def test_band_price_v3_checkpoint_round_trip(
+    tmp_path: Path, in_band_factor: float | None
+) -> None:
     cfg = _band_cfg(tmp_path)
+    if in_band_factor is not None:
+        cfg.algorithm.fixed_branch_cost.controller.signed_price.in_band_decay_factor = (
+            in_band_factor
+        )
     source_runtime = FastWAMIDMCostControlRuntime.from_config(cfg)
     source_runtime.before_rollout(actor=_BranchActor(), runner_step=0)
     source_runtime.after_rollout(
@@ -288,6 +295,21 @@ def test_band_price_v3_checkpoint_round_trip(tmp_path: Path) -> None:
     assert source_runtime.before_rollout(
         actor=_BranchActor(), runner_step=1
     ) == restored_runtime.before_rollout(actor=_BranchActor(), runner_step=1)
+    records = [
+        runtime.after_rollout(
+            runner_step=1,
+            actor_rollout_metrics=_worker_metrics(probability=0.5),
+            guard_result=_guard_result(),
+        )
+        for runtime in (source_runtime, restored_runtime)
+    ]
+    assert records[0] == records[1]
+    assert source_runtime.state_dict() == restored_runtime.state_dict()
+    changed_cfg = copy.deepcopy(cfg)
+    changed_cfg.algorithm.fixed_branch_cost.controller.signed_price.in_band_decay_factor = 0.5
+    changed_runtime = FastWAMIDMCostControlRuntime.from_config(changed_cfg)
+    with pytest.raises(ValueError, match="config hash mismatch"):
+        changed_runtime.load_state_dict(source_runtime.state_dict(), global_step=2)
 
 
 def test_config_validation_rejects_pipeline_infeasible_target_and_scope_mismatch(
@@ -379,6 +401,7 @@ def test_config_validation_rejects_pipeline_infeasible_target_and_scope_mismatch
             "band_price_reversal_damped",
             0.5,
         ),
+        ("band_price_in_band_decay_b50", "band_price_reversal_damped", 0.5),
     ),
 )
 def test_hydra_cost_control_group_composes_single_explicit_source(
@@ -405,6 +428,8 @@ def test_hydra_cost_control_group_composes_single_explicit_source(
     if name == "band_price_reversal_damped_b50":
         assert controller.signed_price.reversal.mode == "opposing_decay"
         assert controller.signed_price.reversal.factor == pytest.approx(0.5)
+    if name == "band_price_in_band_decay_b50":
+        assert controller.signed_price.in_band_decay_factor == 0.0
     validate_fastwam_idm_cost_control_config(cfg)
 
 

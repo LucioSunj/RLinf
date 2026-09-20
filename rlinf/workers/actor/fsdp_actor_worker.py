@@ -122,6 +122,7 @@ from rlinf.utils.metric_utils import (
     compute_critic_explained_variance_from_stats,
     compute_loss_mask,
     compute_rollout_metrics,
+    materialize_scalar_metrics,
     pop_critic_explained_variance_stats,
 )
 from rlinf.utils.nested_dict_process import (
@@ -1650,22 +1651,38 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
         if adapter is None:
             raise TypeError("FastWAM adaptive policy has no LoRA adapter.")
         previous_lora = adapter.lora_state_dict()
+        video_adapter = getattr(policy, "video_lora_adapter", None)
+        previous_video = (
+            None if video_adapter is None else video_adapter.lora_state_dict()
+        )
         try:
             sidecar_payload = torch.load(
                 resolved_path,
                 map_location="cpu",
                 weights_only=True,
             )
-            expected_lora = sidecar_payload.get("state_dict")
+            action_payload = (
+                sidecar_payload if video_adapter is None else sidecar_payload["action"]
+            )
+            expected_lora = action_payload.get("state_dict")
             if not isinstance(expected_lora, dict) or not expected_lora:
                 raise TypeError("BC LoRA sidecar has no tensor state_dict.")
-            metadata = adapter.load_sidecar(
-                resolved_path,
-                expected_parent_checkpoint_sha256=str(
-                    self.cfg.actor.model.actor_checkpoint_sha256
-                ).lower(),
-                strict=True,
-            )
+            parent_sha256 = str(self.cfg.actor.model.actor_checkpoint_sha256).lower()
+            if video_adapter is None:
+                metadata = adapter.load_sidecar(
+                    resolved_path,
+                    expected_parent_checkpoint_sha256=parent_sha256,
+                    strict=True,
+                )
+            else:
+                from fastwam.uncond_bc_checkpoint import load_uncond_bc_sidecar
+
+                metadata = load_uncond_bc_sidecar(
+                    resolved_path,
+                    adapter=adapter,
+                    video_adapter=video_adapter,
+                    expected_parent_checkpoint_sha256=parent_sha256,
+                )
             extra = metadata.get("extra") if isinstance(metadata, dict) else None
             if not isinstance(extra, dict):
                 raise ValueError("BC LoRA sidecar requires mapping metadata.extra.")
@@ -1683,22 +1700,34 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
                     self.cfg.actor.model.actor_checkpoint_sha256
                 ).lower(),
             )
-            loaded_lora = adapter.lora_state_dict()
-            if set(loaded_lora) != set(expected_lora):
-                raise ValueError("BC LoRA bootstrap tensor names changed on load.")
-            for name, expected_tensor in expected_lora.items():
-                loaded_tensor = loaded_lora[name]
-                if (
-                    not isinstance(expected_tensor, torch.Tensor)
-                    or loaded_tensor.shape != expected_tensor.shape
-                    or loaded_tensor.dtype != expected_tensor.dtype
-                    or not torch.equal(loaded_tensor.cpu(), expected_tensor.cpu())
-                ):
-                    raise ValueError(
-                        f"BC LoRA bootstrap tensor {name!r} is not bitwise equal."
+            branches = [("action", adapter.lora_state_dict(), expected_lora)]
+            if video_adapter is not None:
+                branches.append(
+                    (
+                        "video",
+                        video_adapter.lora_state_dict(),
+                        sidecar_payload["video"]["state_dict"],
                     )
+                )
+            for branch, loaded_lora, expected_state in branches:
+                if set(loaded_lora) != set(expected_state):
+                    raise ValueError("BC LoRA bootstrap tensor names changed on load.")
+                for name, expected_tensor in expected_state.items():
+                    loaded_tensor = loaded_lora[name]
+                    if (
+                        not isinstance(expected_tensor, torch.Tensor)
+                        or loaded_tensor.shape != expected_tensor.shape
+                        or loaded_tensor.dtype != expected_tensor.dtype
+                        or not torch.equal(loaded_tensor.cpu(), expected_tensor.cpu())
+                    ):
+                        raise ValueError(
+                            f"BC LoRA bootstrap tensor {branch}.{name!s} "
+                            "is not bitwise equal."
+                        )
         except Exception:
             adapter.load_lora_state_dict(previous_lora, strict=True)
+            if video_adapter is not None:
+                video_adapter.load_lora_state_dict(previous_video, strict=True)
             raise
 
         self._fastwam_bc_bootstrap = provenance
@@ -4086,6 +4115,11 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
             kv_metrics = self._stop_fastwam_handle_replay()
             append_to_dict(metrics, kv_metrics)
         clear_memory()
+        if (
+            SupportedModel(self.cfg.actor.model.model_type)
+            is SupportedModel.FASTWAM_ADAPTIVE
+        ):
+            materialize_scalar_metrics(metrics)
         self._finalize_train_metrics_before_reduction(metrics)
         explained_variance_stats = pop_critic_explained_variance_stats(metrics)
         weighted_sums = {}
@@ -4137,7 +4171,7 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
         micro_batch: dict,
         output_dict: dict[str, torch.Tensor],
         selected_loss_scales: dict[str, float] | None = None,
-    ) -> tuple[torch.Tensor, dict[str, float]]:
+    ) -> tuple[torch.Tensor, dict[str, float | torch.Tensor]]:
         """Compute independent Gate/Flow PPO losses and the fresh critic loss."""
 
         required_fields = (
@@ -4255,7 +4289,7 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
         metrics.update(critic_metrics)
         metrics["fastwam/total_loss"] = loss.detach()
         return loss, {
-            key: value.detach().item() if isinstance(value, torch.Tensor) else value
+            key: value.detach() if isinstance(value, torch.Tensor) else value
             for key, value in metrics.items()
         }
 
@@ -4278,7 +4312,7 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
     def train_micro_batch(
         self,
         micro_batch: dict[str, torch.Tensor],
-        metrics: dict[str, list[float]],
+        metrics: dict[str, list[float | torch.Tensor]],
         *,
         is_last: bool,
         selected_loss_scales: dict[str, float] | None = None,
@@ -4450,7 +4484,9 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
         if self.enable_sft_co_train:
             loss = self._train_sft_epoch(metrics_data, loss)
 
-        loss /= self.gradient_accumulation
+        # Detached loss metrics share storage with their source tensor.
+        # Normalize out of place so their pre-accumulation values stay intact.
+        loss = loss / self.gradient_accumulation
         with backward_ctx:
             self.grad_scaler.scale(loss).backward()
         if is_fastwam:
@@ -4458,7 +4494,9 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
                 self._restore_fastwam_fsdp_parameter_views_after_backward()
             )
 
-        metrics_data["actor/total_loss"] = loss.detach().item()
+        metrics_data["actor/total_loss"] = (
+            loss.detach() if is_fastwam else loss.detach().item()
+        )
         append_to_dict(metrics, metrics_data)
 
     def set_global_step(self, global_step: int) -> None:

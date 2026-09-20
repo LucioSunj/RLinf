@@ -57,8 +57,11 @@ class CurrentStepRouteTracker:
         self._states: dict[int, _EnvironmentState] = {}
         self._next_episode_ids: dict[int, int] = {}
 
-    def _start_episode(self, env_id: int) -> _EnvironmentState:
-        episode_id = self._next_episode_ids.get(env_id, 0)
+    def _start_episode(
+        self, env_id: int, episode_id: int | None = None
+    ) -> _EnvironmentState:
+        if episode_id is None:
+            episode_id = self._next_episode_ids.get(env_id, 0)
         state = _EnvironmentState(episode_id=episode_id, chunk_id=0)
         self._next_episode_ids[env_id] = episode_id + 1
         self._states[env_id] = state
@@ -70,6 +73,7 @@ class CurrentStepRouteTracker:
         env_ids: torch.Tensor,
         reset_mask: torch.Tensor,
         actor_version: int,
+        episode_ids: torch.Tensor | None = None,
     ) -> CurrentStepRouteIdentity:
         if env_ids.ndim != 1:
             raise ValueError("`env_ids` must be one-dimensional.")
@@ -79,17 +83,30 @@ class CurrentStepRouteTracker:
             raise ValueError("`env_ids` must be unique within one policy batch.")
         if actor_version < 0:
             raise ValueError("`actor_version` must be non-negative.")
+        if episode_ids is not None:
+            if episode_ids.shape != env_ids.shape or episode_ids.dtype not in (
+                torch.int32,
+                torch.int64,
+            ):
+                raise ValueError("Explicit episode IDs must be integer [B] values.")
+            if bool((episode_ids < 0).any()):
+                raise ValueError("Explicit episode IDs must be non-negative.")
+        requested_ids = (
+            [None] * env_ids.numel() if episode_ids is None else episode_ids.tolist()
+        )
         chunks: list[int] = []
         episodes: list[int] = []
-        for raw_env, raw_reset in zip(
-            env_ids.tolist(), reset_mask.tolist(), strict=True
+        for raw_env, raw_reset, requested_id in zip(
+            env_ids.tolist(), reset_mask.tolist(), requested_ids, strict=True
         ):
             env_id = int(raw_env)
             state = self._states.get(env_id)
             if state is None or bool(raw_reset):
                 if state is not None and state.prepared:
                     raise RuntimeError("Cannot reset an uncommitted PAD route.")
-                state = self._start_episode(env_id)
+                state = self._start_episode(env_id, requested_id)
+            elif requested_id is not None and state.episode_id != requested_id:
+                raise ValueError("Explicit episode identity changed without a reset.")
             if state.prepared:
                 raise RuntimeError(f"Environment {env_id} already has a PAD route.")
             state.prepared = True

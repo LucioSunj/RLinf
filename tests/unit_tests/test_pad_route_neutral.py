@@ -55,6 +55,9 @@ from rlinf.models.embodiment.wam_policy.pad_rv.route_neutral_gate import (
 from rlinf.models.embodiment.wam_policy.pad_rv.route_neutral_policy import (
     PadRouteNeutralPolicy,
 )
+from rlinf.models.embodiment.wam_policy.route_neutral_online.config import (
+    validate_route_neutral_online_idm_bc_training_config,
+)
 from rlinf.runners.fastwam_idm_cost_control import FastWAMIDMCostObservation
 
 
@@ -179,6 +182,43 @@ def test_route_neutral_config_rejects_mode_input(monkeypatch) -> None:
     cfg.actor.model.gate.input_contract.forbidden.current_mode = True
     with pytest.raises(ValueError, match="current_mode"):
         validate_pad_route_neutral_training_config(cfg)
+
+
+@pytest.mark.parametrize("online", (False, True))
+@pytest.mark.parametrize("factor", (0.0, 0.2))
+def test_in_band_decay_profile_composes_with_route_neutral_warmup(
+    monkeypatch, online: bool, factor: float
+) -> None:
+    config_dir = _set_config_environment(monkeypatch)
+    config_name = (
+        "libero_10_ppo_fastwam_route_neutral_online_formal"
+        if online
+        else "libero_10_ppo_fastwam_pad_route_neutral_formal"
+    )
+    overrides = [
+        "fastwam_idm_cost_control=pad_route_neutral_warmup_in_band_decay_b50",
+    ]
+    if factor != 0.0:
+        overrides.append(
+            "algorithm.fixed_branch_cost.controller.signed_price.in_band_decay_factor=0.2"
+        )
+    if online:
+        overrides.append("+route_neutral_online_perfopt=task3_28")
+    with initialize_config_dir(version_base="1.1", config_dir=str(config_dir)):
+        cfg = compose(config_name=config_name, overrides=overrides)
+    if online:
+        validate_route_neutral_online_idm_bc_training_config(cfg)
+    else:
+        validate_pad_route_neutral_training_config(cfg)
+    controller = cfg.algorithm.fixed_branch_cost.controller
+    assert controller.type == PAD_WARMUP_DAMPED_CONTROLLER_TYPE
+    assert controller.signed_price.in_band_decay_factor == factor
+    assert controller.signed_price.reversal.factor == (0.0 if online else 0.5)
+    assert controller.rate.target_idm_fraction == 0.5
+    assert controller.rate.half_width == 0.03
+    for owner in (cfg.actor, cfg.rollout):
+        model = owner.model.route_neutral_online if online else owner.model
+        assert controller.critic_warmup == model.critic_warmup
 
 
 def test_route_neutral_config_rejects_actor_rollout_gate_drift(monkeypatch) -> None:
@@ -353,6 +393,37 @@ def test_cost_controller_freezes_history_then_reuses_opposing_decay() -> None:
     assert low_record["update"]["opposing_decay_applied"] is True
     assert low_record["update"]["post_decay_signed_price"] == pytest.approx(
         positive_price * 0.5
+    )
+
+
+@pytest.mark.parametrize("factor", (0.0, 0.2))
+def test_in_band_decay_starts_after_warmup_and_survives_restore(factor: float) -> None:
+    config = _controller_config()
+    config["signed_price"]["in_band_decay_factor"] = factor
+    source = PadCriticWarmupReversalDampedController(config)
+    for step, rate in enumerate((0.9, 0.5)):
+        source.decision_for_step(step)
+        record = source.observe_rollout(_observation(step, rate))
+        assert source.rate_ema is None
+        assert source.signed_price == 0.0
+        assert (
+            source.record_metrics(record)[
+                "fastwam/branch_cost_control/in_band_decay_applied"
+            ]
+            == 0.0
+        )
+    source.decision_for_step(2)
+    source.observe_rollout(_observation(2, 0.9))
+    previous_price = source.signed_price
+    assert previous_price > 0.0
+    source.decision_for_step(3)
+    source.observe_rollout(_observation(3, 0.5))
+    assert source.signed_price == pytest.approx(previous_price * factor)
+    restored = PadCriticWarmupReversalDampedController(config)
+    restored.load_state_dict(source.state_dict())
+    assert restored.decision_for_step(4) == source.decision_for_step(4)
+    assert restored.observe_rollout(_observation(4, 0.5)) == source.observe_rollout(
+        _observation(4, 0.5)
     )
 
 

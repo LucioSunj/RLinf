@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import inspect
 from dataclasses import replace
+from types import SimpleNamespace
 
 import numpy as np
 import pytest
@@ -389,8 +390,11 @@ class _TrainingActionTraceEnv:
         contract,
         *,
         contract_failure_mask=None,
+        active_mask=None,
+        allow_out_of_bounds=False,
     ):
         assert contract is self.action_contract
+        self.allow_out_of_bounds = allow_out_of_bounds
         self.submitted = torch.as_tensor(actions).clone()
         self.contract_failure_mask = (
             torch.zeros(int(actions.shape[0]), dtype=torch.bool)
@@ -442,6 +446,47 @@ def _three_stage_model_trace(actions, contract) -> ActionExecutionTrace:
             )
         )
     )
+
+
+@pytest.mark.parametrize("outcome", ["fail_episode", "execute"])
+def test_eval_worker_execute_mode_passes_raw_outlier_to_traced_environment(
+    monkeypatch, outcome
+) -> None:
+    contract = _contract()
+    environment = _TrainingActionTraceEnv(contract)
+    worker = object.__new__(EnvWorker)
+    worker.cfg = OmegaConf.create(
+        {"env": {"eval": {"env_type": "libero", "auto_reset": False}}}
+    )
+    worker.model_cfg = OmegaConf.create(
+        {"model_type": "fastwam_adaptive", "num_action_chunks": 10, "action_dim": 7}
+    )
+    worker.evaluation_collector = SimpleNamespace(contract_violation_outcome=outcome)
+    worker.eval_env_list = [environment]
+    worker.eval_prev_done = [torch.zeros(1, dtype=torch.bool)]
+    worker.use_external_reward_model = False
+    monkeypatch.setattr(
+        "rlinf.workers.env.env_worker.prepare_actions",
+        lambda *, raw_chunk_actions, **_: raw_chunk_actions,
+    )
+    monkeypatch.setattr(
+        "rlinf.workers.env.env_worker.get_env_attr",
+        lambda owner, name: getattr(owner, name),
+    )
+    actions = torch.zeros(1, 10, 7)
+    actions[:, :, 0] = 1.083984375
+    if outcome == "fail_episode":
+        with pytest.raises(ValueError, match="Refusing to submit"):
+            worker.env_evaluate_step(actions, 0)
+        assert environment.submitted is None
+    else:
+        result, _ = worker.env_evaluate_step(actions, 0)
+        assert torch.equal(environment.submitted, actions)
+        assert environment.allow_out_of_bounds is True
+        assert not result.dones.any()
+        assert (
+            int(result.action_execution_trace.stages[-1].above_high_count[0, 0]) == 10
+        )
 
 
 def test_guarded_env_step_combines_exact_five_stage_trace_without_clamp(

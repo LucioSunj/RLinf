@@ -261,3 +261,44 @@ def test_initial_checkpoint_export_rejects_rank_16_sidecar_for_rank_32_rl(
 
     with pytest.raises(ValueError, match="contract mismatch.*rank"):
         validate_initial_checkpoint_export_config(cfg, actor_world_size=1)
+
+
+@pytest.mark.parametrize("invalid_branch", [None, "action", "video"])
+def test_dual_bootstrap_validates_each_branch_before_actor_allocation(
+    tmp_path: Path, invalid_branch: str | None
+) -> None:
+    import copy
+
+    from fastwam.adapters import VIDEO_BC_LORA_SIDECAR_SCHEMA
+    from fastwam.uncond_bc_checkpoint import DUAL_UNCOND_BC_SIDECAR_SCHEMA
+
+    sidecar = tmp_path / "dual.pt"
+    _write_sidecar(sidecar, rank=128)
+    action = torch.load(sidecar, weights_only=True)
+    action["metadata"].update(alpha=128.0, extra={"bc_step": 1942})
+    video = copy.deepcopy(action)
+    video["metadata"]["schema"] = VIDEO_BC_LORA_SIDECAR_SCHEMA
+    payload = {
+        "schema": DUAL_UNCOND_BC_SIDECAR_SCHEMA,
+        "action": action,
+        "video": video,
+    }
+    if invalid_branch is not None:
+        payload[invalid_branch]["metadata"]["rank"] = 16
+    torch.save(payload, sidecar)
+    cfg = _cfg(tmp_path / "native")
+    cfg.actor.model.uncond_lora.rank = 128
+    cfg.actor.model.uncond_lora.alpha = 128.0
+    cfg.actor.model.video_lora = copy.deepcopy(cfg.actor.model.uncond_lora)
+    cfg.runner.bootstrap_uncond_lora_sidecar = str(sidecar)
+    cfg.runner.bootstrap_uncond_lora_sidecar_sha256 = hashlib.sha256(
+        sidecar.read_bytes()
+    ).hexdigest()
+    actor = _ActorGroup()
+    if invalid_branch is None:
+        export_initial_actor_checkpoint(cfg, actor_group=actor, actor_world_size=1)
+        assert actor.calls[1][0] == "bootstrap_fastwam_uncond_lora"
+    else:
+        with pytest.raises(ValueError, match="contract mismatch.*rank"):
+            export_initial_actor_checkpoint(cfg, actor_group=actor, actor_world_size=1)
+        assert actor.calls == []

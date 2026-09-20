@@ -1201,6 +1201,8 @@ class LiberoEnv(gym.Env):
     def _validate_submitted_actions(
         statistics: ActionStageStatistics,
         contract: LiberoActionContract,
+        *,
+        allow_out_of_bounds: bool = False,
     ) -> None:
         """Reject invalid active-slot Actions before the underlying env step."""
         validate_action_stage_contract(
@@ -1208,6 +1210,7 @@ class LiberoEnv(gym.Env):
             dimension_names=contract.dimension_names,
             low=contract.low,
             high=contract.high,
+            allow_out_of_bounds=allow_out_of_bounds,
         )
 
     def step(self, actions=None, auto_reset=True, active_mask=None):
@@ -1228,7 +1231,7 @@ class LiberoEnv(gym.Env):
 
         capture = self._action_submission_capture
         if capture is not None:
-            contract, records = capture
+            contract, records, allow_out_of_bounds = capture
             statistics = ActionStageStatistics.from_values(
                 stage=SUBMITTED_LIBERO_ACTION_STAGE,
                 values=actions[:, None, :],
@@ -1243,7 +1246,11 @@ class LiberoEnv(gym.Env):
                 else statistics
             )
             records.append(submitted_statistics)
-            self._validate_submitted_actions(submitted_statistics, contract)
+            self._validate_submitted_actions(
+                submitted_statistics,
+                contract,
+                allow_out_of_bounds=allow_out_of_bounds,
+            )
 
         self._elapsed_steps[active_indices] += 1
         if active_mask.all():
@@ -1305,12 +1312,15 @@ class LiberoEnv(gym.Env):
         active_mask=None,
         *,
         contract_failure_mask=None,
+        allow_out_of_bounds: bool = False,
     ):
         """Execute a chunk while reducing only actually submitted Actions.
 
         Contract-failure slots are never passed to the underlying environment.
         They become zero-reward true terminations and are reset independently,
         so value bootstrapping is disabled while the other vector slots run.
+        Explicit evaluation may submit finite out-of-range values unchanged
+        for the underlying controller to handle, while retaining their trace.
         """
 
         if not isinstance(action_contract, LiberoActionContract):
@@ -1326,7 +1336,11 @@ class LiberoEnv(gym.Env):
             batch_size=self.num_envs,
         )
         records: list[ActionStageStatistics] = []
-        self._action_submission_capture = (action_contract, records)
+        self._action_submission_capture = (
+            action_contract,
+            records,
+            allow_out_of_bounds,
+        )
         try:
             result = self.chunk_step(
                 chunk_actions,

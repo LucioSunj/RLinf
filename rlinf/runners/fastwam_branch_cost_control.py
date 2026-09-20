@@ -265,6 +265,9 @@ class SignedBandPriceController(LaggedBranchCostControllerBase):
         self.signed_price = _finite(
             signed.get("initial_value", 0.0), name="initial signed price"
         )
+        self.in_band_decay_factor = _finite(
+            signed.get("in_band_decay_factor", 1.0), name="in-band decay factor"
+        )
         self._validate_config()
         self.rate_ema: float | None = None
         self.updates_since_last_update = 0
@@ -300,6 +303,8 @@ class SignedBandPriceController(LaggedBranchCostControllerBase):
             raise ValueError("Maximum signed-price delta is invalid.")
         if not -self.max_abs_value <= self.signed_price <= self.max_abs_value:
             raise ValueError("Initial signed price is outside projection bounds.")
+        if not 0.0 <= self.in_band_decay_factor <= 1.0:
+            raise ValueError("In-band decay factor must lie in [0, 1].")
 
     def _build_decision(self, runner_step: int) -> FastWAMBranchCostDecision:
         idm_cost = max(self.signed_price, 0.0)
@@ -361,8 +366,18 @@ class SignedBandPriceController(LaggedBranchCostControllerBase):
         applied_delta = 0.0
         clipped = False
         update_metadata: dict[str, float | bool] = {}
+        in_band_decay = error == 0.0 and self.in_band_decay_factor < 1.0
         self.updates_since_last_update += 1
-        if self.updates_since_last_update >= self.update_interval:
+        if in_band_decay:
+            # Release stale pressure on every in-band observation. This only
+            # reduces price magnitude, so bypass the accumulation interval and
+            # delta cap: factor=0 must actually clear both next-rollout costs.
+            self.updates_since_last_update = 0
+            next_price = self.signed_price * self.in_band_decay_factor
+            raw_delta = next_price - self.signed_price
+            applied_delta = raw_delta
+            self.signed_price = next_price
+        elif self.updates_since_last_update >= self.update_interval:
             self.updates_since_last_update = 0
             base_price, update_metadata = self._base_price_for_error(error)
             feedback_delta = self.learning_rate * error
@@ -384,6 +399,14 @@ class SignedBandPriceController(LaggedBranchCostControllerBase):
                 self.negative_projection_count += 1
             applied_delta = projected - self.signed_price
             self.signed_price = projected
+        if self.in_band_decay_factor < 1.0:
+            update_metadata.update(
+                {
+                    "in_band_decay_applied": in_band_decay,
+                    "in_band_decay_factor": self.in_band_decay_factor,
+                    "in_band_decay_delta": applied_delta if in_band_decay else 0.0,
+                }
+            )
         self.last_applied_delta = applied_delta
         return {
             "observed": {
@@ -407,7 +430,7 @@ class SignedBandPriceController(LaggedBranchCostControllerBase):
         applied = record["applied"]
         observed = record["observed"]
         update = record["update"]
-        return {
+        metrics = {
             "fastwam/branch_cost_control/signed_price": float(
                 applied["components"]["signed_price"]
             ),
@@ -423,6 +446,21 @@ class SignedBandPriceController(LaggedBranchCostControllerBase):
             "fastwam/branch_cost_control/inside_band": float(update["inside_band"]),
             "fastwam/branch_cost_control/projection_hit": float(update["clipped"]),
         }
+        if self.in_band_decay_factor < 1.0:
+            metrics.update(
+                {
+                    "fastwam/branch_cost_control/in_band_decay_applied": float(
+                        update.get("in_band_decay_applied", False)
+                    ),
+                    "fastwam/branch_cost_control/in_band_decay_factor": (
+                        self.in_band_decay_factor
+                    ),
+                    "fastwam/branch_cost_control/in_band_decay_delta": float(
+                        update.get("in_band_decay_delta", 0.0)
+                    ),
+                }
+            )
+        return metrics
 
     def state_dict(self) -> dict[str, Any]:
         if self._pending is not None:

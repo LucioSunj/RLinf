@@ -271,6 +271,97 @@ def test_reversal_damped_band_price_rejects_invalid_factor(factor: float) -> Non
         ReversalDampedBandPriceController(_reversal_damped_config(factor=factor))
 
 
+@pytest.mark.parametrize("initial_price", (-0.08, 0.08))
+@pytest.mark.parametrize("rate", (0.47, 0.5, 0.53))
+@pytest.mark.parametrize("factor", (0.0, 0.2))
+def test_in_band_decay_releases_both_signs_at_inclusive_edges_without_delay(
+    initial_price: float, rate: float, factor: float
+) -> None:
+    config = _reversal_damped_config()
+    config["signed_price"].update(
+        initial_value=initial_price, in_band_decay_factor=factor, update_interval=3
+    )
+    controller = ReversalDampedBandPriceController(config)
+    decision, record = _advance(controller, 0, rate)
+    # The observed rollout keeps its original cost; only the next one releases.
+    assert decision.components["signed_price"] == initial_price
+    assert record["next"]["components"]["signed_price"] == pytest.approx(
+        initial_price * factor
+    )
+    assert record["update"]["in_band_decay_applied"]
+    assert not record["update"]["clipped"]
+    assert abs(record["update"]["applied_delta"]) > 0.005
+    assert controller.max_delta_clip_count == 0
+    next_decision, repeated = _advance(controller, 1, rate)
+    _assert_branch_identity(next_decision)
+    assert repeated["next"]["components"]["signed_price"] == pytest.approx(
+        initial_price * factor**2
+    )
+    if factor == 0.0:
+        assert next_decision.idm_cost == next_decision.uncond_cost == 0.0
+    metrics = controller.record_metrics(record)
+    assert metrics["fastwam/branch_cost_control/in_band_decay_applied"] == 1.0
+    assert metrics["fastwam/branch_cost_control/in_band_decay_delta"] == pytest.approx(
+        initial_price * (factor - 1.0)
+    )
+
+
+def test_in_band_decay_uses_configured_ema_and_restarts_outside_interval() -> None:
+    config = _config(ema_beta=0.5, update_interval=3)
+    config["signed_price"].update(initial_value=0.08, in_band_decay_factor=0.0)
+    controller = SignedBandPriceController(config)
+    _advance(controller, 0, 0.8)
+    _, raw_inside = _advance(controller, 1, 0.5)
+    assert raw_inside["observed"]["rate_ema"] == pytest.approx(0.65)
+    assert not raw_inside["update"]["in_band_decay_applied"]
+    _, ema_inside = _advance(controller, 2, 0.35)
+    assert ema_inside["observed"]["rate_ema"] == pytest.approx(0.5)
+    assert ema_inside["next"]["idm_cost"] == 0.0
+    for step in (3, 4):
+        _, waiting = _advance(controller, step, 0.9)
+        assert waiting["next"]["idm_cost"] == 0.0
+    _, resumed = _advance(controller, 5, 0.9)
+    assert resumed["next"]["idm_cost"] > 0.0
+
+
+@pytest.mark.parametrize("rate", (0.2, 0.8))
+def test_in_band_decay_preserves_outside_reversal_and_delta_cap(rate: float) -> None:
+    legacy_config = _reversal_damped_config()
+    legacy_config["signed_price"]["initial_value"] = 0.08
+    decay_config = copy.deepcopy(legacy_config)
+    decay_config["signed_price"]["in_band_decay_factor"] = 0.0
+    legacy = ReversalDampedBandPriceController(legacy_config)
+    decay = ReversalDampedBandPriceController(decay_config)
+    _, legacy_record = _advance(legacy, 0, rate)
+    _, decay_record = _advance(decay, 0, rate)
+    assert decay_record["next"] == legacy_record["next"]
+    assert not decay_record["update"]["in_band_decay_applied"]
+    assert abs(decay_record["update"]["applied_delta"]) <= 0.005 + 1.0e-15
+    assert decay.reversal_decay_count == legacy.reversal_decay_count
+
+
+@pytest.mark.parametrize("factor", (None, 1.0))
+def test_legacy_band_price_keeps_nonzero_price_inside_band(
+    factor: float | None,
+) -> None:
+    config = _reversal_damped_config()
+    config["signed_price"]["initial_value"] = 0.08
+    if factor is not None:
+        config["signed_price"]["in_band_decay_factor"] = factor
+    controller = ReversalDampedBandPriceController(config)
+    _, record = _advance(controller, 0, 0.5)
+    assert controller.signed_price == 0.08
+    assert "in_band_decay_applied" not in record["update"]
+
+
+@pytest.mark.parametrize("factor", (-0.1, 1.1, float("nan"), float("inf")))
+def test_in_band_decay_rejects_invalid_retention_factor(factor: float) -> None:
+    config = _config()
+    config["signed_price"]["in_band_decay_factor"] = factor
+    with pytest.raises(ValueError, match="[Ii]n-band decay factor"):
+        SignedBandPriceController(config)
+
+
 def test_legacy_idm_adapter_preserves_delegate_state_and_decision() -> None:
     dual_config = {
         "type": "budget_dual",

@@ -11,8 +11,7 @@ from typing import Any
 import torch
 
 from rlinf.algorithms.fastwam_dual_ppo import (
-    compute_gate_ppo_loss,
-    compute_uncond_flow_ppo_loss,
+    clipped_ppo_objective,
 )
 from rlinf.models.embodiment.wam_policy.contracts import WAMRoute
 
@@ -92,84 +91,93 @@ def summarize_task_rollout(batch: dict[str, Any]) -> dict[str, float]:
 
 @torch.no_grad()
 def accumulate_task_losses(
-    totals: dict[str, float],
+    totals: dict[str, torch.Tensor],
     batch: dict[str, Any],
     output: dict[str, torch.Tensor],
     cfg: Any,
 ) -> None:
-    """Reuse the actual PPO loss functions on detached, task-masked outputs."""
+    """Accumulate detached PPO/BC numerators for all ten tasks on-device."""
 
-    def cpu(value):
-        return value.detach().cpu()
-
-    task_ids = cpu(batch["forward_inputs"]["multitask_task_id"]).long().reshape(-1)
-    route = cpu(batch["route_info"].route_used)
-    outputs = {
-        key: cpu(output[key]).float()
-        for key in (
-            "gate_logprobs",
-            "gate_base_probabilities",
-            "gate_behavior_probabilities",
-            "flow_logprobs",
-            "online_idm_bc_per_sample_loss",
+    task_ids = batch["forward_inputs"]["multitask_task_id"].reshape(-1).long()
+    route = batch["route_info"].route_used
+    by_task = task_ids[None, :] == torch.arange(10, device=task_ids.device)[:, None]
+    gate_mask = batch["gate_valid_mask"].bool().reshape(-1)
+    flow_mask = batch["flow_valid_mask"].bool().reshape(-1) & (
+        route.reshape(-1) == int(WAMRoute.UNCOND)
+    )
+    gate_logprobs = output["gate_logprobs"].detach().float().reshape(-1)
+    gate_old = batch["emitted_gate"].old_logprob.detach().float().reshape(-1)
+    flow_logprobs = output["flow_logprobs"].detach().float()
+    flow_old = batch["prev_logprobs"].detach().float()
+    reduction_dims = tuple(range(route.ndim, flow_logprobs.ndim))
+    if reduction_dims:
+        flow_logprobs = flow_logprobs.sum(dim=reduction_dims)
+        flow_old = flow_old.sum(dim=reduction_dims)
+    objectives = {}
+    for owner, log_ratio, advantage, clip_cfg in (
+        (
+            "gate",
+            gate_logprobs - gate_old,
+            batch["gate_advantages"],
+            cfg.algorithm.gate_ppo,
+        ),
+        (
+            "flow",
+            (flow_logprobs - flow_old).reshape(-1),
+            batch["flow_advantages"],
+            cfg.algorithm.uncond_flow_ppo,
+        ),
+    ):
+        objectives[owner] = clipped_ppo_objective(
+            log_ratio.exp(),
+            advantage.detach().float().reshape(-1),
+            clip_ratio_low=float(clip_cfg.clip_ratio_low),
+            clip_ratio_high=float(clip_cfg.clip_ratio_high),
         )
-    }
-    for task in task_ids.unique().tolist():
-        selected = task_ids == task
-        gate_mask = cpu(batch["gate_valid_mask"]).bool().reshape(-1) & selected
-        flow_mask = cpu(batch["flow_valid_mask"]).bool().reshape(-1) & selected
-        _, gate = compute_gate_ppo_loss(
-            logprobs=outputs["gate_logprobs"],
-            old_logprobs=cpu(batch["emitted_gate"].old_logprob).float(),
-            advantages=cpu(batch["gate_advantages"]).float().reshape(-1),
-            valid_mask=gate_mask,
-            clip_ratio_low=float(cfg.algorithm.gate_ppo.clip_ratio_low),
-            clip_ratio_high=float(cfg.algorithm.gate_ppo.clip_ratio_high),
-            base_probabilities=outputs["gate_base_probabilities"],
-            behavior_probabilities=outputs["gate_behavior_probabilities"],
-        )
-        _, flow = compute_uncond_flow_ppo_loss(
-            logprobs=outputs["flow_logprobs"],
-            old_logprobs=cpu(batch["prev_logprobs"]).float(),
-            advantages=cpu(batch["flow_advantages"]).float(),
-            route_used=route,
-            valid_mask=flow_mask,
-            clip_ratio_low=float(cfg.algorithm.uncond_flow_ppo.clip_ratio_low),
-            clip_ratio_high=float(cfg.algorithm.uncond_flow_ppo.clip_ratio_high),
-        )
-        for owner, values, original in (
-            ("gate", gate, "gate"),
-            ("flow", flow, "uncond_flow"),
-        ):
-            count = float(values[f"{original}/sample_count"])
-            for name, value in (
-                ("count", count),
-                ("loss_sum", float(values[f"{original}/policy_loss"]) * count),
-            ):
-                key = f"task/{task}/{owner}_{name}"
-                totals[key] = totals.get(key, 0.0) + value
-        bc_mask = flow_mask & (route == int(WAMRoute.UNCOND))
-        for name, value in (
-            ("count", float(bc_mask.sum())),
+    objectives["bc"] = (
+        output["online_idm_bc_per_sample_loss"].detach().float().reshape(-1)
+    )
+    for owner, valid in (("gate", gate_mask), ("flow", flow_mask), ("bc", flow_mask)):
+        selected = by_task & valid[None, :]
+        for suffix, value in (
+            ("count", selected.sum(dim=1).double()),
             (
                 "loss_sum",
-                float(outputs["online_idm_bc_per_sample_loss"][bc_mask].sum()),
+                torch.where(selected, objectives[owner][None, :], 0)
+                .double()
+                .sum(dim=1),
             ),
         ):
-            key = f"task/{task}/bc_{name}"
-            totals[key] = totals.get(key, 0.0) + value
+            key = f"{owner}_{suffix}"
+            if key in totals:
+                totals[key].add_(value)
+            else:
+                totals[key] = value
 
 
-def finalize_task_losses(totals: dict[str, float]) -> dict[str, float]:
-    """Convert additive counts and loss numerators into task-conditioned means."""
+def finalize_task_losses(totals: dict[str, torch.Tensor]) -> dict[str, float]:
+    """Transfer additive statistics once and recover the original task means."""
 
+    keys = [
+        (owner, suffix)
+        for owner in ("gate", "flow", "bc")
+        for suffix in ("count", "loss_sum")
+    ]
+    values = (
+        torch.stack([totals[f"{owner}_{suffix}"] for owner, suffix in keys])
+        .cpu()
+        .tolist()
+        if totals
+        else [[0.0] * 10 for _ in keys]
+    )
+    accumulated = dict(zip(keys, values, strict=True))
     metrics = {}
     for task in range(10):
         for owner in ("gate", "flow", "bc"):
             prefix = f"task/{task}/{owner}"
-            count = totals.get(f"{prefix}_count", 0.0)
+            count = accumulated[owner, "count"][task]
             metrics[f"{prefix}_sample_count"] = count
-            metrics[f"{prefix}_raw_loss"] = totals.get(f"{prefix}_loss_sum", 0.0) / max(
+            metrics[f"{prefix}_raw_loss"] = accumulated[owner, "loss_sum"][task] / max(
                 count, 1.0
             )
     return metrics

@@ -56,7 +56,7 @@ EPISODE_SCHEMA = "fastwam-libero-eval-episode-v1"
 COMPLETED_EPISODE_SCHEMA = "fastwam-libero-eval-completed-episode-v1"
 PROGRESS_SCHEMA = "fastwam-libero-eval-progress-v1"
 NOISE_SEED_MODES = {"stateless_per_chunk", "fixed_per_episode"}
-CONTRACT_VIOLATION_OUTCOMES = {"raise", "fail_episode"}
+CONTRACT_VIOLATION_OUTCOMES = {"raise", "fail_episode", "execute"}
 _IDENTITY_FIELDS_V1 = (
     "task_suite",
     "task_id",
@@ -296,7 +296,7 @@ class FastWAMLiberoEvalCollector:
         fixed_idm_cost: float,
         decision_telemetry_enabled: bool = False,
         noise_seed_mode: str = "stateless_per_chunk",
-        contract_violation_outcome: str = "raise",
+        contract_violation_outcome: str = "execute",
         resume: bool = False,
         policy_checkpoint_sha256: str | None = None,
         evaluation_runtime_identity: Mapping[str, Any] | None = None,
@@ -360,7 +360,7 @@ class FastWAMLiberoEvalCollector:
             raise ValueError("fixed_idm_cost must be finite and non-negative.")
         if self.contract_violation_outcome not in CONTRACT_VIOLATION_OUTCOMES:
             raise ValueError(
-                "contract_violation_outcome must be 'raise' or 'fail_episode'."
+                "contract_violation_outcome must be 'raise', 'fail_episode', or 'execute'."
             )
         if self.policy_checkpoint_sha256 is not None and not _valid_sha256(
             self.policy_checkpoint_sha256
@@ -680,11 +680,20 @@ class FastWAMLiberoEvalCollector:
         result["obs"] = dict(data["obs"])
         action_seeds = []
         idm_seeds = []
+        episode_ids = []
         for slot in snapshot.slots:
             entry = slot.entry
             if entry is None:
                 state = self._states[(slot.stage_id, slot.local_env_index)]
                 entry = state.entry
+            episode_ids.append(
+                int(
+                    entry.get(
+                        "episode_index",
+                        self._ledger_order[str(entry["episode_identity"])],
+                    )
+                )
+            )
             if self.noise_seed_mode == "fixed_per_episode":
                 action_seeds.append(int(entry["action_noise_seed"]))
                 idm_seeds.append(int(entry["idm_video_noise_seed"]))
@@ -713,6 +722,11 @@ class FastWAMLiberoEvalCollector:
         result["obs"]["_fastwam_idm_noise_seeds"] = torch.tensor(
             idm_seeds,
             dtype=torch.long,
+        )
+        # Continuation ledgers retain the original shard-local episode indices,
+        # keeping stochastic Gate draws tied to the same episode after restart.
+        result["obs"]["_fastwam_evaluation_episode_ids"] = torch.tensor(
+            episode_ids, dtype=torch.long
         )
         batch_size = len(snapshot.slots)
         contract = snapshot.action_contract
@@ -995,6 +1009,12 @@ class FastWAMLiberoEvalCollector:
                 "action_contract_sha256": (snapshot.action_contract.canonical_sha256),
                 "action_trace": action_trace.record_for_batch_index(index),
             }
+            if self.contract_violation_outcome == "execute":
+                submitted = action_trace.stages[-1]
+                record["action_bounds_exceeded"] = bool(
+                    (submitted.below_low_count[index] > 0).any()
+                    or (submitted.above_high_count[index] > 0).any()
+                )
             _canonical_bytes(record)
             state.chunks.append(record)
             self._chunks.append(record)
@@ -1073,9 +1093,14 @@ class FastWAMLiberoEvalCollector:
                 raise ValueError(
                     "Episode id or actor version changed within a rejected episode."
                 )
-            if bool(emitted.valid[index]):
+            current_step = bool(
+                not route.route_was_forced[index]
+                and route.route_source_chunk_ids[index] == route.chunk_ids[index]
+            )
+            if bool(emitted.valid[index]) != current_step:
                 raise ValueError(
-                    "Rejected terminal chunks must discard their emitted Gate decision."
+                    "Rejected terminal chunks must preserve current-step Gate "
+                    "decisions and discard unused next-step decisions."
                 )
             probability = float(emitted.base_probability[index])
             if not math.isfinite(probability):
@@ -1118,7 +1143,7 @@ class FastWAMLiberoEvalCollector:
                     configured_idm_cost=None,
                     destination_advantage_unnormalized=None,
                     destination_advantage_normalized=None,
-                    eligible_decision=False,
+                    eligible_decision=current_step,
                 )
             per_environment_audit = {
                 **failure_audit,
@@ -1169,9 +1194,9 @@ class FastWAMLiberoEvalCollector:
                 ),
                 "routing_mode": selection.mode.value,
                 "random_draw": random_draw,
-                "emitted_decision_consumed": False,
-                "emitted_decision_discarded": True,
-                "eligible_decision": False,
+                "emitted_decision_consumed": current_step,
+                "emitted_decision_discarded": not current_step,
+                "eligible_decision": current_step,
                 **(
                     {"decision_telemetry": decision_telemetry}
                     if self.decision_telemetry_enabled
@@ -1289,6 +1314,10 @@ class FastWAMLiberoEvalCollector:
             "terminal": True,
             "chunk_record_ids": [chunk["record_id"] for chunk in chunks],
         }
+        if self.contract_violation_outcome == "execute":
+            episode["action_bounds_exceeded_chunk_count"] = sum(
+                bool(chunk["action_bounds_exceeded"]) for chunk in chunks
+            )
         _canonical_bytes(episode)
         self._persist_completed_episode(episode=episode, chunks=chunks)
         self._episodes.append(episode)

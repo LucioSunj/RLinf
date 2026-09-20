@@ -241,6 +241,17 @@ class RouteNeutralOnlineIDMBCFSDPActor(OnlineIDMBCFSDPActor):
     def _release_consumed_rollout_batch_before_receive(self) -> None:
         """Drop the previous update's replay before receiving the next one."""
 
+        self._release_consumed_rollout_batch(phase="pre_trajectory_receive")
+
+    async def sync_model_to_rollout(self) -> None:
+        """Release consumed replay before materializing the next weight patch."""
+
+        self._release_consumed_rollout_batch(phase="pre_weight_sync")
+        await super().sync_model_to_rollout()
+
+    def _release_consumed_rollout_batch(self, *, phase: str) -> None:
+        """Return pages from a completed update before the next allocation."""
+
         profile = self.cfg.route_neutral_online_implementation
         if not bool(profile.release_host_memory_after_trajectory_receive):
             raise ValueError("Route-neutral actor host-memory release was disabled.")
@@ -250,7 +261,7 @@ class RouteNeutralOnlineIDMBCFSDPActor(OnlineIDMBCFSDPActor):
         report = release_pad_host_memory(
             schema="route-neutral-online-actor-host-memory-release-v1",
             rank=int(self._rank),
-            phase="pre_trajectory_receive",
+            phase=phase,
         )
         print(
             "ROUTE_NEUTRAL_ONLINE_ACTOR_CONSUMED_BATCH_RELEASE="
@@ -420,9 +431,9 @@ class RouteNeutralOnlineIDMBCFSDPActor(OnlineIDMBCFSDPActor):
     ) -> None:
         """Retain additive metric state before skipped zero rows disappear."""
 
-        def scalar(value: Any) -> float:
+        def scalar(value: Any) -> float | torch.Tensor:
             if isinstance(value, torch.Tensor):
-                return float(value.detach().item())
+                return value.detach()
             return float(value)
 
         def record(name: str, value: Any) -> None:
@@ -757,7 +768,7 @@ class RouteNeutralOnlineIDMBCFSDPActor(OnlineIDMBCFSDPActor):
         micro_batch: dict,
         output_dict: dict[str, torch.Tensor],
         selected_loss_scales: dict[str, float] | None = None,
-    ) -> tuple[torch.Tensor, dict[str, float]]:
+    ) -> tuple[torch.Tensor, dict[str, float | torch.Tensor]]:
         warmup = self._warmup_batch(micro_batch)
         self._route_neutral_warmup_active = warmup
         if "multitask_task_id" in micro_batch.get("forward_inputs", {}):
@@ -788,8 +799,10 @@ class RouteNeutralOnlineIDMBCFSDPActor(OnlineIDMBCFSDPActor):
                     selected_loss_scale=(selected_loss_scales or {}).get("gate"),
                 )
                 loss = loss + correction
-                metrics["fastwam/regularized_policy_loss"] += float(correction.detach())
-                metrics["fastwam/total_loss"] = float(loss.detach())
+                metrics["fastwam/regularized_policy_loss"] = (
+                    metrics["fastwam/regularized_policy_loss"] + correction.detach()
+                )
+                metrics["fastwam/total_loss"] = loss.detach()
             self._append_route_neutral_perf_metrics(metrics, output_dict)
             self._append_route_neutral_metric_numerators(metrics, output_dict)
             return loss, metrics
@@ -868,7 +881,7 @@ class RouteNeutralOnlineIDMBCFSDPActor(OnlineIDMBCFSDPActor):
             }
         )
         scalar_metrics = {
-            key: value.detach().item() if isinstance(value, torch.Tensor) else value
+            key: value.detach() if isinstance(value, torch.Tensor) else value
             for key, value in metrics.items()
         }
         self._append_route_neutral_perf_metrics(scalar_metrics, output_dict)

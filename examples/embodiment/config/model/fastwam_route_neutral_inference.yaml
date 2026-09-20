@@ -1,0 +1,15 @@
+defaults:
+  - fastwam_route_neutral_online
+  - _self_
+
+# Load the native Gate/LoRA checkpoint before the first inference call. These
+# options affect only mode=eval, batch=1, and are not training hyperparameters.
+eval_without_critic: true
+critic:
+  load_for_eval: false
+
+inference_acceleration:
+  merge_lora: true
+  compile: true
+  mode: default
+  backend: inductor

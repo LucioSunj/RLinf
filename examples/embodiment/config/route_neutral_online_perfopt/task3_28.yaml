@@ -1,0 +1,50 @@
+# @package _global_
+# Task6 step50 scientific settings, including its actual H(q) objective.
+
+cluster:
+  component_placement:
+    actor: "0-0"
+    env: "0-6"
+    rollout: "0-6"
+
+route_neutral_online_implementation:
+  shared_gpu_rollout_rank: 0
+
+runner:
+  max_epochs: 60
+  max_steps: 60
+  save_interval: 5
+  use_training_pipeline: false
+  overlap_env_bootstrap: false
+  logger:
+    experiment_name: libero_10_ppo_fastwam_route_neutral_online_task3_perfopt28
+
+algorithm:
+  gate_ppo:
+    entropy_loss_source: behavior
+    entropy_metric_source: base
+    entropy_coefficient: 0.01
+  fixed_branch_cost:
+    controller:
+      signed_price:
+        reversal:
+          factor: 0.0
+  regularization:
+    base_uncond_kl:
+      enabled: false
+      coefficient: 0.0
+      log_metric: false
+
+env:
+  train:
+    task_id_filter: [3]
+    total_num_envs: 28
+
+actor:
+  enable_offload: true
+  global_batch_size: 196
+  micro_batch_size: 4
+
+rollout:
+  enable_offload: false
+  pipeline_stage_num: 1

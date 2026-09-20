@@ -14,10 +14,50 @@
 
 from pathlib import Path
 
+import pytest
 from hydra import compose, initialize_config_dir
+from omegaconf import OmegaConf
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 CONFIG_ROOT = REPO_ROOT / "evaluations/libero"
+
+
+@pytest.mark.parametrize(
+    "config_name",
+    [
+        "libero_10_fastwam_adaptive_eval",
+        "libero_plus_long_fastwam_adaptive_eval",
+        "libero_plus_long_fastwam_route_neutral_online_eval",
+        "libero_plus_long_fastwam_route_neutral_online_compiled_eval",
+        "libero_10_fastwam_pad_frozen_eval",
+    ],
+)
+def test_all_fastwam_eval_presets_execute_finite_outliers(
+    monkeypatch, config_name
+) -> None:
+    monkeypatch.setenv("EMBODIED_PATH", str(REPO_ROOT / "examples/embodiment"))
+    with initialize_config_dir(version_base=None, config_dir=str(CONFIG_ROOT)):
+        cfg = compose(config_name=config_name)
+
+    assert cfg.runner.evaluation_collector.contract_violation_outcome == "execute"
+
+
+def test_compiled_eval_shares_the_same_scientific_config(monkeypatch) -> None:
+    monkeypatch.setenv("EMBODIED_PATH", str(REPO_ROOT / "examples/embodiment"))
+    with initialize_config_dir(version_base=None, config_dir=str(CONFIG_ROOT)):
+        baseline = compose(
+            config_name="libero_plus_long_fastwam_route_neutral_online_eval"
+        )
+        compiled = compose(
+            config_name="libero_plus_long_fastwam_route_neutral_online_compiled_eval"
+        )
+
+    baseline_values = OmegaConf.to_container(baseline, resolve=False)
+    compiled_values = OmegaConf.to_container(compiled, resolve=False)
+    acceleration = compiled_values["rollout"]["model"].pop("inference_acceleration")
+    assert acceleration["merge_lora"] is True
+    assert acceleration["compile"] is True
+    assert compiled_values == baseline_values
 
 
 def test_standard_libero_fastwam_eval_preset_is_one_env_no_critic(monkeypatch) -> None:

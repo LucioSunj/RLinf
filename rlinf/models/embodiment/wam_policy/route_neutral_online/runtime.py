@@ -9,11 +9,14 @@ from __future__ import annotations
 
 import math
 import time
+from collections.abc import Iterator
+from contextlib import AbstractContextManager, contextmanager, nullcontext
 from dataclasses import dataclass
+from functools import partial
 from typing import Any, Literal
 
 import torch
-from fastwam.adapters import PolicyRegime
+from fastwam.adapters import PolicyRegime, VideoBCDiTLoRAAdapter
 from fastwam.models.wan22.adaptive_action import (
     CachedActionCondition,
     CachedActionVelocity,
@@ -44,6 +47,8 @@ from rlinf.models.embodiment.wam_policy.critic import (
 from rlinf.models.embodiment.wam_policy.kv_replay import GateKVReplayBackend
 from rlinf.models.embodiment.wam_policy.libero_runtime import (
     _domain_separated_noise_seed,
+    _format_fastwam_prompts,
+    _load_cached_text_contexts,
     _seeded_randn,
     _validate_flow_sde_sampling,
     _validate_noise_seeds,
@@ -85,6 +90,7 @@ class RouteNeutralPreparedStep:
     current_condition: CachedActionCondition
     gate_features: RouteNeutralGateFeatures
     critic_features: FastWAMValueFeatures | None
+    first_frame_latents: torch.Tensor | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -120,12 +126,15 @@ class RouteNeutralTrainableChunkSample:
 class RouteNeutralOnlineIDMTeacherLiberoRuntime(OnlineIDMTeacherLiberoRuntime):
     """Produce neutral Gate inputs, then reuse trainable UNCOND + IDM teacher."""
 
+    video_lora_adapter: VideoBCDiTLoRAAdapter | None = None
+
     def __init__(
         self,
         *,
         route_neutral_input,
         route_neutral_visual,
         gate_replay_backend="recompute",
+        video_lora_adapter: VideoBCDiTLoRAAdapter | None = None,
         **kwargs: Any,
     ) -> None:
         # The orchestration-level backend is ``recompute`` so RLinf creates no
@@ -142,6 +151,7 @@ class RouteNeutralOnlineIDMTeacherLiberoRuntime(OnlineIDMTeacherLiberoRuntime):
             gate_replay_backend=GateKVReplayBackend.STORED,
             **kwargs,
         )
+        self.video_lora_adapter = video_lora_adapter
         self.batch_linear_context = install_batch_invariant_linears(self.actor)
         state_dim = int(getattr(self.actor, "proprio_dim", 0) or 0)
         self.route_neutral_input = RouteNeutralGateInputContract.from_mapping(
@@ -158,8 +168,10 @@ class RouteNeutralOnlineIDMTeacherLiberoRuntime(OnlineIDMTeacherLiberoRuntime):
         if getattr(self.actor, "proprio_encoder", None) is None:
             raise ValueError("Route-neutral runtime requires FastWAM proprio encoding.")
         self.physical_history = PhysicalStateHistoryTracker(self.route_neutral_input)
+        # One immutable language payload; visual/proprio/history state is rebuilt
+        # every chunk. This cache is neither a module buffer nor checkpoint state.
+        self._evaluation_text_context = None
 
-    @torch.no_grad()
     def _prepare_action_condition(
         self,
         *,
@@ -169,8 +181,41 @@ class RouteNeutralOnlineIDMTeacherLiberoRuntime(OnlineIDMTeacherLiberoRuntime):
         regime: PolicyRegime,
         idm_initial_latents: torch.Tensor | None = None,
         idm_noise_seed: int | None = None,
+        first_frame_latents: torch.Tensor | None = None,
     ) -> tuple[CachedActionCondition, torch.Tensor | None]:
-        with self.batch_linear_context.use(int(image.shape[0])):
+        if self.video_lora_adapter is not None and regime is PolicyRegime.UNCOND:
+            with torch.no_grad():
+                first_frame = (
+                    self.actor._encode_input_image_latents_tensor(
+                        image, tiled=self.tiled_vae
+                    )
+                    if first_frame_latents is None
+                    else first_frame_latents.detach()
+                )
+            batch_size = int(image.shape[0])
+            with self._uncond_video_scope(batch_size):
+                condition = self._prefill_video_condition(
+                    video_latents=first_frame,
+                    context=context.detach(),
+                    context_mask=context_mask,
+                    fuse_flag=bool(
+                        getattr(
+                            self.actor.video_expert,
+                            "fuse_vae_embedding_in_latents",
+                            False,
+                        )
+                    ),
+                    checkpoint_context_fn=partial(
+                        self._video_checkpoint_contexts, batch_size
+                    ),
+                )
+            return condition, None
+        with (
+            self.batch_linear_context.use(int(image.shape[0])),
+            self.lora_adapter.use_regime(PolicyRegime.IDM)
+            if self.video_lora_adapter is not None
+            else nullcontext(),
+        ):
             return super()._prepare_action_condition(
                 image=image,
                 context=context,
@@ -178,7 +223,86 @@ class RouteNeutralOnlineIDMTeacherLiberoRuntime(OnlineIDMTeacherLiberoRuntime):
                 regime=regime,
                 idm_initial_latents=idm_initial_latents,
                 idm_noise_seed=idm_noise_seed,
+                first_frame_latents=first_frame_latents,
             )
+
+    @contextmanager
+    def _uncond_video_scope(self, batch_size: int) -> Iterator[None]:
+        """Retain LoRA/batch contexts through Video checkpoint recomputation."""
+
+        mot_training = self.actor.mot.training
+        # MoT uses this flag only to select activation checkpointing. Keep the
+        # frozen experts in eval mode, including dropout and normalization.
+        self.actor.mot.training = torch.is_grad_enabled()
+        try:
+            with (
+                self.lora_adapter.use_regime(PolicyRegime.UNCOND),
+                self.batch_linear_context.use(batch_size),
+            ):
+                yield
+        finally:
+            self.actor.mot.training = mot_training
+
+    def _video_checkpoint_contexts(
+        self, batch_size: int
+    ) -> tuple[AbstractContextManager[None], AbstractContextManager[None]]:
+        return self._uncond_video_scope(batch_size), self._uncond_video_scope(
+            batch_size
+        )
+
+    @torch.no_grad()
+    def _prepare_parent_current_condition(
+        self, **kwargs: torch.Tensor
+    ) -> tuple[CachedActionCondition, torch.Tensor | None]:
+        """Build canonical parent K/V for the route-neutral Gate and critic."""
+
+        with (
+            self.lora_adapter.use_regime(PolicyRegime.IDM),
+            self.batch_linear_context.use(int(kwargs["image"].shape[0])),
+        ):
+            return super()._prepare_action_condition(
+                **kwargs, regime=PolicyRegime.UNCOND
+            )
+
+    def _uncond_condition_from_prepared(
+        self, prepared: RouteNeutralPreparedStep, indices: torch.Tensor | None = None
+    ) -> CachedActionCondition:
+        """Use adapted Video K/V only for the UNCOND action expert."""
+
+        if self.video_lora_adapter is None:
+            return (
+                prepared.current_condition
+                if indices is None
+                else prepared.current_condition.index_select(indices)
+            )
+
+        def select(value):
+            return (
+                value
+                if value is None or indices is None
+                else value.index_select(0, indices.to(value.device))
+            )
+
+        condition, _ = self._prepare_action_condition(
+            image=select(prepared.images),
+            context=select(prepared.context),
+            context_mask=select(prepared.context_mask),
+            regime=PolicyRegime.UNCOND,
+            first_frame_latents=select(prepared.first_frame_latents),
+        )
+        return condition
+
+    @torch.no_grad()
+    def critic_features(self, *, env_obs: dict[str, Any]) -> FastWAMValueFeatures:
+        """Keep bootstrap values on the same frozen features used in replay."""
+
+        if self.video_lora_adapter is None:
+            return super().critic_features(env_obs=env_obs)
+        images, context, context_mask = self._encode_condition(env_obs)
+        condition, _ = self._prepare_parent_current_condition(
+            image=images, context=context, context_mask=context_mask
+        )
+        return self._critic_features_from_condition(condition)
 
     def _velocity(
         self,
@@ -221,15 +345,55 @@ class RouteNeutralOnlineIDMTeacherLiberoRuntime(OnlineIDMTeacherLiberoRuntime):
         return env_ids, reset_mask
 
     @torch.no_grad()
+    def _encode_evaluation_condition(
+        self,
+        env_obs: dict[str, Any],
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Keep the latest instruction resident, then append fresh proprio."""
+
+        prompts = _format_fastwam_prompts(
+            env_obs["task_descriptions"], prompt_template=self.prompt_template
+        )
+        key = (
+            tuple(prompts),
+            self.text_embedding_cache_dir,
+            self.text_embedding_context_len,
+            self.device,
+            self.dtype,
+        )
+        cached = self._evaluation_text_context
+        if cached is None or cached[0] != key:
+            if self.text_embedding_cache_dir is None:
+                context, mask = self.actor.encode_prompt(prompts)
+            else:
+                context, mask = _load_cached_text_contexts(
+                    prompts,
+                    cache_dir=self.text_embedding_cache_dir,
+                    context_len=self.text_embedding_context_len,
+                    expected_dim=int(self.actor.text_dim),
+                    device=self.device,
+                    dtype=self.dtype,
+                )
+            cached = (key, (context.detach(), mask.detach()))
+            self._evaluation_text_context = cached
+        return self._encode_condition(env_obs, text_context=cached[1])
+
+    @torch.no_grad()
     def prepare_route_neutral_step(
         self,
         *,
         env_obs: dict[str, Any],
         include_critic_features: bool = True,
+        mode: Literal["train", "eval"] = "train",
     ) -> RouteNeutralPreparedStep:
         """Build one batched current-only condition before route choice."""
 
-        images, context, context_mask = self._encode_condition(env_obs)
+        single_eval = mode == "eval" and env_obs["states"].shape[0] == 1
+        images, context, context_mask = (
+            self._encode_evaluation_condition(env_obs)
+            if single_eval
+            else self._encode_condition(env_obs)
+        )
         batch_size = int(images.shape[0])
         state = self._normalized_proprio(env_obs["states"]).detach()
         if state.shape != (batch_size, self.route_neutral_input.state_dim):
@@ -237,12 +401,31 @@ class RouteNeutralOnlineIDMTeacherLiberoRuntime(OnlineIDMTeacherLiberoRuntime):
         if context.shape[1] < 2 or not bool(context_mask[:, -1].all().item()):
             raise ValueError("Could not isolate FastWAM's appended proprio token.")
 
-        condition, replay_noise = self._prepare_action_condition(
-            image=images,
-            context=context,
-            context_mask=context_mask,
-            regime=PolicyRegime.UNCOND,
+        first_frame_latents = (
+            self.actor._encode_input_image_latents_tensor(images, tiled=self.tiled_vae)
+            if single_eval or self.video_lora_adapter is not None
+            else None
         )
+        condition_kwargs = (
+            {"first_frame_latents": first_frame_latents}
+            if first_frame_latents is not None
+            else {}
+        )
+        if self.video_lora_adapter is not None:
+            condition, replay_noise = self._prepare_parent_current_condition(
+                image=images,
+                context=context,
+                context_mask=context_mask,
+                **condition_kwargs,
+            )
+        else:
+            condition, replay_noise = self._prepare_action_condition(
+                image=images,
+                context=context,
+                context_mask=context_mask,
+                regime=PolicyRegime.UNCOND,
+                **condition_kwargs,
+            )
         if replay_noise is not None:
             raise AssertionError("Current-frame condition created future noise.")
         visual_features = extract_fastwam_value_features(
@@ -281,6 +464,7 @@ class RouteNeutralOnlineIDMTeacherLiberoRuntime(OnlineIDMTeacherLiberoRuntime):
             current_condition=condition,
             gate_features=gate_features,
             critic_features=critic_features,
+            first_frame_latents=first_frame_latents,
         )
 
     @torch.no_grad()
@@ -370,6 +554,11 @@ class RouteNeutralOnlineIDMTeacherLiberoRuntime(OnlineIDMTeacherLiberoRuntime):
             context_mask=selected_context_mask,
             regime=PolicyRegime.IDM,
             idm_initial_latents=initial_latents,
+            first_frame_latents=(
+                None
+                if prepared.first_frame_latents is None
+                else prepared.first_frame_latents.index_select(0, indices)
+            ),
         )
         timesteps, deltas = self._action_schedule()
         rollout = sample_action_flow_sde(
@@ -491,7 +680,7 @@ class RouteNeutralOnlineIDMTeacherLiberoRuntime(OnlineIDMTeacherLiberoRuntime):
             uncond_rollout = sample_action_flow_sde(
                 initial_noise.index_select(0, uncond_indices),
                 velocity_fn=self._velocity(
-                    prepared.current_condition.index_select(uncond_indices),
+                    self._uncond_condition_from_prepared(prepared, uncond_indices),
                     regime=PolicyRegime.UNCOND,
                     capture_gate_kv=False,
                     actor_version=int(actor_version),
@@ -545,6 +734,11 @@ class RouteNeutralOnlineIDMTeacherLiberoRuntime(OnlineIDMTeacherLiberoRuntime):
                 context_mask=selected_context_mask,
                 regime=PolicyRegime.IDM,
                 idm_initial_latents=idm_latents,
+                first_frame_latents=(
+                    None
+                    if prepared.first_frame_latents is None
+                    else prepared.first_frame_latents.index_select(0, idm_indices)
+                ),
             )
             idm_rollout = sample_action_flow_sde(
                 initial_noise.index_select(0, idm_indices),
@@ -669,6 +863,133 @@ class RouteNeutralOnlineIDMTeacherLiberoRuntime(OnlineIDMTeacherLiberoRuntime):
             action_execution_trace=action_execution_trace,
         )
 
+    @torch.no_grad()
+    def _sample_prepared_evaluation(
+        self,
+        *,
+        env_obs: dict[str, Any],
+        routes: torch.Tensor,
+        actor_version: int,
+        prepared: RouteNeutralPreparedStep,
+    ) -> RouteNeutralTrainableChunkSample:
+        """Run one deterministic action chunk using its existing Gate condition.
+
+        Keep batch one: the legacy evaluation branch uses serial B1 kernels,
+        whereas a batched Gate prefill can have different numerical behavior.
+        """
+
+        if routes.shape != (1,):
+            raise ValueError(
+                "Prepared single-environment evaluation requires one route."
+            )
+        route = int(routes.item())
+        if route not in (int(WAMRoute.IDM), int(WAMRoute.UNCOND)):
+            raise ValueError("Evaluation route must be IDM or UNCOND.")
+        regime = PolicyRegime.IDM if route == int(WAMRoute.IDM) else PolicyRegime.UNCOND
+        action_shape = (
+            1,
+            self.action_protocol.generation_horizon,
+            self.actor.action_expert.action_dim,
+        )
+        action_noise = env_obs.get("_fastwam_action_initial_noise")
+        if action_noise is not None:
+            action_noise = torch.as_tensor(
+                action_noise, device=self.device, dtype=self.dtype
+            )
+            if tuple(action_noise.shape) != action_shape:
+                raise ValueError(
+                    f"Injected FastWAM action noise must have shape {action_shape}."
+                )
+        action_seeds = env_obs.get("_fastwam_action_noise_seeds")
+        if action_seeds is not None:
+            if action_noise is not None:
+                raise ValueError(
+                    "Specify either injected action noise or action seeds, not both."
+                )
+            action_seeds = _validate_noise_seeds(
+                action_seeds, batch_size=1, name="action noise"
+            )
+        video_noise = env_obs.get("_fastwam_idm_initial_latents")
+        if video_noise is not None:
+            video_noise = torch.as_tensor(
+                video_noise, device=self.device, dtype=self.dtype
+            )
+            if video_noise.shape[0] != 1:
+                raise ValueError(
+                    "Injected FastWAM IDM video noise batch must match routes."
+                )
+        idm_seeds = env_obs.get("_fastwam_idm_noise_seeds")
+        if idm_seeds is not None:
+            if video_noise is not None:
+                raise ValueError(
+                    "Specify either injected IDM latents or IDM seeds, not both."
+                )
+            idm_seeds = _validate_noise_seeds(
+                idm_seeds, batch_size=1, name="IDM video noise"
+            )
+
+        condition = prepared.current_condition
+        if regime is PolicyRegime.IDM:
+            condition, _ = self._prepare_action_condition(
+                image=prepared.images,
+                context=prepared.context,
+                context_mask=prepared.context_mask,
+                regime=regime,
+                idm_initial_latents=video_noise,
+                idm_noise_seed=None if idm_seeds is None else int(idm_seeds[0]),
+                first_frame_latents=prepared.first_frame_latents,
+            )
+        elif self.video_lora_adapter is not None:
+            condition = self._uncond_condition_from_prepared(prepared)
+        # Preserve the legacy order: IDM video noise precedes action noise.
+        if action_noise is None:
+            action_noise = (
+                torch.randn(action_shape, device=self.device, dtype=torch.float32).to(
+                    dtype=self.dtype
+                )
+                if action_seeds is None
+                else _seeded_randn(
+                    int(action_seeds[0]),
+                    action_shape,
+                    device=self.device,
+                    dtype=self.dtype,
+                    rand_device=self.seeded_noise_device,
+                )
+            )
+        timesteps, deltas = self._action_schedule()
+        rollout = sample_action_flow_sde(
+            action_noise,
+            velocity_fn=self._velocity(
+                condition,
+                regime=regime,
+                capture_gate_kv=False,
+                actor_version=actor_version,
+            ),
+            timesteps=timesteps,
+            scheduler_deltas=deltas,
+            num_train_timesteps=self.actor.infer_action_scheduler.num_train_timesteps,
+            noise_level=self.flow_sde_noise_level,
+            gate_last_n=1,
+            ignore_last_transition=self.flow_sde_ignore_last_transition,
+            stochastic=False,
+            collect_replay=False,
+        )
+        executed = select_executed_action_prefix(
+            rollout.actions, protocol=self.action_protocol
+        )
+        actions, trace = self._denormalize_action_stages(executed, env_obs=env_obs)
+        return RouteNeutralTrainableChunkSample(
+            actions=actions,
+            old_flow_logprobs=select_executed_flow_statistics(
+                rollout.old_log_probs, protocol=self.action_protocol
+            ),
+            flow_chains=rollout.chains,
+            denoise_indices=rollout.denoise_indices,
+            forward_inputs={},
+            critic_features=None,
+            action_execution_trace=trace,
+        )
+
     def sample_routed_action_batch(
         self,
         *,
@@ -679,13 +1000,25 @@ class RouteNeutralOnlineIDMTeacherLiberoRuntime(OnlineIDMTeacherLiberoRuntime):
         collect_replay: bool,
         prepared: RouteNeutralPreparedStep | None = None,
     ) -> RouteNeutralTrainableChunkSample:
-        """Use the batched formal path and retain serial evaluation behavior."""
+        """Reuse B1 evaluation conditions; retain the existing training path."""
 
         _validate_flow_sde_sampling(
             mode=mode,
             routes=routes,
             noise_level=self.flow_sde_noise_level,
         )
+        if (
+            mode == "eval"
+            and not collect_replay
+            and prepared is not None
+            and prepared.images.shape[0] == 1
+        ):
+            return self._sample_prepared_evaluation(
+                env_obs=env_obs,
+                routes=routes,
+                actor_version=actor_version,
+                prepared=prepared,
+            )
         can_batch = (
             mode == "train"
             and collect_replay
@@ -727,12 +1060,23 @@ class RouteNeutralOnlineIDMTeacherLiberoRuntime(OnlineIDMTeacherLiberoRuntime):
         )
         chains = forward_inputs["flow_chains"]
         indices = forward_inputs["denoise_indices"]
-        current_condition, replay_noise = self._prepare_action_condition(
-            image=forward_inputs["fastwam_images"],
-            context=forward_inputs["fastwam_context"],
-            context_mask=forward_inputs["fastwam_context_mask"],
-            regime=PolicyRegime.UNCOND,
-        )
+        condition_inputs = {
+            "image": forward_inputs["fastwam_images"],
+            "context": forward_inputs["fastwam_context"],
+            "context_mask": forward_inputs["fastwam_context_mask"],
+        }
+        if self.video_lora_adapter is None:
+            current_condition, replay_noise = self._prepare_action_condition(
+                **condition_inputs, regime=PolicyRegime.UNCOND
+            )
+        elif self.critic_feature_config is not None or compute_base_logprobs:
+            current_condition, replay_noise = self._prepare_parent_current_condition(
+                **condition_inputs
+            )
+        else:
+            # The pi0.5 critic has its own frozen observation encoder. It does
+            # not consume Video K/V, so replay needs only the adapted prefill.
+            current_condition, replay_noise = None, None
         if replay_noise is not None:
             raise AssertionError("Current-only replay created future video noise.")
         timesteps, deltas = self._action_schedule()
@@ -748,7 +1092,16 @@ class RouteNeutralOnlineIDMTeacherLiberoRuntime(OnlineIDMTeacherLiberoRuntime):
         if selected.numel():
             actor_versions = route_info.actor_versions.reshape(-1)
             actor_version = int(actor_versions[selected[0]].item())
-            selected_condition = current_condition.index_select(selected)
+            if self.video_lora_adapter is not None:
+                selected_condition, _ = self._prepare_action_condition(
+                    **{
+                        name: value.index_select(0, selected.to(value.device))
+                        for name, value in condition_inputs.items()
+                    },
+                    regime=PolicyRegime.UNCOND,
+                )
+            else:
+                selected_condition = current_condition.index_select(selected)
             current_replay = replay_action_flow_sde_transition(
                 chains.index_select(0, selected),
                 indices.index_select(0, selected),
@@ -778,7 +1131,7 @@ class RouteNeutralOnlineIDMTeacherLiberoRuntime(OnlineIDMTeacherLiberoRuntime):
                         chains.index_select(0, selected),
                         indices.index_select(0, selected),
                         velocity_fn=self._velocity(
-                            selected_condition,
+                            current_condition.index_select(selected),
                             regime=PolicyRegime.IDM,
                             capture_gate_kv=False,
                             actor_version=actor_version,

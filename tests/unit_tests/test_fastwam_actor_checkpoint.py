@@ -840,6 +840,71 @@ def test_fastwam_actor_bc_bootstrap_rejects_non_bitwise_load_atomically(
     assert not hasattr(worker, "_fastwam_bc_bootstrap")
 
 
+@pytest.mark.parametrize("invalid_video", [False, True])
+def test_dual_bc_bootstrap_loads_both_or_restores_both(tmp_path, invalid_video):
+    from fastwam.adapters import (
+        RegimeLoRAConfig,
+        inject_action_dit_lora,
+        inject_video_bc_dit_lora,
+    )
+    from fastwam.models.wan22.wan_video_dit import DiTBlock
+    from fastwam.uncond_bc_checkpoint import (
+        DUAL_UNCOND_BC_SIDECAR_SCHEMA,
+        build_lora_sidecar_payload,
+    )
+
+    worker = _checkpoint_worker()
+    worker.optimizer_steps = 0
+    policy = _BootstrapPolicy()
+    action = torch.nn.Module()
+    action.blocks = torch.nn.ModuleList(
+        DiTBlock(hidden_dim=8, attn_head_dim=4, num_heads=2, ffn_dim=16)
+        for _ in range(2)
+    )
+    video = copy.deepcopy(action)
+    policy.lora_adapter = inject_action_dit_lora(
+        action, RegimeLoRAConfig(rank=128, alpha=128)
+    )
+    policy.video_lora_adapter = inject_video_bc_dit_lora(
+        video,
+        RegimeLoRAConfig(rank=128, alpha=128),
+        regime_context=policy.lora_adapter.regime_context,
+    )
+    worker.model = policy
+    adapters = {"action": policy.lora_adapter, "video": policy.video_lora_adapter}
+    before = {name: adapter.lora_state_dict() for name, adapter in adapters.items()}
+    gate_before = policy.gate.state_dict()
+    critic_before = policy.critic.value_head.state_dict()
+    payload = {"schema": DUAL_UNCOND_BC_SIDECAR_SCHEMA}
+    for name, adapter in adapters.items():
+        payload[name] = build_lora_sidecar_payload(
+            adapter,
+            parent_checkpoint_sha256="a" * 64,
+            extra_metadata={"bc_step": 1942, "bc_config_sha256": "c" * 64},
+        )
+        for value in payload[name]["state_dict"].values():
+            value.fill_(0.25 if name == "action" else 0.5)
+    if invalid_video:
+        first = next(iter(payload["video"]["state_dict"]))
+        payload["video"]["state_dict"][first] = torch.zeros(1)
+    sidecar = tmp_path / "dual_bc.pt"
+    torch.save(payload, sidecar)
+    digest = hashlib.sha256(sidecar.read_bytes()).hexdigest()
+    if invalid_video:
+        with pytest.raises(ValueError, match="shape mismatch"):
+            worker.bootstrap_fastwam_uncond_lora(str(sidecar), digest)
+    else:
+        provenance = worker.bootstrap_fastwam_uncond_lora(str(sidecar), digest)
+        assert provenance["bc_step"] == 1942
+    for name, adapter in adapters.items():
+        expected = before[name] if invalid_video else payload[name]["state_dict"]
+        actual = adapter.lora_state_dict()
+        assert actual.keys() == expected.keys()
+        assert all(torch.equal(actual[key], value) for key, value in expected.items())
+    assert torch.equal(policy.gate.value, gate_before["value"])
+    assert torch.equal(policy.critic.value_head.value, critic_before["value"])
+
+
 @pytest.mark.parametrize(
     ("version", "optimizer_steps", "resume_dir", "message"),
     [

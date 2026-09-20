@@ -386,10 +386,16 @@ def _validate_critic_build_config(cfg) -> bool:
 def get_model(cfg, torch_dtype):
     """Build the composite policy from explicit FastWAM/OpenPi sub-configs."""
 
+    if cfg.get("uncond_bc_eval") is not None:
+        from .uncond_bc_policy import get_uncond_bc_model
+
+        return get_uncond_bc_model(cfg, torch_dtype)
+
     import torch
     from fastwam.adapters import (
         RegimeLoRAConfig,
         inject_action_dit_lora,
+        inject_video_bc_dit_lora,
         sha256_file,
     )
     from fastwam.models.wan22.gate_transformer import (
@@ -432,6 +438,15 @@ def get_model(cfg, torch_dtype):
     lora_config = RegimeLoRAConfig(**lora_payload)
     if lora_config.dropout != 0.0:
         raise ValueError("FastWAM PPO requires deterministic LoRA dropout == 0.")
+    video_lora_config = None
+    if cfg.get("video_lora") is not None:
+        if cfg.get("route_neutral_online") is None:
+            raise ValueError("Video LoRA RL requires the route-neutral online profile.")
+        video_lora_config = RegimeLoRAConfig(
+            **OmegaConf.to_container(cfg.video_lora, resolve=True)
+        )
+        if video_lora_config.dropout != 0.0:
+            raise ValueError("FastWAM PPO requires Video LoRA dropout == 0.")
     layer_payload = OmegaConf.to_container(
         cfg.gate.get("layer_taps", {}),
         resolve=True,
@@ -551,6 +566,15 @@ def get_model(cfg, torch_dtype):
         actor.action_expert,
         lora_config,
     )
+    video_lora_adapter = (
+        None
+        if video_lora_config is None
+        else inject_video_bc_dit_lora(
+            actor.video_expert,
+            video_lora_config,
+            regime_context=lora_adapter.regime_context,
+        )
+    )
     # The Gate is trainable, so it stays in FP32 rather than adopting the frozen
     # model dtype. A BF16 Gate discards every Adam update below half a BF16 ULP,
     # which is where this Gate's updates land; see
@@ -606,6 +630,11 @@ def get_model(cfg, torch_dtype):
         flow_sde_ignore_last_transition=bool(
             cfg.flow_sde.get("ignore_last_transition", False)
         ),
+        **(
+            {"video_lora_adapter": video_lora_adapter}
+            if video_lora_adapter is not None
+            else {}
+        ),
     )
     return FastWAMAdaptivePolicy(
         actor=actor,
@@ -614,6 +643,7 @@ def get_model(cfg, torch_dtype):
         gate=gate,
         critic=critic,
         config=policy_config,
+        video_lora_adapter=video_lora_adapter,
     )
 
 

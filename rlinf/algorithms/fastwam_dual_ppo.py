@@ -302,6 +302,19 @@ def finalize_fastwam_weighted_metrics(
     return finalized
 
 
+def clipped_ppo_objective(
+    ratio: torch.Tensor,
+    advantages: torch.Tensor,
+    *,
+    clip_ratio_low: float,
+    clip_ratio_high: float,
+) -> torch.Tensor:
+    """Return unreduced PPO objectives for loss and detached task accounting."""
+
+    clipped_ratio = torch.clamp(ratio, 1.0 - clip_ratio_low, 1.0 + clip_ratio_high)
+    return torch.maximum(-advantages * ratio, -advantages * clipped_ratio)
+
+
 def _compute_masked_clipped_ppo_loss(
     *,
     logprobs: torch.Tensor,
@@ -362,10 +375,12 @@ def _compute_masked_clipped_ppo_loss(
     selected_advantages = expanded_advantages[expanded_mask]
     log_ratio = selected_logprobs - selected_old_logprobs
     ratio = torch.exp(log_ratio)
-    clipped_ratio = torch.clamp(ratio, 1.0 - clip_ratio_low, 1.0 + clip_ratio_high)
-    unclipped_objective = -selected_advantages * ratio
-    clipped_objective = -selected_advantages * clipped_ratio
-    selected_objective = torch.maximum(unclipped_objective, clipped_objective)
+    selected_objective = clipped_ppo_objective(
+        ratio,
+        selected_advantages,
+        clip_ratio_low=clip_ratio_low,
+        clip_ratio_high=clip_ratio_high,
+    )
     policy_loss = (
         selected_objective.mean()
         if selected_loss_scale is None

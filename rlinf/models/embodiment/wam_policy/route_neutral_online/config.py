@@ -176,6 +176,16 @@ def validate_route_neutral_online_idm_bc_training_config(
         raise ValueError("Actor and rollout route-neutral profiles differ.")
     if not isinstance(actor_resolved, Mapping):
         raise TypeError("Route-neutral model profile must resolve to a mapping.")
+    pure_uncond_num_envs = actor_resolved.get("pure_uncond_num_envs", 0)
+    if (
+        isinstance(pure_uncond_num_envs, bool)
+        or not isinstance(pure_uncond_num_envs, int)
+        or not 0 <= pure_uncond_num_envs < int(cfg.env.train.total_num_envs)
+    ):
+        raise ValueError(
+            "pure_uncond_num_envs must be a non-negative integer smaller than "
+            "env.train.total_num_envs, leaving at least one mixed-policy slot."
+        )
     state_dim = int(OmegaConf.select(cfg, "actor.model.fastwam.proprio_dim"))
     RouteNeutralGateInputContract.from_mapping(
         actor_resolved["input_contract"],
@@ -264,7 +274,10 @@ def validate_route_neutral_online_idm_bc_training_config(
         {"actor": "0-0", "env": "1-7", "rollout": "1-7"},
     )
     shared_rank = lifecycle.get("shared_gpu_rollout_rank")
-    shared_placement = {"actor": "0-0", "env": "0-3,5-7", "rollout": "0-3,5-7"}
+    shared_placements = (
+        {"actor": "0-0", "env": "0-3,5-7", "rollout": "0-3,5-7"},
+        {"actor": "0-0", "env": "0-6", "rollout": "0-6"},
+    )
     balanced_tasks = cfg.env.train.get("task_sampling") == "global_balanced"
     if cfg.algorithm.gate_ppo.get("entropy_loss_source", "behavior") not in {
         "base",
@@ -273,20 +286,21 @@ def validate_route_neutral_online_idm_bc_training_config(
         raise ValueError("Gate entropy loss source must be base or behavior.")
     balanced_placement = {"actor": "0-0", "env": "0-6", "rollout": "0-6"}
     total_envs = int(cfg.env.train.total_num_envs)
+    mixed_envs = total_envs - pure_uncond_num_envs
     batch_size = int(cfg.actor.global_batch_size)
     balanced_geometry = (
         balanced_tasks
         and placement == balanced_placement
-        and total_envs >= 42
-        and total_envs % 42 == 0
-        and batch_size == 196 * (total_envs // 42)
+        and mixed_envs >= 42
+        and mixed_envs % 42 == 0
+        and batch_size == 196 * (mixed_envs // 42)
         and int(cfg.actor.micro_batch_size) == 4
     )
     balanced_dedicated_geometry = (
         balanced_tasks
         and placement == {"actor": "0-0", "env": "1-7", "rollout": "1-7"}
         and shared_rank is None
-        and total_envs == 42
+        and mixed_envs == 42
         and batch_size == 196
         and int(cfg.actor.micro_batch_size) == 4
         and not bool(cfg.actor.enable_offload)
@@ -301,7 +315,8 @@ def validate_route_neutral_online_idm_bc_training_config(
         ):
             raise ValueError(
                 "Balanced ten-task training requires the shared GPU0 geometry "
-                "with N a positive multiple of 42 and global batch 196*N/42, "
+                "with mixed N a positive multiple of 42 and global batch "
+                "196*mixed_N/42, "
                 "or resident actor GPU0 with env=rollout=1-7 at N42/global batch "
                 "196. Both use microbatch 4 and synchronous execution."
             )
@@ -330,18 +345,19 @@ def validate_route_neutral_online_idm_bc_training_config(
         if (
             isinstance(shared_rank, bool)
             or shared_rank != 0
-            or (placement != shared_placement and not balanced_geometry)
+            or (placement not in shared_placements and not balanced_geometry)
             or not bool(cfg.actor.enable_offload)
             or bool(cfg.rollout.enable_offload)
             or bool(cfg.runner.get("use_training_pipeline", False))
             or bool(cfg.runner.get("overlap_env_bootstrap", False))
             or int(cfg.rollout.pipeline_stage_num) != 1
-            or (not balanced_geometry and (total_envs != 28 or batch_size != 196))
+            or (not balanced_geometry and (mixed_envs != 28 or batch_size != 196))
         ):
             raise ValueError(
                 "Shared-GPU route-neutral training requires actor=0-0, "
-                "env=rollout=0-3,5-7, shared rollout rank 0, actor offload, "
-                "rank-local rollout offload, synchronous 28-env/global-batch-196 "
+                "env=rollout=0-3,5-7 or 0-6, shared rollout rank 0, actor offload, "
+                "rank-local rollout offload, synchronous 28 mixed envs with "
+                "global batch 196 "
                 "training without environment bootstrap overlap."
             )
     elif placement not in supported_placements:

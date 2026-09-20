@@ -651,8 +651,9 @@ def validate_action_stage_contract(
     low: Sequence[float],
     high: Sequence[float],
     active_mask: Sequence[bool] | torch.Tensor | None = None,
+    allow_out_of_bounds: bool = False,
 ) -> None:
-    """Reject active Action values outside the exact live contract."""
+    """Validate active Actions, optionally leaving finite bounds to the controller."""
 
     violations = action_stage_contract_violations(
         statistics,
@@ -661,6 +662,12 @@ def validate_action_stage_contract(
         high=high,
         active_mask=active_mask,
     )
+    if allow_out_of_bounds:
+        violations = [
+            item
+            for item in violations
+            if item["finite_count"] != item["total_value_count"]
+        ]
     if violations:
         raise ValueError(
             "Refusing to submit Action values outside the exact live LIBERO "

@@ -3,7 +3,9 @@
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
 
+import asyncio
 import inspect
+import weakref
 from dataclasses import replace
 from pathlib import Path
 from types import MethodType, SimpleNamespace
@@ -345,8 +347,9 @@ def test_config_rejects_rollout_size_not_divisible_by_global_batch(
 
 
 @pytest.mark.parametrize("micro_batch_size", [1, 4])
+@pytest.mark.parametrize("rollout_placement", ["0-3,5-7", "0-6"])
 def test_shared_gpu_config_and_rank_local_offload(
-    monkeypatch, micro_batch_size
+    monkeypatch, micro_batch_size, rollout_placement
 ) -> None:
     from rlinf.models.embodiment.wam_policy.route_neutral_online.lifecycle import (
         RouteNeutralOnlineRolloutWorker,
@@ -354,8 +357,8 @@ def test_shared_gpu_config_and_rank_local_offload(
     from rlinf.workers.rollout.hf.huggingface_worker import MultiStepRolloutWorker
 
     cfg = _compose(monkeypatch)
-    cfg.cluster.component_placement.env = "0-3,5-7"
-    cfg.cluster.component_placement.rollout = "0-3,5-7"
+    cfg.cluster.component_placement.env = rollout_placement
+    cfg.cluster.component_placement.rollout = rollout_placement
     cfg.env.train.total_num_envs = 28
     cfg.actor.global_batch_size = 196
     cfg.actor.micro_batch_size = micro_batch_size
@@ -451,6 +454,66 @@ def test_perfopt_configs_select_mb4_geometry(
     assert cfg.runner.max_steps == (6 if total_envs == 42 else 50)
 
 
+def test_task3_profile_optimizes_behavior_entropy_with_base_metric(monkeypatch) -> None:
+    cfg = _compose(
+        monkeypatch,
+        overrides=["+route_neutral_online_perfopt=task3_28"],
+    )
+    validate_route_neutral_online_idm_bc_training_config(cfg)
+    assert cfg.env.train.task_id_filter == [3]
+    assert cfg.env.train.total_num_envs == 28
+    assert cfg.actor.global_batch_size == 196
+    assert cfg.actor.micro_batch_size == 4
+    assert cfg.runner.max_steps == cfg.runner.max_epochs == 60
+    assert cfg.actor.model.route_neutral_online.critic_warmup.runner_updates == 5
+    assert cfg.algorithm.gate_ppo.entropy_loss_source == "behavior"
+    assert cfg.algorithm.gate_ppo.entropy_metric_source == "base"
+    assert cfg.algorithm.gate_ppo.entropy_coefficient == 0.01
+
+    actor = object.__new__(RouteNeutralOnlineIDMBCFSDPActor)
+    actor.cfg = cfg
+    actor._warmup_batch = lambda _: False
+    actor._append_route_neutral_perf_metrics = lambda *args: None
+    actor._append_route_neutral_metric_numerators = lambda *args: None
+    logits = torch.tensor([-2.0, 1.5, 0.8], requires_grad=True)
+    p = logits.sigmoid()
+    q = 0.9 * p + 0.05
+    valid = torch.tensor([True, False, True])
+
+    def parent_loss(self, **kwargs):
+        return compute_gate_ppo_loss(
+            logprobs=q.log(),
+            old_logprobs=q.detach().log(),
+            advantages=torch.zeros(3),
+            valid_mask=valid,
+            clip_ratio_low=0.2,
+            clip_ratio_high=0.2,
+            base_probabilities=p,
+            behavior_probabilities=q,
+            entropy_coefficient=cfg.algorithm.gate_ppo.entropy_coefficient,
+            selected_loss_scale=0.25,
+        )
+
+    monkeypatch.setattr(OnlineIDMBCFSDPActor, "_compute_fastwam_loss", parent_loss)
+    loss, metrics = actor._compute_fastwam_loss(
+        micro_batch={"gate_valid_mask": valid},
+        output_dict={"gate_base_probabilities": p, "gate_behavior_probabilities": q},
+        selected_loss_scales={"gate": 0.25},
+    )
+    expected = (
+        -0.01 * torch.distributions.Bernoulli(probs=q).entropy()[valid].sum() * 0.25
+    )
+    torch.testing.assert_close(loss, expected)
+    torch.testing.assert_close(
+        torch.autograd.grad(loss, logits, retain_graph=True)[0],
+        torch.autograd.grad(expected, logits)[0],
+    )
+    torch.testing.assert_close(
+        metrics["gate/entropy"],
+        torch.distributions.Bernoulli(probs=p).entropy()[valid].mean().detach(),
+    )
+
+
 def test_perfopt_config_rejects_hot_path_base_kl_logging(monkeypatch) -> None:
     cfg = _compose(
         monkeypatch,
@@ -471,6 +534,57 @@ def test_perfopt_config_rejects_non_divisible_35_env_geometry(monkeypatch) -> No
 
     with pytest.raises(ValueError, match="rollout size 2450"):
         validate_route_neutral_online_idm_bc_training_config(cfg)
+
+
+def test_weight_sync_releases_consumed_replay_before_patch_allocation(monkeypatch):
+    from rlinf.models.embodiment.wam_policy.route_neutral_online import (
+        actor as actor_module,
+    )
+
+    worker = object.__new__(RouteNeutralOnlineIDMBCFSDPActor)
+    worker.cfg = SimpleNamespace(
+        route_neutral_online_implementation=SimpleNamespace(
+            release_host_memory_after_trajectory_receive=True
+        )
+    )
+    worker._rank = 0
+    worker.rollout_batch = {"replay": torch.ones(8)}
+    replay_reference = weakref.ref(worker.rollout_batch["replay"])
+    worker.model = torch.nn.Linear(2, 2)
+    worker.optimizer = torch.optim.Adam(worker.model.parameters())
+    worker.version = 6
+    model_before = {
+        key: value.clone() for key, value in worker.model.state_dict().items()
+    }
+    rng_before = torch.get_rng_state().clone()
+    releases = []
+    synchronized = []
+
+    def release(**kwargs):
+        assert replay_reference() is None
+        releases.append(kwargs["phase"])
+        return {"status": "PASS"}
+
+    async def sync(instance):
+        assert instance.rollout_batch is None
+        assert replay_reference() is None
+        synchronized.append(instance.version)
+        for key, value in model_before.items():
+            torch.testing.assert_close(
+                instance.model.state_dict()[key], value, rtol=0, atol=0
+            )
+        assert instance.optimizer.state_dict()["state"] == {}
+        assert torch.equal(torch.get_rng_state(), rng_before)
+
+    monkeypatch.setattr(actor_module, "release_pad_host_memory", release)
+    monkeypatch.setattr(EmbodiedFSDPActor, "sync_model_to_rollout", sync)
+
+    asyncio.run(worker.sync_model_to_rollout())
+    worker._release_consumed_rollout_batch_before_receive()
+    asyncio.run(worker.sync_model_to_rollout())
+
+    assert releases == ["pre_weight_sync"]
+    assert synchronized == [6, 6]
 
 
 def test_resume_preserves_completed_first_joint_update_audit(monkeypatch) -> None:
@@ -1010,7 +1124,8 @@ def test_seeded_route_runtime_batches_each_branch_and_teacher_once() -> None:
     )
 
 
-def test_batched_online_bc_matches_serial_loss_and_gradient() -> None:
+@pytest.mark.parametrize("pure_uncond", [False, True])
+def test_batched_online_bc_matches_serial_loss_and_gradient(pure_uncond) -> None:
     runtime = object.__new__(RouteNeutralOnlineIDMTeacherLiberoRuntime)
     runtime.action_protocol = LiberoActionProtocol(
         generation_horizon=3,
@@ -1068,6 +1183,15 @@ def test_batched_online_bc_matches_serial_loss_and_gradient() -> None:
         [WAMRoute.UNCOND, WAMRoute.IDM, WAMRoute.UNCOND, WAMRoute.UNCOND]
     )
     route_info = _route_record(routes)
+    if pure_uncond:
+        forced = routes == int(WAMRoute.UNCOND)
+        route_info = replace(
+            route_info,
+            route_was_forced=forced,
+            route_source_chunk_ids=torch.where(
+                forced, -1, route_info.route_source_chunk_ids
+            ),
+        )
     teacher_actions = torch.linspace(-1.0, 1.0, 4 * 3 * 7).reshape(4, 3, 7)
     teacher_present = torch.tensor([True, False, True, True])
     forward_inputs = {
@@ -1438,3 +1562,30 @@ def test_mb4_dummy_batch_consumes_zero_selected_metric_state() -> None:
     assert metrics["online_idm_bc/selected_count"] == [0.0]
     assert "online_idm_bc/mse_pose" not in metrics
     assert all(not key.startswith(prefix) for key in metrics)
+
+
+def test_dual_rank128_overlay_keeps_task3_science(monkeypatch) -> None:
+    from omegaconf import OmegaConf
+
+    cfg = _compose(
+        monkeypatch,
+        overrides=[
+            "+route_neutral_online_perfopt=task3_28",
+            "+route_neutral_online_lora=dual_rank128",
+        ],
+    )
+    validate_route_neutral_online_idm_bc_training_config(cfg)
+    assert cfg.actor.model.uncond_lora.rank == 128
+    assert cfg.rollout.model.uncond_lora.rank == 128
+    assert OmegaConf.to_container(cfg.actor.model.video_lora, resolve=True) == (
+        OmegaConf.to_container(cfg.rollout.model.video_lora, resolve=True)
+    )
+    assert cfg.actor.model.video_lora.alpha == 128
+    assert (
+        cfg.env.train.total_num_envs,
+        cfg.actor.global_batch_size,
+        cfg.actor.micro_batch_size,
+    ) == (28, 196, 4)
+    assert cfg.actor.optim.lora_lr == 1e-5
+    assert cfg.actor.optim.gate_lr == 3e-5
+    assert cfg.actor.optim.value_lr == 1e-4

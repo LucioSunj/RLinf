@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import hashlib
 import math
+from collections import OrderedDict
 from pathlib import Path
 from typing import Any, Literal
 
@@ -36,6 +37,7 @@ from fastwam.models.wan22.kv_tap import (
     GateLayerKV,
     KeyValueBank,
 )
+from fastwam.models.wan22.mot import CheckpointContextFn
 
 from rlinf.envs.action_contract import (
     DENORMALIZED_ACTION_STAGE,
@@ -92,14 +94,21 @@ def _load_cached_text_contexts(
     expected_dim: int,
     device: torch.device,
     dtype: torch.dtype,
+    memory_cache: OrderedDict[str, tuple[torch.Tensor, torch.Tensor]] | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Load deterministic precomputed Wan2.2 contexts without loading UMT5."""
+    """Load contexts, optionally reusing a runtime-owned CPU language cache."""
 
     if context_len < 1 or expected_dim < 1:
         raise ValueError("Cached text context length and dimension must be positive.")
     contexts = []
     masks = []
     for prompt in prompts:
+        if memory_cache is not None and prompt in memory_cache:
+            context, mask = memory_cache[prompt]
+            memory_cache.move_to_end(prompt)
+            contexts.append(context)
+            masks.append(mask)
+            continue
         digest = hashlib.sha256(prompt.encode("utf-8")).hexdigest()
         path = cache_dir / f"{digest}.t5_len{context_len}.wan22ti2v5b.pt"
         if not path.is_file():
@@ -138,6 +147,12 @@ def _load_cached_text_contexts(
         context = context.clone()
         context[~mask] = 0
         mask = torch.ones_like(mask)
+        if memory_cache is not None:
+            memory_cache[prompt] = (context, mask)
+            # Ten training tasks fit permanently; larger evaluation suites
+            # retain a bounded working set instead of every language variant.
+            if len(memory_cache) > 32:
+                memory_cache.popitem(last=False)
         masks.append(mask)
         contexts.append(context)
     return (
@@ -436,6 +451,9 @@ class LiberoFastWAMRuntime:
             else Path(text_embedding_cache_dir).expanduser().resolve()
         )
         self.text_embedding_context_len = int(text_embedding_context_len)
+        self._text_context_cache: OrderedDict[
+            str, tuple[torch.Tensor, torch.Tensor]
+        ] = OrderedDict()
         if self.num_inference_steps < 1:
             raise ValueError("Inference steps must be positive.")
         if self.flow_sde_ignore_last_transition and self.num_inference_steps < 2:
@@ -586,23 +604,29 @@ class LiberoFastWAMRuntime:
     def _encode_condition(
         self,
         env_obs: dict[str, Any],
+        *,
+        text_context: tuple[torch.Tensor, torch.Tensor] | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         images = self._model_images(env_obs)
-        prompts = _format_fastwam_prompts(
-            env_obs["task_descriptions"],
-            prompt_template=self.prompt_template,
-        )
-        if self.text_embedding_cache_dir is None:
-            context, context_mask = self.actor.encode_prompt(prompts)
+        if text_context is not None:
+            context, context_mask = text_context
         else:
-            context, context_mask = _load_cached_text_contexts(
-                prompts,
-                cache_dir=self.text_embedding_cache_dir,
-                context_len=self.text_embedding_context_len,
-                expected_dim=int(self.actor.text_dim),
-                device=self.device,
-                dtype=self.dtype,
+            prompts = _format_fastwam_prompts(
+                env_obs["task_descriptions"],
+                prompt_template=self.prompt_template,
             )
+            if self.text_embedding_cache_dir is None:
+                context, context_mask = self.actor.encode_prompt(prompts)
+            else:
+                context, context_mask = _load_cached_text_contexts(
+                    prompts,
+                    cache_dir=self.text_embedding_cache_dir,
+                    context_len=self.text_embedding_context_len,
+                    expected_dim=int(self.actor.text_dim),
+                    device=self.device,
+                    dtype=self.dtype,
+                    memory_cache=self._text_context_cache,
+                )
         proprio = self._normalized_proprio(env_obs["states"])
         context, context_mask = self.actor._append_proprio_to_context(
             context=context,
@@ -621,16 +645,33 @@ class LiberoFastWAMRuntime:
         regime: PolicyRegime,
         idm_initial_latents: torch.Tensor | None = None,
         idm_noise_seed: int | None = None,
+        first_frame_latents: torch.Tensor | None = None,
     ) -> tuple[CachedActionCondition, torch.Tensor | None]:
         batch_size = int(image.shape[0])
         if batch_size < 1:
             raise ValueError("FastWAM action conditions require a non-empty batch.")
         if context.shape[0] != batch_size or context_mask.shape[0] != batch_size:
             raise ValueError("FastWAM image, context, and mask batches must agree.")
-        first_frame = self.actor._encode_input_image_latents_tensor(
-            image,
-            tiled=self.tiled_vae,
-        )
+        if first_frame_latents is None:
+            first_frame = self.actor._encode_input_image_latents_tensor(
+                image,
+                tiled=self.tiled_vae,
+            )
+        else:
+            expected_first_frame_shape = (
+                batch_size,
+                self.actor.vae.model.z_dim,
+                1,
+                image.shape[-2] // self.actor.vae.upsampling_factor,
+                image.shape[-1] // self.actor.vae.upsampling_factor,
+            )
+            if tuple(first_frame_latents.shape) != expected_first_frame_shape:
+                raise ValueError(
+                    "Prepared first-frame latents have shape "
+                    f"{tuple(first_frame_latents.shape)}, "
+                    f"expected {expected_first_frame_shape}."
+                )
+            first_frame = first_frame_latents
         fuse_flag = bool(
             getattr(self.actor.video_expert, "fuse_vae_embedding_in_latents", False)
         )
@@ -710,6 +751,28 @@ class LiberoFastWAMRuntime:
                 )
                 video_latents[:, :, :1] = first_frame
 
+        return (
+            self._prefill_video_condition(
+                video_latents=video_latents,
+                context=context,
+                context_mask=context_mask,
+                fuse_flag=fuse_flag,
+            ),
+            replay_initial_latents,
+        )
+
+    def _prefill_video_condition(
+        self,
+        *,
+        video_latents: torch.Tensor,
+        context: torch.Tensor,
+        context_mask: torch.Tensor,
+        fuse_flag: bool,
+        checkpoint_context_fn: CheckpointContextFn | None = None,
+    ) -> CachedActionCondition:
+        """Prefill a completed video, outside action/video denoising kernels."""
+
+        batch_size = int(video_latents.shape[0])
         video_pre = self.actor.video_expert.pre_dit(
             x=video_latents,
             timestep=torch.zeros(
@@ -740,17 +803,19 @@ class LiberoFastWAMRuntime:
             },
             video_attention_mask=attention_mask[:video_seq_len, :video_seq_len],
             gate_current_frame_video_tokens=tokens_per_frame,
-        )
-        return (
-            CachedActionCondition(
-                context=context,
-                context_mask=context_mask,
-                video_kv_cache=video_cache,
-                attention_mask=attention_mask,
-                video_seq_len=video_seq_len,
-                current_frame_video_tokens=tokens_per_frame,
+            **(
+                {"checkpoint_context_fn": checkpoint_context_fn}
+                if checkpoint_context_fn is not None
+                else {}
             ),
-            replay_initial_latents,
+        )
+        return CachedActionCondition(
+            context=context,
+            context_mask=context_mask,
+            video_kv_cache=video_cache,
+            attention_mask=attention_mask,
+            video_seq_len=video_seq_len,
+            current_frame_video_tokens=tokens_per_frame,
         )
 
     def _critic_features_from_condition(

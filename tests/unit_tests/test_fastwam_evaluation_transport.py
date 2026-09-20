@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import asyncio
 from dataclasses import replace
+from types import SimpleNamespace
 
 import numpy as np
 import pytest
@@ -471,7 +472,7 @@ def test_env_evaluate_step_rejects_entire_invalid_chunk_before_env_step(
     )
     env = RejectingEnv()
     worker.eval_env_list = [env]
-    worker.evaluation_collector = object()
+    worker.evaluation_collector = SimpleNamespace(contract_violation_outcome="raise")
     monkeypatch.setattr(
         env_worker_module,
         "prepare_actions",
@@ -488,7 +489,10 @@ def test_env_evaluate_step_rejects_entire_invalid_chunk_before_env_step(
     assert caught.value.prepared_actions[0, 1, 0] == pytest.approx(7.207030773162842)
 
 
-def test_contract_violation_records_route_before_abort_and_resets_episode() -> None:
+@pytest.mark.parametrize("current_step", (False, True))
+def test_contract_violation_records_route_before_abort_and_resets_episode(
+    current_step,
+) -> None:
     events = []
 
     class Collector:
@@ -539,10 +543,10 @@ def test_contract_violation_records_route_before_abort_and_resets_episode() -> N
     ).stages[0]
     route, emitted, selection = _records(
         routes=(1,),
-        forced=(True,),
+        forced=(not current_step,),
         chunk_ids=(0,),
         episode_ids=(0,),
-        source_chunk_ids=(-1,),
+        source_chunk_ids=(0 if current_step else -1,),
     )
     result = RolloutResult(
         actions=prepared_values,
@@ -578,7 +582,7 @@ def test_contract_violation_records_route_before_abort_and_resets_episode() -> N
     assert violation["route_metadata"]["chunk_id"] == 0
     assert violation["first_invalid_primitive_index"] == 1
     assert violation["first_invalid_prepared_value"] == pytest.approx(7.207030773162842)
-    assert aligned.emitted_gate.valid.tolist() == [False]
+    assert aligned.emitted_gate.valid.tolist() == [current_step]
     assert env_output.dones.tolist() == [True]
     assert env_output.truncations[:, -1].tolist() == [True]
     assert env_info["success_once"].tolist() == [False]

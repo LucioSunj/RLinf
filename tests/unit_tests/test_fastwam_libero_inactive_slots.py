@@ -278,6 +278,35 @@ def test_traced_chunk_ignores_invalid_values_in_inactive_slots() -> None:
     assert submitted.finite_count[1].eq(0).all()
 
 
+def test_execute_outcome_submits_out_of_bounds_actions_unchanged() -> None:
+    env = _libero_env()
+    actions = np.zeros((3, 2, 7), dtype=np.float32)
+    actions[0, :, 0] = 1.083984375
+    actions[1] = np.nan
+    result, submitted = env.chunk_step_with_action_trace(
+        actions,
+        _contract(),
+        active_mask=np.array([True, False, True]),
+        allow_out_of_bounds=True,
+    )
+    assert len(env.env.calls) == 2
+    for step, (values, indices) in enumerate(env.env.calls):
+        assert indices == (0, 2)
+        np.testing.assert_array_equal(values, actions[[0, 2], step])
+    assert int(submitted.above_high_count[0, 0]) == 2
+    assert not result[2].any()
+    assert not result[3][[0, 2]].any()
+
+
+def test_execute_outcome_still_rejects_nonfinite_active_action() -> None:
+    env = _libero_env()
+    actions = np.zeros((3, 2, 7), dtype=np.float32)
+    actions[0, 0, 0] = np.nan
+    with pytest.raises(ValueError, match="Refusing to submit"):
+        env.chunk_step_with_action_trace(actions, _contract(), allow_out_of_bounds=True)
+    assert env.env.calls == []
+
+
 def test_contract_failure_slot_is_not_stepped_and_becomes_true_termination() -> None:
     env = _libero_env()
     reset_masks = []

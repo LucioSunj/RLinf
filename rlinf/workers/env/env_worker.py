@@ -1260,6 +1260,15 @@ class EnvWorker(Worker):
                 high=action_contract.high,
                 active_mask=active_mask,
             )
+            allow_out_of_bounds = (
+                self.evaluation_collector.contract_violation_outcome == "execute"
+            )
+            if allow_out_of_bounds:
+                violations = [
+                    item
+                    for item in violations
+                    if item["finite_count"] != item["total_value_count"]
+                ]
             if violations:
                 rejected_indices = {
                     int(violation["environment_index"]) for violation in violations
@@ -1289,6 +1298,7 @@ class EnvWorker(Worker):
                 chunk_actions,
                 action_contract,
                 active_mask=active_mask,
+                allow_out_of_bounds=allow_out_of_bounds,
             )
             action_execution_trace = ActionExecutionTrace(
                 stages=(prepared_statistics, submitted_statistics)

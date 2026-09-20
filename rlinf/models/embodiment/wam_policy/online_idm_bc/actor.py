@@ -64,9 +64,9 @@ def assemble_online_idm_bc_loss(
     config: OnlineIDMBCConfig,
     selected_loss_scale: float | None,
     metric_scale_numerator: float,
-    flow_metric_loss: float,
-) -> tuple[torch.Tensor, dict[str, float]]:
-    """Apply global Flow-selected normalization and build scalar diagnostics."""
+    flow_metric_loss: float | torch.Tensor,
+) -> tuple[torch.Tensor, dict[str, float | torch.Tensor]]:
+    """Apply global Flow-selected normalization and retain detached diagnostics."""
 
     missing = sorted(_ONLINE_BC_OUTPUT_KEYS - set(output_dict))
     if missing:
@@ -76,7 +76,20 @@ def assemble_online_idm_bc_loss(
         raise ValueError("Online IDM BC selected loss scale must be nonnegative.")
     if not math.isfinite(metric_scale_numerator) or metric_scale_numerator <= 0.0:
         raise ValueError("Online IDM BC metric scale numerator must be positive.")
-    local_selected = float(output_dict["online_idm_bc_selected_count"].item())
+    # These counts determine which historical metric keys exist. Pack only
+    # that control metadata; loss values and numerators stay on the device.
+    control_counts = (
+        torch.cat(
+            (
+                output_dict["online_idm_bc_selected_count"].detach().reshape(1),
+                output_dict["online_idm_bc_present_count"].detach().reshape(1),
+                output_dict["online_idm_bc_timestep_bin_count"].detach().reshape(-1),
+            )
+        )
+        .cpu()
+        .tolist()
+    )
+    local_selected, present, *bin_counts = control_counts
     if scale == 0.0 and local_selected != 0.0:
         raise RuntimeError(
             "Online IDM BC selected samples received a zero global scale."
@@ -85,12 +98,16 @@ def assemble_online_idm_bc_loss(
     normalized_loss = output_dict["online_idm_bc_loss_sum"].float() * scale
     weighted_loss = float(config.loss_weight) * normalized_loss
     total_loss = current_loss + weighted_loss
-    raw_loss = float(normalized_loss.detach().item())
+    raw_loss = normalized_loss.detach()
     weighted_metric_loss = float(config.loss_weight) * raw_loss
-    denominator = max(abs(float(flow_metric_loss)), 1.0e-12)
-    present = float(output_dict["online_idm_bc_present_count"].item())
-    teacher_seconds = float(output_dict["online_idm_bc_teacher_seconds_sum"].item())
-    teacher_bytes = float(output_dict["online_idm_bc_teacher_bytes_sum"].item())
+    denominator = (
+        torch.as_tensor(flow_metric_loss, device=raw_loss.device)
+        .detach()
+        .abs()
+        .clamp_min(1.0e-12)
+    )
+    teacher_seconds = output_dict["online_idm_bc_teacher_seconds_sum"].detach()
+    teacher_bytes = output_dict["online_idm_bc_teacher_bytes_sum"].detach()
     metrics = {
         "online_idm_bc/raw_loss": raw_loss,
         "online_idm_bc/weighted_loss": weighted_metric_loss,
@@ -100,7 +117,7 @@ def assemble_online_idm_bc_loss(
         "online_idm_bc/loss_weight": float(config.loss_weight),
         "online_idm_bc/selected_loss_scale": scale,
         "online_idm_bc/expected_count": metric_scale_numerator
-        * float(output_dict["online_idm_bc_expected_count"].item()),
+        * output_dict["online_idm_bc_expected_count"].detach(),
         "online_idm_bc/teacher_call_count": metric_scale_numerator * present,
         "online_idm_bc/selected_count": metric_scale_numerator * local_selected,
         "online_idm_bc/teacher_seconds": metric_scale_numerator * teacher_seconds,
@@ -112,39 +129,61 @@ def assemble_online_idm_bc_loss(
     if local_selected > 0.0:
         metrics.update(
             {
-                "online_idm_bc/valid_action_count": float(
-                    output_dict["online_idm_bc_valid_action_count"].item()
-                ),
-                "online_idm_bc/mse_pose": float(
-                    output_dict["online_idm_bc_mse_pose"].item()
-                ),
-                "online_idm_bc/mse_gripper": float(
-                    output_dict["online_idm_bc_mse_gripper"].item()
-                ),
-                "online_idm_bc/full_action_mse": float(
-                    output_dict["online_idm_bc_full_action_mse"].item()
-                ),
-                "online_idm_bc/executed_prefix_mse": float(
-                    output_dict["online_idm_bc_executed_prefix_mse"].item()
-                ),
+                "online_idm_bc/valid_action_count": output_dict[
+                    "online_idm_bc_valid_action_count"
+                ].detach(),
+                "online_idm_bc/mse_pose": output_dict[
+                    "online_idm_bc_mse_pose"
+                ].detach(),
+                "online_idm_bc/mse_gripper": output_dict[
+                    "online_idm_bc_mse_gripper"
+                ].detach(),
+                "online_idm_bc/full_action_mse": output_dict[
+                    "online_idm_bc_full_action_mse"
+                ].detach(),
+                "online_idm_bc/executed_prefix_mse": output_dict[
+                    "online_idm_bc_executed_prefix_mse"
+                ].detach(),
             }
         )
         for index, value in enumerate(
-            output_dict["online_idm_bc_mse_per_dimension"].reshape(-1).tolist()
+            output_dict["online_idm_bc_mse_per_dimension"].detach().reshape(-1)
         ):
-            metrics[f"online_idm_bc/mse_dimension_{index}"] = float(value)
+            metrics[f"online_idm_bc/mse_dimension_{index}"] = value
         bin_values = output_dict["online_idm_bc_mse_by_timestep_bin"].reshape(-1)
-        bin_counts = output_dict["online_idm_bc_timestep_bin_count"].reshape(-1)
-        for index, count in enumerate(bin_counts.tolist()):
+        for index, count in enumerate(bin_counts):
             if int(count) > 0:
-                metrics[f"online_idm_bc/mse_timestep_bin_{index}"] = float(
-                    bin_values[index].item()
-                )
+                metrics[f"online_idm_bc/mse_timestep_bin_{index}"] = bin_values[
+                    index
+                ].detach()
                 metrics[f"online_idm_bc/timestep_bin_count_{index}"] = float(count)
     if present > 0.0:
         metrics["online_idm_bc/teacher_seconds_per_call"] = teacher_seconds / present
         metrics["online_idm_bc/teacher_bytes_per_call"] = teacher_bytes / present
     return total_loss, metrics
+
+
+def _lora_branch_gradient_metrics(
+    policy: OnlineIDMBCFastWAMPolicy,
+    gradients: dict[int, torch.Tensor | None],
+) -> dict[str, float]:
+    """Require a nonzero gradient in every configured UNCOND branch."""
+
+    metrics = {}
+    for name, adapter in policy.lora_adapters.items():
+        branch_gradients = [gradients[id(p)] for p in adapter.lora_parameters()]
+        nonzero = sum(
+            gradient is not None and bool((gradient != 0).any().item())
+            for gradient in branch_gradients
+        )
+        if not nonzero:
+            raise RuntimeError(
+                f"Online IDM BC produced no nonzero LoRA gradient in {name}."
+            )
+        metrics[f"online_idm_bc/gradient_audit_{name}_lora_nonzero_count"] = float(
+            nonzero
+        )
+    return metrics
 
 
 def audit_online_idm_bc_gradient_ownership(
@@ -154,7 +193,7 @@ def audit_online_idm_bc_gradient_ownership(
 ) -> dict[str, float]:
     """Prove that the isolated BC graph reaches LoRA and no other owner."""
 
-    lora_parameters = tuple(policy.lora_adapter.lora_parameters())
+    lora_parameters = tuple(policy.lora_parameters())
     lora_ids = {id(parameter) for parameter in lora_parameters}
     gate_parameters = tuple(
         parameter for parameter in policy.gate.parameters() if parameter.requires_grad
@@ -204,6 +243,10 @@ def audit_online_idm_bc_gradient_ownership(
     ):
         raise RuntimeError("Online IDM BC gradient escaped into Gate or critic state.")
     return {
+        **_lora_branch_gradient_metrics(
+            policy,
+            {id(p): g for p, g in zip(lora_parameters, lora_gradients, strict=True)},
+        ),
         "online_idm_bc/gradient_audit_pass": 1.0,
         "online_idm_bc/gradient_audit_lora_parameter_count": float(
             len(lora_parameters)
@@ -230,7 +273,7 @@ def audit_online_idm_bc_backward_gradient_ownership(
             "and value-head optimizer groups."
         )
     group_parameters = {name: tuple(group["params"]) for name, group in groups.items()}
-    lora_parameters = tuple(policy.lora_adapter.lora_parameters())
+    lora_parameters = tuple(policy.lora_parameters())
     gate_parameters = tuple(
         parameter for parameter in policy.gate.parameters() if parameter.requires_grad
     )
@@ -283,6 +326,9 @@ def audit_online_idm_bc_backward_gradient_ownership(
     if nonzero_counts["gate"] or nonzero_counts["value_head"]:
         raise RuntimeError("Online IDM BC gradient escaped into Gate or critic state.")
     return {
+        **_lora_branch_gradient_metrics(
+            policy, {id(p): p.grad for p in lora_parameters}
+        ),
         "online_idm_bc/gradient_audit_pass": 1.0,
         "online_idm_bc/gradient_audit_lora_parameter_count": float(
             len(group_parameters["uncond_lora"])
@@ -355,7 +401,7 @@ class OnlineIDMBCFSDPActor(EmbodiedFSDPActor):
     def train_micro_batch(
         self,
         micro_batch: dict[str, torch.Tensor],
-        metrics: dict[str, list[float]],
+        metrics: dict[str, list[float | torch.Tensor]],
         *,
         is_last: bool,
         selected_loss_scales: dict[str, float] | None = None,
@@ -395,7 +441,7 @@ class OnlineIDMBCFSDPActor(EmbodiedFSDPActor):
         micro_batch: dict,
         output_dict: dict[str, torch.Tensor],
         selected_loss_scales: dict[str, float] | None = None,
-    ) -> tuple[torch.Tensor, dict[str, float]]:
+    ) -> tuple[torch.Tensor, dict[str, float | torch.Tensor]]:
         """Preserve the current loss and append fixed-weight online BC."""
 
         current_loss, metrics = super()._compute_fastwam_loss(
@@ -410,10 +456,10 @@ class OnlineIDMBCFSDPActor(EmbodiedFSDPActor):
             config=self.online_idm_bc_config,
             selected_loss_scale=scales.get("flow"),
             metric_scale_numerator=float(self.gradient_accumulation * self._world_size),
-            flow_metric_loss=float(metrics.get("uncond_flow/total_loss", 0.0)),
+            flow_metric_loss=metrics.get("uncond_flow/total_loss", 0.0),
         )
         metrics.update(online_metrics)
-        metrics["fastwam/total_loss"] = float(total_loss.detach().item())
+        metrics["fastwam/total_loss"] = total_loss.detach()
         return total_loss, metrics
 
     def _run_online_idm_bc_gradient_audit(self) -> dict[str, float]:

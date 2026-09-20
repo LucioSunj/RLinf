@@ -7,8 +7,11 @@
 
 from __future__ import annotations
 
+import copy
 import time
 from collections.abc import Mapping
+from contextlib import nullcontext
+from dataclasses import replace
 from typing import Any, Literal
 
 import torch
@@ -18,6 +21,7 @@ from rlinf.models.embodiment.wam_policy.adaptive_policy import _column_values
 from rlinf.models.embodiment.wam_policy.contracts import (
     ChunkRouteRecord,
     GateDecisionRecord,
+    WAMRoute,
 )
 from rlinf.models.embodiment.wam_policy.critic import CriticKind
 from rlinf.models.embodiment.wam_policy.online_idm_bc.policy import (
@@ -35,6 +39,7 @@ from rlinf.models.embodiment.wam_policy.pad_rv.route_neutral_policy import (
     RouteNeutralRoutingState,
 )
 
+from .inference import InferenceAccelerationConfig, RouteNeutralInference
 from .runtime import (
     ROUTE_NEUTRAL_ROLLOUT_IDM_BATCH_SIZE,
     ROUTE_NEUTRAL_ROLLOUT_UNCOND_BATCH_SIZE,
@@ -51,15 +56,107 @@ class RouteNeutralOnlineIDMBCFastWAMPolicy(OnlineIDMBCFastWAMPolicy):
         *,
         runtime: RouteNeutralOnlineIDMTeacherLiberoRuntime,
         critic_warmup,
+        pure_uncond_num_envs: int = 0,
+        inference_acceleration: Mapping[str, Any] | None = None,
         **kwargs: Any,
     ) -> None:
         if not isinstance(runtime, RouteNeutralOnlineIDMTeacherLiberoRuntime):
             raise TypeError("Route-neutral policy requires its dedicated runtime.")
         self.critic_warmup = PadCriticWarmupConfig.from_mapping(critic_warmup)
+        self.pure_uncond_num_envs = pure_uncond_num_envs
         super().__init__(runtime=runtime, **kwargs)
         self.route_tracker = RouteNeutralRoutingState(
             physical_history=runtime.physical_history
         )
+        self.inference_acceleration = (
+            None
+            if inference_acceleration is None
+            else InferenceAccelerationConfig(**dict(inference_acceleration))
+        )
+        self._inference_engine = None
+
+    def enable_inference_acceleration(
+        self,
+        *,
+        merge_lora: bool = True,
+        compile: bool = True,
+        mode: str = "default",
+        backend: str = "inductor",
+    ) -> None:
+        """Prepare resident experts lazily on the next B1 evaluation call."""
+
+        self.inference_acceleration = InferenceAccelerationConfig(
+            merge_lora=merge_lora, compile=compile, mode=mode, backend=backend
+        )
+        self._inference_engine = None
+
+    def enable_torch_compile(self, mode: str = "default", **kwargs) -> None:
+        """Support RLinf's rollout compile switch for pure evaluation only."""
+
+        self.enable_inference_acceleration(compile=True, mode=mode, **kwargs)
+
+    @torch.no_grad()
+    def warmup_inference(
+        self, env_obs: dict[str, Any], *, repetitions: int = 3
+    ) -> dict[str, list[float]]:
+        """Warm both route kernels before control, retaining history and RNG."""
+
+        if env_obs["states"].shape[0] != 1 or repetitions < 1:
+            raise ValueError("Inference warmup requires B1 and positive repetitions.")
+        config = self.config
+        history = copy.deepcopy(self.route_tracker.state_dict())
+        cpu_rng = torch.get_rng_state()
+        device = self.runtime.device
+        cuda_rng = torch.cuda.get_rng_state(device) if device.type == "cuda" else None
+        times = {}
+        try:
+            for routing in ("forced_uncond", "forced_idm"):
+                self.config = replace(config, eval_routing_mode=routing)
+                times[routing] = []
+                for _ in range(repetitions):
+                    self.route_tracker.load_state_dict(copy.deepcopy(history))
+                    torch.set_rng_state(cpu_rng)
+                    if cuda_rng is not None:
+                        torch.cuda.set_rng_state(cuda_rng, device)
+                        torch.cuda.synchronize(device)
+                    started = time.perf_counter()
+                    self.predict_action_batch(env_obs, mode="eval")
+                    if cuda_rng is not None:
+                        torch.cuda.synchronize(device)
+                    times[routing].append(time.perf_counter() - started)
+        finally:
+            self.config = config
+            self.route_tracker.load_state_dict(history)
+            torch.set_rng_state(cpu_rng)
+            if cuda_rng is not None:
+                torch.cuda.set_rng_state(cuda_rng, device)
+        return times
+
+    def _apply(self, fn, recurse=True):
+        # Inference views share frozen tensor storage. Rebuild after .to() so
+        # their plain modules and compiled graphs follow the actual device/dtype.
+        self._inference_engine = None
+        return super()._apply(fn, recurse=recurse)
+
+    def train(self, mode: bool = True):
+        if mode:
+            self._inference_engine = None
+        return super().train(mode)
+
+    def _load_from_state_dict(self, *args, **kwargs):
+        self._inference_engine = None
+        return super()._load_from_state_dict(*args, **kwargs)
+
+    def load_trainable_state_dict(self, payload):
+        self._inference_engine = None
+        return super().load_trainable_state_dict(payload)
+
+    def set_global_step(self, version: int) -> None:
+        # RLinf's native actor-to-rollout weight transfer finishes with this
+        # hook, including transfers which copy tensors without load_state_dict.
+        if int(version) != self.actor_version:
+            self._inference_engine = None
+        super().set_global_step(version)
 
     def capture_gate_recompute_reference(self) -> None:
         """Condition replay never reconstructs route-derived Gate snapshots."""
@@ -171,10 +268,31 @@ class RouteNeutralOnlineIDMBCFastWAMPolicy(OnlineIDMBCFastWAMPolicy):
         reset_mask: torch.Tensor,
         identity_metadata: dict[str, torch.Tensor | None],
     ) -> tuple[torch.Tensor, dict[str, Any]]:
+        runtime = self.runtime
+        gate_forward = self.gate
+        acceleration = self.inference_acceleration
+        if (
+            mode == "eval"
+            and env_obs["states"].shape[0] == 1
+            and acceleration is not None
+            and acceleration.merge_lora
+        ):
+            if self._inference_engine is None:
+                self._inference_engine = RouteNeutralInference(
+                    self.runtime, self.gate, acceleration
+                )
+            self._inference_engine.begin_chunk()
+            runtime = self._inference_engine.runtime
+            gate_forward = self._inference_engine.gate_logits
         identity = self.route_tracker.prepare(
             env_ids=env_ids,
             reset_mask=reset_mask,
             actor_version=self.actor_version,
+            episode_ids=(
+                env_obs.get("_fastwam_evaluation_episode_ids")
+                if mode == "eval"
+                else None
+            ),
         )
         sampling_seeds = (
             self._formal_training_sampling_seeds(
@@ -197,8 +315,9 @@ class RouteNeutralOnlineIDMBCFastWAMPolicy(OnlineIDMBCFastWAMPolicy):
                 )
             runtime_obs = {**env_obs, **seed_fields}
 
-        prepared = self.runtime.prepare_route_neutral_step(
+        prepared = runtime.prepare_route_neutral_step(
             env_obs=runtime_obs,
+            mode=mode,
             include_critic_features=(
                 compute_values
                 and self._critic_kind() is CriticKind.FASTWAM_CURRENT_FRAME_VALUE
@@ -210,7 +329,7 @@ class RouteNeutralOnlineIDMBCFastWAMPolicy(OnlineIDMBCFastWAMPolicy):
         if measure_latency and gate_parameter.device.type == "cuda":
             torch.cuda.synchronize(gate_parameter.device)
         started = time.perf_counter()
-        logits = self.gate(gate_features.to(device=gate_parameter.device))
+        logits = gate_forward(gate_features.to(device=gate_parameter.device))
         selection = None
         if mode == "train":
             routes, base, behavior, logprob, exploration = self._training_gate_decision(
@@ -234,6 +353,14 @@ class RouteNeutralOnlineIDMBCFastWAMPolicy(OnlineIDMBCFastWAMPolicy):
                 else None
             )
             epsilon = torch.zeros_like(logits)
+        # Global environment slots retain their behavior across chunks, resets,
+        # rollout microbatches and actor updates. Evaluation has its own routing.
+        pure_uncond = None
+        if mode == "train" and self.pure_uncond_num_envs:
+            pure_uncond = env_ids.to(routes.device) < self.pure_uncond_num_envs
+            routes = torch.where(pure_uncond, int(WAMRoute.UNCOND), routes)
+            behavior = torch.where(pure_uncond, 0.0, behavior)
+            logprob = torch.where(pure_uncond, 0.0, logprob)
         gate_latency = None
         if measure_latency:
             if logits.device.type == "cuda":
@@ -244,7 +371,15 @@ class RouteNeutralOnlineIDMBCFastWAMPolicy(OnlineIDMBCFastWAMPolicy):
                 dtype=torch.float64,
             )
         route_info = self.route_tracker.commit(identity=identity, routes=routes)
-        sample = self.runtime.sample_routed_action_batch(
+        if pure_uncond is not None:
+            route_info = replace(
+                route_info,
+                route_was_forced=pure_uncond,
+                route_source_chunk_ids=torch.where(
+                    pure_uncond, -1, route_info.route_source_chunk_ids
+                ),
+            )
+        sample = runtime.sample_routed_action_batch(
             env_obs=runtime_obs,
             routes=route_info.route_used,
             mode=mode,
@@ -259,7 +394,7 @@ class RouteNeutralOnlineIDMBCFastWAMPolicy(OnlineIDMBCFastWAMPolicy):
             old_logprob=logprob,
             epsilon=epsilon,
             temperature=torch.full_like(logits, self.config.gate_temperature),
-            valid=torch.ones_like(routes, dtype=torch.bool),
+            valid=~route_info.route_was_forced,
             source_chunk_ids=route_info.chunk_ids,
             episode_ids=route_info.episode_ids,
             actor_versions=route_info.actor_versions,
@@ -314,12 +449,16 @@ class RouteNeutralOnlineIDMBCFastWAMPolicy(OnlineIDMBCFastWAMPolicy):
                 dtype=torch.float32,
             )
         values = _column_values(values, batch_size=gate_features.batch_size)
-        forward_inputs = {
-            **sample.forward_inputs,
-            **serialize_route_neutral_features(gate_features),
-            "flow_chains": sample.flow_chains,
-            "denoise_indices": sample.denoise_indices,
-        }
+        forward_inputs = (
+            {
+                **sample.forward_inputs,
+                **serialize_route_neutral_features(gate_features),
+                "flow_chains": sample.flow_chains,
+                "denoise_indices": sample.denoise_indices,
+            }
+            if mode == "train"
+            else {}
+        )
         if (
             critic_features is not None
             and self._critic_kind() is not CriticKind.FASTWAM_CURRENT_FRAME_VALUE
@@ -374,14 +513,15 @@ class RouteNeutralOnlineIDMBCFastWAMPolicy(OnlineIDMBCFastWAMPolicy):
             if self.config.decision_telemetry_enabled
             else {"task_ids": None, "trial_ids": None, "reset_state_ids": None}
         )
-        return self._predict_current_step(
-            env_obs=env_obs,
-            mode=mode,
-            compute_values=compute_values,
-            env_ids=env_ids,
-            reset_mask=reset_mask,
-            identity_metadata=identity_metadata,
-        )
+        with torch.no_grad() if mode == "eval" else nullcontext():
+            return self._predict_current_step(
+                env_obs=env_obs,
+                mode=mode,
+                compute_values=compute_values,
+                env_ids=env_ids,
+                reset_mask=reset_mask,
+                identity_metadata=identity_metadata,
+            )
 
     def default_forward(
         self,
@@ -445,6 +585,10 @@ class RouteNeutralOnlineIDMBCFastWAMPolicy(OnlineIDMBCFastWAMPolicy):
             "gate_behavior_probabilities": behavior.behavior_idm_probability,
             "values": _column_values(values, batch_size=int(routes.shape[0])),
         }
+        if self.pure_uncond_num_envs:
+            forced = route_info.route_was_forced.to(logits.device)
+            for key in ("gate_logprobs", "gate_entropy", "gate_behavior_probabilities"):
+                result[key] = torch.where(forced, 0.0, result[key])
         if compute_base_logprobs:
             if "base_uncond_kl" not in replay:
                 raise KeyError("UNCOND replay did not return base KL.")
@@ -467,10 +611,16 @@ class RouteNeutralOnlineIDMBCFastWAMPolicy(OnlineIDMBCFastWAMPolicy):
         return result
 
     def load_eval_checkpoint(self, *args, **kwargs) -> int:
+        self._inference_engine = None
         version = super().load_eval_checkpoint(*args, **kwargs)
         history = PhysicalStateHistoryTracker(self.runtime.route_neutral_input)
         self.runtime.physical_history = history
         self.route_tracker = RouteNeutralRoutingState(physical_history=history)
+        if self.inference_acceleration is None:
+            # Standalone native-checkpoint evaluation uses the accelerated
+            # path by default. Training restores call load_trainable_state_dict
+            # and never opt into these evaluation-only implementation choices.
+            self.enable_inference_acceleration()
         return version
 
 

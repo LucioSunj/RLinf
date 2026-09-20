@@ -19,7 +19,7 @@ from __future__ import annotations
 import hashlib
 import math
 import time
-from collections.abc import Mapping
+from collections.abc import Iterator, Mapping
 from dataclasses import dataclass, field, replace
 from typing import Any, Literal, Protocol
 
@@ -338,11 +338,13 @@ class FastWAMAdaptivePolicy(nn.Module, BasePolicy):
         gate: nn.Module,
         critic: nn.Module | None,
         config: FastWAMAdaptivePolicyConfig | None = None,
+        video_lora_adapter: Any | None = None,
     ) -> None:
         super().__init__()
         self.actor = actor
         self.runtime = runtime
         self.lora_adapter = lora_adapter
+        self.video_lora_adapter = video_lora_adapter
         self.gate = gate
         self.critic = critic
         self.config = config or FastWAMAdaptivePolicyConfig()
@@ -379,10 +381,25 @@ class FastWAMAdaptivePolicy(nn.Module, BasePolicy):
         batch_size = int(env_obs["states"].shape[0])
         return _column_values(values, batch_size=batch_size)
 
+    @property
+    def lora_adapters(self) -> dict[str, Any]:
+        """Return Action and optional Video adapters in checkpoint order."""
+
+        adapters = {"action": self.lora_adapter}
+        if self.video_lora_adapter is not None:
+            adapters["video"] = self.video_lora_adapter
+        return adapters
+
+    def lora_parameters(self) -> Iterator[nn.Parameter]:
+        """Yield both UNCOND branches for the existing LoRA optimizer owner."""
+
+        for adapter in self.lora_adapters.values():
+            yield from adapter.lora_parameters()
+
     def _enforce_frozen_actor(self) -> None:
         """Keep only the injected UNCOND LoRA trainable inside FastWAM."""
 
-        lora_parameters = tuple(self.lora_adapter.lora_parameters())
+        lora_parameters = tuple(self.lora_parameters())
         if not lora_parameters:
             raise ValueError(
                 "FastWAM adaptive policy requires trainable LoRA parameters."
@@ -1434,7 +1451,7 @@ class FastWAMAdaptivePolicy(nn.Module, BasePolicy):
                 "name": "uncond_lora",
                 "params": [
                     parameter
-                    for parameter in self.lora_adapter.lora_parameters()
+                    for parameter in self.lora_parameters()
                     if parameter.requires_grad
                 ],
                 "lr": lora_lr,
@@ -1463,7 +1480,7 @@ class FastWAMAdaptivePolicy(nn.Module, BasePolicy):
         """Save only adaptive state plus delayed-route schedules."""
 
         critic = self._require_critic()
-        return {
+        payload = {
             "schema": "fastwam-adaptive-policy-v1",
             "actor_version": self.actor_version,
             "gate": self.gate.state_dict(),
@@ -1471,6 +1488,10 @@ class FastWAMAdaptivePolicy(nn.Module, BasePolicy):
             "value_head": critic.value_head.state_dict(),
             "route_tracker": self.route_tracker.state_dict(),
         }
+        if self.video_lora_adapter is not None:
+            payload["schema"] = "fastwam-adaptive-policy-dual-lora-v1"
+            payload["video_lora"] = self.video_lora_adapter.lora_state_dict()
+        return payload
 
     def load_trainable_state_dict(self, payload: dict[str, Any]) -> None:
         expected_keys = {
@@ -1481,14 +1502,22 @@ class FastWAMAdaptivePolicy(nn.Module, BasePolicy):
             "value_head",
             "route_tracker",
         }
+        expected_schema = "fastwam-adaptive-policy-v1"
+        if self.video_lora_adapter is not None:
+            expected_keys.add("video_lora")
+            expected_schema = "fastwam-adaptive-policy-dual-lora-v1"
         if set(payload) != expected_keys:
             raise ValueError(
                 f"FastWAM adaptive-policy checkpoint keys changed: {sorted(payload)}."
             )
-        if payload.get("schema") != "fastwam-adaptive-policy-v1":
+        if payload.get("schema") != expected_schema:
             raise ValueError("Unsupported FastWAM adaptive-policy checkpoint.")
         self.gate.load_state_dict(payload["gate"], strict=True)
         self.lora_adapter.load_lora_state_dict(payload["lora"], strict=True)
+        if self.video_lora_adapter is not None:
+            self.video_lora_adapter.load_lora_state_dict(
+                payload["video_lora"], strict=True
+            )
         if self.critic is not None:
             self.critic.value_head.load_state_dict(payload["value_head"], strict=True)
         self.route_tracker.load_state_dict(payload["route_tracker"])

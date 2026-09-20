@@ -1,49 +1,74 @@
-# PR Review Checklist
+# RLinf review criteria
 
-Use alongside the PR diff. **Always cross-reference against `origin/main`** (`git fetch origin main` first; read with `git show origin/main:<path>` or the GitHub `main` URL), not the local working tree. Categories are in priority order — most of the review should be on (a) and (b).
+Read the section relevant to the resolved PR or local diff. The baseline and
+proposed state come from [SKILL.md](SKILL.md), not an assumed `origin/main`.
+For FastWAM, apply the Outer project's scoped scientific contracts as well.
 
-## (a) Correctness & bugs — primary
-- [ ] Logic: off-by-one, inverted conditions, wrong default, mutated shared state, missing await/sync
-- [ ] Edge cases: empty/None/NaN, single rank, world-size=1, first/last iter, resume-from-checkpoint, eval-only paths
-- [ ] Distributed: collectives called on every rank, device placement, deterministic ordering, no races on Ray actors/channels
-- [ ] Lifecycle & resources: GPU/file/actor cleanup, no leaks, no double-init/double-free
-- [ ] Numerical: dtype, in-place on grad-required tensors, unsafe casts, loss-mask correctness
-- [ ] Error handling: meaningful messages, validate at boundaries, no silent except
-- [ ] Behavior parity vs `origin/main` on refactored code paths (read both side-by-side)
+## Runtime and integration
 
-## (b) Design & pattern consistency vs `origin/main` — primary
-- [ ] Closest sibling identified in `origin/main`; new code matches its structure/naming
-- [ ] Registry decorators used (`register_advantage` / `register_policy_loss` / `register_reward`)
-- [ ] `SupportedModel` / `SupportedEnvType` / `get_env_cls()` / `validate_cfg` updated where needed
-- [ ] Worker subclasses `Worker`, uses `self.log_*`, launched via `create_group(...).launch(...)`
-- [ ] Embodied policy extends `BasePolicy`; no reimplemented base behavior
-- [ ] YAML config copied from a sibling; no dynamic values; fields read-only in code
-- [ ] No duplication of helpers already in `rlinf/utils/` (cite the existing helper)
-- [ ] Simpler approach used when the codebase already has one
-- [ ] No hardcoded machine paths, sleep-based sync, or monkey-patches
+Trace the changed behavior through its callers and the closest existing
+implementation. In distributed/numerical work, pay attention to the invariants
+the change touches: collective participation, tensor shape/dtype and masks,
+actor/rollout placement, gradient ownership, replay/state restoration, and
+worker/offload lifetime. An uncommon supported path still matters; a merely
+constructible input or unrelated hardening idea is not a reason to broaden a fix.
 
-## (c) Code ↔ docs consistency
-- [ ] If docs changed, follow the [docs-check skill](../docs-check/SKILL.md) (code↔docs cross-check + EN↔ZH parity)
-- [ ] Every config key / CLI flag / env var / path / supported name mentioned in changed docs exists in `origin/main` + PR
-- [ ] Public-facing additions/renames/removals in code are reflected in BOTH `docs/source-en/` AND `docs/source-zh/`
-- [ ] Changed `examples/embodiment/config/*.yaml` model-weight paths (`model_path`/`lora_path`/`backbone_model_path`/`wan_wm_hf_ckpt_path`): basename == repo in the `# https://huggingface.co/...` comment; repo resolves on HF (`/api/models/<org>/<repo>` → 200, non-redirecting `id`); and matches the model the env recipe doc prescribes for that env+suite+model family (e.g. LIBERO spatial/object/goal + π₀ → `RLinf-Pi0-LIBERO-Spatial-Object-Goal-SFT`); no base-vs-LoRA mixup or casing drift
-- [ ] EN/ZH paired pages agree: commands, paths, keys, claims, numbers, structure
-- [ ] No duplicated/missing/conflicting paragraphs between EN and ZH (or justified)
-- [ ] Style aligned with sibling docs (section titles/order, code blocks, table/link style)
-- [ ] Each docs finding gives concrete wording/structure fix and file references
+For new components, verify the applicable registration and interface:
+`register_advantage`, `register_policy_loss`, or `register_reward`;
+`SupportedModel` in `rlinf/config.py`; `SupportedEnvType` and `get_env_cls()`
+in `rlinf/envs/__init__.py`; embodied `BasePolicy` forwards; or scheduler
+`Worker` initialization and group launch. Check the actual current signatures.
+Use `self.log_*` in workers and the project logger elsewhere.
 
-## (d) Tests & CI
-- [ ] If the install script changed (`requirements/install.sh`, `requirements/embodied/`, `docker/Dockerfile`), follow the [install-check skill](../install-check/SKILL.md)
-- [ ] User-facing changes have unit or e2e tests
-- [ ] New env/model has install-script + Docker stage + CI/e2e coverage (use add-install-docker-ci-e2e)
-- [ ] New CI-relevant YAML referenced in the e2e test matrix
-- [ ] Large deps (docker/models/datasets) → maintainer ping noted
+Public YAML follows existing hierarchy, contains static values, and remains
+read-only in code. Compare refactors against the resolved baseline and distinguish
+changed semantics from existing behavior. Suggest an existing helper when it
+actually replaces duplicated logic; avoid introducing abstractions for hypothetical
+future uses.
 
-## (e) Style & metadata — only flag real issues
-- [ ] Google Python Style; pre-commit clean
-- [ ] Public classes/methods have Google-style docstrings; param type hints; return type when needed
-- [ ] Assertions/exceptions have meaningful messages
-- [ ] Logging used (no `print`)
-- [ ] Newly-added files (`git diff --name-status origin/main...<pr-head>`, status `A`) carry the `# Copyright <YEAR> The RLinf Authors.` header with `<YEAR>` = current year (`date +%Y`); third-party-vendored files keep their upstream copyright line
-- [ ] Every commit `Signed-off-by`; Conventional Commits subject
-- [ ] PR title in Conventional Commits format; PR Description + Checklist sections filled
+## Documentation and contribution
+
+[CONTRIBUTING.md](../../../CONTRIBUTING.md) is authoritative for style, tests,
+documentation, sign-off, and PR acceptance. User-facing behavior needs tests and
+documentation validated by a reviewer for reproducibility. Include relevant
+training performance/stability evidence when the change affects it.
+
+Changed user documentation must match the proposed code/configuration and its
+EN/ZH counterpart: commands, paths, keys, supported names, claims, metrics,
+dataset/trial counts, and structure. Use [docs-check](../docs-check/SKILL.md)
+for those pages. Agent Markdown and research artifacts outside the Sphinx trees
+do not acquire Sphinx layout/build rules from this review.
+
+New model/env integrations need install, Docker, and e2e/CI coverage unless the
+project explicitly exempts that target. Review changed installation paths with
+[install-check](../install-check/SKILL.md); do not start runtime tests solely
+because the review mentions CI.
+
+Style/metadata findings should identify a concrete requirement violation.
+Use Google docstrings/type hints and project logging; preserve third-party
+licenses and existing headers on moved files. Newly authored RLinf source files
+use the current-year RLinf license header in a format appropriate to the file.
+PR-only title, template, and commit checks apply when a PR/commit exists;
+Conventional Commits and `Signed-off-by:` remain required.
+
+A review does not post comments, request reviewers, or merge by itself.
+If large dependencies require maintainer involvement, identify that need in the
+review/PR preparation without sending an unsolicited message.
+
+## Model-weight examples
+
+For changed public example recipes under `examples/embodiment/config/`, follow
+the matching documentation's download command for the exact environment, task
+suite, and model family. Where the recipe downloads into a repo-named directory,
+the `/path/to/<repo-name>` placeholder and Hugging Face comment must agree.
+Distinguish base weights from LoRA adapters in `model_path`, `lora_path`,
+`backbone_model_path`, and `wan_wm_hf_ckpt_path`.
+
+Verify each distinct changed model reference against its official Hub API and
+check a returned canonical id for renames. An authentication/access failure
+limits verification; it does not by itself prove the repo is absent. Intentional
+user-selected checkpoint placeholders or task-specific deployment paths follow
+their own recipe/run contract. Do not replace them with a generic public model.
+
+Report a mismatch with its exact config/doc location and correction. Keep failed
+access distinct from a confirmed wrong model or broken public download.

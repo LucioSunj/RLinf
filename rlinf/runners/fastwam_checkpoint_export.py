@@ -77,44 +77,61 @@ def _resolve_uncond_lora_bootstrap(
 def _validate_uncond_lora_bootstrap_contract(cfg: Any, sidecar: Path) -> None:
     """Reject rank/config mismatches before allocating the adaptive model."""
 
+    from fastwam.adapters import (
+        REGIME_LORA_SIDECAR_SCHEMA,
+        VIDEO_BC_LORA_SIDECAR_SCHEMA,
+    )
+    from fastwam.uncond_bc_checkpoint import DUAL_UNCOND_BC_SIDECAR_SCHEMA
+
     payload = torch.load(sidecar, map_location="cpu", weights_only=True)
     if not isinstance(payload, dict):
         raise TypeError("BC LoRA sidecar payload must be a mapping.")
-    metadata = payload.get("metadata")
-    state = payload.get("state_dict")
-    if not isinstance(metadata, dict) or not isinstance(state, dict) or not state:
-        raise TypeError("BC LoRA sidecar requires metadata and non-empty state_dict.")
-    target_groups = OmegaConf.select(
-        cfg,
-        "actor.model.uncond_lora.target_groups",
-        default=[],
-    )
-    expected = {
-        "schema": "fastwam-regime-lora-v1",
-        "parent_checkpoint_sha256": str(
-            OmegaConf.select(
-                cfg,
-                "actor.model.actor_checkpoint_sha256",
-                default="",
+    dual = OmegaConf.select(cfg, "actor.model.video_lora") is not None
+    if dual:
+        if set(payload) != {"schema", "action", "video"} or (
+            payload["schema"] != DUAL_UNCOND_BC_SIDECAR_SCHEMA
+        ):
+            raise ValueError("Dual BC bootstrap requires Action and Video sidecars.")
+        branches = (
+            (payload["action"], "uncond_lora", REGIME_LORA_SIDECAR_SCHEMA),
+            (payload["video"], "video_lora", VIDEO_BC_LORA_SIDECAR_SCHEMA),
+        )
+    else:
+        branches = ((payload, "uncond_lora", REGIME_LORA_SIDECAR_SCHEMA),)
+    metadata_by_branch = []
+    for branch, field, schema in branches:
+        metadata = branch.get("metadata")
+        state = branch.get("state_dict")
+        if not isinstance(metadata, dict) or not isinstance(state, dict) or not state:
+            raise TypeError(
+                "BC LoRA sidecar requires metadata and non-empty state_dict."
             )
-        ).lower(),
-        "active_regime": "uncond",
-        "rank": int(OmegaConf.select(cfg, "actor.model.uncond_lora.rank", default=-1)),
-        "alpha": float(
-            OmegaConf.select(cfg, "actor.model.uncond_lora.alpha", default=-1.0)
-        ),
-        "dropout": float(
-            OmegaConf.select(cfg, "actor.model.uncond_lora.dropout", default=-1.0)
-        ),
-        "target_groups": [str(value) for value in target_groups],
-    }
-    mismatches = {
-        key: {"expected": expected_value, "actual": metadata.get(key)}
-        for key, expected_value in expected.items()
-        if metadata.get(key) != expected_value
-    }
-    if mismatches:
-        raise ValueError(f"BC LoRA bootstrap contract mismatch: {mismatches}.")
+        lora = OmegaConf.select(cfg, f"actor.model.{field}")
+        expected = {
+            "schema": schema,
+            "parent_checkpoint_sha256": str(
+                OmegaConf.select(cfg, "actor.model.actor_checkpoint_sha256", default="")
+            ).lower(),
+            "active_regime": "uncond",
+            "rank": int(lora.rank),
+            "alpha": float(lora.alpha),
+            "dropout": float(lora.dropout),
+            "target_groups": [str(value) for value in lora.target_groups],
+        }
+        mismatches = {
+            key: {"expected": expected_value, "actual": metadata.get(key)}
+            for key, expected_value in expected.items()
+            if metadata.get(key) != expected_value
+        }
+        if mismatches:
+            raise ValueError(
+                f"BC LoRA bootstrap contract mismatch for {field}: {mismatches}."
+            )
+        metadata_by_branch.append(metadata)
+    if dual and metadata_by_branch[0].get("extra") != metadata_by_branch[1].get(
+        "extra"
+    ):
+        raise ValueError("Action and Video BC bootstrap provenance differs.")
 
 
 def validate_initial_checkpoint_export_config(

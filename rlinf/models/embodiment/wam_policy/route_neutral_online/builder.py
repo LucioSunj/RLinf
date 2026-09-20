@@ -48,11 +48,14 @@ def build_route_neutral_online_idm_bc_model(cfg: Any, torch_dtype):
         actor=base.actor,
         runtime=runtime,
         lora_adapter=base.lora_adapter,
+        video_lora_adapter=base.video_lora_adapter,
         gate=gate,
         critic=base.critic,
         config=base.config,
         online_idm_bc_config=OnlineIDMBCConfig.from_mapping(profile.online_idm_bc),
         critic_warmup=profile.critic_warmup,
+        pure_uncond_num_envs=profile.get("pure_uncond_num_envs", 0),
+        inference_acceleration=cfg.get("inference_acceleration"),
     )
 
 

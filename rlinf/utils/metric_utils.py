@@ -26,6 +26,28 @@ if TYPE_CHECKING:
     from rlinf.data.embodied_io_struct import Trajectory
 
 
+def materialize_scalar_metrics(
+    metrics: dict[str, list[float | torch.Tensor]],
+) -> None:
+    """Copy detached scalar histories once per device before CPU reduction.
+
+    Keep every microbatch value in order so weighted means, maxima, and
+    compaction's original denominators still use their existing reducers.
+    """
+
+    pending: dict[torch.device, list[tuple[str, int, torch.Tensor]]] = {}
+    for name, values in metrics.items():
+        for index, value in enumerate(values):
+            if isinstance(value, torch.Tensor):
+                pending.setdefault(value.device, []).append(
+                    (name, index, value.detach().reshape(()))
+                )
+    for entries in pending.values():
+        scalars = torch.stack([entry[2] for entry in entries]).double().cpu().tolist()
+        for (name, index, _), scalar in zip(entries, scalars, strict=True):
+            metrics[name][index] = scalar
+
+
 def mean_bool_tensor_rate(
     tensors: Sequence[torch.Tensor | None],
     *,

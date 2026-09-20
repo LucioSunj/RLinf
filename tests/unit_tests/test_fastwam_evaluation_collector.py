@@ -96,9 +96,10 @@ def _action_trace(
     *,
     batch_size: int = 1,
     contract: LiberoActionContract | None = None,
+    values: torch.Tensor | None = None,
 ) -> ActionExecutionTrace:
     contract = _action_contract() if contract is None else contract
-    values = torch.zeros(batch_size, 2, 7)
+    values = torch.zeros(batch_size, 2, 7) if values is None else values
     return ActionExecutionTrace(
         stages=tuple(
             ActionStageStatistics.from_values(
@@ -234,7 +235,7 @@ def _collector(
     *,
     noise_seed_mode: str = "stateless_per_chunk",
     resume: bool = False,
-    contract_violation_outcome: str = "raise",
+    contract_violation_outcome: str | None = None,
     routing_mode: str = "forced_uncond",
     random_idm_probability: float | None = None,
     random_lag1_autocorrelation: float | None = None,
@@ -259,7 +260,11 @@ def _collector(
         fixed_idm_cost=0.01,
         decision_telemetry_enabled=decision_telemetry_enabled,
         noise_seed_mode=noise_seed_mode,
-        contract_violation_outcome=contract_violation_outcome,
+        **(
+            {}
+            if contract_violation_outcome is None
+            else {"contract_violation_outcome": contract_violation_outcome}
+        ),
         resume=resume,
         policy_checkpoint_sha256=policy_checkpoint_sha256,
         evaluation_runtime_identity=(
@@ -306,6 +311,82 @@ def test_nonrecursive_hydra_identity_is_canonicalized_as_audit_data(tmp_path) ->
     )
 
     assert collector.evaluation_runtime_identity == runtime_identity
+
+
+def test_continuation_input_retains_original_shard_episode_index(tmp_path) -> None:
+    ledger_path = tmp_path / "ledger.json"
+    ledger = _ledger(ledger_path)
+    ledger["entries"][0]["episode_index"] = 86
+    ledger_path.write_text(json.dumps(ledger), encoding="utf-8")
+    collector = _collector(tmp_path)
+    snapshot = collector.snapshot_before_step(
+        0, _IdentityEnv(), torch.tensor([1 << 50])
+    )
+
+    data = collector.augment_rollout_input(
+        {"obs": {"states": torch.zeros(1, 3)}}, snapshot
+    )
+
+    assert data["obs"]["_fastwam_evaluation_episode_ids"].tolist() == [86]
+    assert (
+        snapshot.slots[0].entry["episode_identity"]
+        == (ledger["entries"][0]["episode_identity"])
+    )
+
+
+@pytest.mark.parametrize("success", [False, True])
+def test_default_outlier_continues_until_environment_outcome(tmp_path, success) -> None:
+    collector = _collector(tmp_path)
+    env = _IdentityEnv()
+    snapshot = collector.snapshot_before_step(0, env, torch.tensor([1 << 50]))
+    actions = torch.zeros(1, 2, 7)
+    actions[:, :, 0] = 7.03125
+    actions[:, :, 2] = -1.125
+    rollout = _rollout(
+        chunk_id=0, route_used=1, forced=True, source_chunk_id=-1, terminal=False
+    )
+    rollout = replace(
+        rollout,
+        actions=actions,
+        action_execution_trace=_action_trace(
+            rollout.action_execution_trace.stage_names, values=actions
+        ),
+    )
+    outcome = _outcome(terminal=False)
+    outcome = replace(
+        outcome,
+        action_execution_trace=_action_trace(
+            outcome.action_execution_trace.stage_names, values=actions
+        ),
+    )
+    collector.record_chunk(
+        snapshot=snapshot,
+        rollout_result=rollout,
+        env_output=outcome,
+        environment_latency_seconds=0.02,
+    )
+    assert collector._episodes == []
+    collector.record_chunk(
+        snapshot=collector.snapshot_before_step(0, env, torch.tensor([1 << 50])),
+        rollout_result=_rollout(
+            chunk_id=1, route_used=0, forced=False, source_chunk_id=0, terminal=True
+        ),
+        env_output=_outcome(terminal=True, success=success),
+        environment_latency_seconds=0.02,
+    )
+    episode = json.loads(collector._episode_path.read_text().splitlines()[0])
+    chunk = json.loads(collector._chunk_path.read_text().splitlines()[0])
+    assert episode["success"] is success
+    assert episode["termination_type"] == ("success" if success else "truncation")
+    assert episode["chunk_episode_length"] == 2
+    assert episode["return"] == float(success)
+    assert episode["contract_violation_count"] == 0
+    assert episode["action_bounds_exceeded_chunk_count"] == 1
+    assert chunk["action_submission_status"] == "submitted"
+    assert chunk["primitive_steps_executed"] == 16
+    assert chunk["action_bounds_exceeded"] is True
+    assert chunk["action_max"] == 7.03125
+    assert chunk["action_min"] == -1.125
 
 
 def test_collector_records_aligned_chunks_episode_and_atomic_shards(tmp_path) -> None:
@@ -884,9 +965,11 @@ def test_action_contract_accepts_exact_bounds_and_rejects_bf16_next_value() -> N
     "contract_violation_outcome",
     ("fail_episode", "raise"),
 )
+@pytest.mark.parametrize("current_step", (False, True))
 def test_collector_persists_task884_contract_violation_without_submission(
     tmp_path,
     contract_violation_outcome,
+    current_step,
 ) -> None:
     collector = _collector(
         tmp_path,
@@ -896,10 +979,10 @@ def test_collector_persists_task884_contract_violation_without_submission(
     snapshot = collector.snapshot_before_step(0, env, torch.tensor([1 << 50]))
     rollout = _rollout(
         chunk_id=0,
-        route_used=1,
-        forced=True,
-        source_chunk_id=-1,
-        terminal=True,
+        route_used=0 if current_step else 1,
+        forced=not current_step,
+        source_chunk_id=0 if current_step else -1,
+        terminal=not current_step,
     )
     prepared_values = torch.zeros(1, 2, 7)
     prepared_values[0, 0, 0] = 7.207030773162842
@@ -956,7 +1039,10 @@ def test_collector_persists_task884_contract_violation_without_submission(
     )
     assert chunk["action_submission_status"] == "rejected"
     assert chunk["primitive_steps_executed"] == 0
-    assert chunk["route"] == "idm"
+    assert chunk["route"] == ("uncond" if current_step else "idm")
+    assert chunk["emitted_decision_consumed"] is current_step
+    assert chunk["emitted_decision_discarded"] is not current_step
+    assert chunk["eligible_decision"] is current_step
     assert chunk["action_max"] == pytest.approx(7.207030773162842)
     assert chunk["action_contract_violation"]["no_silent_clamp"] is True
     assert episode["success"] is False

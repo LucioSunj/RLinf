@@ -128,6 +128,13 @@ class _FSDPAuditPolicy(nn.Module):
         self.gate = nn.Linear(4, 1, bias=False)
         self.critic = nn.Linear(4, 1, bias=False)
 
+    @property
+    def lora_adapters(self):
+        return {"action": self.lora_adapter}
+
+    def lora_parameters(self):
+        return self.lora_adapter.lora_parameters()
+
     def forward(self, inputs: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         frozen = self.actor.base(inputs)
         bc_output = frozen + self.actor.lora_b(self.actor.lora_a(inputs))

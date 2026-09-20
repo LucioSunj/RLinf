@@ -1,0 +1,25 @@
+# @package _global_
+# Keep the formal preset's 30 mixed-policy slots and add 6 pure UNCOND slots.
+# Select with +pure_uncond_rollouts=extra6 on the online formal preset.
+# Global training environment IDs 0--5 always execute UNCOND; IDs 6--35 use
+# the existing warm-up/learned Gate. Evaluation routing is independent.
+
+runner:
+  logger:
+    experiment_name: libero_10_ppo_fastwam_route_neutral_online_extra_uncond
+
+env:
+  train:
+    total_num_envs: 36
+
+actor:
+  # 36 * 70 chunks / 252 = 10 global batches, as in the base preset.
+  global_batch_size: 252
+  model:
+    route_neutral_online:
+      pure_uncond_num_envs: 6
+
+rollout:
+  model:
+    route_neutral_online:
+      pure_uncond_num_envs: 6

@@ -1,0 +1,12 @@
+# @package _global_
+
+defaults:
+  - pad_route_neutral_warmup_reversal_damped_b50
+  - _self_
+
+algorithm:
+  fixed_branch_cost:
+    controller:
+      signed_price:
+        # Starts after critic warm-up. Override with 0.2 for rapid decay.
+        in_band_decay_factor: 0.0

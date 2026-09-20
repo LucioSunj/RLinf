@@ -14,6 +14,7 @@
 
 from __future__ import annotations
 
+import json
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 
@@ -21,6 +22,7 @@ import torch
 from torch.distributed.tensor import DTensor
 
 from rlinf.scheduler import Worker
+from rlinf.utils.logging import get_logger
 from rlinf.utils.utils import (
     materialize_tensor,
     normalize_device,
@@ -252,6 +254,14 @@ class CompressedWeightPatch:
             self.cols_dtype_code,
             self.values_dtype_code,
         ]
+
+
+@dataclass
+class WeightPatchSequence:
+    """Header for bounded CPU patch transfers belonging to one model version."""
+
+    version: torch.Tensor
+    patch_count: torch.Tensor
 
 
 WeightPatchTransport = EmptyWeightPatch | WeightPatch | CompressedWeightPatch
@@ -1055,21 +1065,114 @@ class PatchWeightSyncer(WeightSyncer):
             raise RuntimeError("Sender not initialized")
         return self.patch_builder.create_patch(state_dict, version)
 
+    def _patch_key_groups(
+        self, state_dict: dict[str, torch.Tensor | DTensor]
+    ) -> list[list[str]]:
+        """Bound CPU patch construction with the existing sync bucket budget.
+
+        The budget counts source tensor bytes. Sparse indices add a bounded
+        multiple of that size, and an individual tensor is never split.
+        """
+        if self.patch_builder is None:
+            raise RuntimeError("Sender not initialized")
+        self.patch_builder._validate_state_dict_keys(state_dict)
+        if self.transport_device.type != "cpu":
+            return [self.param_names_need_sync]
+
+        groups: list[list[str]] = []
+        current: list[str] = []
+        current_bytes = 0
+        for key in self.param_names_need_sync:
+            value = state_dict[key]
+            tensor_bytes = value.numel() * value.element_size()
+            if current and current_bytes + tensor_bytes > self.init_sync_bucket_size:
+                groups.append(current)
+                current = []
+                current_bytes = 0
+            current.append(key)
+            current_bytes += tensor_bytes
+        if current:
+            groups.append(current)
+        return groups
+
+    @torch.no_grad()
+    def _create_group_patch(
+        self,
+        state_dict: dict[str, torch.Tensor | DTensor],
+        keys: list[str],
+        version: int | torch.Tensor,
+    ) -> EmptyWeightPatch | WeightPatch:
+        """Build one patch while sharing the authoritative sender snapshot."""
+        builder = type(self.patch_builder)(
+            snapshot=(
+                {key: self.snapshot[key] for key in keys}
+                if self.snapshot is not None
+                else None
+            ),
+            ordered_keys=self.ordered_keys,
+            param_names_need_sync=keys,
+            original_shapes=self.original_shapes,
+            transport_device=self.transport_device,
+            delta_encoding=self.delta_encoding,
+        )
+        if isinstance(builder, CPUSnapshotPatchBuilder):
+            builder._copy_streams = self.patch_builder._copy_streams
+        return builder.create_patch({key: state_dict[key] for key in keys}, version)
+
     async def sync(
         self,
         state_dict: dict[str, torch.Tensor | DTensor],
         send: SendFn,
         version: int | torch.Tensor,
     ) -> None:
-        patch = self.create_patch(state_dict, version)
-        transport_patch = patch.to(
-            device=self.transport_device,
-            non_blocking=self.transport_device.type != "cpu",
-        )
-        if isinstance(transport_patch, EmptyWeightPatch):
-            await send(transport_patch)
-        else:
-            await send(self.compressor.compress(transport_patch))
+        groups = self._patch_key_groups(state_dict)
+        if len(groups) > 1:
+            await send(
+                WeightPatchSequence(
+                    version=torch.as_tensor(
+                        version, dtype=torch.int64, device=self.transport_device
+                    ),
+                    patch_count=torch.tensor(
+                        len(groups), dtype=torch.int32, device=self.transport_device
+                    ),
+                )
+            )
+        for keys in groups:
+            patch = (
+                self.create_patch(state_dict, version)
+                if len(groups) == 1
+                else self._create_group_patch(state_dict, keys, version)
+            )
+            transport_patch = patch.to(
+                device=self.transport_device,
+                non_blocking=self.transport_device.type != "cpu",
+            )
+            if isinstance(transport_patch, EmptyWeightPatch):
+                await send(transport_patch)
+            else:
+                await send(self.compressor.compress(transport_patch))
+            del patch, transport_patch
+        if len(groups) > 1 and self._active_sender:
+            group_bytes = [
+                sum(
+                    state_dict[key].numel() * state_dict[key].element_size()
+                    for key in keys
+                )
+                for keys in groups
+            ]
+            get_logger().info(
+                "FASTWAM_CPU_PATCH_SYNC="
+                + json.dumps(
+                    {
+                        "status": "PASS",
+                        "version": int(version),
+                        "patch_count": len(groups),
+                        "source_bytes": sum(group_bytes),
+                        "maximum_source_bucket_bytes": max(group_bytes),
+                    },
+                    sort_keys=True,
+                )
+            )
 
     @torch.no_grad()
     async def apply(self, model: torch.nn.Module, recv: RecvFn) -> int:
@@ -1077,7 +1180,24 @@ class PatchWeightSyncer(WeightSyncer):
             "Snapshot info not initialized"
         )
 
-        payload: WeightPatchTransport = await recv()
+        payload: WeightPatchTransport | WeightPatchSequence = await recv()
+        if isinstance(payload, WeightPatchSequence):
+            expected_version = int(payload.version.item())
+            patch_count = int(payload.patch_count.item())
+            for _ in range(patch_count):
+                payload = await recv()
+                applied_version = self._apply_patch_payload(model, payload)
+                if applied_version != expected_version:
+                    raise ValueError("Weight patch sequence contains mixed versions")
+                del payload
+            return expected_version
+        return self._apply_patch_payload(model, payload)
+
+    @torch.no_grad()
+    def _apply_patch_payload(
+        self, model: torch.nn.Module, payload: WeightPatchTransport
+    ) -> int:
+        """Apply and release one patch before receiving the next CPU bucket."""
 
         fallback_keepalive: list[torch.Tensor] = []
         if self.transport_device.type == Worker.torch_device_type:

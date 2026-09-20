@@ -1,0 +1,13 @@
+# @package _global_
+
+defaults:
+  - band_price_reversal_damped_b50
+  - _self_
+
+algorithm:
+  fixed_branch_cost:
+    controller:
+      signed_price:
+        # Clear stale pressure on reaching the band; 0.2 retains 20% per rollout.
+        # This release bypasses update_interval and max_delta_per_update.
+        in_band_decay_factor: 0.0

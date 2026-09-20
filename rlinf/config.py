@@ -938,6 +938,7 @@ def _validate_fastwam_adaptive_cfg(cfg, *, only_eval: bool) -> None:
         "num_action_chunks",
         "fastwam",
         "uncond_lora",
+        "video_lora",
         "gate",
         "gate_epsilon",
         "gate_temperature",

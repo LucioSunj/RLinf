@@ -94,6 +94,8 @@ _FASTWAM_EVAL_RUNTIME_ONLY_PATHS = (
     "eval_timing_cuda_synchronize",
     "decision_telemetry_enabled",
     "eval_without_critic",
+    "inference_acceleration",
+    "route_neutral_online.pure_uncond_num_envs",
 )
 
 
