@@ -38,6 +38,7 @@ from rlinf.models.embodiment.wam_policy.pad_rv.route_neutral_gate import (
 from rlinf.models.embodiment.wam_policy.pad_rv.route_neutral_policy import (
     RouteNeutralRoutingState,
 )
+from rlinf.utils.nested_dict_process import map_nested_tensors
 
 from .inference import InferenceAccelerationConfig, RouteNeutralInference
 from .runtime import (
@@ -74,6 +75,8 @@ class RouteNeutralOnlineIDMBCFastWAMPolicy(OnlineIDMBCFastWAMPolicy):
             else InferenceAccelerationConfig(**dict(inference_acceleration))
         )
         self._inference_engine = None
+        self._replay_text_ids: dict[str, int] = {}
+        self._inactive_rollout_template = None
 
     def enable_inference_acceleration(
         self,
@@ -222,8 +225,14 @@ class RouteNeutralOnlineIDMBCFastWAMPolicy(OnlineIDMBCFastWAMPolicy):
         self,
         forward_inputs: Mapping[str, torch.Tensor],
     ):
+        inputs = dict(forward_inputs)
+        if "gate_condition_language" not in inputs:
+            inputs["gate_condition_language"] = inputs["fastwam_context"][:, :-1]
+            inputs["gate_condition_language_mask"] = inputs["fastwam_context_mask"][
+                :, :-1
+            ]
         return deserialize_route_neutral_features(
-            forward_inputs,
+            inputs,
             layer_indices=self.runtime.route_neutral_visual.layer_indices,
         )
 
@@ -267,6 +276,10 @@ class RouteNeutralOnlineIDMBCFastWAMPolicy(OnlineIDMBCFastWAMPolicy):
         env_ids: torch.Tensor,
         reset_mask: torch.Tensor,
         identity_metadata: dict[str, torch.Tensor | None],
+        gate_batch_indices: torch.Tensor | None = None,
+        gate_batch_size: int | None = None,
+        critic_env_obs: dict[str, Any] | None = None,
+        critic_batch_indices: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, dict[str, Any]]:
         runtime = self.runtime
         gate_forward = self.gate
@@ -329,7 +342,23 @@ class RouteNeutralOnlineIDMBCFastWAMPolicy(OnlineIDMBCFastWAMPolicy):
         if measure_latency and gate_parameter.device.type == "cuda":
             torch.cuda.synchronize(gate_parameter.device)
         started = time.perf_counter()
-        logits = gate_forward(gate_features.to(device=gate_parameter.device))
+        gate_input = gate_features.to(device=gate_parameter.device)
+        if gate_batch_indices is not None:
+            # Gate GEMM geometry depends on the original rollout microbatch.
+            # Cheap placeholder rows retain that shape without evaluating their
+            # Video, action, or teacher backbones.
+            gate_input = map_nested_tensors(
+                gate_input,
+                lambda tensor: (
+                    tensor[:1]
+                    .expand(gate_batch_size, *tensor.shape[1:])
+                    .clone()
+                    .index_copy_(0, gate_batch_indices.to(tensor.device), tensor)
+                ),
+            )
+        logits = gate_forward(gate_input)
+        if gate_batch_indices is not None:
+            logits = logits.index_select(0, gate_batch_indices.to(logits.device))
         selection = None
         if mode == "train":
             routes, base, behavior, logprob, exploration = self._training_gate_decision(
@@ -434,10 +463,22 @@ class RouteNeutralOnlineIDMBCFastWAMPolicy(OnlineIDMBCFastWAMPolicy):
                 critic_features = sample.critic_features
                 values = critic.value_from_features(critic_features)
             else:
+                # The pi05 backbone and value head depend numerically on their
+                # original rollout batch shape. Select live rows only after
+                # the full critic forward, including its cached replay prefix.
                 critic_result = critic.predict_value_batch(
-                    self.runtime.critic_observation(env_obs=env_obs),
+                    self.runtime.critic_observation(
+                        env_obs=env_obs if critic_env_obs is None else critic_env_obs
+                    ),
                     return_prefix=True,
                 )
+                if critic_batch_indices is not None:
+                    critic_result = map_nested_tensors(
+                        critic_result,
+                        lambda tensor: tensor.index_select(
+                            0, critic_batch_indices.to(tensor.device)
+                        ),
+                    )
                 if isinstance(critic_result, tuple):
                     values, critic_features = critic_result
                 else:
@@ -459,6 +500,21 @@ class RouteNeutralOnlineIDMBCFastWAMPolicy(OnlineIDMBCFastWAMPolicy):
             if mode == "train"
             else {}
         )
+        if "fastwam_context" in forward_inputs:
+            descriptions = env_obs["task_descriptions"]
+            if isinstance(descriptions, str):
+                descriptions = [descriptions]
+            forward_inputs["route_neutral_text_id"] = torch.tensor(
+                [
+                    self._replay_text_ids.setdefault(text, len(self._replay_text_ids))
+                    for text in descriptions
+                ],
+                device=routes.device,
+                dtype=torch.long,
+            )
+            # The Gate uses the same frozen language tokens as the action model.
+            del forward_inputs["gate_condition_language"]
+            del forward_inputs["gate_condition_language_mask"]
         if (
             critic_features is not None
             and self._critic_kind() is not CriticKind.FASTWAM_CURRENT_FRAME_VALUE
@@ -466,7 +522,13 @@ class RouteNeutralOnlineIDMBCFastWAMPolicy(OnlineIDMBCFastWAMPolicy):
             replay_key = getattr(
                 self._require_critic(), "replay_feature_key", "critic_prefix"
             )
-            forward_inputs[replay_key] = critic_features
+            critic = self._require_critic()
+            if hasattr(critic, "pool_prefix_features"):
+                forward_inputs["critic_pooled"] = critic.pool_prefix_features(
+                    critic_features
+                )
+            else:
+                forward_inputs[replay_key] = critic_features
         result: dict[str, Any] = {
             "prev_logprobs": sample.old_flow_logprobs,
             "prev_values": values,
@@ -481,6 +543,123 @@ class RouteNeutralOnlineIDMBCFastWAMPolicy(OnlineIDMBCFastWAMPolicy):
             result["gate_latency_seconds"] = gate_latency
             result["gate_h2d_seconds"] = torch.zeros_like(gate_latency)
         return sample.actions, result
+
+    def _predict_active_training_rows(
+        self, env_obs: dict[str, Any], *, compute_values: bool
+    ) -> tuple[torch.Tensor, dict[str, Any]]:
+        """Skip finished actor rows while advancing their identity/history."""
+
+        active = env_obs["_route_neutral_active"].bool().reshape(-1)
+        batch_size = active.numel()
+        live = active.nonzero(as_tuple=False).reshape(-1)
+        dead = (~active).nonzero(as_tuple=False).reshape(-1)
+
+        def select_obs(indices: torch.Tensor) -> dict[str, Any]:
+            rows = indices.tolist()
+            selected = {}
+            for key, value in env_obs.items():
+                if key == "_route_neutral_active":
+                    continue
+                if isinstance(value, torch.Tensor) and value.ndim > 0:
+                    selected[key] = value.index_select(0, indices.to(value.device))
+                elif isinstance(value, (list, tuple)) and len(value) == batch_size:
+                    selected[key] = [value[row] for row in rows]
+                else:
+                    selected[key] = value
+            return selected
+
+        actions, results = [], []
+        if live.numel():
+            live_obs = select_obs(live)
+            live_ids, live_reset = self._routing_metadata(
+                live_obs, live.numel(), live_obs["states"].device
+            )
+            live_metadata = (
+                self._decision_identity_metadata(
+                    live_obs, batch_size=live.numel(), device=live_ids.device
+                )
+                if self.config.decision_telemetry_enabled
+                else {"task_ids": None, "trial_ids": None, "reset_state_ids": None}
+            )
+            live_actions, live_result = self._predict_current_step(
+                env_obs=live_obs,
+                mode="train",
+                compute_values=compute_values,
+                env_ids=live_ids,
+                reset_mask=live_reset,
+                identity_metadata=live_metadata,
+                gate_batch_indices=live,
+                gate_batch_size=batch_size,
+                critic_env_obs=env_obs,
+                critic_batch_indices=live,
+            )
+            actions.append(live_actions)
+            results.append(live_result)
+        if self._inactive_rollout_template is None:
+            raise RuntimeError("A rollout must start with active environments.")
+
+        dead_obs = select_obs(dead)
+        env_ids, reset_mask = self._routing_metadata(
+            dead_obs, dead.numel(), dead_obs["states"].device
+        )
+        identity = self.route_tracker.prepare(
+            env_ids=env_ids, reset_mask=reset_mask, actor_version=self.actor_version
+        )
+        route_device = self._inactive_rollout_template[1][
+            "route_info"
+        ].route_used.device
+        route = self.route_tracker.commit(
+            identity=identity,
+            routes=torch.full_like(env_ids, int(WAMRoute.IDM), device=route_device),
+        )
+        route = replace(
+            route,
+            route_was_forced=torch.ones_like(route.route_used, dtype=torch.bool),
+            route_source_chunk_ids=torch.full_like(route.route_used, -1),
+        )
+        self.runtime.physical_history.features_and_append(
+            env_ids=env_ids,
+            reset_mask=reset_mask,
+            current_state=self.runtime._normalized_proprio(dead_obs["states"]).detach(),
+        )
+        dead_actions, dead_result = map_nested_tensors(
+            self._inactive_rollout_template,
+            lambda tensor: tensor.expand(dead.numel(), *tensor.shape[1:]),
+        )
+        dead_result["route_info"] = route
+        metadata = (
+            self._decision_identity_metadata(
+                dead_obs, batch_size=dead.numel(), device=route_device
+            )
+            if self.config.decision_telemetry_enabled
+            else {}
+        )
+        dead_result["emitted_gate"] = replace(
+            dead_result["emitted_gate"],
+            next_route=route.route_used,
+            source_chunk_ids=route.chunk_ids,
+            episode_ids=route.episode_ids,
+            actor_versions=route.actor_versions,
+            temperature=torch.full_like(
+                dead_result["emitted_gate"].temperature, self.config.gate_temperature
+            ),
+            environment_ids=(
+                env_ids.to(route_device)
+                if self.config.decision_telemetry_enabled
+                else None
+            ),
+            **metadata,
+        )
+        dead_result["forward_inputs"]["denoise_indices"] = torch.full_like(
+            dead_result["forward_inputs"]["denoise_indices"], -1
+        )
+        actions.append(dead_actions)
+        results.append(dead_result)
+        merged = self._merge_training_microbatch_results(actions, results)
+        order = torch.cat((live, dead)).argsort()
+        return map_nested_tensors(
+            merged, lambda tensor: tensor.index_select(0, order.to(tensor.device))
+        )
 
     def predict_action_batch(
         self,
@@ -502,6 +681,15 @@ class RouteNeutralOnlineIDMBCFastWAMPolicy(OnlineIDMBCFastWAMPolicy):
                 compute_values=compute_values,
                 microbatch_size=microbatch,
             )
+        if (
+            mode == "train"
+            and "_route_neutral_active" in env_obs
+            and self.config.formal_training_sampling_seed is not None
+            and not bool(env_obs["_route_neutral_active"].all())
+        ):
+            return self._predict_active_training_rows(
+                env_obs, compute_values=compute_values
+            )
         device = env_obs["states"].device
         env_ids, reset_mask = self._routing_metadata(env_obs, batch_size, device)
         identity_metadata = (
@@ -514,7 +702,7 @@ class RouteNeutralOnlineIDMBCFastWAMPolicy(OnlineIDMBCFastWAMPolicy):
             else {"task_ids": None, "trial_ids": None, "reset_state_ids": None}
         )
         with torch.no_grad() if mode == "eval" else nullcontext():
-            return self._predict_current_step(
+            output = self._predict_current_step(
                 env_obs=env_obs,
                 mode=mode,
                 compute_values=compute_values,
@@ -522,6 +710,17 @@ class RouteNeutralOnlineIDMBCFastWAMPolicy(OnlineIDMBCFastWAMPolicy):
                 reset_mask=reset_mask,
                 identity_metadata=identity_metadata,
             )
+        if mode == "train":
+            # Expanded scalar zeros retain only schema/placement, not an old
+            # observation, K/V bank, action, or autograd graph. Zero-count Action
+            # traces explicitly mean no model actions were generated for padding.
+            self._inactive_rollout_template = map_nested_tensors(
+                output,
+                lambda tensor: torch.zeros(
+                    (), dtype=tensor.dtype, device=tensor.device
+                ).expand(1, *tensor.shape[1:]),
+            )
+        return output
 
     def default_forward(
         self,
@@ -562,7 +761,11 @@ class RouteNeutralOnlineIDMBCFastWAMPolicy(OnlineIDMBCFastWAMPolicy):
                 values = critic.value_from_features(replay["critic_features"])
             else:
                 replay_key = getattr(critic, "replay_feature_key", "critic_prefix")
-                if replay_key in forward_inputs:
+                if "critic_pooled" in forward_inputs:
+                    values = critic.value_from_pooled_features_rowwise_head(
+                        forward_inputs["critic_pooled"]
+                    )
+                elif replay_key in forward_inputs:
                     prefix = forward_inputs[replay_key]
                     values = self._critic_replay_values(critic, prefix)
                 else:
@@ -593,10 +796,10 @@ class RouteNeutralOnlineIDMBCFastWAMPolicy(OnlineIDMBCFastWAMPolicy):
             if "base_uncond_kl" not in replay:
                 raise KeyError("UNCOND replay did not return base KL.")
             result["base_uncond_kl"] = replay["base_uncond_kl"]
-        online_bc = self.runtime.compute_online_idm_bc_loss(
-            forward_inputs=forward_inputs,
-            route_info=route_info,
-        )
+        bc_kwargs = {"forward_inputs": forward_inputs, "route_info": route_info}
+        if "uncond_condition" in replay:
+            bc_kwargs["uncond_condition"] = replay["uncond_condition"]
+        online_bc = self.runtime.compute_online_idm_bc_loss(**bc_kwargs)
         result.update(online_bc.as_forward_outputs())
         for forward_key, metric_name in (
             (ROUTE_NEUTRAL_ROLLOUT_IDM_BATCH_SIZE, "perf/rollout_idm_batch_size"),
@@ -616,9 +819,10 @@ class RouteNeutralOnlineIDMBCFastWAMPolicy(OnlineIDMBCFastWAMPolicy):
         history = PhysicalStateHistoryTracker(self.runtime.route_neutral_input)
         self.runtime.physical_history = history
         self.route_tracker = RouteNeutralRoutingState(physical_history=history)
-        if self.inference_acceleration is None:
-            # Standalone native-checkpoint evaluation uses the accelerated
-            # path by default. Training restores call load_trainable_state_dict
+        if self.inference_acceleration is None and self.video_lora_adapter is None:
+            # Action-only native evaluation uses acceleration by default;
+            # dual adapters retain their supported eager path. Training restores
+            # call load_trainable_state_dict
             # and never opt into these evaluation-only implementation choices.
             self.enable_inference_acceleration()
         return version

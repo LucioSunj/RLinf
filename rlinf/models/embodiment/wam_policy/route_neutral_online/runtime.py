@@ -175,7 +175,7 @@ class RouteNeutralOnlineIDMTeacherLiberoRuntime(OnlineIDMTeacherLiberoRuntime):
     def _prepare_action_condition(
         self,
         *,
-        image: torch.Tensor,
+        image: torch.Tensor | None,
         context: torch.Tensor,
         context_mask: torch.Tensor,
         regime: PolicyRegime,
@@ -192,7 +192,7 @@ class RouteNeutralOnlineIDMTeacherLiberoRuntime(OnlineIDMTeacherLiberoRuntime):
                     if first_frame_latents is None
                     else first_frame_latents.detach()
                 )
-            batch_size = int(image.shape[0])
+            batch_size = int(context.shape[0])
             with self._uncond_video_scope(batch_size):
                 condition = self._prefill_video_condition(
                     video_latents=first_frame,
@@ -252,14 +252,27 @@ class RouteNeutralOnlineIDMTeacherLiberoRuntime(OnlineIDMTeacherLiberoRuntime):
 
     @torch.no_grad()
     def _prepare_parent_current_condition(
-        self, **kwargs: torch.Tensor
+        self, **kwargs: torch.Tensor | None
     ) -> tuple[CachedActionCondition, torch.Tensor | None]:
         """Build canonical parent K/V for the route-neutral Gate and critic."""
 
         with (
             self.lora_adapter.use_regime(PolicyRegime.IDM),
-            self.batch_linear_context.use(int(kwargs["image"].shape[0])),
+            self.batch_linear_context.use(int(kwargs["context"].shape[0])),
         ):
+            if kwargs.get("image") is None:
+                return self._prefill_video_condition(
+                    video_latents=kwargs["first_frame_latents"],
+                    context=kwargs["context"],
+                    context_mask=kwargs["context_mask"],
+                    fuse_flag=bool(
+                        getattr(
+                            self.actor.video_expert,
+                            "fuse_vae_embedding_in_latents",
+                            False,
+                        )
+                    ),
+                ), None
             return super()._prepare_action_condition(
                 **kwargs, regime=PolicyRegime.UNCOND
             )
@@ -773,10 +786,15 @@ class RouteNeutralOnlineIDMTeacherLiberoRuntime(OnlineIDMTeacherLiberoRuntime):
             env_obs=env_obs,
         )
         forward_inputs = {
-            "fastwam_images": prepared.images.detach(),
             "fastwam_context": prepared.context.detach(),
             "fastwam_context_mask": prepared.context_mask.detach(),
         }
+        if prepared.first_frame_latents is None:
+            forward_inputs["fastwam_images"] = prepared.images.detach()
+        else:
+            forward_inputs["fastwam_first_frame_latents"] = (
+                prepared.first_frame_latents.detach()
+            )
 
         teacher_actions = torch.zeros_like(
             chains[:, -1],
@@ -1044,6 +1062,31 @@ class RouteNeutralOnlineIDMTeacherLiberoRuntime(OnlineIDMTeacherLiberoRuntime):
         )
         return RouteNeutralTrainableChunkSample.without_route_snapshot(sample)
 
+    @staticmethod
+    def _replay_condition_inputs(
+        forward_inputs: dict[str, torch.Tensor],
+        indices: torch.Tensor | None = None,
+    ) -> dict[str, torch.Tensor | None]:
+        """Use the frozen VAE result already computed by the dual rollout."""
+
+        result = {
+            "image": forward_inputs.get("fastwam_images"),
+            "context": forward_inputs["fastwam_context"],
+            "context_mask": forward_inputs["fastwam_context_mask"],
+        }
+        if "fastwam_first_frame_latents" in forward_inputs:
+            result["first_frame_latents"] = forward_inputs[
+                "fastwam_first_frame_latents"
+            ]
+        if indices is not None:
+            result = {
+                name: value.index_select(0, indices.to(value.device))
+                if value is not None
+                else None
+                for name, value in result.items()
+            }
+        return result
+
     def replay_action_batch(
         self,
         *,
@@ -1060,11 +1103,7 @@ class RouteNeutralOnlineIDMTeacherLiberoRuntime(OnlineIDMTeacherLiberoRuntime):
         )
         chains = forward_inputs["flow_chains"]
         indices = forward_inputs["denoise_indices"]
-        condition_inputs = {
-            "image": forward_inputs["fastwam_images"],
-            "context": forward_inputs["fastwam_context"],
-            "context_mask": forward_inputs["fastwam_context_mask"],
-        }
+        condition_inputs = self._replay_condition_inputs(forward_inputs)
         if self.video_lora_adapter is None:
             current_condition, replay_noise = self._prepare_action_condition(
                 **condition_inputs, regime=PolicyRegime.UNCOND
@@ -1089,15 +1128,13 @@ class RouteNeutralOnlineIDMTeacherLiberoRuntime(OnlineIDMTeacherLiberoRuntime):
         )
         routes = route_info.route_used.reshape(-1).to(self.device)
         selected = (routes == int(WAMRoute.UNCOND)).nonzero(as_tuple=False).reshape(-1)
+        selected_condition = None
         if selected.numel():
             actor_versions = route_info.actor_versions.reshape(-1)
             actor_version = int(actor_versions[selected[0]].item())
             if self.video_lora_adapter is not None:
                 selected_condition, _ = self._prepare_action_condition(
-                    **{
-                        name: value.index_select(0, selected.to(value.device))
-                        for name, value in condition_inputs.items()
-                    },
+                    **self._replay_condition_inputs(forward_inputs, selected),
                     regime=PolicyRegime.UNCOND,
                 )
             else:
@@ -1152,6 +1189,9 @@ class RouteNeutralOnlineIDMTeacherLiberoRuntime(OnlineIDMTeacherLiberoRuntime):
                 )
                 base_kl = base_kl.index_copy(0, selected, selected_kl)
         result = {
+            # This graph belongs only to the current forward. BC consumes a
+            # subset of it before the combined loss is backpropagated.
+            "uncond_condition": (selected, selected_condition),
             "flow_logprobs": select_executed_action_prefix(
                 logprobs,
                 protocol=self.action_protocol,
@@ -1177,16 +1217,22 @@ class RouteNeutralOnlineIDMTeacherLiberoRuntime(OnlineIDMTeacherLiberoRuntime):
         *,
         forward_inputs: dict[str, torch.Tensor],
         route_info: ChunkRouteRecord,
+        uncond_condition: tuple[torch.Tensor, CachedActionCondition | None]
+        | None = None,
     ) -> OnlineIDMBCLossBatch:
         """Compute the online BC numerator with one selected-row forward."""
 
         required = set(ONLINE_IDM_BC_FORWARD_KEYS) | {
             ONLINE_IDM_BC_FLOW_VALID,
             "flow_chains",
-            "fastwam_images",
             "fastwam_context",
             "fastwam_context_mask",
         }
+        required.add(
+            "fastwam_first_frame_latents"
+            if "fastwam_first_frame_latents" in forward_inputs
+            else "fastwam_images"
+        )
         missing = sorted(required - set(forward_inputs))
         if missing:
             raise KeyError(f"Online IDM BC actor replay is missing fields: {missing}.")
@@ -1305,25 +1351,23 @@ class RouteNeutralOnlineIDMTeacherLiberoRuntime(OnlineIDMTeacherLiberoRuntime):
                 noise,
                 timestep,
             )
-            condition, replay_noise = self._prepare_action_condition(
-                image=forward_inputs["fastwam_images"].index_select(
-                    0,
-                    selected_indices.to(forward_inputs["fastwam_images"].device),
-                ),
-                context=forward_inputs["fastwam_context"].index_select(
-                    0,
-                    selected_indices.to(forward_inputs["fastwam_context"].device),
-                ),
-                context_mask=forward_inputs["fastwam_context_mask"].index_select(
-                    0,
-                    selected_indices.to(forward_inputs["fastwam_context_mask"].device),
-                ),
-                regime=PolicyRegime.UNCOND,
-            )
-            if replay_noise is not None:
-                raise AssertionError(
-                    "Online BC current condition created future noise."
+            if uncond_condition is None:
+                condition, replay_noise = self._prepare_action_condition(
+                    **self._replay_condition_inputs(forward_inputs, selected_indices),
+                    regime=PolicyRegime.UNCOND,
                 )
+                if replay_noise is not None:
+                    raise AssertionError(
+                        "Online BC current condition created future noise."
+                    )
+            else:
+                replay_indices, replay_condition = uncond_condition
+                # Both index vectors follow the original microbatch row order.
+                if selected_indices.numel() == replay_indices.numel():
+                    condition = replay_condition
+                else:
+                    bc_in_replay = torch.searchsorted(replay_indices, selected_indices)
+                    condition = replay_condition.index_select(bc_in_replay)
             actor_versions = route_info.actor_versions.reshape(-1)
             prediction = self._velocity(
                 condition,

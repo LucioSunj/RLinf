@@ -95,6 +95,46 @@ def test_capture_matches_trainable_and_persistent_sync_contract() -> None:
     assert not captured["persistent"].is_parameter
 
 
+def test_fastwam_sync_sends_each_parameter_once_and_updates_all_aliases() -> None:
+    from rlinf.hybrid_engines.weight_syncer.patch_syncer import (
+        PatchWeightSyncer,
+        WeightPatch,
+    )
+    from rlinf.utils.utils import collect_param_names_need_sync
+
+    module = nn.Module()
+    module.expert = nn.Linear(2, 2, bias=False)
+    module.mot = nn.ModuleDict({"expert": module.expert})
+    module.dit = module.mot
+    module.expert.register_buffer("persistent", torch.ones(1))
+    captured = capture_fastwam_sync_tensors(module)
+    names = collect_param_names_need_sync(module, remove_duplicate=True)
+    assert names == list(captured) == ["expert.weight", "expert.persistent"]
+    assert len(collect_param_names_need_sync(module)) == 6
+    receiver = nn.Module()
+    receiver.expert = nn.Linear(2, 2, bias=False, dtype=torch.bfloat16)
+    receiver.mot = nn.ModuleDict({"expert": receiver.expert})
+    receiver.dit = receiver.mot
+    receiver.expert.register_buffer("persistent", torch.zeros(1))
+    state = receiver.state_dict()
+    syncer = PatchWeightSyncer(transport_device="cpu", delta_encoding=False)
+    syncer.ordered_keys = list(state)
+    syncer.original_shapes = {key: value.shape for key, value in state.items()}
+    expected = torch.tensor([[1.25, 2.5], [3.75, 4.0]], dtype=torch.bfloat16)
+    patch = WeightPatch(
+        version=torch.tensor(9),
+        ordinals=torch.tensor([syncer.ordered_keys.index("expert.weight")]),
+        nnz_per_tensor=torch.tensor([4]),
+        rows=torch.tensor([0, 0, 1, 1]),
+        cols=torch.tensor([0, 1, 0, 1]),
+        values=expected.reshape(-1).view(torch.uint8),
+    )
+    assert syncer._apply_patch_payload(receiver, patch) == 9
+    for name in ("expert.weight", "mot.expert.weight", "dit.expert.weight"):
+        assert torch.equal(receiver.state_dict()[name], expected)
+    assert receiver.expert.weight.dtype is torch.bfloat16
+
+
 def test_current_frame_critic_sync_has_one_value_head_and_no_actor_copy() -> None:
     module = _CurrentFrameCriticSyncModule()
 

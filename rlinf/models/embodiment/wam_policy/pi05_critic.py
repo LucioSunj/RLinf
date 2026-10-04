@@ -156,6 +156,13 @@ class Pi05ValueAfterVLMCritic(nn.Module):
     ) -> torch.Tensor:
         """Pool a replay batch together, then evaluate its value head by row."""
 
+        return self.value_from_pooled_features_rowwise_head(
+            self.pool_prefix_features(prefix_output)
+        )
+
+    def pool_prefix_features(self, prefix_output: torch.Tensor) -> torch.Tensor:
+        """Keep the exact frozen prefix reduction as a compact replay feature."""
+
         config = self.backbone.config
         if (
             "pi05_" not in str(config.config_name)
@@ -170,9 +177,15 @@ class Pi05ValueAfterVLMCritic(nn.Module):
             + [True] * 200
         )
         pooled = prefix_output.detach()[:, prefix_mask, :].mean(dim=1)
-        pooled = pooled.to(dtype=torch.float32)
+        return pooled.to(dtype=torch.float32)
+
+    def value_from_pooled_features_rowwise_head(
+        self, pooled: torch.Tensor
+    ) -> torch.Tensor:
+        """Evaluate stored mean-token features with the original B1 head calls."""
+
         return torch.cat(
-            [self.value_head(row)[:, 0] for row in pooled.split(1, dim=0)],
+            [self.value_head(row)[:, 0] for row in pooled.detach().split(1, dim=0)],
             dim=0,
         )
 

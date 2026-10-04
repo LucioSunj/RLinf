@@ -286,7 +286,13 @@ class FSDPModelManager:
 
         # here record the original trainable parameters' names before FSDP wrapping
         # persist buffers' names are also recorded, which will be used for weight syncing.
-        self.param_names_need_sync = collect_param_names_need_sync(module)
+        self.param_names_need_sync = collect_param_names_need_sync(
+            module,
+            remove_duplicate=(
+                self._cfg.model.get("model_type")
+                == SupportedModel.FASTWAM_ADAPTIVE.value
+            ),
+        )
 
         # build model, optimizer, lr_scheduler, grad_scaler
         self.model = self._strategy.wrap_model(
@@ -425,6 +431,17 @@ class FSDPModelManager:
             A tuple of (grad_norm, lr_list), lr_list contains learning rates for all param groups.
         """
         self.optimizer_steps += 1
+        uncond_rl = self._cfg.model.get("uncond_rl")
+        uncond_value_warmup = uncond_rl is not None and int(
+            getattr(self, "version", 0)
+        ) < int(uncond_rl.get("critic_warmup_updates", 0))
+        if uncond_value_warmup:
+            # FSDP can materialize zero gradient views for unused LoRA tensors.
+            # Clear them so Adam moments/weight decay also stay frozen.
+            for group in self.optimizer.param_groups:
+                if group.get("name") == "uncond_lora":
+                    for parameter in group["params"]:
+                        parameter.grad = None
         self.grad_scaler.unscale_(self.optimizer)
         grad_norm = self._strategy.clip_grad_norm_(
             model=self.model,
@@ -438,7 +455,7 @@ class FSDPModelManager:
             )
 
             self._fastwam_last_gradient_norms = fastwam_optimizer_gradient_norms(
-                self.optimizer
+                self.optimizer, require_gate=uncond_rl is None
             )
 
         if not torch.isfinite(torch.as_tensor(grad_norm)):
@@ -448,6 +465,7 @@ class FSDPModelManager:
         else:
             if (
                 not self._fastwam_update_resolution_checked
+                and (not uncond_value_warmup or self.optimizer_steps == 1)
                 and SupportedModel(self._cfg.model.model_type)
                 is SupportedModel.FASTWAM_ADAPTIVE
             ):
@@ -460,8 +478,10 @@ class FSDPModelManager:
                     minimum_half_ulp_ratio=float(
                         self._cfg.optim.update_resolution_min_half_ulp_ratio
                     ),
+                    require_gate=uncond_rl is None,
+                    value_only=uncond_value_warmup,
                 )
-                self._fastwam_update_resolution_checked = True
+                self._fastwam_update_resolution_checked = not uncond_value_warmup
                 self._logger.info(
                     "[FSDP] FastWAM first-step update resolution: "
                     f"{json.dumps(resolution, sort_keys=True)}"
@@ -578,13 +598,14 @@ class FSDPModelManager:
             )
 
             fastwam_groups = partition_fastwam_trainable_parameters(
-                model.named_parameters()
+                model.named_parameters(),
+                require_gate=self._cfg.model.get("uncond_rl") is None,
             )
             param_groups.extend(
                 [
                     {
                         "name": "gate",
-                        "params": fastwam_groups["gate"],
+                        "params": fastwam_groups.get("gate", []),
                         "lr": self._cfg.optim.get("gate_lr", self._cfg.optim.lr),
                         "betas": betas,
                         "weight_decay": self._cfg.optim.get(
@@ -611,6 +632,7 @@ class FSDPModelManager:
                     },
                 ]
             )
+            param_groups = [group for group in param_groups if group["params"]]
         elif len(params_actor) > 0:
             param_groups.append(
                 {

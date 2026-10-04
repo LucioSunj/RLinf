@@ -438,32 +438,33 @@ def get_model(cfg, torch_dtype):
     lora_config = RegimeLoRAConfig(**lora_payload)
     if lora_config.dropout != 0.0:
         raise ValueError("FastWAM PPO requires deterministic LoRA dropout == 0.")
+    uncond_rl = cfg.get("uncond_rl") is not None
     video_lora_config = None
     if cfg.get("video_lora") is not None:
-        if cfg.get("route_neutral_online") is None:
-            raise ValueError("Video LoRA RL requires the route-neutral online profile.")
+        if cfg.get("route_neutral_online") is None and not uncond_rl:
+            raise ValueError("Video LoRA RL requires a dual-LoRA training profile.")
         video_lora_config = RegimeLoRAConfig(
             **OmegaConf.to_container(cfg.video_lora, resolve=True)
         )
         if video_lora_config.dropout != 0.0:
             raise ValueError("FastWAM PPO requires Video LoRA dropout == 0.")
-    layer_payload = OmegaConf.to_container(
-        cfg.gate.get("layer_taps", {}),
-        resolve=True,
-    )
-    if layer_payload.get("indices") is not None:
-        layer_payload["indices"] = tuple(layer_payload["indices"])
-    layer_taps = LayerTapConfig(**layer_payload)
-    gate_payload = OmegaConf.to_container(cfg.gate, resolve=True)
-    gate_payload.pop("layer_taps", None)
     action_dit_config = cfg.fastwam.action_dit_config
-    gate_config = GateTransformerConfig(
-        num_mot_layers=int(action_dit_config.num_layers),
-        source_num_heads=int(action_dit_config.num_heads),
-        source_head_dim=int(action_dit_config.attn_head_dim),
-        layer_taps=layer_taps,
-        **gate_payload,
-    )
+    gate_config = None
+    if not uncond_rl:
+        layer_payload = OmegaConf.to_container(
+            cfg.gate.get("layer_taps", {}), resolve=True
+        )
+        if layer_payload.get("indices") is not None:
+            layer_payload["indices"] = tuple(layer_payload["indices"])
+        gate_payload = OmegaConf.to_container(cfg.gate, resolve=True)
+        gate_payload.pop("layer_taps", None)
+        gate_config = GateTransformerConfig(
+            num_mot_layers=int(action_dit_config.num_layers),
+            source_num_heads=int(action_dit_config.num_heads),
+            source_head_dim=int(action_dit_config.attn_head_dim),
+            layer_taps=LayerTapConfig(**layer_payload),
+            **gate_payload,
+        )
     replay_payload = OmegaConf.to_container(
         cfg.get("kv_replay", {}),
         resolve=True,
@@ -475,7 +476,7 @@ def get_model(cfg, torch_dtype):
         cfg.critic.get("kind", CriticKind.PI0_5_VALUE_AFTER_VLM)
     )
     inference_steps = int(cfg.runtime.get("num_inference_steps", 0))
-    if gate_config.denoise_last_n > inference_steps:
+    if gate_config is not None and gate_config.denoise_last_n > inference_steps:
         raise ValueError(
             "Gate `denoise_last_n` cannot exceed runtime `num_inference_steps`: "
             f"{gate_config.denoise_last_n} > {inference_steps}."
@@ -549,9 +550,9 @@ def get_model(cfg, torch_dtype):
         int(actor.mot.attn_head_dim),
     )
     configured_mot_contract = (
-        gate_config.num_mot_layers,
-        gate_config.source_num_heads,
-        gate_config.source_head_dim,
+        int(action_dit_config.num_layers),
+        int(action_dit_config.num_heads),
+        int(action_dit_config.attn_head_dim),
     )
     if actual_mot_contract != configured_mot_contract:
         raise ValueError(
@@ -580,7 +581,11 @@ def get_model(cfg, torch_dtype):
     # which is where this Gate's updates land; see
     # `docs/BF16_PARAMETER_UPDATE_LOSS.md`. `DirectKVAttention` already casts the
     # stored K/V banks to the query dtype, so the read-only tap still works.
-    gate = GateTransformer(gate_config).to(dtype=torch.float32)
+    gate = (
+        None
+        if gate_config is None
+        else GateTransformer(gate_config).to(dtype=torch.float32)
+    )
 
     critic = None
     critic_feature_config = None
@@ -622,8 +627,12 @@ def get_model(cfg, torch_dtype):
         cfg.runtime,
         actor=actor,
         lora_adapter=lora_adapter,
-        gate_layer_indices=gate_config.layer_taps.resolve(gate_config.num_mot_layers),
-        gate_denoise_last_n=gate_config.denoise_last_n,
+        gate_layer_indices=(
+            ()
+            if gate_config is None
+            else gate_config.layer_taps.resolve(gate_config.num_mot_layers)
+        ),
+        gate_denoise_last_n=(1 if gate_config is None else gate_config.denoise_last_n),
         gate_replay_backend=replay_config.backend,
         critic_feature_config=critic_feature_config,
         flow_sde_noise_level=float(cfg.flow_sde.noise_level),
@@ -636,7 +645,12 @@ def get_model(cfg, torch_dtype):
             else {}
         ),
     )
-    return FastWAMAdaptivePolicy(
+    policy_class = FastWAMAdaptivePolicy
+    if uncond_rl:
+        from .uncond_rl import FastWAMUncondRLPolicy
+
+        policy_class = FastWAMUncondRLPolicy
+    return policy_class(
         actor=actor,
         runtime=runtime,
         lora_adapter=lora_adapter,

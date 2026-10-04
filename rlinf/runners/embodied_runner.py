@@ -218,15 +218,20 @@ class EmbodiedRunner:
             )
         )
 
+    def _init_rollout_workers(self) -> Handle | None:
+        """Start rollout initialization; specialized runners may wait serially."""
+        return self.rollout.init_worker()
+
     def init_workers(self):
         # create worker in order to decrease the maximum memory usage
-        rollout_handle = self.rollout.init_worker()
+        rollout_handle = self._init_rollout_workers()
         env_handle = self.env.init_worker()
 
         if self.reward is not None:
             self.reward.init_worker().wait()
 
-        rollout_handle.wait()
+        if rollout_handle is not None:
+            rollout_handle.wait()
         env_handle.wait()
         self.actor.init_worker().wait()
 
@@ -705,6 +710,39 @@ class EmbodiedRunner:
         self.env.stop_profile().wait()
         self.logger.info(f"Closed profiling window at step {step_idx}")
 
+    def _run_actor_training(
+        self, *, next_step: bool
+    ) -> tuple[list[dict], Handle, Handle | None]:
+        """Execute one training phase and retain the existing bootstrap overlap."""
+
+        gate_kv_service_handle: Handle | None = None
+        if self.gate_kv_request_channel is not None:
+            gate_kv_service_handle = self.rollout.serve_gate_kv_requests(
+                request_channel=self.gate_kv_request_channel,
+                response_channel=self.gate_kv_response_channel,
+            )
+            actor_training_handle = self.actor.run_training(
+                kv_request_channel=self.gate_kv_request_channel,
+                kv_response_channel=self.gate_kv_response_channel,
+            )
+        else:
+            actor_training_handle = self.actor.run_training()
+        env_bootstrap_handle: Handle | None = None
+        if self.overlap_env_bootstrap and next_step:
+            env_bootstrap_handle = self.env.prefetch_train_bootstrap(
+                rollout_channel=self.rollout_channel,
+                runner_step=self.global_step + 1,
+            )
+
+        actor_training_metrics = actor_training_handle.wait()
+        if gate_kv_service_handle is not None:
+            gate_kv_service_metrics = gate_kv_service_handle.wait()
+            self._merge_gate_kv_service_metrics(
+                actor_training_metrics,
+                gate_kv_service_metrics,
+            )
+        return actor_training_metrics, actor_training_handle, env_bootstrap_handle
+
     def run(self):
         if self.cfg.runner.get("use_training_pipeline", False):
             return self.run_pipeline()
@@ -768,32 +806,11 @@ class EmbodiedRunner:
 
                 # actor training.
                 with self.timer("actor_training"):
-                    gate_kv_service_handle: Handle | None = None
-                    if self.gate_kv_request_channel is not None:
-                        gate_kv_service_handle = self.rollout.serve_gate_kv_requests(
-                            request_channel=self.gate_kv_request_channel,
-                            response_channel=self.gate_kv_response_channel,
-                        )
-                        actor_training_handle = self.actor.run_training(
-                            kv_request_channel=self.gate_kv_request_channel,
-                            kv_response_channel=self.gate_kv_response_channel,
-                        )
-                    else:
-                        actor_training_handle = self.actor.run_training()
-                    env_bootstrap_handle: Handle | None = None
-                    if self.overlap_env_bootstrap and _step + 1 < self.max_steps:
-                        env_bootstrap_handle = self.env.prefetch_train_bootstrap(
-                            rollout_channel=self.rollout_channel,
-                            runner_step=self.global_step + 1,
-                        )
-
-                    actor_training_metrics = actor_training_handle.wait()
-                    if gate_kv_service_handle is not None:
-                        gate_kv_service_metrics = gate_kv_service_handle.wait()
-                        self._merge_gate_kv_service_metrics(
-                            actor_training_metrics,
-                            gate_kv_service_metrics,
-                        )
+                    (
+                        actor_training_metrics,
+                        actor_training_handle,
+                        env_bootstrap_handle,
+                    ) = self._run_actor_training(next_step=_step + 1 < self.max_steps)
                     self.fastwam_training_guard.observe_training(actor_training_metrics)
                     if env_bootstrap_handle is not None:
                         env_bootstrap_handle.wait()

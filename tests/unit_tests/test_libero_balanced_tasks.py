@@ -23,19 +23,27 @@ from rlinf.utils.nested_dict_process import map_nested_tensors
 from rlinf.workers.actor.fsdp_actor_worker import flatten_nested_tensor_time_batch
 
 
-@pytest.mark.parametrize("n", [42, 49, 56, 63, 70, 84, 126])
-def test_balanced_quotas_and_rank_assignment(n):
-    sampler = BalancedLiberoTaskSampler(total_envs=n, reset_pool_sizes=[50] * 10)
+@pytest.mark.parametrize(
+    "n,num_ranks",
+    [(n, 7) for n in [42, 49, 56, 63, 70, 84, 126]]
+    + [(n, 6) for n in [42, 48, 54, 60, 72, 84, 126]],
+)
+def test_balanced_quotas_and_rank_assignment(n, num_ranks):
+    sampler = BalancedLiberoTaskSampler(
+        total_envs=n, reset_pool_sizes=[50] * 10, num_ranks=num_ranks
+    )
     allocations = Counter()
     for step in range(sampler.cycle_length * 3):
         plan = sampler.next_plan(step)
         assert max(plan["quotas"]) - min(plan["quotas"]) <= 1
         assert sum(plan["quotas"]) == n
-        assert [len(slots) for slots in plan["ranks"]] == [n // 7] * 7
+        assert [len(slots) for slots in plan["ranks"]] == [n // num_ranks] * num_ranks
         slots = [slot for rank in plan["ranks"] for slot in rank]
         counts = Counter(slot["task_id"] for slot in slots)
         assert [counts[i] for i in range(10)] == plan["quotas"]
-        assert len({slot["episode_slot_id"] for slot in slots}) == n
+        assert {slot["episode_slot_id"] for slot in slots} == set(
+            range(step * n, (step + 1) * n)
+        )
         assert all(
             slot["reset_state_id"] == 50 * slot["task_id"] + slot["trial_id"]
             for slot in slots
@@ -46,14 +54,15 @@ def test_balanced_quotas_and_rank_assignment(n):
 
 
 @pytest.mark.parametrize("saved_step", [1, 4, 5, 9, 10, 11])
-def test_resume_continues_plan_and_both_rng_streams(saved_step):
+@pytest.mark.parametrize("num_ranks", [6, 7])
+def test_resume_continues_plan_and_both_rng_streams(saved_step, num_ranks):
     sampler = BalancedLiberoTaskSampler(
-        total_envs=42, reset_pool_sizes=list(range(40, 50))
+        total_envs=42, reset_pool_sizes=list(range(40, 50)), num_ranks=num_ranks
     )
     for step in range(saved_step):
         sampler.next_plan(step)
     restored = BalancedLiberoTaskSampler(
-        total_envs=42, reset_pool_sizes=list(range(40, 50))
+        total_envs=42, reset_pool_sizes=list(range(40, 50)), num_ranks=num_ranks
     )
     restored.load_state_dict(
         json.loads(json.dumps(sampler.state_dict())), runner_step=saved_step
@@ -64,9 +73,31 @@ def test_resume_continues_plan_and_both_rng_streams(saved_step):
         restored.next_plan(0)
 
 
-def test_capacity_candidates_share_common_task_reset_ordinals():
-    a = BalancedLiberoTaskSampler(total_envs=42, reset_pool_sizes=[50] * 10)
-    b = BalancedLiberoTaskSampler(total_envs=84, reset_pool_sizes=[50] * 10)
+def test_legacy_seven_rank_checkpoint_continues_and_rejects_geometry_change():
+    original = BalancedLiberoTaskSampler(total_envs=42, reset_pool_sizes=[50] * 10)
+    original.next_plan(0)
+    state = original.state_dict()
+    del state["num_ranks"]
+    restored = BalancedLiberoTaskSampler(total_envs=42, reset_pool_sizes=[50] * 10)
+    restored.load_state_dict(state, runner_step=1)
+    assert restored.next_plan(1) == original.next_plan(1)
+    six_rank = BalancedLiberoTaskSampler(
+        total_envs=42, reset_pool_sizes=[50] * 10, num_ranks=6
+    )
+    with pytest.raises(ValueError, match="num_ranks"):
+        six_rank.load_state_dict(state, runner_step=1)
+    with pytest.raises(ValueError, match="num_ranks"):
+        restored.load_state_dict(six_rank.state_dict(), runner_step=0)
+
+
+@pytest.mark.parametrize("num_ranks", [6, 7])
+def test_capacity_candidates_share_common_task_reset_ordinals(num_ranks):
+    a = BalancedLiberoTaskSampler(
+        total_envs=42, reset_pool_sizes=[50] * 10, num_ranks=num_ranks
+    )
+    b = BalancedLiberoTaskSampler(
+        total_envs=84, reset_pool_sizes=[50] * 10, num_ranks=num_ranks
+    )
     torch_state = torch.get_rng_state().clone()
     numpy_state = np.random.get_state()
     for step in range(15):
@@ -118,29 +149,56 @@ def test_rejects_unvalidated_balanced_geometry(monkeypatch, override):
         validate_route_neutral_online_idm_bc_training_config(cfg)
 
 
-def _dedicated_balanced_config(monkeypatch):
+def _dedicated_balanced_config(monkeypatch, num_ranks=7, n=42):
     return _compose(
         monkeypatch,
         "libero_10_ppo_fastwam_route_neutral_online_all",
         [
-            "cluster.component_placement.env=1-7",
-            "cluster.component_placement.rollout=1-7",
+            f"cluster.component_placement.env=1-{num_ranks}",
+            f"cluster.component_placement.rollout=1-{num_ranks}",
             "route_neutral_online_implementation.shared_gpu_rollout_rank=null",
             "actor.enable_offload=false",
+            f"env.train.total_num_envs={n}",
+            f"actor.global_batch_size={196 * n // 42}",
         ],
     )
 
 
+@pytest.mark.parametrize("n", [42, 84, 126, 168, 210])
 def test_dedicated_eight_gpu_balanced_configuration_preserves_scientific_geometry(
     monkeypatch,
+    n,
 ):
-    cfg = _dedicated_balanced_config(monkeypatch)
+    cfg = _dedicated_balanced_config(monkeypatch, n=n)
     validate_route_neutral_online_idm_bc_training_config(cfg)
-    assert cfg.env.train.total_num_envs == 42
-    assert cfg.actor.global_batch_size == 196
+    assert cfg.env.train.total_num_envs == n
+    assert cfg.actor.global_batch_size == 196 * n // 42
+    assert 70 * n // cfg.actor.global_batch_size == 15
     assert cfg.actor.micro_batch_size == 4
     assert cfg.actor.enable_offload is False
     assert cfg.rollout.enable_offload is False
+
+
+@pytest.mark.parametrize("n", [21, 49, 63, 98, 147])
+def test_dedicated_seven_rollout_ranks_reject_invalid_capacity(monkeypatch, n):
+    cfg = _dedicated_balanced_config(monkeypatch, num_ranks=7, n=n)
+    with pytest.raises(ValueError):
+        validate_route_neutral_online_idm_bc_training_config(cfg)
+
+
+@pytest.mark.parametrize("n", [42, 48, 54, 60, 72, 84, 126])
+def test_dedicated_six_rollout_ranks_preserve_k15(monkeypatch, n):
+    cfg = _dedicated_balanced_config(monkeypatch, num_ranks=6, n=n)
+    validate_route_neutral_online_idm_bc_training_config(cfg)
+    assert cfg.env.train.total_num_envs == n
+    assert 70 * n // cfg.actor.global_batch_size == 15
+
+
+@pytest.mark.parametrize("n", [36, 49, 56])
+def test_dedicated_six_rollout_ranks_reject_invalid_capacity(monkeypatch, n):
+    cfg = _dedicated_balanced_config(monkeypatch, num_ranks=6, n=n)
+    with pytest.raises(ValueError):
+        validate_route_neutral_online_idm_bc_training_config(cfg)
 
 
 @pytest.mark.parametrize(
@@ -165,13 +223,18 @@ def test_dedicated_balanced_configuration_rejects_incompatible_lifecycle(
 
 
 @pytest.mark.parametrize("wrong_physical_plan", [False, True])
+@pytest.mark.parametrize("num_ranks", [6, 7])
 def test_dedicated_balanced_device_plan_preserves_physical_indices(
-    monkeypatch, wrong_physical_plan
+    monkeypatch, wrong_physical_plan, num_ranks
 ):
-    cfg = _dedicated_balanced_config(monkeypatch)
-    devices = {"actor": [0], "env": list(range(1, 8)), "rollout": list(range(1, 8))}
+    cfg = _dedicated_balanced_config(monkeypatch, num_ranks=num_ranks)
+    devices = {
+        "actor": [0],
+        "env": list(range(1, num_ranks + 1)),
+        "rollout": list(range(1, num_ranks + 1)),
+    }
     if wrong_physical_plan:
-        devices["rollout"] = list(range(7))
+        devices["rollout"] = list(range(num_ranks))
 
     def strategy(component):
         return SimpleNamespace(
@@ -191,7 +254,7 @@ def test_dedicated_balanced_device_plan_preserves_physical_indices(
         report = validate_shared_gpu_device_plan(cfg, None, placement)
         assert report["schema"] == "route-neutral-dedicated-gpu-device-plan-v1"
         assert report["rollout"][0] == (0, 0, ["1"])
-        assert report["rollout"][-1] == (6, 0, ["7"])
+        assert report["rollout"][-1] == (num_ranks - 1, 0, [str(num_ranks)])
 
 
 def test_task_identity_stays_with_language_and_trajectory_after_flatten_shuffle():

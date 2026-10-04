@@ -313,12 +313,12 @@ def _snapshot_fastwam_fsdp_lazy_root_state(
     *,
     fsdp_cls=None,
 ):
-    """Capture private FSDP lazy-root flags before adaptive checkpoint load.
+    """Capture private FSDP lazy-root flags before adaptive checkpoint I/O.
 
-    Loading rank-local trainable and optimizer state before the first forward
-    may trigger PyTorch FSDP bookkeeping on nested wrappers. Those flags are
+    Saving or loading rank-local state before the first forward may trigger
+    PyTorch FSDP bookkeeping on nested wrappers. Those flags are
     execution state rather than checkpoint state and must remain exactly as
-    they were before restore so the first resumed root forward can initialize
+    they were before checkpoint I/O so the first root forward can initialize
     the hierarchy normally.
     """
 
@@ -343,7 +343,7 @@ def _snapshot_fastwam_fsdp_lazy_root_state(
 
 
 def _restore_fastwam_fsdp_lazy_root_state(snapshot) -> None:
-    """Restore private FSDP lazy-root flags captured before checkpoint load."""
+    """Restore private FSDP lazy-root flags captured before checkpoint I/O."""
 
     for module, original in snapshot:
         if original is _MISSING_FASTWAM_FSDP_ROOT:
@@ -1400,7 +1400,8 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
             "bootstrap_project_checkpoint_dir",
             None,
         )
-        if bootstrap_output_dir is not None:
+        uncond_rl = self.cfg.actor.model.get("uncond_rl") is not None
+        if bootstrap_output_dir is not None or uncond_rl:
             seed_everything(int(self.cfg.actor.seed) + int(self._rank))
 
         self.setup_model_and_optimizer()
@@ -1423,6 +1424,17 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
                     "FastWAM runner.ckpt_path training bootstrap requires a "
                     f"native step-zero checkpoint, got step {loaded_step}."
                 )
+
+        if (
+            uncond_rl
+            and bootstrap_path is None
+            and self.cfg.runner.get("resume_dir") is None
+            and bootstrap_output_dir is None
+        ):
+            self.bootstrap_fastwam_uncond_lora(
+                str(self.cfg.runner.bootstrap_uncond_lora_sidecar),
+                str(self.cfg.runner.bootstrap_uncond_lora_sidecar_sha256),
+            )
 
         if self.enable_offload:
             self.offload_param_and_grad()
@@ -1746,6 +1758,7 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
             self.load_param_and_grad(self.device)
         if restore_optimizer_offload:
             self.load_optimizer(self.device)
+        fsdp_lazy_root_state = _snapshot_fastwam_fsdp_lazy_root_state(self.model)
         try:
             local_error: Exception | None = None
             try:
@@ -1794,6 +1807,7 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
                 context="actor checkpoint save",
             )
         finally:
+            _restore_fastwam_fsdp_lazy_root_state(fsdp_lazy_root_state)
             if restore_weight_offload:
                 self.offload_param_and_grad()
             if restore_optimizer_offload:
@@ -2068,10 +2082,16 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
             for logical_env_rank, _ in routes
         ]
         recv_list: list[Trajectory] = [await work.async_wait() for work in works]
+        recv_list = self._prepare_received_trajectories(recv_list)
 
         self.rollout_batch = convert_trajectories_to_batch(recv_list, consume=True)
 
         self.rollout_batch = self._process_received_rollout_batch(self.rollout_batch)
+
+    def _prepare_received_trajectories(self, trajectories: list) -> list[Trajectory]:
+        """Allow a policy adapter to retain compact replay beside trajectories."""
+
+        return trajectories
 
     def _release_consumed_rollout_batch_before_receive(self) -> None:
         """Optional scheme hook before the next rollout transfer starts."""
@@ -2668,7 +2688,14 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
         if kwargs["loss_mask_sum"] is not None:
             self.rollout_batch.update({"loss_mask_sum": kwargs["loss_mask_sum"]})
 
-        rollout_metrics = compute_rollout_metrics(self.rollout_batch)
+        metric_batch = self.rollout_batch
+        if self.cfg.algorithm.get("loss_type") == "fastwam_uncond_ppo":
+            metric_batch = {
+                key: value
+                for key, value in metric_batch.items()
+                if key != "gate_advantages"
+            }
+        rollout_metrics = compute_rollout_metrics(metric_batch)
         if reward_audit is not None:
             rollout_metrics.update(reward_audit.to_metrics())
         if rollout_state_audit is not None:
@@ -2857,7 +2884,10 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
                 group.get("name"): float(group["lr"])
                 for group in self.optimizer.param_groups
             }
-            expected = {"gate", "uncond_lora", "value_head"}
+            uncond_rl = self.cfg.actor.model.get("uncond_rl") is not None
+            expected = {"uncond_lora", "value_head"}
+            if not uncond_rl:
+                expected.add("gate")
             if set(lr_by_name) != expected:
                 raise RuntimeError(
                     "FastWAM adaptive optimizer groups changed unexpectedly: "
@@ -2871,14 +2901,19 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
                 )
             data.update(
                 {
-                    "gate/lr": lr_by_name["gate"],
                     "uncond_flow/lora_lr": lr_by_name["uncond_lora"],
                     "critic/lr": lr_by_name["value_head"],
-                    "gate/grad_norm": gradient_norms["gate"],
                     "uncond_lora/grad_norm": gradient_norms["uncond_lora"],
                     "value_head/grad_norm": gradient_norms["value_head"],
                 }
             )
+            if not uncond_rl:
+                data.update(
+                    {
+                        "gate/lr": lr_by_name["gate"],
+                        "gate/grad_norm": gradient_norms["gate"],
+                    }
+                )
             return data
         data["actor/lr"] = lr_list[0]
         if len(lr_list) > 1:
@@ -3738,6 +3773,64 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
         metrics.update(getattr(self, "_fastwam_gate_kv_sampling_metrics", {}))
         return metrics
 
+    def _iter_training_microbatches(self, micro_batches: list[dict]):
+        """Yield original microbatches, allowing policy-local input prefetch."""
+
+        yield from enumerate(micro_batches)
+
+    def _execute_training_microbatches(
+        self,
+        train_micro_batches: list[dict],
+        *,
+        metrics: dict,
+        selected_loss_scales: dict[str, float] | None,
+    ) -> None:
+        """Accumulate one optimizer batch through the policy's replay path."""
+
+        pending_prefetches: deque[Future] = deque()
+        next_prefetch_index = 0
+        if self._uses_fastwam_handle_replay():
+            prefetch_depth = min(
+                int(self.cfg.actor.model.kv_replay.prefetch_depth),
+                len(train_micro_batches),
+            )
+            while next_prefetch_index < prefetch_depth:
+                pending_prefetches.append(
+                    self._schedule_fastwam_kv_prefetch(
+                        train_micro_batches[next_prefetch_index]
+                    )
+                )
+                next_prefetch_index += 1
+        for idx, batch in self._iter_training_microbatches(train_micro_batches):
+            consumed_handles: tuple[int, ...] = ()
+            if self._uses_fastwam_handle_replay():
+                prefetch = pending_prefetches.popleft()
+                if next_prefetch_index < len(train_micro_batches):
+                    pending_prefetches.append(
+                        self._schedule_fastwam_kv_prefetch(
+                            train_micro_batches[next_prefetch_index]
+                        )
+                    )
+                    next_prefetch_index += 1
+                consumed_handles = self._consume_fastwam_kv_prefetch(
+                    batch,
+                    prefetch,
+                )
+            self.train_micro_batch(
+                micro_batch=batch,
+                metrics=metrics,
+                is_last=(idx + 1) == len(train_micro_batches),
+                selected_loss_scales=selected_loss_scales,
+            )
+            if consumed_handles:
+                self._release_consumed_fastwam_kv(consumed_handles)
+            # avoid gpu memory leak
+            train_micro_batches[idx] = None
+            del batch
+
+    def _after_training_optimizer_step(self) -> None:
+        """Publish a completed optimizer opportunity to optional compute helpers."""
+
     @Worker.timer("run_training")
     def run_training(
         self,
@@ -3963,53 +4056,22 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
                     }
 
                 self.optimizer.zero_grad()
-                pending_prefetches: deque[Future] = deque()
-                next_prefetch_index = 0
-                if self._uses_fastwam_handle_replay():
-                    prefetch_depth = min(
-                        int(self.cfg.actor.model.kv_replay.prefetch_depth),
-                        len(train_micro_batch),
-                    )
-                    while next_prefetch_index < prefetch_depth:
-                        pending_prefetches.append(
-                            self._schedule_fastwam_kv_prefetch(
-                                train_micro_batch[next_prefetch_index]
-                            )
-                        )
-                        next_prefetch_index += 1
-                for idx, batch in enumerate(train_micro_batch):
-                    consumed_handles: tuple[int, ...] = ()
-                    if self._uses_fastwam_handle_replay():
-                        prefetch = pending_prefetches.popleft()
-                        if next_prefetch_index < len(train_micro_batch):
-                            pending_prefetches.append(
-                                self._schedule_fastwam_kv_prefetch(
-                                    train_micro_batch[next_prefetch_index]
-                                )
-                            )
-                            next_prefetch_index += 1
-                        consumed_handles = self._consume_fastwam_kv_prefetch(
-                            batch,
-                            prefetch,
-                        )
-                    self.train_micro_batch(
-                        micro_batch=batch,
-                        metrics=metrics,
-                        is_last=(idx + 1) == len(train_micro_batch),
-                        selected_loss_scales=selected_loss_scales,
-                    )
-                    if consumed_handles:
-                        self._release_consumed_fastwam_kv(consumed_handles)
-                    # avoid gpu memory leak
-                    train_micro_batch[idx] = None
-                    del batch
+                self._execute_training_microbatches(
+                    train_micro_batch,
+                    metrics=metrics,
+                    selected_loss_scales=selected_loss_scales,
+                )
 
                 if preupdate_log_ratio_audit_pending:
                     if counts is None:
                         raise RuntimeError(
                             "FastWAM pre-update log-ratio audit lacks branch counts."
                         )
-                    prefixes = ("gate", "uncond_flow")
+                    prefixes = (
+                        ("uncond_flow",)
+                        if self.cfg.actor.model.get("uncond_rl") is not None
+                        else ("gate", "uncond_flow")
+                    )
                     local_maxima = []
                     for prefix in prefixes:
                         values = metrics.get(f"{prefix}/log_ratio_max_abs", [])
@@ -4035,39 +4097,29 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
                         preupdate_maxima,
                         op=torch.distributed.ReduceOp.MAX,
                     )
-                    gate_samples = int(counts[0].item())
-                    flow_samples = int(counts[1].item())
-                    gate_max = float(preupdate_maxima[0].item())
-                    flow_max = float(preupdate_maxima[1].item())
                     audit = {
                         "schema": "fastwam-preupdate-log-ratio-audit-v1",
                         "actor_rank": int(self._rank),
                         "actor_version": int(self.version),
                         "optimizer_steps_before": int(self.optimizer_steps),
-                        "gate": {
-                            "sample_count": gate_samples,
-                            "max_abs_log_ratio": gate_max,
-                        },
-                        "uncond_flow": {
-                            "sample_count": flow_samples,
-                            "max_abs_log_ratio": flow_max,
-                        },
                     }
+                    audit_metrics = {}
+                    for index, prefix in enumerate(prefixes):
+                        count = int(counts[0 if prefix == "gate" else 1].item())
+                        maximum = float(preupdate_maxima[index].item())
+                        audit[prefix] = {
+                            "sample_count": count,
+                            "max_abs_log_ratio": maximum,
+                        }
+                        audit_metrics[f"{prefix}/preupdate_log_ratio_max_abs"] = maximum
+                        audit_metrics[f"{prefix}/preupdate_sample_count"] = float(count)
                     if self._rank == 0:
                         print(
                             f"{FASTWAM_PREUPDATE_LOG_RATIO_AUDIT_SENTINEL} "
                             + json.dumps(audit, sort_keys=True),
                             flush=True,
                         )
-                    append_to_dict(
-                        metrics,
-                        {
-                            "gate/preupdate_log_ratio_max_abs": gate_max,
-                            "gate/preupdate_sample_count": float(gate_samples),
-                            "uncond_flow/preupdate_log_ratio_max_abs": flow_max,
-                            "uncond_flow/preupdate_sample_count": float(flow_samples),
-                        },
-                    )
+                    append_to_dict(metrics, audit_metrics)
                     preupdate_log_ratio_audit_pending = False
 
                 self.torch_platform.empty_cache()
@@ -4075,6 +4127,7 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
                 grad_norm, lr_list = self.optimizer_step()
                 data = self._optimizer_metrics(grad_norm, lr_list)
                 append_to_dict(metrics, data)
+                self._after_training_optimizer_step()
         # put LR scheduler step here
         self.lr_scheduler.step()
         self.optimizer.zero_grad()
@@ -4173,6 +4226,19 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
         selected_loss_scales: dict[str, float] | None = None,
     ) -> tuple[torch.Tensor, dict[str, float | torch.Tensor]]:
         """Compute independent Gate/Flow PPO losses and the fresh critic loss."""
+
+        if self.cfg.algorithm.get("loss_type") == "fastwam_uncond_ppo":
+            from rlinf.models.embodiment.wam_policy.uncond_rl import (
+                compute_uncond_rl_loss,
+            )
+
+            return compute_uncond_rl_loss(
+                cfg=self.cfg,
+                actor_version=int(self.version),
+                micro_batch=micro_batch,
+                output_dict=output_dict,
+                selected_loss_scales=selected_loss_scales,
+            )
 
         required_fields = (
             "route_info",

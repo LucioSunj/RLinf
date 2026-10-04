@@ -45,6 +45,7 @@ from rlinf.workers.actor.fsdp_actor_worker import (
 )
 
 from .policy import RouteNeutralOnlineIDMBCFastWAMPolicy
+from .replay import REPLAY_ROW, RouteNeutralReplayStore
 from .task_metrics import (
     accumulate_task_losses,
     finalize_task_losses,
@@ -238,6 +239,34 @@ class RouteNeutralOnlineIDMBCFSDPActor(OnlineIDMBCFSDPActor):
             flush=True,
         )
 
+    def _prepare_received_trajectories(self, trajectories: list) -> list:
+        """Keep packed replay outside the time-major batch and its shuffle."""
+
+        self._route_neutral_replay = RouteNeutralReplayStore()
+        return [self._route_neutral_replay.add(item) for item in trajectories]
+
+    def train_micro_batch(
+        self,
+        micro_batch: dict[str, Any],
+        metrics: dict[str, list[float | torch.Tensor]],
+        *,
+        is_last: bool,
+        selected_loss_scales: dict[str, float] | None = None,
+    ) -> None:
+        """Materialize only the rows selected by the original training loop."""
+
+        if REPLAY_ROW in micro_batch.get("forward_inputs", {}):
+            micro_batch = dict(micro_batch)
+            micro_batch["forward_inputs"] = self._route_neutral_replay.materialize(
+                micro_batch["forward_inputs"]
+            )
+        super().train_micro_batch(
+            micro_batch,
+            metrics,
+            is_last=is_last,
+            selected_loss_scales=selected_loss_scales,
+        )
+
     def _release_consumed_rollout_batch_before_receive(self) -> None:
         """Drop the previous update's replay before receiving the next one."""
 
@@ -255,6 +284,7 @@ class RouteNeutralOnlineIDMBCFSDPActor(OnlineIDMBCFSDPActor):
         profile = self.cfg.route_neutral_online_implementation
         if not bool(profile.release_host_memory_after_trajectory_receive):
             raise ValueError("Route-neutral actor host-memory release was disabled.")
+        self._route_neutral_replay = None
         if getattr(self, "rollout_batch", None) is None:
             return
         self.rollout_batch = None
@@ -281,7 +311,7 @@ class RouteNeutralOnlineIDMBCFSDPActor(OnlineIDMBCFSDPActor):
         self,
         train_global_batch: dict[str, Any],
     ) -> tuple[dict[str, Any], dict[str, float]]:
-        """Remove rows with zero contribution while preserving global divisors."""
+        """Pack UNCOND rows within one optimizer batch, retaining its divisors."""
 
         reference = self._training_batch_reference(train_global_batch)
         batch_size = int(reference.shape[0])
@@ -362,20 +392,34 @@ class RouteNeutralOnlineIDMBCFSDPActor(OnlineIDMBCFSDPActor):
                 "perf/actor_microbatches_executed": float(batch_size),
             }
 
-        if active_count == 0:
-            selected_indices = torch.arange(
-                micro_batch_size,
-                device=active.device,
-                dtype=torch.long,
+        if active_count == 0 or active_count % micro_batch_size:
+            inactive_idm = (~active) & (
+                route_info.route_used.reshape(-1) == int(WAMRoute.IDM)
             )
+            # An IDM padding row needs no unused Flow/BC prefill. Retain every
+            # original scalar and mask; this only chooses the padding indices.
+            inactive_indices = torch.cat(
+                (
+                    inactive_idm.nonzero(as_tuple=False).reshape(-1),
+                    ((~active) & ~inactive_idm).nonzero(as_tuple=False).reshape(-1),
+                )
+            )
+        if active_count == 0:
+            selected_indices = inactive_indices[:micro_batch_size]
         else:
+            # Preserve optimizer boundaries and stable order within each route.
+            # Flow/BC then use full MB4s instead of many scattered small batches;
+            # Gate and value still see every contributing row exactly once.
+            active_indices = torch.cat(
+                (
+                    flow_rows.nonzero(as_tuple=False).reshape(-1),
+                    (active & ~flow_rows).nonzero(as_tuple=False).reshape(-1),
+                )
+            )
             padding = (-active_count) % micro_batch_size
             if padding:
-                inactive_indices = (~active).nonzero(as_tuple=False).reshape(-1)
-                selected_indices = (
-                    torch.cat((active_indices, inactive_indices[:padding]), dim=0)
-                    .sort()
-                    .values
+                selected_indices = torch.cat(
+                    (active_indices, inactive_indices[:padding]), dim=0
                 )
             else:
                 selected_indices = active_indices

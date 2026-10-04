@@ -32,6 +32,8 @@ _FASTWAM_GROUP_NAMES = ("gate", "uncond_lora", "value_head")
 
 def fastwam_optimizer_gradient_norms(
     optimizer: torch.optim.Optimizer,
+    *,
+    require_gate: bool = True,
 ) -> dict[str, float]:
     """Measure global post-clip gradient norms for each adaptive family."""
 
@@ -43,15 +45,14 @@ def fastwam_optimizer_gradient_norms(
                 f"FastWAM optimizer has duplicate parameter group {name!r}."
             )
         indexed_groups[name] = group
-    if set(indexed_groups) != set(_FASTWAM_GROUP_NAMES):
+    group_names = _FASTWAM_GROUP_NAMES if require_gate else _FASTWAM_GROUP_NAMES[1:]
+    if set(indexed_groups) != set(group_names):
         raise RuntimeError(
             "FastWAM gradient-norm groups differ from Gate, UNCOND LoRA, "
             f"and value head: {sorted(indexed_groups)}."
         )
 
-    parameters_by_group = [
-        list(indexed_groups[name]["params"]) for name in _FASTWAM_GROUP_NAMES
-    ]
+    parameters_by_group = [list(indexed_groups[name]["params"]) for name in group_names]
     if any(not parameters for parameters in parameters_by_group):
         raise RuntimeError("FastWAM gradient-norm group is empty.")
     devices = {
@@ -65,7 +66,7 @@ def fastwam_optimizer_gradient_norms(
             f"{sorted(map(str, devices))}."
         )
     squared_norms = torch.zeros(
-        len(_FASTWAM_GROUP_NAMES),
+        len(group_names),
         dtype=torch.float64,
         device=next(iter(devices)),
     )
@@ -82,7 +83,7 @@ def fastwam_optimizer_gradient_norms(
                     values.detach().float().square().sum(dtype=torch.float64)
                 )
     norms = squared_norms.sqrt().cpu().tolist()
-    return {name: float(norm) for name, norm in zip(_FASTWAM_GROUP_NAMES, norms)}
+    return {name: float(norm) for name, norm in zip(group_names, norms)}
 
 
 def _optimizer_step_value(value: Any) -> int:
@@ -141,6 +142,8 @@ def assert_fastwam_optimizer_update_resolution(
     optimizer: torch.optim.Optimizer,
     *,
     minimum_half_ulp_ratio: float,
+    require_gate: bool = True,
+    value_only: bool = False,
 ) -> dict[str, dict[str, float | int | str]]:
     """Require the first AdamW update to be representable in every group.
 
@@ -165,14 +168,15 @@ def assert_fastwam_optimizer_update_resolution(
                 f"FastWAM optimizer has duplicate parameter group {name!r}."
             )
         indexed_groups[name] = group
-    if set(indexed_groups) != set(_FASTWAM_GROUP_NAMES):
+    group_names = _FASTWAM_GROUP_NAMES if require_gate else _FASTWAM_GROUP_NAMES[1:]
+    if set(indexed_groups) != set(group_names):
         raise RuntimeError(
             "FastWAM update-resolution groups differ from Gate, UNCOND LoRA, "
             f"and value head: {sorted(indexed_groups)}."
         )
 
     report: dict[str, dict[str, float | int | str]] = {}
-    for name in _FASTWAM_GROUP_NAMES:
+    for name in ("value_head",) if value_only else group_names:
         group = indexed_groups[name]
         parameters = list(group["params"])
         if not parameters:
@@ -270,6 +274,8 @@ def assert_fastwam_optimizer_update_resolution(
 
 def partition_fastwam_trainable_parameters(
     named_parameters: Iterable[tuple[str, nn.Parameter]],
+    *,
+    require_gate: bool = True,
 ) -> dict[str, list[nn.Parameter]]:
     """Fail closed unless every trainable tensor has one intended owner."""
 
@@ -295,6 +301,9 @@ def partition_fastwam_trainable_parameters(
             "FastWAM adaptive training found trainable parameters outside Gate, "
             f"UNCOND LoRA, and value head: {unexpected}"
         )
+    if not require_gate:
+        if groups.pop("gate"):
+            raise RuntimeError("UNCOND RL must not have trainable Gate parameters.")
     missing = [name for name, parameters in groups.items() if not parameters]
     if missing:
         raise RuntimeError(

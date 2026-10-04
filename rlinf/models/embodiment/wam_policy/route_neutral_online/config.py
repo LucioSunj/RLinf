@@ -54,6 +54,26 @@ RUNNER_TARGET = (
 )
 
 
+def rollout_initialization_batch_size(profile: Any) -> int:
+    """Resolve the maximum concurrently initialized rollout ranks."""
+
+    mode = str(profile.get("rollout_init_mode", "serial_rank"))
+    batch_size = profile.get("rollout_init_batch_size", 1)
+    if mode not in {"serial_rank", "batched_ranks"}:
+        raise ValueError(f"Unsupported route-neutral rollout initialization: {mode}.")
+    if (
+        isinstance(batch_size, bool)
+        or not isinstance(batch_size, int)
+        or batch_size < 1
+    ):
+        raise ValueError(
+            "Rollout initialization batch size must be a positive integer."
+        )
+    if mode == "serial_rank" and batch_size != 1:
+        raise ValueError("Use batched_ranks initialization for a batch size above one.")
+    return batch_size
+
+
 def validate_route_neutral_online_idm_bc_training_config(
     cfg: Any,
     *,
@@ -249,8 +269,7 @@ def validate_route_neutral_online_idm_bc_training_config(
         if not str(OmegaConf.select(cfg, field, default="") or "").strip():
             raise ValueError(f"BC-initialized UNCOND requires {field}.")
     lifecycle = OmegaConf.select(cfg, "route_neutral_online_implementation")
-    if str(lifecycle.get("rollout_init_mode")) != "serial_rank":
-        raise ValueError("Route-neutral rollout initialization must be serial_rank.")
+    rollout_initialization_batch_size(lifecycle)
     if str(lifecycle.get("trajectory_send_mode")) not in {
         "concurrent",
         "serialized",
@@ -298,10 +317,21 @@ def validate_route_neutral_online_idm_bc_training_config(
     )
     balanced_dedicated_geometry = (
         balanced_tasks
-        and placement == {"actor": "0-0", "env": "1-7", "rollout": "1-7"}
+        and (
+            (
+                placement == {"actor": "0-0", "env": "1-7", "rollout": "1-7"}
+                and mixed_envs >= 42
+                and mixed_envs % 42 == 0
+                and batch_size * 42 == 196 * mixed_envs
+            )
+            or (
+                placement == {"actor": "0-0", "env": "1-6", "rollout": "1-6"}
+                and mixed_envs >= 42
+                and mixed_envs % 6 == 0
+                and batch_size * 42 == 196 * mixed_envs
+            )
+        )
         and shared_rank is None
-        and mixed_envs == 42
-        and batch_size == 196
         and int(cfg.actor.micro_batch_size) == 4
         and not bool(cfg.actor.enable_offload)
         and not bool(cfg.rollout.enable_offload)
@@ -317,8 +347,10 @@ def validate_route_neutral_online_idm_bc_training_config(
                 "Balanced ten-task training requires the shared GPU0 geometry "
                 "with mixed N a positive multiple of 42 and global batch "
                 "196*mixed_N/42, "
-                "or resident actor GPU0 with env=rollout=1-7 at N42/global batch "
-                "196. Both use microbatch 4 and synchronous execution."
+                "or resident actor GPU0 with env=rollout=1-7 and mixed N a "
+                "positive multiple of 42, or env=rollout=1-6 with mixed N >= 42 divisible by six "
+                "and global batch 196*mixed_N/42. All use microbatch 4 and "
+                "synchronous execution."
             )
         train = cfg.env.train
         if (
@@ -414,7 +446,11 @@ def validate_shared_gpu_device_plan(
     if shared_rank is None:
         if cfg.env.train.get("task_sampling") != "global_balanced":
             return None
-        healthy_devices = list(range(1, 8))
+        healthy_devices = (
+            list(range(1, 7))
+            if str(cfg.cluster.component_placement.env) == "1-6"
+            else list(range(1, 8))
+        )
         schema = "route-neutral-dedicated-gpu-device-plan-v1"
     else:
         healthy_devices = (
@@ -447,6 +483,7 @@ __all__ = [
     "ENV_WORKER_TARGET",
     "ROLLOUT_WORKER_TARGET",
     "RUNNER_TARGET",
+    "rollout_initialization_batch_size",
     "RUNTIME_TARGET",
     "validate_route_neutral_online_idm_bc_training_config",
 ]

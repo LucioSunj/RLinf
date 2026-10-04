@@ -43,7 +43,14 @@ def main(cfg) -> None:
 
     # Create rollout worker group
     rollout_placement = component_placement.get_strategy("rollout")
-    rollout_group = MultiStepRolloutWorker.create_group(cfg).launch(
+    rollout_worker = MultiStepRolloutWorker
+    if cfg.rollout.model.get("uncond_rl") is not None:
+        from rlinf.models.embodiment.wam_policy.uncond_rl_lifecycle import (
+            UncondRLRolloutWorker,
+        )
+
+        rollout_worker = UncondRLRolloutWorker
+    rollout_group = rollout_worker.create_group(cfg).launch(
         cluster, name=cfg.rollout.group_name, placement_strategy=rollout_placement
     )
     # Create env worker group

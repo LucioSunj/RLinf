@@ -705,7 +705,7 @@ class EnvWorker(Worker):
                 _recursive_=False,
                 rank=self._rank,
                 routing_mode=self.model_cfg.eval_routing_mode,
-                idm_threshold=self.model_cfg.eval_idm_threshold,
+                idm_threshold=self.model_cfg.get("eval_idm_threshold", 0.5),
                 random_idm_probability=self.model_cfg.get(
                     "eval_random_idm_probability", None
                 ),
@@ -715,7 +715,7 @@ class EnvWorker(Worker):
                 periodic_period=self.model_cfg.get("eval_period", None),
                 periodic_on_count=self.model_cfg.get("eval_periodic_on_count", None),
                 periodic_phase=self.model_cfg.get("eval_periodic_phase", None),
-                routing_seed=self.model_cfg.eval_routing_seed,
+                routing_seed=self.model_cfg.get("eval_routing_seed", 0),
                 decision_telemetry_enabled=bool(
                     self.model_cfg.get("decision_telemetry_enabled", False)
                 ),

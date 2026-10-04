@@ -243,6 +243,35 @@ def test_default_replay_value_head_remains_batched():
     assert recording_head.batch_sizes == [4]
 
 
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+@pytest.mark.parametrize("num_images", [1, 2])
+def test_pooled_replay_preserves_values_and_value_head_gradients(dtype, num_images):
+    critic = Pi05ValueAfterVLMCritic(
+        _MeanTokenDummyPi05(), input_dim=4, hidden_sizes=(3, 2)
+    )
+    critic.backbone.config.num_images_in_input = num_images
+    prefix = torch.randn(
+        4, 968, 4, dtype=dtype, generator=torch.Generator().manual_seed(47)
+    ).requires_grad_()
+    # Unused camera tokens must never affect the saved sufficient statistic.
+    with torch.no_grad():
+        prefix[:, 256 * num_images : 768] = float("nan")
+    parameters = tuple(critic.value_head.parameters())
+    expected = torch.cat([critic.value_from_prefix(row) for row in prefix.split(1)])
+    weights = torch.tensor([1.0, 0.0, -0.5, 2.0])
+    expected_grads = torch.autograd.grad((expected * weights).sum(), parameters)
+    pooled = critic.pool_prefix_features(prefix)
+    assert pooled.dtype == torch.float32
+    assert pooled.shape == (4, 4)
+    assert not pooled.requires_grad
+    actual = critic.value_from_pooled_features_rowwise_head(pooled)
+    actual_grads = torch.autograd.grad((actual * weights).sum(), parameters)
+    assert torch.equal(actual, expected)
+    for actual_grad, expected_grad in zip(actual_grads, expected_grads, strict=True):
+        assert torch.equal(actual_grad, expected_grad)
+    assert prefix.grad is None
+
+
 def test_non_pi05_backbone_is_rejected():
     backbone = _DummyPi05()
     backbone.config.config_name = "pi0_libero"

@@ -329,6 +329,497 @@ def test_dual_lora_flow_replay_and_bc_reach_both_branches(monkeypatch, checkpoin
     assert not policy.actor.video_expert.training
 
 
+@pytest.mark.parametrize("checkpoint", [False, True])
+def test_dual_latent_replay_matches_pixels_without_vae_reencoding(
+    monkeypatch, checkpoint
+):
+    policy = _make_policy(monkeypatch, dual=True, checkpoint=checkpoint).train()
+    prepared, sample, routes = _dual_training_sample(policy)
+    assert "fastwam_images" not in sample.forward_inputs
+    assert torch.equal(
+        sample.forward_inputs["fastwam_first_frame_latents"],
+        prepared.first_frame_latents,
+    )
+    pixel_inputs = dict(sample.forward_inputs)
+    pixel_inputs.pop("fastwam_first_frame_latents")
+    pixel_inputs["fastwam_images"] = prepared.images
+    parameters = tuple(
+        parameter
+        for adapter in policy.lora_adapters.values()
+        for parameter in adapter.lora_parameters()
+    )
+
+    def evaluate(forward):
+        replay = policy.runtime.replay_action_batch(
+            forward_inputs=forward, route_info=routes, compute_base_logprobs=True
+        )
+        bc = policy.runtime.compute_online_idm_bc_loss(
+            forward_inputs=forward, route_info=routes
+        )
+        grads = torch.autograd.grad(
+            replay["flow_logprobs"].sum() + bc.loss_sum, parameters
+        )
+        return replay, bc, grads
+
+    expected, expected_bc, expected_grads = evaluate(pixel_inputs)
+    before = policy.actor.calls["vae"]
+    actual, actual_bc, actual_grads = evaluate(sample.forward_inputs)
+    assert policy.actor.calls["vae"] == before
+    for key in ("flow_logprobs", "flow_entropy", "base_uncond_kl"):
+        assert torch.equal(actual[key], expected[key])
+    assert torch.equal(actual_bc.loss_sum, expected_bc.loss_sum)
+    for actual_grad, expected_grad in zip(actual_grads, expected_grads, strict=True):
+        assert torch.equal(actual_grad, expected_grad)
+
+
+def test_training_policy_replays_packed_mixed_rows_with_masked_padding(monkeypatch):
+    from rlinf.data.embodied_io_struct import ChunkStepResult
+    from rlinf.models.embodiment.wam_policy.route_neutral_online.replay import (
+        RouteNeutralReplayStore,
+        RouteNeutralRolloutResult,
+    )
+
+    policy = _make_policy(monkeypatch, dual=True).train()
+    observation = {
+        key: value.repeat(4, *([1] * (value.ndim - 1)))
+        if isinstance(value, torch.Tensor)
+        else value * 4
+        for key, value in _observation().items()
+    }
+    observation.update(
+        _fastwam_env_ids=torch.arange(4),
+        _fastwam_action_noise_seeds=torch.arange(41, 45),
+        _fastwam_idm_noise_seeds=torch.arange(51, 55),
+        _fastwam_gate_noise_seeds=torch.arange(4),
+    )
+    observation["states"] += torch.arange(4)[:, None] / 10
+    with torch.no_grad():
+        _, predicted = policy.predict_action_batch(
+            observation, mode="train", compute_values=False
+        )
+    inputs = predicted["forward_inputs"]
+    assert inputs["route_neutral_text_id"].tolist() == [0, 0, 0, 0]
+    assert "gate_condition_language" not in inputs
+    assert "fastwam_images" not in inputs
+    assert set(predicted["route_info"].route_used.tolist()) == {0, 1}
+    collector = RouteNeutralRolloutResult(mask_after_terminal=True)
+    collector.append_step_result(
+        ChunkStepResult(
+            forward_inputs=inputs, dones=torch.zeros(4, 2, dtype=torch.bool)
+        )
+    )
+    dones = torch.zeros(4, 2, dtype=torch.bool)
+    dones[1] = True
+    collector.append_step_result(ChunkStepResult(forward_inputs=inputs, dones=dones))
+    store = RouteNeutralReplayStore()
+    trajectory = store.add(
+        collector.to_splited_trajectories_by_sizes([4], consume=True)[0]
+    )
+    packed = store.materialize(
+        {key: value[1] for key, value in trajectory.forward_inputs.items()}
+    )
+    valid = torch.tensor([True, False, True, True])
+    parameters = tuple(
+        parameter for parameter in policy.parameters() if parameter.requires_grad
+    )
+
+    def evaluate(forward):
+        result = policy.default_forward(
+            {**forward, "online_idm_bc_flow_valid": valid},
+            route_info=predicted["route_info"],
+            emitted_gate=predicted["emitted_gate"],
+            compute_values=False,
+        )
+        loss = (
+            result["gate_logprobs"][valid].sum()
+            + result["flow_logprobs"][valid].sum()
+            + result["online_idm_bc_loss_sum"]
+        )
+        return result, torch.autograd.grad(loss, parameters, allow_unused=True)
+
+    original, original_grads = evaluate(inputs)
+    restored, restored_grads = evaluate(packed)
+    for name in ("gate_logprobs", "gate_entropy", "flow_logprobs", "flow_entropy"):
+        assert torch.equal(original[name][valid], restored[name][valid]), name
+    assert torch.equal(
+        original["online_idm_bc_loss_sum"], restored["online_idm_bc_loss_sum"]
+    )
+    for original_grad, restored_grad in zip(
+        original_grads, restored_grads, strict=True
+    ):
+        if original_grad is None:
+            assert restored_grad is None
+        else:
+            assert torch.equal(original_grad, restored_grad)
+
+
+@pytest.mark.parametrize("checkpoint", [False, True])
+@pytest.mark.parametrize("valid_uncond", [True, False])
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+def test_shared_ppo_bc_condition_matches_loss_gradient_and_adam_step(
+    monkeypatch, checkpoint, valid_uncond, dtype, record_property
+):
+    policy = _make_policy(monkeypatch, dual=True, checkpoint=checkpoint).train()
+    _, sample, routes = _dual_training_sample(policy)
+    sample.forward_inputs["online_idm_bc_flow_valid"][0] = valid_uncond
+    if dtype is torch.bfloat16:
+        policy.actor.to(dtype=dtype)
+        for adapter in policy.lora_adapters.values():
+            for parameter in adapter.lora_parameters():
+                parameter.data = parameter.data.float()
+        for key in ("fastwam_first_frame_latents", "fastwam_context", "flow_chains"):
+            sample.forward_inputs[key] = sample.forward_inputs[key].to(dtype=dtype)
+    parameters = tuple(
+        p
+        for adapter in policy.lora_adapters.values()
+        for p in adapter.lora_parameters()
+    )
+    original = [p.detach().clone() for p in parameters]
+
+    def run(shared):
+        optimizer = torch.optim.AdamW(parameters, lr=1e-4)
+        optimizer.zero_grad(set_to_none=True)
+        before = policy.actor.calls["prefill"]
+        replay = policy.runtime.replay_action_batch(
+            forward_inputs=sample.forward_inputs, route_info=routes
+        )
+        bc = policy.runtime.compute_online_idm_bc_loss(
+            forward_inputs=sample.forward_inputs,
+            route_info=routes,
+            uncond_condition=replay["uncond_condition"] if shared else None,
+        )
+        loss = replay["flow_logprobs"].mean() + 0.2 * bc.loss_sum
+        loss.backward()
+        grads = [p.grad.clone() for p in parameters]
+        optimizer.step()
+        return (
+            loss.detach(),
+            grads,
+            [p.detach().clone() for p in parameters],
+            (policy.actor.calls["prefill"] - before),
+        )
+
+    expected = run(False)
+    with torch.no_grad():
+        for parameter, value in zip(parameters, original, strict=True):
+            parameter.copy_(value)
+    actual = run(True)
+    assert torch.equal(actual[0], expected[0])
+    if dtype is torch.float32:
+        for actual_group, expected_group in zip(
+            actual[1:3], expected[1:3], strict=True
+        ):
+            for actual_value, expected_value in zip(
+                actual_group, expected_group, strict=True
+            ):
+                torch.testing.assert_close(
+                    actual_value, expected_value, rtol=2e-5, atol=2e-7
+                )
+    else:
+        # A shared BF16 graph adds upstream gradients before its backward.
+        # Bound the resulting rounding against the separate-graph baseline;
+        # retain FP32 master gradients and compare the optimizer delta as well.
+        grad_error = torch.cat(
+            [(a - b).flatten() for a, b in zip(actual[1], expected[1], strict=True)]
+        ).norm()
+        grad_norm = torch.cat([g.flatten() for g in expected[1]]).norm()
+        step_error = torch.cat(
+            [(a - b).flatten() for a, b in zip(actual[2], expected[2], strict=True)]
+        ).norm()
+        step_norm = torch.cat(
+            [(b - p).flatten() for b, p in zip(expected[2], original, strict=True)]
+        ).norm()
+        parameter_norm = torch.cat([p.flatten() for p in original]).norm()
+        record_property("gradient_relative_l2", float(grad_error / grad_norm))
+        record_property("adam_delta_relative_l2", float(step_error / step_norm))
+        record_property("parameter_relative_l2", float(step_error / parameter_norm))
+        # Adam's first step amplifies rounding near zero-gradient coordinates.
+        # Record that delta separately; this CPU check bounds full gradients and
+        # updated weights, and is not the full-model GPU acceptance criterion.
+        assert grad_error / grad_norm < 1e-3
+        assert step_error / parameter_norm < 1e-4
+    assert actual[3] == 1
+    assert expected[3] == (2 if valid_uncond else 1)
+
+
+@pytest.mark.parametrize("microbatch", [None, 2])
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+@pytest.mark.parametrize(
+    "partially_active", [[True, False, True, False], [True, False, False, False]]
+)
+def test_finished_rollout_rows_skip_models_and_preserve_next_episode_seeds(
+    monkeypatch, microbatch, dtype, partially_active
+):
+    from rlinf.algorithms.advantages import compute_gae_advantages_and_returns
+    from rlinf.data.embodied_io_struct import ChunkStepResult
+    from rlinf.models.embodiment.wam_policy.route_neutral_online.replay import (
+        RouteNeutralReplayStore,
+        RouteNeutralRolloutResult,
+    )
+    from rlinf.utils.nested_dict_process import map_nested_tensors
+
+    original = _make_policy(monkeypatch, dual=True)
+    optimized = _make_policy(monkeypatch, dual=True)
+
+    class _CountingCritic(torch.nn.Module):
+        def __init__(self, calls):
+            super().__init__()
+            self.calls = calls
+
+        def predict_value_batch(self, observation, return_prefix=False):
+            state = observation["states"]
+            self.calls["critic_rows"] += len(state)
+            # Real pi05 BF16 GEMMs change with batch geometry. Make that
+            # dependence explicit so shrinking the critic batch fails this
+            # regression even when the per-row inputs are unchanged.
+            prefix = state[:, None] + len(state) / 16
+            pooled = self.pool_prefix_features(prefix)
+            return self.value_from_pooled_features_rowwise_head(pooled), prefix
+
+        def pool_prefix_features(self, prefix):
+            return prefix.mean(1).float()
+
+        def value_from_pooled_features_rowwise_head(self, pooled):
+            return pooled.sum(-1)
+
+    for policy in (original, optimized):
+        policy.actor.to(dtype=dtype)
+        for adapter in policy.lora_adapters.values():
+            for parameter in adapter.lora_parameters():
+                parameter.data = parameter.data.float()
+        policy.critic = _CountingCritic(policy.actor.calls)
+        policy.config = replace(
+            policy.config,
+            formal_training_sampling_seed=17,
+            training_rollout_microbatch_size=microbatch,
+            decision_telemetry_enabled=True,
+        )
+    observation = {
+        key: value.repeat(4, *([1] * (value.ndim - 1)))
+        if isinstance(value, torch.Tensor)
+        else value * 4
+        for key, value in _observation().items()
+    }
+    observation["image"] = observation["image"].to(dtype)
+    observation.update(
+        _fastwam_env_ids=torch.arange(4),
+        _fastwam_task_ids=torch.arange(4),
+        _fastwam_trial_ids=torch.zeros(4, dtype=torch.long),
+        _fastwam_reset_state_ids=torch.arange(4) * 50,
+        _fastwam_action_contract_low=torch.full((4, 7), -1.0),
+        _fastwam_action_contract_high=torch.ones(4, 7),
+        _fastwam_action_gripper_indices=torch.full((4,), 6),
+        _fastwam_action_contract_sha256=["0" * 64] * 4,
+    )
+    masks = ([True] * 4, partially_active, [False] * 4, [True] * 4)
+    original_values, optimized_values = [], []
+    collector = RouteNeutralRolloutResult(mask_after_terminal=True)
+    for step, mask in enumerate(masks):
+        active = torch.tensor(mask)
+        observation["_fastwam_reset_mask"] = (
+            torch.ones(4, dtype=torch.bool) if step in (0, 3) else ~active
+        )
+        observation["states"] = observation["states"] + 0.01
+        with torch.no_grad():
+            expected_action, expected = original.predict_action_batch(
+                observation, mode="train", compute_values=True
+            )
+            before = optimized.actor.calls.copy()
+            actual_action, actual = optimized.predict_action_batch(
+                {**observation, "_route_neutral_active": active},
+                mode="train",
+                compute_values=True,
+            )
+        expected_critic_rows = sum(
+            len(rows) for rows in active.split(microbatch or len(active)) if rows.any()
+        )
+        assert (
+            optimized.actor.calls["critic_rows"] - before["critic_rows"]
+            == expected_critic_rows
+        )
+        if not active.any():
+            assert optimized.actor.calls == before
+        else:
+            # The additional single-live UNCOND case changes its adapted
+            # batch geometry. Use the existing real-model GPU close bound only
+            # for that path; unchanged IDM/teacher/Gate/critic stay exact, as do
+            # all four original dtype/microbatch cases.
+            adapted_rounding = (
+                active & (actual["route_info"].route_used == 0)
+                if sum(partially_active) == 1 and int(active.sum()) == 1
+                else torch.zeros_like(active)
+            )
+            exact_action_rows = active & ~adapted_rounding
+            torch.testing.assert_close(
+                actual_action[exact_action_rows],
+                expected_action[exact_action_rows],
+                atol=0,
+                rtol=0,
+            )
+            torch.testing.assert_close(
+                actual_action[adapted_rounding],
+                expected_action[adapted_rounding],
+                atol=1e-6,
+                rtol=1e-5,
+            )
+            for name in ("prev_logprobs", "prev_values", "route_info", "emitted_gate"):
+                actual_value = actual[name]
+                expected_value = expected[name]
+                if name in ("route_info", "emitted_gate"):
+                    actual_value, expected_value = (
+                        asdict(actual_value),
+                        asdict(expected_value),
+                    )
+                if name == "prev_logprobs":
+                    torch.testing.assert_close(
+                        actual_value[adapted_rounding],
+                        expected_value[adapted_rounding],
+                        atol=1e-6,
+                        rtol=1e-5,
+                    )
+                    selected = exact_action_rows
+                else:
+                    selected = active
+                _assert_equal(
+                    map_nested_tensors(actual_value, lambda t: t[selected]),
+                    map_nested_tensors(expected_value, lambda t: t[selected]),
+                )
+            for name in (
+                "critic_pooled",
+                "flow_chains",
+                "online_idm_bc_teacher_actions",
+                "online_idm_bc_sample_identities",
+            ):
+                actual_value = actual["forward_inputs"][name]
+                expected_value = expected["forward_inputs"][name]
+                if name == "flow_chains":
+                    torch.testing.assert_close(
+                        actual_value[adapted_rounding],
+                        expected_value[adapted_rounding],
+                        atol=1e-6,
+                        rtol=1e-5,
+                    )
+                    selected = exact_action_rows
+                else:
+                    selected = active
+                assert torch.equal(actual_value[selected], expected_value[selected]), (
+                    name
+                )
+        assert not actual["emitted_gate"].valid[~active].any()
+        assert not actual["forward_inputs"]["online_idm_bc_teacher_present"][
+            ~active
+        ].any()
+        assert torch.equal(
+            actual["route_info"].episode_ids, expected["route_info"].episode_ids
+        )
+        assert torch.equal(
+            actual["route_info"].chunk_ids, expected["route_info"].chunk_ids
+        )
+        _assert_equal(
+            optimized.runtime.physical_history.state_dict(),
+            original.runtime.physical_history.state_dict(),
+        )
+        for stage in actual["action_execution_trace"].stages:
+            assert not stage.total_value_count[~active].any()
+        if step < 3:
+            original_values.append(expected["prev_values"].squeeze(-1))
+            optimized_values.append(actual["prev_values"].squeeze(-1))
+            collector.append_step_result(
+                ChunkStepResult(
+                    forward_inputs=actual["forward_inputs"],
+                    route_info=actual["route_info"],
+                    emitted_gate=actual["emitted_gate"],
+                    prev_values=actual["prev_values"],
+                    prev_logprobs=actual["prev_logprobs"],
+                    dones=(~active)[:, None].expand(-1, 2),
+                )
+            )
+
+    valid = torch.tensor(masks[:3])
+    dones = torch.cat((~valid, torch.ones(1, 4, dtype=torch.bool)))
+    rewards = (dones[1:] & ~dones[:-1]).float()
+    old_gae = compute_gae_advantages_and_returns(
+        rewards,
+        gamma=0.99,
+        gae_lambda=0.95,
+        values=torch.stack(original_values + [torch.zeros(4)]),
+        dones=dones,
+        loss_mask=valid,
+    )
+    new_gae = compute_gae_advantages_and_returns(
+        rewards,
+        gamma=0.99,
+        gae_lambda=0.95,
+        values=torch.stack(optimized_values + [torch.zeros(4)]),
+        dones=dones,
+        loss_mask=valid,
+    )
+    for old, new in zip(old_gae, new_gae, strict=True):
+        assert torch.equal(old[valid], new[valid])
+    collector.append_step_result(
+        ChunkStepResult(
+            prev_values=torch.zeros(4, 1), dones=torch.ones(4, 2, dtype=torch.bool)
+        )
+    )
+    store = RouteNeutralReplayStore()
+    trajectory = store.add(
+        collector.to_splited_trajectories_by_sizes([4], consume=True)[0]
+    )
+    for step in range(3):
+        inputs = store.materialize(
+            {key: value[step] for key, value in trajectory.forward_inputs.items()}
+        )
+        with torch.no_grad():
+            replay = optimized.default_forward(
+                {**inputs, "online_idm_bc_flow_valid": valid[step]},
+                route_info=map_nested_tensors(trajectory.route_info, lambda t: t[step]),
+                emitted_gate=map_nested_tensors(
+                    trajectory.emitted_gate, lambda t: t[step]
+                ),
+            )
+        assert torch.equal(
+            replay["values"].reshape(-1)[valid[step]],
+            optimized_values[step][valid[step]],
+        )
+        if not valid[step].any():
+            assert replay["online_idm_bc_loss_sum"] == 0
+
+
+def test_shared_bc_condition_selects_only_valid_uncond_positions(monkeypatch):
+    from rlinf.utils.nested_dict_process import map_nested_tensors
+
+    policy = _make_policy(monkeypatch, dual=True).train()
+    _, sample, routes = _dual_training_sample(policy)
+    inputs = {
+        key: value.repeat(2, *([1] * (value.ndim - 1)))
+        for key, value in sample.forward_inputs.items()
+    }
+    routes = map_nested_tensors(routes, lambda t: t.repeat(2))
+    inputs["fastwam_context"][2] += 0.2
+    inputs["online_idm_bc_teacher_actions"][2] += 0.1
+    inputs["online_idm_bc_sample_identities"][2] += 999
+    inputs["online_idm_bc_flow_valid"] = torch.tensor([False, False, True, False])
+    parameters = tuple(policy.lora_parameters())
+
+    def run(shared):
+        replay = policy.runtime.replay_action_batch(
+            forward_inputs=inputs, route_info=routes
+        )
+        bc = policy.runtime.compute_online_idm_bc_loss(
+            forward_inputs=inputs,
+            route_info=routes,
+            uncond_condition=replay["uncond_condition"] if shared else None,
+        )
+        return bc, torch.autograd.grad(bc.loss_sum, parameters)
+
+    expected, expected_gradients = run(False)
+    actual, actual_gradients = run(True)
+    assert actual.selected_count == 1
+    assert torch.equal(actual.loss_sum, expected.loss_sum)
+    for old, new in zip(expected_gradients, actual_gradients, strict=True):
+        torch.testing.assert_close(new, old, rtol=2e-5, atol=2e-7)
+
+
 def test_dual_video_changes_uncond_but_not_parent_gate_critic_or_idm(monkeypatch):
     policy = _make_policy(monkeypatch, dual=True)
     policy.runtime.critic_feature_config = policy.runtime.route_neutral_visual
@@ -384,6 +875,41 @@ def test_dual_lora_rejects_action_only_inference_merge(monkeypatch):
     policy.enable_inference_acceleration(compile=False)
     with pytest.raises(ValueError, match="requires eager inference"):
         policy.predict_action_batch(_observation(), mode="eval")
+
+
+def test_dual_eval_checkpoint_keeps_eager_and_restores_both_branches(monkeypatch):
+    policy = _make_policy(monkeypatch, dual=True)
+    parent = "a" * 64
+    state = {
+        "schema": "fastwam-adaptive-policy-dual-lora-v1",
+        "actor_version": 30,
+        "gate": copy.deepcopy(policy.gate.state_dict()),
+        "lora": copy.deepcopy(policy.lora_adapter.lora_state_dict()),
+        "video_lora": copy.deepcopy(policy.video_lora_adapter.lora_state_dict()),
+        "value_head": {},
+        "route_tracker": policy.route_tracker.state_dict(),
+    }
+    payload = {
+        "schema": "fastwam-adaptive-rl-checkpoint-v1",
+        "parent_checkpoint_sha256": parent,
+        "contract": {"model": {"actor_checkpoint_sha256": parent}},
+        "step": 30,
+        "policy": state,
+    }
+    with torch.no_grad():
+        for adapter in policy.lora_adapters.values():
+            for parameter in adapter.lora_parameters():
+                parameter.zero_()
+    assert (
+        policy.load_eval_checkpoint(payload, expected_parent_checkpoint_sha256=parent)
+        == 30
+    )
+    assert policy.inference_acceleration is None
+    _assert_equal(state["lora"], policy.lora_adapter.lora_state_dict())
+    _assert_equal(state["video_lora"], policy.video_lora_adapter.lora_state_dict())
+    actions, _ = policy.predict_action_batch(_observation(), mode="eval")
+    assert torch.isfinite(actions).all()
+    assert policy._inference_engine is None
 
 
 def test_continuation_ledger_keeps_stochastic_gate_draws_and_actions(policy):

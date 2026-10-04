@@ -648,6 +648,76 @@ def test_fastwam_actor_init_rejects_bootstrap_plus_resume(tmp_path: Path) -> Non
         EmbodiedFSDPActor.init_worker(worker)
 
 
+@pytest.mark.parametrize("save_fails", [False, True])
+def test_fastwam_actor_checkpoint_save_preserves_first_fsdp_forward(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    save_fails: bool,
+) -> None:
+    from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
+
+    class ValuePolicy(torch.nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.value_head = FSDP(
+                torch.nn.Linear(2, 1),
+                device_id=torch.device("cpu"),
+                use_orig_params=True,
+            )
+            self.actor_version = 0
+
+        def set_global_step(self, step: int) -> None:
+            self.actor_version = step
+
+        def trainable_state_dict(self) -> dict[str, Any]:
+            return {"value_head": self.value_head.state_dict()}
+
+        def load_trainable_state_dict(self, state: dict[str, Any]) -> None:
+            self.value_head.load_state_dict(state["value_head"])
+
+        def forward(self, inputs: torch.Tensor) -> torch.Tensor:
+            return self.value_head(inputs)
+
+    monkeypatch.setattr(
+        worker_module, "get_rng_state", lambda: {"cpu": torch.get_rng_state()}
+    )
+    torch.distributed.init_process_group(
+        "gloo",
+        init_method=f"file://{tmp_path / 'rdzv'}",
+        rank=0,
+        world_size=1,
+    )
+    try:
+        policy = ValuePolicy()
+        worker = _checkpoint_worker()
+        worker.model = FSDP(policy, device_id=torch.device("cpu"), use_orig_params=True)
+        inputs = torch.ones(1, 2)
+        expected = torch.nn.functional.linear(
+            inputs,
+            policy.value_head.module.weight,
+            policy.value_head.module.bias,
+        ).detach()
+        if save_fails:
+
+            def fail_save(*_args: Any, **_kwargs: Any) -> None:
+                raise RuntimeError("simulated save failure")
+
+            monkeypatch.setattr(torch, "save", fail_save)
+            with pytest.raises(RuntimeError, match="simulated save failure"):
+                worker.save_checkpoint(str(tmp_path / "actor"), step=0)
+        else:
+            worker.save_checkpoint(str(tmp_path / "actor"), step=0)
+
+        assert worker.model._is_root is None
+        assert policy.value_head._is_root is None
+        output = worker.model(inputs)
+        torch.testing.assert_close(output, expected)
+        output.sum().backward()
+        torch.testing.assert_close(policy.value_head.module.weight.grad, inputs)
+    finally:
+        torch.distributed.destroy_process_group()
+
+
 def test_fastwam_actor_checkpoint_load_restores_fsdp_lazy_root_state(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

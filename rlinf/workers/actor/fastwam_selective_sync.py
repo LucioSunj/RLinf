@@ -63,13 +63,15 @@ def capture_fastwam_sync_tensors(
 
     Returns:
         An insertion-ordered mapping whose keys exactly match
-        :func:`collect_param_names_need_sync`.
+        :func:`collect_param_names_need_sync` with duplicate objects removed.
 
     Raises:
         RuntimeError: If the collector produces duplicate or unresolved names.
     """
 
-    sync_names = collect_param_names_need_sync(module)
+    # FastWAM registers each expert directly, through MoT, and through dit.
+    # The receiver's state-dict aliases share these same Parameter objects.
+    sync_names = collect_param_names_need_sync(module, remove_duplicate=True)
     if not sync_names:
         raise RuntimeError("FastWAM selective sync found no tensors to synchronize.")
     if len(sync_names) != len(set(sync_names)):

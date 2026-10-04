@@ -25,6 +25,9 @@ from rlinf.models.embodiment.wam_policy.pad_rv.memory import release_pad_host_me
 from rlinf.models.embodiment.wam_policy.pad_rv.route_neutral_runner import (
     PadRouteNeutralRunner,
 )
+from rlinf.models.embodiment.wam_policy.route_neutral_online.config import (
+    rollout_initialization_batch_size,
+)
 from rlinf.scheduler import Channel
 from rlinf.workers.env.env_worker import EnvWorker
 from rlinf.workers.rollout.hf.huggingface_worker import MultiStepRolloutWorker
@@ -89,6 +92,59 @@ class RouteNeutralOnlineRolloutWorker(MultiStepRolloutWorker):
 
 class RouteNeutralOnlineEnvWorker(EnvWorker):
     """Serialize large rank payloads and release them after channel transfer."""
+
+    def _build_rollout_input_data(
+        self,
+        env_batch: dict[str, Any],
+        *,
+        stage_id: int,
+        eval_mode: bool = False,
+        force_reset: bool = False,
+    ) -> dict[str, Any]:
+        """Mark post-terminal rows without shortening the trajectory time axis."""
+
+        data = super()._build_rollout_input_data(
+            env_batch,
+            stage_id=stage_id,
+            eval_mode=eval_mode,
+            force_reset=force_reset,
+        )
+        if (
+            eval_mode
+            or self.cfg.env.train.auto_reset
+            or self.cfg.env.train.ignore_terminations
+        ):
+            return data
+        if not hasattr(self, "_route_neutral_finished"):
+            self._route_neutral_finished = {}
+        if force_reset or stage_id not in self._route_neutral_finished:
+            self._route_neutral_finished[stage_id] = torch.zeros_like(
+                data["fastwam_reset_mask"]
+            )
+        elif env_batch.get("dones") is not None:
+            finished = self._route_neutral_finished[stage_id]
+            finished |= env_batch["dones"].bool().reshape(finished.numel(), -1).any(1)
+        data["obs"] = {
+            **data["obs"],
+            "_route_neutral_active": ~self._route_neutral_finished[stage_id],
+        }
+        return data
+
+    def _prepare_rollout_results(self, rollout_results: list | None = None) -> list:
+        """Pack frozen replay payloads before they accumulate on the host."""
+
+        from .replay import RouteNeutralRolloutResult
+
+        return [
+            RouteNeutralRolloutResult(
+                max_episode_length=self.cfg.env.train.max_episode_steps,
+                mask_after_terminal=(
+                    not self.cfg.env.train.auto_reset
+                    and not self.cfg.env.train.ignore_terminations
+                ),
+            )
+            for _ in range(self.stage_num)
+        ]
 
     def describe_task_pools(self) -> dict[str, Any]:
         """Expose actual reset-pool sizes and language labels to the sampler."""
@@ -244,7 +300,7 @@ class RouteNeutralOnlineEnvWorker(EnvWorker):
 
 
 class RouteNeutralOnlineRunner(PadRouteNeutralRunner):
-    """Reuse generic damped control with rank-serial rollout initialization."""
+    """Reuse generic damped control with bounded rollout initialization batches."""
 
     def init_workers(self) -> None:
         super().init_workers()
@@ -256,6 +312,7 @@ class RouteNeutralOnlineRunner(PadRouteNeutralRunner):
                 total_envs=int(self.cfg.env.train.total_num_envs),
                 reset_pool_sizes=descriptions[0]["reset_pool_sizes"],
                 seed=int(self.cfg.env.train.seed),
+                num_ranks=len(descriptions),
             )
             self.task_names = descriptions[0]["task_names"]
             resume_dir = self.cfg.runner.get("resume_dir")
@@ -345,24 +402,30 @@ class RouteNeutralOnlineRunner(PadRouteNeutralRunner):
         super()._log_step_metrics(**kwargs)
 
     def _init_rollout_workers_serially(self) -> None:
+        """Implement PAD's initialization hook with bounded concurrent batches."""
+
         profile = _lifecycle_cfg(self.cfg)
-        if str(profile.rollout_init_mode) != "serial_rank":
-            raise ValueError(
-                "Route-neutral online training requires serial_rank initialization."
-            )
+        batch_size = rollout_initialization_batch_size(profile)
         ranks = [item.rank for item in self.rollout.worker_info_list]
         if ranks != list(range(len(ranks))):
             raise ValueError(
                 f"Route-neutral rollout ranks are not contiguous: {ranks}."
             )
-        for rank in ranks:
+        for start in range(0, len(ranks), batch_size):
+            batch = ranks[start : start + batch_size]
+            started = time.perf_counter()
             self.logger.info(
-                "Initializing route-neutral online rollout rank %s/%s with "
-                "bounded host memory.",
-                rank,
-                len(ranks) - 1,
+                "Initializing route-neutral online rollout ranks %s with "
+                "at most %s concurrent model loads.",
+                batch,
+                batch_size,
             )
-            self.rollout.execute_on(rank).init_worker().wait()
+            self.rollout.execute_on(*batch).init_worker().wait()
+            self.logger.info(
+                "Route-neutral online rollout ranks %s initialized in %.3fs.",
+                batch,
+                time.perf_counter() - started,
+            )
 
 
 __all__ = [

@@ -4,7 +4,6 @@
 # you may not use this file except in compliance with the License.
 
 import asyncio
-import inspect
 import weakref
 from dataclasses import replace
 from pathlib import Path
@@ -303,6 +302,85 @@ def test_config_selects_bc_initialized_trainable_uncond(monkeypatch) -> None:
         is True
     )
     assert issubclass(RouteNeutralOnlineRunner, PadRouteNeutralRunner)
+
+
+@pytest.mark.parametrize("batch_size", [1, 2, 3])
+def test_config_accepts_batched_rollout_initialization(monkeypatch, batch_size):
+    cfg = _compose(monkeypatch)
+    cfg.route_neutral_online_implementation.rollout_init_mode = "batched_ranks"
+    cfg.route_neutral_online_implementation.rollout_init_batch_size = batch_size
+    validate_route_neutral_online_idm_bc_training_config(cfg)
+
+
+@pytest.mark.parametrize("batch_size", [0, -1, True, 1.5])
+def test_config_rejects_invalid_rollout_initialization_batch(monkeypatch, batch_size):
+    cfg = _compose(monkeypatch)
+    cfg.route_neutral_online_implementation.rollout_init_mode = "batched_ranks"
+    cfg.route_neutral_online_implementation.rollout_init_batch_size = batch_size
+    with pytest.raises(ValueError, match="batch size must be a positive integer"):
+        validate_route_neutral_online_idm_bc_training_config(cfg)
+
+
+def test_config_rejects_parallel_batch_with_serial_mode(monkeypatch):
+    cfg = _compose(monkeypatch)
+    cfg.route_neutral_online_implementation.rollout_init_batch_size = 3
+    with pytest.raises(ValueError, match="Use batched_ranks"):
+        validate_route_neutral_online_idm_bc_training_config(cfg)
+
+
+@pytest.mark.parametrize("batch_size,fail_first", [(1, False), (3, False), (3, True)])
+def test_rollout_initialization_bounds_concurrency_and_propagates_failure(
+    batch_size, fail_first
+):
+    class RolloutGroup:
+        worker_info_list = [SimpleNamespace(rank=rank) for rank in range(7)]
+
+        def __init__(self):
+            self.active = set()
+            self.completed = set()
+            self.launched = []
+            self.peak = 0
+
+        def execute_on(self, *ranks):
+            assert not self.active, "The previous batch must finish before the next."
+            self.ranks = ranks
+            return self
+
+        def init_worker(self):
+            self.active.update(self.ranks)
+            self.launched.append(self.ranks)
+            self.peak = max(self.peak, len(self.active))
+            return self
+
+        def wait(self):
+            if fail_first:
+                raise RuntimeError("model load failed")
+            assert not (self.completed & self.active), "A rank was initialized twice."
+            self.completed.update(self.active)
+            self.active.clear()
+
+    rollout = RolloutGroup()
+    profile = {
+        "rollout_init_mode": "serial_rank" if batch_size == 1 else "batched_ranks",
+        "rollout_init_batch_size": batch_size,
+        "release_host_memory_after_rollout_init": True,
+        "release_host_memory_after_trajectory_send": True,
+        "release_host_memory_after_trajectory_receive": True,
+    }
+    runner = SimpleNamespace(
+        cfg=SimpleNamespace(route_neutral_online_implementation=profile),
+        rollout=rollout,
+        logger=SimpleNamespace(info=lambda *args: None),
+    )
+    if fail_first:
+        with pytest.raises(RuntimeError, match="model load failed"):
+            RouteNeutralOnlineRunner._init_rollout_workers_serially(runner)
+        assert rollout.launched == [(0, 1, 2)]
+    else:
+        RouteNeutralOnlineRunner._init_rollout_workers_serially(runner)
+        assert rollout.completed == set(range(7))
+        assert rollout.peak == batch_size
+        assert rollout.launched[-1] == (6,)
 
 
 def test_config_accepts_five_rollout_rank_training_placement(monkeypatch) -> None:
@@ -686,6 +764,54 @@ def test_recompute_backend_enum_preserves_runtime_boundary() -> None:
     assert GateKVReplayBackend("recompute") is GateKVReplayBackend.RECOMPUTE
 
 
+@pytest.mark.parametrize(
+    "auto_reset,ignore_terminations", [(False, False), (True, False), (False, True)]
+)
+def test_rollout_active_mask_is_sticky_and_resets_at_epoch_bootstrap(
+    monkeypatch, auto_reset, ignore_terminations
+):
+    from rlinf.models.embodiment.wam_policy.route_neutral_online.lifecycle import (
+        RouteNeutralOnlineEnvWorker,
+    )
+    from rlinf.workers.env.env_worker import EnvWorker
+
+    monkeypatch.setattr(
+        EnvWorker,
+        "_build_rollout_input_data",
+        lambda self, batch, **kwargs: {
+            "obs": batch["obs"],
+            "fastwam_reset_mask": torch.zeros(3, dtype=torch.bool),
+        },
+    )
+    worker = object.__new__(RouteNeutralOnlineEnvWorker)
+    worker.cfg = SimpleNamespace(
+        env=SimpleNamespace(
+            train=SimpleNamespace(
+                auto_reset=auto_reset, ignore_terminations=ignore_terminations
+            )
+        )
+    )
+    batch = {
+        "obs": {"states": torch.zeros(3, 2)},
+        "dones": torch.zeros(3, 2, dtype=torch.bool),
+    }
+    first = worker._build_rollout_input_data(batch, stage_id=0, force_reset=True)
+    if auto_reset or ignore_terminations:
+        assert "_route_neutral_active" not in first["obs"]
+        return
+    assert first["obs"]["_route_neutral_active"].tolist() == [True] * 3
+    batch["dones"][1, 0] = True
+    second = worker._build_rollout_input_data(batch, stage_id=0)
+    batch["dones"].zero_()
+    third = worker._build_rollout_input_data(batch, stage_id=0)
+    assert second["obs"]["_route_neutral_active"].tolist() == [True, False, True]
+    assert torch.equal(
+        third["obs"]["_route_neutral_active"], second["obs"]["_route_neutral_active"]
+    )
+    reset = worker._build_rollout_input_data(batch, stage_id=0, force_reset=True)
+    assert reset["obs"]["_route_neutral_active"].all()
+
+
 def test_route_neutral_train_preparation_consumes_recompute_replay() -> None:
     actor = object.__new__(RouteNeutralOnlineIDMBCFSDPActor)
     actor.cfg = SimpleNamespace(
@@ -731,17 +857,17 @@ def test_mb4_compaction_keeps_union_and_minimal_padding() -> None:
 
     compacted, metrics = actor._prepare_train_global_batch_for_microbatches(batch)
 
-    assert compacted["prev_logprobs"].reshape(-1).tolist() == [0.0, 1.0, 2.0, 5.0]
+    assert compacted["prev_logprobs"].reshape(-1).tolist() == [2.0, 0.0, 5.0, 1.0]
     assert compacted["forward_inputs"]["payload"].reshape(-1).tolist() == [
-        0.0,
-        1.0,
         2.0,
+        0.0,
         5.0,
+        1.0,
     ]
     assert compacted["route_info"].route_used.tolist() == [
-        WAMRoute.IDM,
-        WAMRoute.IDM,
         WAMRoute.UNCOND,
+        WAMRoute.IDM,
+        WAMRoute.IDM,
         WAMRoute.IDM,
     ]
     assert metrics["perf/actor_rows_original"] == 8.0
@@ -842,10 +968,28 @@ def test_mb4_compacted_rowwise_critic_padding_has_valid_zero_gradient(
         assert critic.value_head.weight.grad.item() != 0.0
 
 
-def test_actor_syncs_on_actual_final_compacted_microbatch() -> None:
-    source = inspect.getsource(EmbodiedFSDPActor.run_training)
+@pytest.mark.parametrize("microbatch_count", [1, 3])
+def test_actor_syncs_on_actual_final_compacted_microbatch(
+    monkeypatch, microbatch_count
+) -> None:
+    actor = object.__new__(EmbodiedFSDPActor)
+    actor.gradient_accumulation = 49
+    monkeypatch.setattr(actor, "_uses_fastwam_handle_replay", lambda: False)
+    calls = []
 
-    assert "is_last=(idx + 1) == len(train_micro_batch)" in source
+    def train_micro_batch(*, micro_batch, metrics, is_last, selected_loss_scales):
+        calls.append((micro_batch["index"], is_last))
+
+    monkeypatch.setattr(actor, "train_micro_batch", train_micro_batch)
+    actor._execute_training_microbatches(
+        [{"index": index} for index in range(microbatch_count)],
+        metrics={},
+        selected_loss_scales=None,
+    )
+
+    assert calls == [
+        (index, index == microbatch_count - 1) for index in range(microbatch_count)
+    ]
 
 
 def test_current_step_alignment_preserves_flow_and_gate_credit() -> None:
@@ -1371,6 +1515,112 @@ def test_mb4_compaction_preserves_original_global_batch_denominator() -> None:
     assert metrics["perf/actor_rows_padded"] == 1.0
     assert metrics["perf/actor_rows_forwarded"] == 68.0
     assert metrics["perf/actor_microbatches_executed"] == 17.0
+
+
+def test_route_packing_preserves_all_fifteen_optimizer_updates_and_loss_scales():
+    from rlinf.algorithms.fastwam_dual_ppo import compute_fastwam_dual_ppo_loss
+    from rlinf.utils.nested_dict_process import split_dict_to_chunk
+
+    actor = object.__new__(RouteNeutralOnlineIDMBCFSDPActor)
+    actor.cfg = SimpleNamespace(actor=SimpleNamespace(micro_batch_size=4))
+    generator = torch.Generator().manual_seed(84)
+    initial = torch.tensor([0.2, -0.1, 0.3])
+    batches = []
+    for step in range(15):
+        x = torch.randn(392, generator=generator)
+        route = torch.randint(2, (392,), generator=generator)
+        active = torch.rand(392, generator=generator) < 0.38
+        batches.append(
+            {
+                "prev_logprobs": (initial[1] * x)[:, None, None],
+                "route_info": _route_record(route),
+                "gate_valid_mask": active,
+                "flow_valid_mask": active,
+                "loss_mask": active[:, None],
+                "loss_mask_sum": torch.ones(392, 1, dtype=torch.long),
+                "forward_inputs": {"x": x, "row_id": torch.arange(392) + 392 * step},
+            }
+        )
+
+    def train(pack):
+        owners = torch.nn.Parameter(initial.clone())
+        optimizer = torch.optim.AdamW([owners], lr=1e-4)
+        observed = []
+        for batch in batches:
+            gate_count = batch["gate_valid_mask"].sum().item()
+            flow_count = (
+                (batch["flow_valid_mask"] & (batch["route_info"].route_used == 0))
+                .sum()
+                .item()
+            )
+            prepared = (
+                actor._prepare_train_global_batch_for_microbatches(batch)[0]
+                if pack
+                else batch
+            )
+            if pack:
+                expected_ids = batch["forward_inputs"]["row_id"][
+                    batch["gate_valid_mask"]
+                ]
+                actual_ids = prepared["forward_inputs"]["row_id"][
+                    prepared["gate_valid_mask"]
+                ]
+                assert torch.equal(actual_ids.sort().values, expected_ids)
+                micro_routes = prepared["route_info"].route_used.reshape(-1, 4)
+                assert int((micro_routes == 0).any(1).sum()) == (flow_count + 3) // 4
+            optimizer.zero_grad(set_to_none=True)
+            total_loss = 0.0
+            for micro in split_dict_to_chunk(
+                prepared, len(prepared["prev_logprobs"]) // 4
+            ):
+                x = micro["forward_inputs"]["x"]
+                route = micro["route_info"].route_used
+                sign = route.float() * 2 - 1
+                loss, _ = compute_fastwam_dual_ppo_loss(
+                    gate_logprobs=torch.nn.functional.logsigmoid(sign * owners[0] * x),
+                    gate_old_logprobs=torch.nn.functional.logsigmoid(
+                        sign * initial[0] * x
+                    ),
+                    gate_advantages=x.sin(),
+                    gate_valid_mask=micro["gate_valid_mask"],
+                    gate_clip_ratio_low=0.2,
+                    gate_clip_ratio_high=0.2,
+                    flow_logprobs=(owners[1] * x)[:, None, None],
+                    flow_old_logprobs=micro["prev_logprobs"],
+                    flow_advantages=x.cos()[:, None],
+                    route_used=route,
+                    flow_valid_mask=micro["flow_valid_mask"],
+                    flow_clip_ratio_low=0.2,
+                    flow_clip_ratio_high=0.2,
+                    gate_selected_loss_scale=98 / gate_count,
+                    flow_selected_loss_scale=98 / flow_count,
+                )
+                critic, _ = compute_ppo_critic_loss(
+                    values=(owners[2] * x)[:, None],
+                    returns=x.sin()[:, None],
+                    prev_values=(initial[2] * x)[:, None],
+                    value_clip=0.2,
+                    huber_delta=10,
+                    loss_mask=micro["loss_mask"],
+                    loss_mask_sum=micro["loss_mask_sum"],
+                    max_episode_steps=1,
+                )
+                uncond = micro["flow_valid_mask"] & (route == 0)
+                bc = (owners[1] * x - x.sin()).square()[uncond].sum() * 98 / flow_count
+                loss = (loss + critic + 0.2 * bc) / 98
+                loss.backward()
+                total_loss += float(loss.detach())
+            gradient = owners.grad.clone()
+            optimizer.step()
+            observed.append((total_loss, gradient, owners.detach().clone()))
+        assert optimizer.state[owners]["step"] == 15
+        return observed
+
+    expected, actual = train(False), train(True)
+    for old, new in zip(expected, actual, strict=True):
+        assert new[0] == pytest.approx(old[0], abs=1e-7)
+        torch.testing.assert_close(new[1], old[1], rtol=2e-6, atol=2e-7)
+        torch.testing.assert_close(new[2], old[2], rtol=2e-6, atol=2e-7)
 
 
 def test_mb4_compaction_reports_original_rollout_batch_means() -> None:

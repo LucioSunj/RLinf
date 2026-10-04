@@ -335,7 +335,7 @@ class FastWAMAdaptivePolicy(nn.Module, BasePolicy):
         actor: nn.Module,
         runtime: FastWAMPolicyRuntime,
         lora_adapter: Any,
-        gate: nn.Module,
+        gate: nn.Module | None,
         critic: nn.Module | None,
         config: FastWAMAdaptivePolicyConfig | None = None,
         video_lora_adapter: Any | None = None,
@@ -422,7 +422,8 @@ class FastWAMAdaptivePolicy(nn.Module, BasePolicy):
 
         super().train(mode)
         self.actor.eval()
-        self.gate.train(mode)
+        if self.gate is not None:
+            self.gate.train(mode)
         if self.critic is not None:
             self.critic.train(mode)
         return self
@@ -1645,6 +1646,9 @@ class FastWAMAdaptivePolicy(nn.Module, BasePolicy):
                 "FastWAM evaluation checkpoint step does not match its policy version."
             )
         checkpoint_gate = policy_payload.get("gate")
+        if self.gate is None:
+            self.load_trainable_state_dict(dict(policy_payload))
+            return self.actor_version
         if not isinstance(checkpoint_gate, Mapping):
             raise ValueError(
                 "FastWAM evaluation checkpoint is missing its Gate state mapping."

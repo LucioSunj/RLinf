@@ -423,7 +423,10 @@ class MultiStepRolloutWorker(Worker):
             raise TypeError("FastWAM rollout policy has no runtime-state API.")
         step = int(step)
         rollout_actor_version = int(self.version)
-        if step < 1 or rollout_actor_version not in {step - 1, step}:
+        minimum_step = (
+            0 if getattr(self.model_cfg, "uncond_rl", None) is not None else 1
+        )
+        if step < minimum_step or rollout_actor_version not in {max(0, step - 1), step}:
             raise ValueError(
                 "FastWAM rollout checkpoint version must be the checkpoint step "
                 f"or its immediately preceding behavior version, got "
@@ -537,7 +540,10 @@ class MultiStepRolloutWorker(Worker):
             raise ValueError("FastWAM rollout-runtime rank/world-size mismatch.")
         step = int(payload.get("step", -1))
         rollout_actor_version = int(payload.get("rollout_actor_version", -1))
-        if step < 1 or rollout_actor_version not in {step - 1, step}:
+        minimum_step = (
+            0 if getattr(self.model_cfg, "uncond_rl", None) is not None else 1
+        )
+        if step < minimum_step or rollout_actor_version not in {max(0, step - 1), step}:
             raise ValueError(
                 "FastWAM rollout-runtime checkpoint step/version mismatch."
             )

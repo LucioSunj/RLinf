@@ -22,13 +22,19 @@ class BalancedLiberoTaskSampler:
     """
 
     def __init__(
-        self, *, total_envs: int, reset_pool_sizes: list[int], seed: int = 42
+        self,
+        *,
+        total_envs: int,
+        reset_pool_sizes: list[int],
+        seed: int = 42,
+        num_ranks: int = 7,
     ) -> None:
-        if total_envs < 10 or total_envs % 7:
-            raise ValueError("Balanced LIBERO needs N >= 10 divisible by seven.")
+        if num_ranks < 1 or total_envs < 10 or total_envs % num_ranks:
+            raise ValueError("Balanced LIBERO needs N >= 10 divisible by num_ranks.")
         if len(reset_pool_sizes) != 10 or min(reset_pool_sizes) < 1:
             raise ValueError("Balanced LIBERO needs ten nonempty reset pools.")
         self.total_envs = int(total_envs)
+        self.num_ranks = int(num_ranks)
         self.reset_pool_sizes = list(map(int, reset_pool_sizes))
         self.seed = int(seed)
         self.remainder = self.total_envs % 10
@@ -68,14 +74,14 @@ class BalancedLiberoTaskSampler:
                         "reset_state_id": int(starts[task]) + trial,
                     }
                 )
-        ranks: list[list[dict[str, int]]] = [[] for _ in range(7)]
-        rank_order = self.assignment_rng.permutation(7).tolist()
+        ranks: list[list[dict[str, int]]] = [[] for _ in range(self.num_ranks)]
+        rank_order = self.assignment_rng.permutation(self.num_ranks).tolist()
         for index, slot in enumerate(slots):
-            ranks[rank_order[index % 7]].append(slot)
+            ranks[rank_order[index % self.num_ranks]].append(slot)
         for rank, rank_slots in enumerate(ranks):
             self.assignment_rng.shuffle(rank_slots)
             for local_slot, slot in enumerate(rank_slots):
-                global_slot = rank * (self.total_envs // 7) + local_slot
+                global_slot = rank * (self.total_envs // self.num_ranks) + local_slot
                 slot["episode_slot_id"] = runner_step * self.total_envs + global_slot
         plan = {
             "runner_step": runner_step,
@@ -97,6 +103,7 @@ class BalancedLiberoTaskSampler:
             {
                 "schema": "libero10-balanced-task-sampler-v1",
                 "total_envs": self.total_envs,
+                "num_ranks": self.num_ranks,
                 "reset_pool_sizes": self.reset_pool_sizes,
                 "seed": self.seed,
                 "permutation": self.permutation,
@@ -113,6 +120,9 @@ class BalancedLiberoTaskSampler:
         for name in ("schema", "total_envs", "reset_pool_sizes", "seed"):
             if state[name] != self.state_dict()[name]:
                 raise ValueError(f"Sampler resume changed {name}.")
+        # Existing checkpoints predate configurable ranks and always used seven.
+        if state.get("num_ranks", 7) != self.num_ranks:
+            raise ValueError("Sampler resume changed num_ranks.")
         if state["next_update"] != runner_step:
             raise ValueError("Sampler next update differs from the checkpoint step.")
         position = int(state["cycle_position"])

@@ -42,6 +42,7 @@ route_neutral_online_implementation:
   env_worker_target: rlinf.models.embodiment.wam_policy.route_neutral_online.lifecycle.RouteNeutralOnlineEnvWorker
   runner_target: rlinf.models.embodiment.wam_policy.route_neutral_online.lifecycle.RouteNeutralOnlineRunner
   rollout_init_mode: serial_rank
+  rollout_init_batch_size: 1
   trajectory_send_mode: serialized
   release_host_memory_after_rollout_init: true
   release_host_memory_after_trajectory_send: true

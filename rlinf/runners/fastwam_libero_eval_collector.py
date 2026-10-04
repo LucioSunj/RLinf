@@ -779,6 +779,13 @@ class FastWAMLiberoEvalCollector:
             return torch.empty(0)
         return torch.as_tensor(value[index]).reshape(-1)
 
+    def _expected_gate_validity(
+        self, route, selection, *, index: int, current_step: bool, terminal: bool
+    ) -> bool:
+        """Return whether this chunk owns an executed or pending Gate decision."""
+
+        return current_step or not terminal
+
     def record_chunk(
         self,
         *,
@@ -885,7 +892,13 @@ class FastWAMLiberoEvalCollector:
                 not route.route_was_forced[index]
                 and route.route_source_chunk_ids[index] == route.chunk_ids[index]
             )
-            expected_valid = current_step or not terminal
+            expected_valid = self._expected_gate_validity(
+                route,
+                selection,
+                index=index,
+                current_step=current_step,
+                terminal=terminal,
+            )
             if valid != expected_valid:
                 raise ValueError(
                     "Gate decision validity disagrees with its current-step or "

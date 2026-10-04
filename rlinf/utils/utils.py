@@ -116,24 +116,30 @@ def normalize_device(device: torch.device | str | None) -> torch.device:
     return device if isinstance(device, torch.device) else torch.device(device)
 
 
-def collect_param_names_need_sync(module: torch.nn.Module) -> list[str]:
+def collect_param_names_need_sync(
+    module: torch.nn.Module, *, remove_duplicate: bool = False
+) -> list[str]:
     """Collect trainable parameters and persistent buffers for selective sync."""
     trainable_param_names = [
         name
-        for name, param in module.named_parameters(remove_duplicate=False)
+        for name, param in module.named_parameters(remove_duplicate=remove_duplicate)
         if param.requires_grad
     ]
 
     persistent_buffer_names: list[str] = []
+    seen_buffers: set[int] = set()
     for module_name, submodule in module.named_modules(remove_duplicate=False):
         non_persistent_buffers = getattr(
             submodule, "_non_persistent_buffers_set", set()
         )
-        for buffer_name, _ in submodule.named_buffers(
+        for buffer_name, buffer in submodule.named_buffers(
             recurse=False, remove_duplicate=False
         ):
             if buffer_name in non_persistent_buffers:
                 continue
+            if remove_duplicate and id(buffer) in seen_buffers:
+                continue
+            seen_buffers.add(id(buffer))
             full_name = (
                 buffer_name if not module_name else f"{module_name}.{buffer_name}"
             )
