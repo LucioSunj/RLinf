@@ -27,6 +27,8 @@ from fastwam.models.wan22.adaptive_sampler import (
     sample_denoise_indices,
 )
 from fastwam.models.wan22.batch_linear import install_batch_invariant_linears
+from fastwam.models.wan22.kv_tap import KeyValueBank, KVSource
+from fastwam.models.wan22.mot import _GATE_CURRENT_FRAME_PROVENANCE_KEY
 from fastwam.uncond_bc import (
     compute_action_flow_matching_bc_loss,
     stateless_validation_flow_inputs,
@@ -42,7 +44,6 @@ from rlinf.models.embodiment.wam_policy.contracts import ChunkRouteRecord, WAMRo
 from rlinf.models.embodiment.wam_policy.critic import (
     FastWAMValueFeatures,
     FastWAMValueTransformerConfig,
-    extract_fastwam_value_features,
 )
 from rlinf.models.embodiment.wam_policy.kv_replay import GateKVReplayBackend
 from rlinf.models.embodiment.wam_policy.libero_runtime import (
@@ -73,6 +74,7 @@ from rlinf.models.embodiment.wam_policy.pad_rv.route_neutral_gate import (
     PhysicalStateHistoryTracker,
     RouteNeutralGateFeatures,
     RouteNeutralVisualFeatures,
+    RouteNeutralVisualLayer,
 )
 
 ROUTE_NEUTRAL_ROLLOUT_IDM_BATCH_SIZE = "route_neutral_rollout_idm_batch_size"
@@ -305,6 +307,157 @@ class RouteNeutralOnlineIDMTeacherLiberoRuntime(OnlineIDMTeacherLiberoRuntime):
         )
         return condition
 
+    def _prefill_parent_gate_kv(
+        self,
+        video_tokens: torch.Tensor,
+        video_freqs: torch.Tensor,
+        video_t_mod: torch.Tensor,
+        video_context_payload: dict[str, torch.Tensor],
+        video_attention_mask: torch.Tensor,
+    ) -> tuple[list[torch.Tensor], list[torch.Tensor]]:
+        """Compute parent Video K/V only through the final Gate tap.
+
+        This tensor-only loop is separately compilable in the inference view.
+        The final tapped layer needs its input K/V but no attention or FFN.
+        """
+
+        mot = self.actor.mot
+        expert = self.actor.video_expert
+        last_layer = self.route_neutral_visual.layer_indices[-1]
+        x = video_tokens
+        keys, values = [], []
+        for layer_index in range(last_layer + 1):
+            block = expert.blocks[layer_index]
+            q, k, v, residual, gate_msa, shift, scale, gate_mlp, _ = (
+                mot._build_expert_attention_io(
+                    expert=expert,
+                    block=block,
+                    x=x,
+                    freqs=video_freqs,
+                    t_mod=video_t_mod,
+                )
+            )
+            keys.append(k)
+            values.append(v)
+            if layer_index == last_layer:
+                break
+            mixed = mot._mixed_attention(
+                q_cat=q,
+                k_cat=k,
+                v_cat=v,
+                attention_mask=video_attention_mask,
+            )
+            x = mot._apply_expert_post_block(
+                block=block,
+                residual_x=residual,
+                mixed_attn_out=mixed,
+                gate_msa=gate_msa,
+                shift_mlp=shift,
+                scale_mlp=scale,
+                gate_mlp=gate_mlp,
+                context_payload=video_context_payload,
+            )
+        return keys, values
+
+    @torch.no_grad()
+    def _prepare_parent_gate_condition(
+        self,
+        *,
+        first_frame_latents: torch.Tensor,
+        context: torch.Tensor,
+        context_mask: torch.Tensor,
+    ) -> CachedActionCondition:
+        """Build a Gate-only prefix; dual routes prepare their own action cache."""
+
+        with (
+            self.lora_adapter.use_regime(PolicyRegime.IDM),
+            self.batch_linear_context.use(1),
+        ):
+            video_pre = self.actor.video_expert.pre_dit(
+                x=first_frame_latents,
+                timestep=torch.zeros(1, device=self.device, dtype=self.dtype),
+                context=context,
+                context_mask=context_mask,
+                action=None,
+                fuse_vae_embedding_in_latents=bool(
+                    getattr(
+                        self.actor.video_expert, "fuse_vae_embedding_in_latents", False
+                    )
+                ),
+            )
+            video_seq_len = int(video_pre["tokens"].shape[1])
+            tokens_per_frame = int(video_pre["meta"]["tokens_per_frame"])
+            attention_mask = self.actor._build_mot_attention_mask(
+                video_seq_len=video_seq_len,
+                action_seq_len=self.action_protocol.generation_horizon,
+                video_tokens_per_frame=tokens_per_frame,
+                device=self.device,
+            )
+            video_mask = attention_mask[:video_seq_len, :video_seq_len]
+            self.actor.mot._validate_current_frame_video_mask(
+                attention_mask=video_mask,
+                current_frame_video_tokens=tokens_per_frame,
+                video_seq_len=video_seq_len,
+            )
+            keys, values = self._prefill_parent_gate_kv(
+                video_pre["tokens"],
+                video_pre["freqs"],
+                video_pre["t_mod"],
+                {"context": video_pre["context"], "mask": video_pre["context_mask"]},
+                video_mask,
+            )
+        return CachedActionCondition(
+            context=context,
+            context_mask=context_mask,
+            video_kv_cache=[
+                {
+                    "k": key,
+                    "v": value,
+                    _GATE_CURRENT_FRAME_PROVENANCE_KEY: tokens_per_frame,
+                }
+                for key, value in zip(keys, values, strict=True)
+            ],
+            attention_mask=attention_mask,
+            video_seq_len=video_seq_len,
+            current_frame_video_tokens=tokens_per_frame,
+        )
+
+    def _current_frame_gate_features(
+        self, condition: CachedActionCondition
+    ) -> RouteNeutralVisualFeatures:
+        """Read current Video K/V without projecting unused Action context."""
+
+        layers = []
+        current_length = condition.current_frame_video_tokens
+        for layer_index in self.route_neutral_visual.layer_indices:
+            cache = condition.video_kv_cache[layer_index]
+            self.actor.mot._validate_condition_cache_provenance(
+                layer_index=layer_index,
+                layer_cache=cache,
+                current_frame_video_tokens=current_length,
+            )
+            key = cache["k"][:, :current_length].detach()
+            layers.append(
+                RouteNeutralVisualLayer(
+                    layer_index=layer_index,
+                    current_frame_video=KeyValueBank(
+                        source=KVSource.CURRENT_FRAME_VIDEO,
+                        key=key,
+                        value=cache["v"][:, :current_length].detach(),
+                        valid_mask=torch.ones(
+                            key.shape[:2], dtype=torch.bool, device=key.device
+                        ),
+                        contains_generated_future_video=False,
+                    ),
+                )
+            )
+        features = RouteNeutralVisualFeatures(tuple(layers))
+        if features.feature_dim != self.route_neutral_visual.source_dim:
+            raise ValueError(
+                "Route-neutral visual K/V width differs from configuration."
+            )
+        return features
+
     @torch.no_grad()
     def critic_features(self, *, env_obs: dict[str, Any]) -> FastWAMValueFeatures:
         """Keep bootstrap values on the same frozen features used in replay."""
@@ -386,6 +539,7 @@ class RouteNeutralOnlineIDMTeacherLiberoRuntime(OnlineIDMTeacherLiberoRuntime):
                     expected_dim=int(self.actor.text_dim),
                     device=self.device,
                     dtype=self.dtype,
+                    text_padding=getattr(self.actor, "text_padding", "legacy_visible"),
                 )
             cached = (key, (context.detach(), mask.detach()))
             self._evaluation_text_context = cached
@@ -424,7 +578,15 @@ class RouteNeutralOnlineIDMTeacherLiberoRuntime(OnlineIDMTeacherLiberoRuntime):
             if first_frame_latents is not None
             else {}
         )
-        if self.video_lora_adapter is not None:
+        need_critic = include_critic_features and self.critic_feature_config is not None
+        if single_eval and self.video_lora_adapter is not None and not need_critic:
+            condition = self._prepare_parent_gate_condition(
+                first_frame_latents=first_frame_latents,
+                context=context,
+                context_mask=context_mask,
+            )
+            replay_noise = None
+        elif self.video_lora_adapter is not None:
             condition, replay_noise = self._prepare_parent_current_condition(
                 image=images,
                 context=context,
@@ -441,13 +603,7 @@ class RouteNeutralOnlineIDMTeacherLiberoRuntime(OnlineIDMTeacherLiberoRuntime):
             )
         if replay_noise is not None:
             raise AssertionError("Current-frame condition created future noise.")
-        visual_features = extract_fastwam_value_features(
-            condition,
-            mot=self.actor.mot,
-            action_expert=self.actor.action_expert,
-            config=self.route_neutral_visual,
-            regime_context=None,
-        )
+        visual_features = self._current_frame_gate_features(condition)
         env_ids, reset_mask = self._history_metadata(
             env_obs,
             batch_size=batch_size,
@@ -459,16 +615,14 @@ class RouteNeutralOnlineIDMTeacherLiberoRuntime(OnlineIDMTeacherLiberoRuntime):
             current_state=state,
         )
         gate_features = RouteNeutralGateFeatures(
-            visual=RouteNeutralVisualFeatures.from_value_features(visual_features),
+            visual=visual_features,
             language=context[:, :-1].detach(),
             language_mask=context_mask[:, :-1].detach().to(dtype=torch.bool),
             state=state,
             physical_history=history,
         )
         critic_features = (
-            self._critic_features_from_condition(condition)
-            if include_critic_features and self.critic_feature_config is not None
-            else None
+            self._critic_features_from_condition(condition) if need_critic else None
         )
         return RouteNeutralPreparedStep(
             images=images,

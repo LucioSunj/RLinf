@@ -8,6 +8,7 @@
 from __future__ import annotations
 
 import copy
+import hashlib
 import importlib.util
 from collections import Counter
 from dataclasses import asdict, replace
@@ -36,6 +37,7 @@ from fastwam.models.wan22.schedulers.scheduler_continuous import (
 )
 from fastwam.models.wan22.wan_video_dit import WanVideoDiT
 
+from rlinf.models.embodiment.wam_policy import _load_strict_fastwam_parent
 from rlinf.models.embodiment.wam_policy.adaptive_policy import (
     FastWAMAdaptivePolicyConfig,
 )
@@ -50,6 +52,10 @@ from rlinf.models.embodiment.wam_policy.pad_rv.route_neutral_gate import (
     PadRouteNeutralCurrentStepGate,
     PadRouteNeutralGateConfig,
     PhysicalStateHistoryTracker,
+)
+from rlinf.models.embodiment.wam_policy.route_neutral_online.inference import (
+    InferenceAccelerationConfig,
+    RouteNeutralInference,
 )
 from rlinf.models.embodiment.wam_policy.route_neutral_online.policy import (
     RouteNeutralOnlineIDMBCFastWAMPolicy,
@@ -272,6 +278,116 @@ def _dual_training_sample(policy):
         online_idm_bc_flow_valid=routes == 0,
     )
     return prepared, sample, route_info
+
+
+def test_exported_masked_parent_requires_matching_runtime_semantics(tmp_path):
+    actor = _TinyActor()
+    actor.text_padding = "masked"
+    actor.load_checkpoint = MethodType(FastWAM.load_checkpoint, actor)
+    source = _TinyActor()
+    payload = {
+        "mot": source.mot.state_dict(),
+        "proprio_encoder": source.proprio_encoder.state_dict(),
+        "text_padding": "masked",
+        "model_variant": "fastwam_idm",
+        "backbone_name": "wan22",
+        "state_position": "context",
+    }
+    path = tmp_path / "parent.pt"
+    torch.save(payload, path)
+    _load_strict_fastwam_parent(actor, str(path))
+    for name, tensor in source.mot.state_dict().items():
+        assert torch.equal(actor.mot.state_dict()[name], tensor)
+    for name, tensor in source.proprio_encoder.state_dict().items():
+        assert torch.equal(actor.proprio_encoder.state_dict()[name], tensor)
+
+    actor.text_padding = "legacy_visible"
+    with pytest.raises(ValueError, match="text_padding"):
+        _load_strict_fastwam_parent(actor, str(path))
+    actor.text_padding = "masked"
+    payload.pop("text_padding")
+    torch.save(payload, path)
+    with pytest.raises(ValueError, match="text_padding"):
+        _load_strict_fastwam_parent(actor, str(path))
+
+
+def test_easywam_masked_cache_reaches_gate_teacher_and_dual_replay(
+    tmp_path, monkeypatch
+):
+    policy = _make_policy(monkeypatch, dual=True).train()
+    policy.actor.text_padding = "masked"
+    runtime = policy.runtime
+    runtime.text_embedding_cache_dir = tmp_path
+    runtime.text_embedding_context_len = 4
+    prompt = runtime.prompt_template.format(task="open the drawer")
+    digest = hashlib.sha256(prompt.encode()).hexdigest()
+    path = tmp_path / f"{digest}.text_len4.wan22ti2v5b.pt"
+    payload = {
+        "format_version": 3,
+        "encoder_id": "wan22ti2v5b",
+        "context_len": 4,
+        "prompt_hash": digest,
+        "context": torch.randn(4, 8, generator=torch.Generator().manual_seed(5)).to(
+            torch.bfloat16
+        ),
+        "mask": torch.tensor([True, True, False, False]),
+    }
+    torch.save(payload, path)
+    seen_conditions = []
+    velocity = runtime._velocity
+
+    def observed_velocity(condition, **kwargs):
+        seen_conditions.append((kwargs["regime"], condition.context_mask.clone()))
+        return velocity(condition, **kwargs)
+
+    monkeypatch.setattr(runtime, "_velocity", observed_velocity)
+    prepared, sample, routes = _dual_training_sample(policy)
+    expected_mask = torch.tensor([True, True, False, False, True])
+    assert torch.equal(prepared.context_mask, expected_mask.expand(2, -1))
+    assert torch.equal(
+        sample.forward_inputs["fastwam_context_mask"], prepared.context_mask
+    )
+    assert torch.equal(
+        prepared.gate_features.language_mask, payload["mask"].expand(2, -1)
+    )
+    original_gate = policy.gate(prepared.gate_features).detach()
+    replay = runtime.replay_action_batch(
+        forward_inputs=sample.forward_inputs, route_info=routes
+    )
+    torch.testing.assert_close(
+        replay["flow_logprobs"], sample.old_flow_logprobs, atol=1e-6, rtol=1e-6
+    )
+    bc = runtime.compute_online_idm_bc_loss(
+        forward_inputs=sample.forward_inputs, route_info=routes
+    )
+    bc.loss_sum.backward()
+    assert torch.isfinite(bc.loss_sum)
+    assert {regime for regime, _ in seen_conditions} == {
+        PolicyRegime.UNCOND,
+        PolicyRegime.IDM,
+    }
+    assert all(
+        torch.equal(mask, expected_mask.expand(mask.shape[0], -1))
+        for _, mask in seen_conditions
+    )
+
+    # Change only masked token embeddings. Real teacher, student and Gate
+    # outputs must be independent of these unused cache rows.
+    payload["context"][~payload["mask"]] += 25
+    torch.save(payload, path)
+    runtime._text_context_cache.clear()
+    changed_prepared, changed_sample, _ = _dual_training_sample(policy)
+    assert torch.equal(changed_sample.actions, sample.actions)
+    assert torch.equal(changed_sample.old_flow_logprobs, sample.old_flow_logprobs)
+    assert torch.equal(
+        changed_sample.forward_inputs["online_idm_bc_teacher_actions"],
+        sample.forward_inputs["online_idm_bc_teacher_actions"],
+    )
+    assert torch.equal(policy.gate(changed_prepared.gate_features), original_gate)
+
+    # Evaluation has its own resident text cache and must keep the same mask.
+    _, _, eval_mask = runtime._encode_evaluation_condition(_observation())
+    assert torch.equal(eval_mask, expected_mask.unsqueeze(0))
 
 
 @pytest.mark.parametrize("checkpoint", [False, True])
@@ -870,13 +986,6 @@ def test_dual_native_checkpoint_and_optimizer_own_both_adapters(monkeypatch):
         action_only.load_trainable_state_dict(original)
 
 
-def test_dual_lora_rejects_action_only_inference_merge(monkeypatch):
-    policy = _make_policy(monkeypatch, dual=True)
-    policy.enable_inference_acceleration(compile=False)
-    with pytest.raises(ValueError, match="requires eager inference"):
-        policy.predict_action_batch(_observation(), mode="eval")
-
-
 def test_dual_eval_checkpoint_keeps_eager_and_restores_both_branches(monkeypatch):
     policy = _make_policy(monkeypatch, dual=True)
     parent = "a" * 64
@@ -965,17 +1074,20 @@ def _calibrated_atol(first, repeated, floor):
     return max(floor, 1.25 * repeat_error)
 
 
+@pytest.mark.parametrize("dual", [False, True])
 @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
 @pytest.mark.parametrize(
     "routing", ["forced_idm", "forced_uncond", "learned_threshold"]
 )
 def test_merged_inference_preserves_base_gate_rng_and_bounded_actions(
-    policy, monkeypatch, dtype, routing
+    monkeypatch, dual, dtype, routing
 ):
+    policy = _make_policy(monkeypatch, dual=dual)
     policy.config = replace(policy.config, eval_routing_mode=routing)
     policy.actor.to(dtype=dtype)
-    for parameter in policy.lora_adapter.lora_parameters():
-        parameter.data = parameter.data.float()
+    for adapter in policy.lora_adapters.values():
+        for parameter in adapter.lora_parameters():
+            parameter.data = parameter.data.float()
     obs = _observation()
     obs["image"] = obs["image"].to(dtype)
     rng = torch.get_rng_state().clone()
@@ -997,6 +1109,7 @@ def test_merged_inference_preserves_base_gate_rng_and_bounded_actions(
     actions, result = policy.predict_action_batch(obs, mode="eval")
     baseline_rng = torch.get_rng_state().clone()
     baseline_history = policy.route_tracker.state_dict()
+    baseline_vae_calls = policy.actor.calls["vae"]
     baseline_futures = list(futures)
     futures.clear()
     torch.set_rng_state(rng)
@@ -1012,23 +1125,49 @@ def test_merged_inference_preserves_base_gate_rng_and_bounded_actions(
     assert (
         engine.runtime.actor.mot.mixtures["video"] is engine.runtime.actor.video_expert
     )
-    for expert in (engine.idm_action_expert, engine.uncond_action_expert):
+    expert_pairs = [
+        (policy.lora_adapter, engine.idm_action_expert, engine.uncond_action_expert)
+    ]
+    if dual:
+        assert engine.uncond_runtime.actor.video_expert is engine.uncond_video_expert
+        assert (
+            engine.uncond_runtime.actor.mot.mixtures["video"]
+            is engine.uncond_video_expert
+        )
+        assert (
+            engine.uncond_runtime.actor.mot.mixtures["action"]
+            is engine.uncond_action_expert
+        )
+        expert_pairs.append(
+            (
+                policy.video_lora_adapter,
+                engine.runtime.actor.video_expert,
+                engine.uncond_video_expert,
+            )
+        )
+    for _, parent, merged in expert_pairs:
         assert not any(
             isinstance(layer, (RegimeLoRALinear, BatchInvariantLinear))
+            for expert in (parent, merged)
             for layer in expert.modules()
         )
-    for name, layer in policy.lora_adapter.iter_adapted_linears():
-        plain = engine.idm_action_expert.get_submodule(name)
-        merged = engine.uncond_action_expert.get_submodule(name)
-        assert plain.weight is layer.weight
-        expected = (
-            layer.weight.float()
-            + (layer.lora_B.float() @ layer.lora_A.float()) * layer.scaling
-        )
-        assert torch.equal(merged.weight, expected.to(dtype))
-        assert merged.weight.data_ptr() != layer.weight.data_ptr()
-    assert engine.merged_projection_count == len(policy.lora_adapter.target_names)
-    assert engine.additional_weight_bytes > 0
+    expected_bytes = 0
+    for adapter, parent, merged in expert_pairs:
+        for name, layer in adapter.iter_adapted_linears():
+            plain = parent.get_submodule(name)
+            merged_layer = merged.get_submodule(name)
+            assert plain.weight is layer.weight
+            expected = (
+                layer.weight.float()
+                + (layer.lora_B.float() @ layer.lora_A.float()) * layer.scaling
+            )
+            assert torch.equal(merged_layer.weight, expected.to(dtype))
+            assert merged_layer.weight.data_ptr() != layer.weight.data_ptr()
+            expected_bytes += layer.weight.numel() * layer.weight.element_size()
+    assert engine.merged_projection_count == sum(
+        len(adapter.target_names) for adapter, _, _ in expert_pairs
+    )
+    assert engine.additional_weight_bytes == expected_bytes
     # FP32 merging changes operation order; BF16 additionally rounds the merged
     # weight once. Declare a two-BF16-ULP absolute floor for normalized actions.
     atol = 1e-5 if dtype == torch.float32 else 2 * torch.finfo(dtype).eps
@@ -1036,6 +1175,7 @@ def test_merged_inference_preserves_base_gate_rng_and_bounded_actions(
         assert torch.equal(actions, merged_actions)
     else:
         torch.testing.assert_close(actions, merged_actions, rtol=0, atol=atol)
+    assert torch.equal(actions[..., -1], merged_actions[..., -1])
     assert torch.equal(
         result["emitted_gate"].base_probability,
         merged_result["emitted_gate"].base_probability,
@@ -1048,6 +1188,128 @@ def test_merged_inference_preserves_base_gate_rng_and_bounded_actions(
     assert torch.equal(torch.get_rng_state(), baseline_rng)
     _assert_equal(policy.state_dict(), weights)
     assert parameter_ids == [id(parameter) for parameter in policy.parameters()]
+    assert policy.actor.calls["vae"] == 2 * baseline_vae_calls
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+@pytest.mark.parametrize("padded", [False, True])
+@torch.no_grad()
+def test_action_context_cache_matches_native_steps_and_refreshes_each_chunk(
+    monkeypatch, dtype, padded
+):
+    policy = _make_policy(monkeypatch, dual=True)
+    policy.actor.to(dtype=dtype)
+    for adapter in policy.lora_adapters.values():
+        for parameter in adapter.lora_parameters():
+            parameter.data = parameter.data.float()
+    engine = RouteNeutralInference(
+        policy.runtime, policy.gate, InferenceAccelerationConfig(compile=False)
+    )
+    counts = Counter()
+    handles = []
+
+    def count(name):
+        def hook(*_):
+            counts[name] += 1
+
+        return hook
+
+    for regime, expert in (
+        (PolicyRegime.IDM, engine.idm_action_expert),
+        (PolicyRegime.UNCOND, engine.uncond_action_expert),
+    ):
+        # The read-only module views inherit the source's hook dictionary.
+        # Keep branch counters independent when instrumenting shared structure.
+        monkeypatch.setattr(
+            expert.text_embedding,
+            "_forward_hooks",
+            expert.text_embedding._forward_hooks.copy(),
+        )
+        handles.append(
+            expert.text_embedding.register_forward_hook(count((regime, "text")))
+        )
+        for index, block in enumerate(expert.blocks):
+            for projection in ("k", "v"):
+                handles.append(
+                    getattr(block.cross_attn, projection).register_forward_hook(
+                        count((regime, index, projection))
+                    )
+                )
+    try:
+        previous_contexts = []
+        for chunk, regime in enumerate(
+            (PolicyRegime.UNCOND, PolicyRegime.IDM, PolicyRegime.UNCOND)
+        ):
+            observation = _observation()
+            observation["image"] = (observation["image"] + chunk / 10).to(dtype)
+            observation["states"] += chunk / 5
+            observation["task_descriptions"] = ["open the drawer" + " now" * chunk]
+            runtime = engine.runtime
+            images, context, mask = runtime._encode_evaluation_condition(observation)
+            if padded:
+                mask = mask.clone()
+                mask[:, 1] = False
+            condition, _ = runtime._prepare_action_condition(
+                image=images,
+                context=context,
+                context_mask=mask,
+                regime=regime,
+                idm_noise_seed=89 if regime is PolicyRegime.IDM else None,
+            )
+            if previous_contexts:
+                assert not torch.equal(previous_contexts[-1], context)
+            previous_contexts.append(context.clone())
+            expert = (
+                engine.idm_action_expert
+                if regime is PolicyRegime.IDM
+                else engine.uncond_action_expert
+            )
+            actions = torch.randn((1, 4, 7), dtype=dtype)
+            counts.clear()
+            velocity = engine.velocity(
+                condition, regime=regime, capture_gate_kv=False, actor_version=80
+            )
+            expected_counts = Counter({(regime, "text"): 1})
+            expected_counts.update(
+                (regime, index, projection)
+                for index in range(len(expert.blocks))
+                for projection in ("k", "v")
+            )
+            assert counts == expected_counts
+            for timestep in (900.0, 450.0, 50.0):
+                timestep = torch.tensor([timestep], dtype=dtype)
+                # The reference is the original ActionDiT/MoT implementation,
+                # with fresh text and cross-attention projection at every step.
+                pre = expert.pre_dit(
+                    action_tokens=actions,
+                    timestep=timestep,
+                    context=condition.context,
+                    context_mask=condition.context_mask,
+                )
+                tokens = runtime.actor.mot._forward_action_with_video_cache_inner(
+                    action_tokens=pre["tokens"],
+                    action_freqs=pre["freqs"],
+                    action_t_mod=pre["t_mod"],
+                    action_context_payload={
+                        "context": pre["context"],
+                        "mask": pre["context_mask"],
+                    },
+                    video_cache_k=[layer["k"] for layer in condition.video_kv_cache],
+                    video_cache_v=[layer["v"] for layer in condition.video_kv_cache],
+                    action_attention_mask=condition.attention_mask[
+                        condition.video_seq_len :
+                    ],
+                    action_expert=expert,
+                )
+                expected = expert.post_dit(tokens, pre)
+                after_reference = counts.copy()
+                actual = velocity(actions, timestep).velocity
+                assert torch.equal(actual, expected)
+                assert counts == after_reference
+                actions = actions - 0.1 * expected
+    finally:
+        for handle in handles:
+            handle.remove()
 
 
 @pytest.mark.parametrize("mutation", ["load_state", "device", "version", "train"])
@@ -1073,8 +1335,133 @@ def test_inference_view_is_invalidated_before_model_changes(policy, mutation):
     assert policy._inference_engine is not old_engine
 
 
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+@pytest.mark.parametrize("padded", [False, True])
+@torch.no_grad()
+def test_video_context_cache_matches_native_steps_without_reprojection(
+    monkeypatch, dtype, padded
+):
+    policy = _make_policy(monkeypatch, dual=True)
+    policy.actor.to(dtype=dtype)
+    engine = RouteNeutralInference(
+        policy.runtime, policy.gate, InferenceAccelerationConfig(compile=False)
+    )
+    expert = engine.runtime.actor.video_expert
+    counts = Counter()
+    handles = []
+
+    def count(name):
+        def hook(*_):
+            counts[name] += 1
+
+        return hook
+
+    handles.append(expert.text_embedding.register_forward_hook(count("text")))
+    for index, block in enumerate(expert.blocks):
+        for projection in ("k", "v"):
+            handles.append(
+                getattr(block.cross_attn, projection).register_forward_hook(
+                    count((index, projection))
+                )
+            )
+    try:
+        for chunk in range(2):
+            context = (
+                torch.randn((1, 5, engine.runtime.actor.text_dim), dtype=dtype) + chunk
+            )
+            mask = torch.ones((1, 5), dtype=torch.bool)
+            if padded:
+                mask[:, 1] = False
+            latents = torch.randn((1, 2, 3, 2, 2), dtype=dtype)
+            counts.clear()
+            projected, keys, values = engine._video_context(context)
+            expected_counts = Counter({"text": 1})
+            expected_counts.update(
+                (index, projection)
+                for index in range(len(expert.blocks))
+                for projection in ("k", "v")
+            )
+            assert counts == expected_counts
+            for timestep in (900.0, 450.0, 50.0):
+                timestep = torch.tensor([timestep], dtype=dtype)
+                expected = expert(
+                    x=latents,
+                    timestep=timestep,
+                    context=context,
+                    context_mask=mask,
+                    action=None,
+                    fuse_vae_embedding_in_latents=True,
+                )
+                after_reference = counts.copy()
+                actual = engine._video_step_compiled(
+                    latents_video=latents,
+                    timestep_video=timestep,
+                    context=context,
+                    context_mask=mask,
+                    fuse_flag=True,
+                    projected_context=projected,
+                    context_keys=keys,
+                    context_values=values,
+                )
+                assert torch.equal(actual, expected)
+                assert counts == after_reference
+                latents = latents - 0.1 * expected
+    finally:
+        for handle in handles:
+            handle.remove()
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+@torch.no_grad()
+def test_video_context_cache_is_scoped_to_each_idm_condition(monkeypatch, dtype):
+    policy = _make_policy(monkeypatch, dual=True)
+    policy.actor.to(dtype=dtype)
+    engine = RouteNeutralInference(
+        policy.runtime, policy.gate, InferenceAccelerationConfig(compile=False)
+    )
+    runtime = engine.runtime
+    original_step = runtime.actor._video_denoise_step_compiled
+    futures = []
+    prefill = LiberoFastWAMRuntime._prefill_video_condition
+
+    def capture_future(self, **kwargs):
+        futures.append(kwargs["video_latents"].clone())
+        return prefill(self, **kwargs)
+
+    monkeypatch.setattr(
+        LiberoFastWAMRuntime, "_prefill_video_condition", capture_future
+    )
+    for chunk in range(2):
+        observation = _observation()
+        observation["image"] = (observation["image"] + chunk / 10).to(dtype)
+        observation["states"] += chunk / 5
+        observation["task_descriptions"] = ["open the drawer" + " now" * chunk]
+        images, context, mask = runtime._encode_evaluation_condition(observation)
+        kwargs = {
+            "image": images,
+            "context": context,
+            "context_mask": mask,
+            "regime": PolicyRegime.IDM,
+            "idm_noise_seed": 89 + chunk,
+        }
+        futures.clear()
+        expected, expected_noise = engine._parent_prepare_action_condition(**kwargs)
+        expected_futures = list(futures)
+        futures.clear()
+        rng = torch.get_rng_state().clone()
+        actual, actual_noise = runtime._prepare_action_condition(**kwargs)
+        _assert_equal(futures, expected_futures)
+        _assert_equal(asdict(actual), asdict(expected))
+        assert torch.equal(actual_noise, expected_noise)
+        assert torch.equal(torch.get_rng_state(), rng)
+        assert runtime.actor._video_denoise_step_compiled is original_step
+
+
 def test_native_eval_reload_remerges_new_lora_and_resets_history(policy):
-    policy.enable_inference_acceleration(compile=False)
+    policy.enable_inference_acceleration(
+        compile=False, video_backend="cudagraphs", compile_vae=False
+    )
+    acceleration = policy.inference_acceleration
     policy.predict_action_batch(_observation(), mode="eval")
     old_engine = policy._inference_engine
     lora = policy.lora_adapter.lora_state_dict()
@@ -1100,6 +1487,7 @@ def test_native_eval_reload_remerges_new_lora_and_resets_history(policy):
         == 12
     )
     assert policy._inference_engine is None
+    assert policy.inference_acceleration is acceleration
     assert policy.runtime.physical_history.state_dict()["states"] == {}
     policy.predict_action_batch(_observation(), mode="eval")
     assert (
@@ -1163,20 +1551,137 @@ def test_eval_contract_allows_acceleration_but_retains_scientific_fields():
         validate_fastwam_eval_model_contract(source, live, load_critic=False)
 
 
+@pytest.mark.parametrize(
+    "backend,video_backend,compile_vae,compile_enabled",
+    [
+        ("inductor", None, True, True),
+        ("inductor", "cudagraphs", False, True),
+        ("cudagraphs", "inductor", True, True),
+        ("inductor", "cudagraphs", False, False),
+    ],
+)
+def test_inference_compilation_routes_each_tensor_boundary(
+    monkeypatch, backend, video_backend, compile_vae, compile_enabled
+):
+    policy = _make_policy(monkeypatch, dual=True)
+    compiled = []
+
+    def capture_compile(function, **kwargs):
+        target = function.func if hasattr(function, "func") else function
+        compiled.append((target.__name__, kwargs))
+        return function
+
+    monkeypatch.setattr(torch, "compile", capture_compile)
+    policy.enable_inference_acceleration(
+        backend=backend,
+        video_backend=video_backend,
+        compile_vae=compile_vae,
+        compile=compile_enabled,
+        mode="reduce-overhead",
+    )
+    config = policy.inference_acceleration
+    assert config.video_backend == video_backend
+    assert config.compile_vae is compile_vae
+    RouteNeutralInference(policy.runtime, policy.gate, config)
+    if not compile_enabled:
+        assert not compiled
+        return
+
+    video_boundaries = {
+        "_prefill_parent_gate_kv": 1,
+        "_prefill_step": 2,
+        "pre_dit": 2,
+        "_video_denoise_step_compiled": 1,
+        "_prepare_video_context": 1,
+        "_video_step": 1,
+        "_append_proprio_to_context": 1,
+    }
+    other_boundaries = {
+        "_action_step": 2,
+        "_prepare_action_context": 2,
+        "_project_gate_inputs": 1,
+        "_fuse_gate": 1,
+    }
+    if compile_vae:
+        other_boundaries["_encode_input_image_latents_tensor"] = 1
+    assert Counter(name for name, _ in compiled) == Counter(
+        {**video_boundaries, **other_boundaries}
+    )
+    for name, kwargs in compiled:
+        expected_backend = (
+            video_backend
+            if name in video_boundaries and video_backend is not None
+            else backend
+        )
+        assert kwargs == {
+            "backend": expected_backend,
+            "dynamic": False,
+            "fullgraph": name != "_encode_input_image_latents_tensor",
+            **({"mode": "reduce-overhead"} if expected_backend == "inductor" else {}),
+        }
+
+
+@pytest.mark.parametrize(
+    "backend,video_backend,mode,compile_enabled,expected",
+    [
+        ("inductor", None, "default", True, False),
+        ("inductor", None, "reduce-overhead", True, True),
+        ("inductor", None, "max-autotune", True, True),
+        ("inductor", None, "max-autotune-no-cudagraphs", True, False),
+        ("inductor", "cudagraphs", "default", True, True),
+        ("cudagraphs", None, "default", True, True),
+        ("eager", "inductor", "default", True, False),
+        ("eager", "inductor", "reduce-overhead", True, True),
+        ("inductor", "cudagraphs", "reduce-overhead", False, False),
+    ],
+)
+def test_inference_chunk_marks_each_cuda_graph_backend(
+    monkeypatch, backend, video_backend, mode, compile_enabled, expected
+):
+    marks = []
+    monkeypatch.setattr(
+        torch.compiler, "cudagraph_mark_step_begin", lambda: marks.append(True)
+    )
+    engine = RouteNeutralInference.__new__(RouteNeutralInference)
+    engine.config = InferenceAccelerationConfig(
+        backend=backend,
+        video_backend=video_backend,
+        mode=mode,
+        compile=compile_enabled,
+    )
+    engine.begin_chunk()
+    assert marks == ([True] if expected else [])
+
+
+@pytest.mark.parametrize("split_backend", [False, True])
+@pytest.mark.parametrize("dual", [False, True])
 @pytest.mark.parametrize("routing", ["forced_idm", "forced_uncond"])
-def test_torch_compile_captures_actual_inference_kernels(policy, monkeypatch, routing):
+def test_torch_compile_captures_actual_inference_kernels(
+    monkeypatch, routing, dual, split_backend
+):
+    # Each case installs its own backend; do not count prior test graphs toward
+    # Dynamo's per-code recompilation limit.
+    torch._dynamo.reset()
+    policy = _make_policy(monkeypatch, dual=dual)
     # Use the real Dynamo frontend on every production boundary. A recording
     # backend executes FX graphs on CPU; Inductor lowering is checked separately.
     graphs = []
+    video_graphs = []
 
     def backend(graph, inputs):
         graphs.append(graph)
         return graph.forward
 
+    def video_backend(graph, inputs):
+        video_graphs.append(graph)
+        return graph.forward
+
     from torch._dynamo.backends.registry import register_backend
 
-    name = f"route_neutral_test_{routing}"
+    name = f"route_neutral_test_{routing}_{dual}_{split_backend}"
     register_backend(backend, name=name)
+    video_name = f"{name}_video"
+    register_backend(video_backend, name=video_name)
     # Counter instrumentation belongs outside compiled tensor functions.
     monkeypatch.setattr(
         policy.actor,
@@ -1197,9 +1702,14 @@ def test_torch_compile_captures_actual_inference_kernels(policy, monkeypatch, ro
         repeated_result["emitted_gate"].base_probability,
         1e-6,
     )
-    policy.enable_inference_acceleration(backend=name)
+    policy.enable_inference_acceleration(
+        backend=name,
+        video_backend=video_name if split_backend else None,
+        compile_vae=not split_backend,
+    )
     actual, result = policy.predict_action_batch(obs, mode="eval")
     assert graphs
+    assert bool(video_graphs) is split_backend
     torch.testing.assert_close(actual, expected, atol=action_atol, rtol=0)
     torch.testing.assert_close(
         result["emitted_gate"].base_probability,
@@ -1207,13 +1717,14 @@ def test_torch_compile_captures_actual_inference_kernels(policy, monkeypatch, ro
         atol=gate_atol,
         rtol=0,
     )
-    count = len(graphs)
+    counts = (len(graphs), len(video_graphs))
     # Changes in tensor values/history must not cause per-chunk recompilation.
     obs["image"] = obs["image"] + 0.01
     obs["states"] = obs["states"] + 0.02
     policy.predict_action_batch(obs, mode="eval")
-    assert len(graphs) == count
+    assert (len(graphs), len(video_graphs)) == counts
     assert torch.equal(torch.get_rng_state(), rng)
+    torch._dynamo.reset()
 
 
 def test_inductor_matches_merged_eager_with_real_vae(policy, monkeypatch):

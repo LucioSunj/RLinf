@@ -341,7 +341,18 @@ class FastWAMTrainingGuard:
         configured_idm_cost = None
         break_even_route_window: list[float] = []
         break_even_route_monotonic_decline = False
-        if self.cost_audit_enabled:
+        task_costs = any("fastwam/task_budget/enabled" in item for item in metrics_list)
+        if self.cost_audit_enabled and task_costs:
+            from rlinf.models.embodiment.wam_policy.route_neutral_online.task_budget import (
+                validate_task_cost_metrics,
+            )
+
+            if self.break_even_guard_enabled:
+                raise ValueError(
+                    "A scalar break-even guard cannot audit task-indexed costs."
+                )
+            validate_task_cost_metrics(metrics_list)
+        if self.cost_audit_enabled and not task_costs:
             missing_cost = [
                 index
                 for index, worker_metrics in enumerate(metrics_list)
@@ -479,6 +490,11 @@ class FastWAMTrainingGuard:
             **route_counts,
             "break_even_route_window": break_even_route_window,
             "break_even_route_monotonic_decline": (break_even_route_monotonic_decline),
+            **(
+                {"task_cost_identity": "PASS"}
+                if task_costs and self.cost_audit_enabled
+                else {}
+            ),
         }
 
     def observe_training(

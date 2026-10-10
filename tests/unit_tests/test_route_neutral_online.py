@@ -304,6 +304,33 @@ def test_config_selects_bc_initialized_trainable_uncond(monkeypatch) -> None:
     assert issubclass(RouteNeutralOnlineRunner, PadRouteNeutralRunner)
 
 
+def test_easywam_mixed_preset_selects_masked_same_parent_dual_bc(monkeypatch):
+    cfg = _compose(monkeypatch, "libero_10_ppo_fastwam_easywam_mixed")
+    validate_route_neutral_online_idm_bc_training_config(cfg)
+
+    for model in (cfg.actor.model, cfg.rollout.model):
+        assert model.fastwam.text_padding == "masked"
+        assert model.fastwam._target_ == "fastwam.runtime.create_fastwam_idm"
+        assert model.uncond_lora.rank == model.video_lora.rank == 128
+        assert model.uncond_lora.alpha == model.video_lora.alpha == 128
+        assert model.actor_checkpoint == "/parent.pt"
+        assert model.runtime.processor_stats_path == "/stats.json"
+        assert model.runtime.text_embedding_cache_dir == "/text-cache"
+    assert cfg.runner.resume_dir is None
+    assert cfg.runner.bootstrap_project_checkpoint_dir is None
+    assert cfg.runner.bootstrap_uncond_lora_sidecar == "/bc.pt"
+    assert cfg.algorithm.uncond_flow_ppo.loss_weight == 1.0
+    assert cfg.algorithm.uncond_idm_bc.loss_weight == 0.2
+
+    cfg.rollout.model.fastwam.text_padding = "legacy_visible"
+    with pytest.raises(ValueError, match="text_padding contracts differ"):
+        validate_route_neutral_online_idm_bc_training_config(cfg)
+
+    legacy = _compose(monkeypatch)
+    assert "text_padding" not in legacy.actor.model.fastwam
+    assert "text_padding" not in legacy.rollout.model.fastwam
+
+
 @pytest.mark.parametrize("batch_size", [1, 2, 3])
 def test_config_accepts_batched_rollout_initialization(monkeypatch, batch_size):
     cfg = _compose(monkeypatch)

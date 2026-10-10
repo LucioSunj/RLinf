@@ -170,6 +170,14 @@ def validate_route_neutral_online_idm_bc_training_config(
     )
     if not online.enabled:
         raise ValueError("Route-neutral trainable UNCOND requires online BC enabled.")
+    actor_padding = OmegaConf.select(
+        cfg, "actor.model.fastwam.text_padding", default="legacy_visible"
+    )
+    rollout_padding = OmegaConf.select(
+        cfg, "rollout.model.fastwam.text_padding", default="legacy_visible"
+    )
+    if actor_padding != rollout_padding:
+        raise ValueError("Actor and rollout FastWAM text_padding contracts differ.")
     expected = {
         "route_neutral_online_implementation.actor_target": ACTOR_TARGET,
         "route_neutral_online_implementation.policy_target": POLICY_TARGET,
@@ -261,6 +269,10 @@ def validate_route_neutral_online_idm_bc_training_config(
     if not isinstance(resolved_controller, Mapping):
         raise TypeError("Branch controller must resolve to a mapping.")
     PadCriticWarmupReversalDampedController(resolved_controller)
+    if OmegaConf.select(cfg, "algorithm.fixed_branch_cost.task_budget") is not None:
+        from .task_budget import validate_task_budget_config
+
+        validate_task_budget_config(cfg)
 
     for field in (
         "runner.bootstrap_uncond_lora_sidecar",

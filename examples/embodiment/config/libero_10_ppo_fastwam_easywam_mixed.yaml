@@ -1,0 +1,20 @@
+# A new masked-text FastWAM-IDM parent trained with EasyWAM, followed by
+# same-parent dual rank128 UNCOND BC and a fresh mixed-policy RL initialization.
+defaults:
+  - libero_10_ppo_fastwam_route_neutral_online_base
+  - route_neutral_online_lora: dual_rank128
+  - _self_
+
+runner:
+  logger:
+    experiment_name: libero_10_ppo_fastwam_easywam_mixed
+
+actor:
+  model:
+    fastwam:
+      text_padding: masked
+
+rollout:
+  model:
+    fastwam:
+      text_padding: masked

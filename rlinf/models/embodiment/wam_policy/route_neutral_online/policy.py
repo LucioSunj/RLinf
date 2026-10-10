@@ -85,11 +85,23 @@ class RouteNeutralOnlineIDMBCFastWAMPolicy(OnlineIDMBCFastWAMPolicy):
         compile: bool = True,
         mode: str = "default",
         backend: str = "inductor",
+        video_backend: str | None = None,
+        compile_vae: bool = True,
     ) -> None:
-        """Prepare resident experts lazily on the next B1 evaluation call."""
+        """Prepare resident experts lazily on the next B1 evaluation call.
+
+        Video and observation conditioning use ``video_backend`` when supplied;
+        other kernels use ``backend``. Disable ``compile_vae`` to retain the
+        native image encoder while compiling the other tensor kernels.
+        """
 
         self.inference_acceleration = InferenceAccelerationConfig(
-            merge_lora=merge_lora, compile=compile, mode=mode, backend=backend
+            merge_lora=merge_lora,
+            compile=compile,
+            mode=mode,
+            backend=backend,
+            video_backend=video_backend,
+            compile_vae=compile_vae,
         )
         self._inference_engine = None
 

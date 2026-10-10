@@ -141,6 +141,7 @@ class CausalLiberoFastWAMRuntime(LiberoFastWAMRuntime):
                 expected_dim=int(self.actor.text_dim),
                 device=self.device,
                 dtype=self.dtype,
+                text_padding=getattr(self.actor, "text_padding", "legacy_visible"),
             )
         proprio = self._normalized_proprio(env_obs["states"])
         context, context_mask = self.actor._append_proprio_to_context(

@@ -2355,7 +2355,9 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
                     reward_audit.require_success_signal()
             cost_cfg = self.cfg.algorithm.get("fixed_branch_cost", {})
             configured_idm_cost, configured_uncond_cost = (
-                self._fastwam_effective_branch_costs(cost_cfg)
+                (None, None)
+                if cost_cfg.get("task_budget") is not None
+                else self._fastwam_effective_branch_costs(cost_cfg)
             )
             charge_scope = self._fastwam_charge_scope(cost_cfg)
             charge_mask = self._fastwam_charge_mask(
@@ -2364,34 +2366,48 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
                 valid_mask=self.rollout_batch.get("loss_mask", None),
             )
             if bool(cost_cfg.get("enabled", False)):
-                if "fastwam_branch_costs" in self.rollout_batch:
-                    raise RuntimeError("FastWAM branch cost was already applied.")
-                cost_result = apply_fastwam_chunk_cost(
-                    environment_rewards=raw_environment_rewards,
-                    route_used=self.rollout_batch["route_info"].route_used,
-                    idm_cost=configured_idm_cost,
-                    uncond_cost=configured_uncond_cost,
-                    valid_mask=self.rollout_batch.get("loss_mask", None),
-                    charge_mask=charge_mask,
-                )
-                self.rollout_batch["rewards"] = cost_result.rewards
-                self.rollout_batch["fastwam_branch_costs"] = cost_result.costs
-                if cost_audit_enabled:
-                    cost_audit = summarize_fastwam_chunk_cost(
+                if cost_cfg.get("task_budget") is not None:
+                    from rlinf.models.embodiment.wam_policy.route_neutral_online.task_budget import (
+                        apply_task_chunk_costs,
+                    )
+
+                    _, cost_audit = apply_task_chunk_costs(
+                        self, raw_environment_rewards, charge_mask
+                    )
+                    print(
+                        "FASTWAM_TASK_COST_AUDIT="
+                        + json.dumps(cost_audit.to_artifact(), sort_keys=True),
+                        flush=True,
+                    )
+                else:
+                    if "fastwam_branch_costs" in self.rollout_batch:
+                        raise RuntimeError("FastWAM branch cost was already applied.")
+                    cost_result = apply_fastwam_chunk_cost(
                         environment_rewards=raw_environment_rewards,
-                        route=self.rollout_batch["route_info"],
-                        cost_result=cost_result,
+                        route_used=self.rollout_batch["route_info"].route_used,
                         idm_cost=configured_idm_cost,
                         uncond_cost=configured_uncond_cost,
                         valid_mask=self.rollout_batch.get("loss_mask", None),
                         charge_mask=charge_mask,
-                        charge_scope=charge_scope,
                     )
-                    print(
-                        f"{FASTWAM_CHUNK_COST_AUDIT_SENTINEL} "
-                        + json.dumps(cost_audit.to_artifact(), sort_keys=True),
-                        flush=True,
-                    )
+                    self.rollout_batch["rewards"] = cost_result.rewards
+                    self.rollout_batch["fastwam_branch_costs"] = cost_result.costs
+                    if cost_audit_enabled:
+                        cost_audit = summarize_fastwam_chunk_cost(
+                            environment_rewards=raw_environment_rewards,
+                            route=self.rollout_batch["route_info"],
+                            cost_result=cost_result,
+                            idm_cost=configured_idm_cost,
+                            uncond_cost=configured_uncond_cost,
+                            valid_mask=self.rollout_batch.get("loss_mask", None),
+                            charge_mask=charge_mask,
+                            charge_scope=charge_scope,
+                        )
+                        print(
+                            f"{FASTWAM_CHUNK_COST_AUDIT_SENTINEL} "
+                            + json.dumps(cost_audit.to_artifact(), sort_keys=True),
+                            flush=True,
+                        )
             elif cost_audit_enabled:
                 raise ValueError(
                     "FastWAM cost audit requires fixed_branch_cost.enabled=true."
@@ -2518,7 +2534,7 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
                     decision_records,
                 )
                 decision_telemetry_count = len(decision_records)
-            if cost_audit_enabled:
+            if cost_audit_enabled and cost_cfg.get("task_budget") is None:
                 counterfactual_idm_costs = [
                     float(item)
                     for item in cost_audit_cfg.get("counterfactual_idm_costs", [])
@@ -4590,6 +4606,27 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
             "runner_step": published["runner_step"],
             "idm_cost": published["idm_cost"],
         }
+
+    def set_fastwam_task_branch_costs(self, decision: dict[str, Any]) -> None:
+        """Publish one immutable task-indexed cost map for this rollout version."""
+        from copy import deepcopy
+
+        table = self.cfg.algorithm.fixed_branch_cost.get("task_budget")
+        if table is None or set(decision["tasks"]) != set(table.targets):
+            raise ValueError("Published costs differ from the fixed task budget IDs.")
+        step = int(decision["runner_step"])
+        if step != int(self.version):
+            raise ValueError("Task costs belong to a different Actor version.")
+        previous = getattr(self, "_fastwam_task_cost_decision", None)
+        if previous is not None and step <= previous["runner_step"]:
+            raise RuntimeError("Cannot replace an already published task cost map.")
+        for price in decision["tasks"].values():
+            values = [float(price[key]) for key in ("idm_cost", "uncond_cost")]
+            if price["runner_step"] != step or any(
+                not math.isfinite(v) or v < 0 for v in values
+            ):
+                raise ValueError("Invalid task branch cost or runner step.")
+        self._fastwam_task_cost_decision = deepcopy(decision)
 
     def set_fastwam_branch_costs(
         self,

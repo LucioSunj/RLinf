@@ -95,11 +95,14 @@ def _load_cached_text_contexts(
     device: torch.device,
     dtype: torch.dtype,
     memory_cache: OrderedDict[str, tuple[torch.Tensor, torch.Tensor]] | None = None,
+    text_padding: str = "legacy_visible",
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Load contexts, optionally reusing a runtime-owned CPU language cache."""
 
     if context_len < 1 or expected_dim < 1:
         raise ValueError("Cached text context length and dimension must be positive.")
+    if text_padding not in {"legacy_visible", "masked"}:
+        raise ValueError(f"Unsupported FastWAM text padding: {text_padding!r}.")
     contexts = []
     masks = []
     for prompt in prompts:
@@ -109,44 +112,58 @@ def _load_cached_text_contexts(
             contexts.append(context)
             masks.append(mask)
             continue
-        digest = hashlib.sha256(prompt.encode("utf-8")).hexdigest()
-        path = cache_dir / f"{digest}.t5_len{context_len}.wan22ti2v5b.pt"
-        if not path.is_file():
-            raise FileNotFoundError(
-                f"Missing FastWAM evaluation text context for prompt hash {digest}: "
-                f"{path}"
+        if text_padding == "masked":
+            from fastwam.utils.text_cache import load_text_context
+
+            context, mask = load_text_context(
+                cache_dir,
+                prompt,
+                context_len,
+                text_dim=expected_dim,
+                text_padding=text_padding,
             )
-        payload = torch.load(path, map_location="cpu", weights_only=True)
-        if not isinstance(payload, dict) or set(payload) != {"context", "mask"}:
-            raise ValueError(f"Cached text context has an invalid schema: {path}")
-        context = payload["context"]
-        mask = payload["mask"]
-        if not isinstance(context, torch.Tensor) or not isinstance(mask, torch.Tensor):
-            raise TypeError(f"Cached text context values must be tensors: {path}")
-        if context.shape != torch.Size([context_len, expected_dim]):
-            raise ValueError(
-                "Cached text context shape mismatch: "
-                f"expected {(context_len, expected_dim)}, got {tuple(context.shape)} "
-                f"in {path}."
-            )
-        if mask.shape != torch.Size([context_len]):
-            raise ValueError(
-                f"Cached text mask shape mismatch in {path}: {tuple(mask.shape)}."
-            )
-        if context.dtype is not torch.bfloat16 or mask.dtype is not torch.bool:
-            raise TypeError(
-                "Cached text context must use BF16 context and bool mask: "
-                f"context={context.dtype}, mask={mask.dtype}, path={path}."
-            )
-        if not torch.isfinite(context.float()).all():
-            raise ValueError(f"Cached text context contains non-finite values: {path}")
-        # Match both FastWAM training and ``FastWAM.encode_prompt``: the UMT5
-        # padding embeddings remain present in the raw cache, but consumers
-        # must zero them and then expose an all-valid mask because Wan2.2's
-        # original cross-attention behavior sees the zero padding tokens.
-        context = context.clone()
-        context[~mask] = 0
-        mask = torch.ones_like(mask)
+            if not torch.isfinite(context.float()).all():
+                raise ValueError("Cached text context contains non-finite values.")
+        else:
+            digest = hashlib.sha256(prompt.encode("utf-8")).hexdigest()
+            path = cache_dir / f"{digest}.t5_len{context_len}.wan22ti2v5b.pt"
+            if not path.is_file():
+                raise FileNotFoundError(
+                    f"Missing FastWAM evaluation text context for prompt hash {digest}: "
+                    f"{path}"
+                )
+            payload = torch.load(path, map_location="cpu", weights_only=True)
+            if not isinstance(payload, dict) or set(payload) != {"context", "mask"}:
+                raise ValueError(f"Cached text context has an invalid schema: {path}")
+            context = payload["context"]
+            mask = payload["mask"]
+            if not isinstance(context, torch.Tensor) or not isinstance(
+                mask, torch.Tensor
+            ):
+                raise TypeError(f"Cached text context values must be tensors: {path}")
+            if context.shape != torch.Size([context_len, expected_dim]):
+                raise ValueError(
+                    "Cached text context shape mismatch: "
+                    f"expected {(context_len, expected_dim)}, got {tuple(context.shape)} "
+                    f"in {path}."
+                )
+            if mask.shape != torch.Size([context_len]):
+                raise ValueError(
+                    f"Cached text mask shape mismatch in {path}: {tuple(mask.shape)}."
+                )
+            if context.dtype is not torch.bfloat16 or mask.dtype is not torch.bool:
+                raise TypeError(
+                    "Cached text context must use BF16 context and bool mask: "
+                    f"context={context.dtype}, mask={mask.dtype}, path={path}."
+                )
+            if not torch.isfinite(context.float()).all():
+                raise ValueError(
+                    f"Cached text context contains non-finite values: {path}"
+                )
+            # Legacy parents trained with zero padding visible to attention.
+            context = context.clone()
+            context[~mask] = 0
+            mask = torch.ones_like(mask)
         if memory_cache is not None:
             memory_cache[prompt] = (context, mask)
             # Ten training tasks fit permanently; larger evaluation suites
@@ -626,6 +643,7 @@ class LiberoFastWAMRuntime:
                     device=self.device,
                     dtype=self.dtype,
                     memory_cache=self._text_context_cache,
+                    text_padding=getattr(self.actor, "text_padding", "legacy_visible"),
                 )
         proprio = self._normalized_proprio(env_obs["states"])
         context, context_mask = self.actor._append_proprio_to_context(

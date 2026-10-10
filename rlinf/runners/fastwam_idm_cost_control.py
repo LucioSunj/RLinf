@@ -1503,6 +1503,12 @@ class FastWAMIDMCostControlRuntime:
     def from_config(cls, cfg: Any) -> FastWAMIDMCostControlRuntime:
         algorithm = cfg.get("algorithm", {})
         branch_cost = algorithm.get("fixed_branch_cost", {})
+        if branch_cost.get("task_budget") is not None:
+            from rlinf.models.embodiment.wam_policy.route_neutral_online.task_budget import (
+                TaskBudgetRuntime,
+            )
+
+            return TaskBudgetRuntime.from_config(cfg)
         resolved_branch_cost = _resolved_mapping(
             branch_cost, name="FastWAM fixed_branch_cost config"
         )

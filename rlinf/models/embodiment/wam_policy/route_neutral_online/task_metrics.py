@@ -65,12 +65,18 @@ def summarize_task_rollout(batch: dict[str, Any]) -> dict[str, float]:
                 ),
                 f"{prefix}/training_success": success / episode_count,
                 f"{prefix}/valid_chunks": float(n),
+                f"{prefix}/idm_chunks": float(idm),
+                f"{prefix}/eligible_idm_chunks": float((eligible & ~uncond).sum()),
+                f"{prefix}/forced_chunks": float(
+                    (selected & route.route_was_forced).sum()
+                ),
+                f"{prefix}/behavior_probability_sum": float(q[eligible].double().sum()),
                 f"{prefix}/uncond_chunks": float((selected & uncond).sum()),
                 f"{prefix}/teacher_chunks": float((selected & teacher).sum()),
                 f"{prefix}/gate_chunks": float(eligible.sum()),
-                f"{prefix}/mean_behavior_probability": float(
-                    q[eligible].float().mean()
-                ),
+                f"{prefix}/mean_behavior_probability": float(q[eligible].float().mean())
+                if bool(eligible.any())
+                else 0.0,
                 f"{prefix}/realized_idm_fraction": idm / n,
                 f"{prefix}/critic_preupdate_mse": float(advantage.square().mean()),
                 f"{prefix}/raw_advantage_mean": float(advantage.mean()),
