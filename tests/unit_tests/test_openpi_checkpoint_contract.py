@@ -20,7 +20,7 @@ import torch
 from torch import nn
 
 MODULE_PATH = Path(__file__).resolve().parents[2] / (
-    "rlinf/models/embodiment/openpi/__init__.py"
+    "rlinf/models/embodiment/wam_policy/pi05_backbone/__init__.py"
 )
 SPEC = importlib.util.spec_from_file_location(
     "openpi_checkpoint_under_test", MODULE_PATH

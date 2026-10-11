@@ -8,13 +8,15 @@
 import gc
 import pickle
 import weakref
-from dataclasses import replace
 from types import SimpleNamespace
 
 import pytest
 import torch
 
-from rlinf.data.embodied_io_struct import (
+from rlinf.models.embodiment.wam_policy.execution.actor import (
+    process_nested_dict_for_train,
+)
+from rlinf.models.embodiment.wam_policy.execution.io_struct import (
     ChunkStepResult,
     EmbodiedRolloutResult,
     convert_trajectories_to_batch,
@@ -29,12 +31,11 @@ from rlinf.models.embodiment.wam_policy.route_neutral_online.replay import (
     RouteNeutralRolloutResult,
 )
 from rlinf.scheduler.cluster.utils import (
-    extract_dataclass_tensor_fields,
-    unflatten_dataclass_tensor_fields,
+    pack_dataclass_tensors,
+    unpack_dataclass_tensors,
 )
 from rlinf.utils.metric_utils import compute_loss_mask
 from rlinf.utils.nested_dict_process import split_dict_to_chunk
-from rlinf.workers.actor.fsdp_actor_worker import process_nested_dict_for_train
 
 
 def _step(rank, step, *, dones):
@@ -86,18 +87,12 @@ def _collect(rank, *, mask_after_terminal=True):
 
 
 def _channel_roundtrip(payload):
-    fields, tensors, metadata = extract_dataclass_tensor_fields(payload)
-    assert set(fields) == {"replay_tensors"}
-    assert len(tensors) == len(payload.replay_tensors)
+    skeleton, tensors = pack_dataclass_tensors(payload)
     assert all(tensor.is_contiguous() for tensor in tensors)
-    skeleton = replace(payload, **dict.fromkeys(fields))
     # Exercise the actual Channel split between tensor transfer and pickle.
     assert len(pickle.dumps(skeleton)) < 25_000
-    return replace(
-        pickle.loads(pickle.dumps(skeleton)),
-        **unflatten_dataclass_tensor_fields(
-            metadata, [value.clone() for value in tensors]
-        ),
+    return unpack_dataclass_tensors(
+        pickle.loads(pickle.dumps(skeleton)), [value.clone() for value in tensors]
     )
 
 

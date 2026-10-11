@@ -25,8 +25,8 @@ from fastwam.causal_prediction import (
 )
 
 from rlinf.envs.action_contract import ActionExecutionTrace
-from rlinf.envs.libero.action_contract import LiberoActionContract
-from rlinf.envs.libero.causal_snapshot import CausalSnapshotV2
+from rlinf.envs.sim.libero.action_contract import LiberoActionContract
+from rlinf.envs.sim.libero.causal_snapshot import CausalSnapshotV2
 
 from .causal_runtime import CausalChunkSample, CausalLiberoFastWAMRuntime
 

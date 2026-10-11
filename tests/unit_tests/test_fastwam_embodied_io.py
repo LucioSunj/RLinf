@@ -18,7 +18,7 @@ from pathlib import Path
 
 import torch
 
-from rlinf.data.embodied_io_struct import (
+from rlinf.models.embodiment.wam_policy.execution.io_struct import (
     ChunkStepResult,
     EmbodiedRolloutResult,
     RolloutResult,

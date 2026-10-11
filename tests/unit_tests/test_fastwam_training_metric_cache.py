@@ -17,6 +17,7 @@ from rlinf.algorithms.fastwam_dual_ppo import (
     finalize_fastwam_weighted_metrics,
     pop_fastwam_weighted_metric_sums,
 )
+from rlinf.models.embodiment.wam_policy.execution.actor import EmbodiedFSDPActor
 from rlinf.models.embodiment.wam_policy.libero_runtime import (
     LiberoFastWAMRuntime,
     _load_cached_text_contexts,
@@ -26,7 +27,6 @@ from rlinf.models.embodiment.wam_policy.route_neutral_online.task_metrics import
     finalize_task_losses,
 )
 from rlinf.utils.metric_utils import materialize_scalar_metrics
-from rlinf.workers.actor.fsdp_actor_worker import EmbodiedFSDPActor
 
 
 def test_microbatch_normalization_preserves_detached_loss_metrics():

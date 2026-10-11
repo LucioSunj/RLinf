@@ -75,17 +75,17 @@ class WorkerGroup(Generic[WorkerClsType]):
 
     @property
     def worker_cls_name(self) -> str:
-        """Get the name of the worker class."""
+        """The name of the worker class."""
         return self._worker_cls.__name__
 
     @property
     def worker_group_name(self) -> str:
-        """Get the name of the worker group."""
+        """The name of the worker group."""
         return self._worker_group_name
 
     @property
     def worker_info_list(self):
-        """Get the list of workers in the group."""
+        """The list of workers in the group."""
         return self._workers
 
     @classmethod
@@ -406,12 +406,12 @@ class WorkerGroupFunc:
 
     @property
     def worker_group(self) -> WorkerGroup:
-        """Get the worker group this function belongs to."""
+        """The worker group this function belongs to."""
         return self._worker_group
 
     @property
     def func_name(self) -> str:
-        """Get the name of the function."""
+        """The name of the function."""
         return self._func_name
 
     def __call__(self, *args, **kwargs):
@@ -484,6 +484,7 @@ class WorkerGroupFuncResult:
         self._worker_group: Worker = worker_group
         self._remote_results = results
         self._local_results = None
+        self._wait_error: Optional[BaseException] = None
         self._func_name = func_name
         self._pid = os.getpid()
         self._cls_name = cls_name
@@ -503,13 +504,18 @@ class WorkerGroupFuncResult:
             )
             sys.stdout.flush()
             sys.stderr.flush()
+            # Keep the failure for wait() to raise. A caller that asked for the
+            # result should learn it did not arrive, rather than depending on
+            # the signal below reaching the main thread first.
+            self._wait_error = e
+            self._wait_done = True
             # Send suicide signal if one thread failed, the handler is registered in cluster
             os.kill(self._pid, signal.SIGUSR1)
             exit(-1)
         self._wait_done = True
 
     def consume_duration(self, reduction_type: str = "max"):
-        """Get the max execution time of a function across different ranks of a group.
+        """The max execution time of a function across different ranks of a group.
 
         This implicitly waits for the function to finish.
 
@@ -554,12 +560,16 @@ class WorkerGroupFuncResult:
         """Wait for all remote results to complete and return the results."""
         if not self._wait_done:
             self._wait_thread.join()
+        if self._wait_error is not None:
+            raise self._wait_error
         return self._local_results
 
     async def async_wait(self):
         """Asynchronously wait for all remote results to complete and return the results."""
         while not self._wait_done:
             await asyncio.sleep(0.1)
+        if self._wait_error is not None:
+            raise self._wait_error
         return self._local_results
 
     def done(self):

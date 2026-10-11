@@ -24,7 +24,6 @@ import torch
 from hydra.utils import instantiate
 from omegaconf import OmegaConf
 
-from rlinf.data.embodied_io_struct import EnvOutput, RolloutResult
 from rlinf.envs.action_contract import (
     DENORMALIZED_ACTION_STAGE,
     GRIPPER_CONVERTED_ACTION_STAGE,
@@ -36,12 +35,16 @@ from rlinf.envs.action_contract import (
     action_stage_contract_violations,
     validate_action_stage_contract,
 )
-from rlinf.envs.libero.action_contract import LiberoActionContract
+from rlinf.envs.sim.libero.action_contract import LiberoActionContract
 from rlinf.models.embodiment.wam_policy.contracts import (
     ChunkRouteRecord,
     GateDecisionRecord,
 )
 from rlinf.models.embodiment.wam_policy.evaluation import EvaluationRouteSelection
+from rlinf.models.embodiment.wam_policy.execution.io_struct import (
+    EnvOutput,
+    RolloutResult,
+)
 from rlinf.runners.fastwam_libero_eval_collector import (
     FastWAMLiberoEvalCollector,
     _load_ledger,

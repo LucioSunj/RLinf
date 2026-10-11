@@ -26,8 +26,8 @@ import pytest
 import torch
 from omegaconf import OmegaConf
 
-from rlinf.workers.actor import fsdp_actor_worker as worker_module
-from rlinf.workers.actor.fsdp_actor_worker import EmbodiedFSDPActor
+from rlinf.models.embodiment.wam_policy.execution import actor as worker_module
+from rlinf.models.embodiment.wam_policy.execution.actor import EmbodiedFSDPActor
 
 
 class _RouteTracker:

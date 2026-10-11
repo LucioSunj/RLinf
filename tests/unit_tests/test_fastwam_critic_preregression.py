@@ -23,13 +23,13 @@ import pytest
 import torch
 
 from rlinf.models.embodiment.modules.value_head import ValueHead
+from rlinf.models.embodiment.wam_policy.execution import actor as worker_module
+from rlinf.models.embodiment.wam_policy.execution.actor import EmbodiedFSDPActor
 from rlinf.utils.fastwam_critic_preregression import (
     DATASET_SCHEMA,
     explained_variance,
     run_critic_preregression,
 )
-from rlinf.workers.actor import fsdp_actor_worker as worker_module
-from rlinf.workers.actor.fsdp_actor_worker import EmbodiedFSDPActor
 
 
 class _RouteTracker:

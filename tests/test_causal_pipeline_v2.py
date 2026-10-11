@@ -28,8 +28,8 @@ from rlinf.envs.action_contract import (
     ActionExecutionTrace,
     ActionStageStatistics,
 )
-from rlinf.envs.libero.action_contract import LiberoActionContract
-from rlinf.envs.libero.causal_collection import (
+from rlinf.envs.sim.libero.action_contract import LiberoActionContract
+from rlinf.envs.sim.libero.causal_collection import (
     CausalSourceCollectorV2,
     FutureLatentEntryV1,
     SourceChunkTraceV2,
@@ -37,7 +37,7 @@ from rlinf.envs.libero.causal_collection import (
     assign_future_donors,
     select_source_chunk,
 )
-from rlinf.envs.libero.causal_snapshot import CausalSnapshotV1, CausalSnapshotV2
+from rlinf.envs.sim.libero.causal_snapshot import CausalSnapshotV1, CausalSnapshotV2
 from rlinf.models.embodiment.wam_policy.causal_evaluation_v2 import (
     SameChunkCausalEvaluationRunnerV2,
     SameChunkRouteDecisionV2,

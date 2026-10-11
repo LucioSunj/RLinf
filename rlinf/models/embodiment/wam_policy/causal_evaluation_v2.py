@@ -19,7 +19,7 @@ from fastwam.causal_prediction import (
 )
 
 from rlinf.envs.action_contract import ActionExecutionTrace
-from rlinf.envs.libero.action_contract import LiberoActionContract
+from rlinf.envs.sim.libero.action_contract import LiberoActionContract
 from rlinf.models.embodiment.wam_policy.causal_routing_v2 import (
     EpisodeComputeBudgetV2,
 )

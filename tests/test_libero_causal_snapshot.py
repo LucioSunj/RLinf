@@ -20,12 +20,12 @@ from rlinf.envs.action_contract import (
     ActionExecutionTrace,
     ActionStageStatistics,
 )
-from rlinf.envs.libero.action_contract import LiberoActionContract
-from rlinf.envs.libero.causal_collection import (
+from rlinf.envs.sim.libero.action_contract import LiberoActionContract
+from rlinf.envs.sim.libero.causal_collection import (
     SourceChunkTraceV2,
     select_stage_c_snapshot_audit_targets,
 )
-from rlinf.envs.libero.causal_snapshot import (
+from rlinf.envs.sim.libero.causal_snapshot import (
     CausalSnapshotV1,
     audit_interleaved_snapshot_restore,
     capture_process_rng_state,

@@ -12,8 +12,8 @@ import numpy as np
 import pytest
 import torch
 
-from rlinf.envs.libero.causal_snapshot import CausalSnapshotV1
-from rlinf.envs.libero.stage_c_audit import (
+from rlinf.envs.sim.libero.causal_snapshot import CausalSnapshotV1
+from rlinf.envs.sim.libero.stage_c_audit import (
     StageCInterleavingAuditExecutorV1,
     StageCSourceReplayExecutorV1,
 )

@@ -24,6 +24,7 @@ from rlinf.models.embodiment.wam_policy.contracts import (
     ChunkRouteRecord,
     GateDecisionRecord,
 )
+from rlinf.models.embodiment.wam_policy.execution.actor import EmbodiedFSDPActor
 from rlinf.models.embodiment.wam_policy.online_idm_bc.config import OnlineIDMBCConfig
 from rlinf.models.embodiment.wam_policy.pad_rv.audit import (
     summarize_pad_frozen_rollout_state,
@@ -49,7 +50,6 @@ from rlinf.models.embodiment.wam_policy.route_neutral_online.runtime import (
 from rlinf.runners.fastwam_idm_cost_control import (
     aggregate_fastwam_idm_cost_observation,
 )
-from rlinf.workers.actor.fsdp_actor_worker import EmbodiedFSDPActor
 
 
 def _compose_extra(monkeypatch):

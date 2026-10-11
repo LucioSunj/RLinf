@@ -29,20 +29,20 @@ import numpy as np
 import torch
 from omegaconf import OmegaConf
 
-from rlinf.data.embodied_io_struct import (
-    EnvOutput,
-    EvaluationRolloutControl,
-    RolloutResult,
-)
 from rlinf.envs.action_contract import (
     FASTWAM_LIBERO_ACTION_STAGES,
     ActionExecutionTrace,
 )
-from rlinf.envs.libero.action_contract import LiberoActionContract
+from rlinf.envs.sim.libero.action_contract import LiberoActionContract
 from rlinf.envs.utils import get_env_attr
 from rlinf.models.embodiment.wam_policy.evaluation import (
     EvaluationRoutingConfig,
     EvaluationRoutingMode,
+)
+from rlinf.models.embodiment.wam_policy.execution.io_struct import (
+    EnvOutput,
+    EvaluationRolloutControl,
+    RolloutResult,
 )
 from rlinf.runners.fastwam_decision_telemetry import (
     build_fastwam_decision_telemetry_record,

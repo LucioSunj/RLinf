@@ -19,7 +19,7 @@ import torch.multiprocessing as mp
 from omegaconf import open_dict
 from omegaconf.omegaconf import OmegaConf
 
-from rlinf.config import validate_cfg
+from rlinf.config import SupportedModel, validate_cfg
 from rlinf.runners.embodied_runner import EmbodiedRunner
 from rlinf.scheduler import Cluster
 from rlinf.utils.placement import HybridComponentPlacement
@@ -63,6 +63,14 @@ def main(cfg) -> None:
         from rlinf.workers.actor.fsdp_rlt_ac_policy_worker import RLTACFSDPPolicy
 
         actor_worker_cls = RLTACFSDPPolicy
+    elif cfg.algorithm.loss_type == "rlt_td3":
+        if use_training_pipeline:
+            raise ValueError(
+                "runner.use_training_pipeline=True is not supported for rlt_td3."
+            )
+        from rlinf.workers.actor.fsdp_rlt_td3_policy_worker import RLTTD3FSDPPolicy
+
+        actor_worker_cls = RLTTD3FSDPPolicy
     elif cfg.algorithm.loss_type == "embodied_dagger":
         if use_training_pipeline:
             raise ValueError(
@@ -89,10 +97,14 @@ def main(cfg) -> None:
 
             actor_worker_cls = PipelineEmbodiedFSDPActor
         else:
-            from rlinf.workers.actor.fsdp_actor_worker import EmbodiedFSDPActor
+            from rlinf.workers.actor.embodied_fsdp_actor_worker import EmbodiedFSDPActor
 
             actor_worker_cls = EmbodiedFSDPActor
 
+    if cfg.actor.model.model_type == SupportedModel.FASTWAM_ADAPTIVE.value:
+        from rlinf.models.embodiment.wam_policy.execution.actor import EmbodiedFSDPActor
+
+        actor_worker_cls = EmbodiedFSDPActor
     if cfg.actor.model.get("uncond_rl") is not None:
         from rlinf.models.embodiment.wam_policy.uncond_rl_actor import UncondRLFSDPActor
 
@@ -105,6 +117,20 @@ def main(cfg) -> None:
     runner_cls = EmbodiedRunner
     rollout_worker_cls = MultiStepRolloutWorker
     env_worker_cls = EnvWorker
+    if cfg.actor.model.model_type == SupportedModel.FASTWAM_ADAPTIVE.value:
+        from rlinf.models.embodiment.wam_policy.execution.env import (
+            EnvWorker as FastWAMEnvWorker,
+        )
+        from rlinf.models.embodiment.wam_policy.execution.rollout import (
+            MultiStepRolloutWorker as FastWAMRolloutWorker,
+        )
+        from rlinf.models.embodiment.wam_policy.execution.runner import (
+            EmbodiedRunner as FastWAMRunner,
+        )
+
+        runner_cls = FastWAMRunner
+        rollout_worker_cls = FastWAMRolloutWorker
+        env_worker_cls = FastWAMEnvWorker
     if cfg.actor.model.get("uncond_rl") is not None:
         from rlinf.models.embodiment.wam_policy.uncond_rl_lifecycle import (
             UncondRLEnvWorker,
@@ -186,9 +212,9 @@ def main(cfg) -> None:
     if reward_group is not None:
         reward_group.stop().wait()
     if router_group is not None:
-        router_group.shutdown().wait()
+        router_group.stop().wait()
     if server_group is not None:
-        server_group.shutdown().wait()
+        server_group.stop().wait()
 
 
 if __name__ == "__main__":

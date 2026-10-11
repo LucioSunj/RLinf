@@ -46,12 +46,12 @@ from rlinf.envs.action_contract import (
     ActionExecutionTrace,
     ActionStageStatistics,
 )
-from rlinf.envs.libero.action_protocol import (
+from rlinf.envs.sim.libero.action_protocol import (
     LiberoActionProtocol,
     select_executed_action_prefix,
     select_executed_flow_statistics,
 )
-from rlinf.envs.libero.image_preprocessing import (
+from rlinf.envs.sim.libero.image_preprocessing import (
     OFFICIAL_LIBERO_CAMERA_RESIZE_MODE,
     prepare_libero_camera_batch,
 )

@@ -31,7 +31,7 @@ from fastwam.models.wan22.adaptive_action import CachedActionCondition
 from fastwam.models.wan22.adaptive_sampler import sample_action_flow_sde
 
 from rlinf.envs.action_contract import ActionExecutionTrace
-from rlinf.envs.libero.action_protocol import select_executed_action_prefix
+from rlinf.envs.sim.libero.action_protocol import select_executed_action_prefix
 
 from .libero_runtime import (
     LiberoFastWAMRuntime,

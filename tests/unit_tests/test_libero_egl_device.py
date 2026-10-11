@@ -20,7 +20,7 @@ import os
 
 import pytest
 
-from rlinf.envs.libero.egl import (
+from rlinf.envs.sim.libero.egl import (
     configure_isolated_egl_device,
     instantiate_with_isolated_egl,
 )

@@ -15,15 +15,12 @@
 import asyncio
 import copy
 import gc
-import json
-import os
 import time
-from dataclasses import replace
 from typing import Any, Callable, Literal, Optional
 
 import numpy as np
 import torch
-from omegaconf import DictConfig, OmegaConf, open_dict
+from omegaconf import DictConfig, OmegaConf
 from tqdm import tqdm
 
 from rlinf.algorithms.expert import build_expert_model_config
@@ -31,62 +28,21 @@ from rlinf.algorithms.rlt import (
     build_rlt_route,
     predict_rlt_actions,
 )
+from rlinf.algorithms.rlt.transition import extract_rlt_obs_from_forward_inputs
 from rlinf.config import SupportedModel
-from rlinf.config_contracts import (
-    FASTWAM_RESUME_MODE_N4_TO_THREE_ROLLOUT,
-    build_fastwam_checkpoint_contract,
-    validate_fastwam_eval_checkpoint_contract,
-    validate_fastwam_training_checkpoint_contract,
-)
-from rlinf.data.embodied_io_struct import (
-    EvaluationRolloutControl,
-    RolloutResult,
+from rlinf.data.schema.embodied_types import (
+    EnvPart,
+    PolicyInput,
+    PolicyOutput,
+    PolicyPart,
+    split_batch_value,
 )
 from rlinf.hybrid_engines.weight_syncer import WeightSyncer
 from rlinf.models import get_model
 from rlinf.models.embodiment.base_policy import BasePolicy
-from rlinf.models.embodiment.wam_policy.critic import (
-    critic_parent_checkpoint_sha256,
-)
 from rlinf.scheduler import Channel, Cluster, Worker, split_channel_message
-from rlinf.utils.checkpoint_state import (
-    FASTWAM_RESUME_AUDIT_SCHEMA,
-    FASTWAM_ROLLOUT_RESUME_AUDIT_SENTINEL,
-    checkpoint_state_sha256,
-)
+from rlinf.utils.obs_compression import decompress_obs, infer_obs_batch_size
 from rlinf.utils.placement import HybridComponentPlacement
-from rlinf.utils.utils import get_rng_state, seed_everything, set_rng_state
-
-
-def _fastwam_checkpoint_cpu_clone(value: Any) -> Any:
-    if isinstance(value, torch.Tensor):
-        return value.detach().cpu().clone()
-    if isinstance(value, dict):
-        return {key: _fastwam_checkpoint_cpu_clone(item) for key, item in value.items()}
-    if isinstance(value, list):
-        return [_fastwam_checkpoint_cpu_clone(item) for item in value]
-    if isinstance(value, tuple):
-        return tuple(_fastwam_checkpoint_cpu_clone(item) for item in value)
-    return value
-
-
-def _build_evaluation_rollout_result(
-    actions: torch.Tensor,
-    result: dict[str, Any],
-) -> RolloutResult:
-    """Build the compact typed payload used by standalone FastWAM evaluation."""
-
-    if not isinstance(actions, torch.Tensor):
-        raise TypeError("FastWAM evaluation actions must be a torch.Tensor.")
-    return RolloutResult(
-        actions=actions,
-        route_info=result.get("route_info"),
-        emitted_gate=result.get("emitted_gate"),
-        evaluation_selection=result.get("evaluation_selection"),
-        gate_latency_seconds=result.get("gate_latency_seconds"),
-        gate_h2d_seconds=result.get("gate_h2d_seconds"),
-        action_execution_trace=result.get("action_execution_trace"),
-    )
 
 
 class MultiStepRolloutWorker(Worker):
@@ -128,6 +84,7 @@ class MultiStepRolloutWorker(Worker):
         self.collect_transitions = self.cfg.rollout.get("collect_transitions", False)
         self.enable_dagger = self.algorithm_cfg.get("loss_type") == "embodied_dagger"
         self.enable_opd = self.algorithm_cfg.get("adv_type") == "opd"
+        self.enable_rlt = self.algorithm_cfg.get("loss_type") in {"rlt_ac", "rlt_td3"}
         self.expert_model = None
         self.rlt_feature_model = None
         self.rlt_route = None
@@ -165,7 +122,9 @@ class MultiStepRolloutWorker(Worker):
                 // self.model_cfg.num_action_chunks
             )
         self.collect_prev_infos = self.cfg.rollout.get("collect_prev_infos", True)
+        self.collect_final_values = self.cfg.rollout.get("collect_final_values", True)
         self.version = 0
+        self.global_step = 0
         self.finished_episodes = None
 
         self.weight_syncer = None
@@ -184,82 +143,26 @@ class MultiStepRolloutWorker(Worker):
             # save the run-time imformation in communicate channel for decoupled mode
             # The batch_router is a dictionary that maps the tag to the list of batch_index.
             self.batch_router = {
+                "policy": [],
                 "rollout_results": [],
             }
         self.rollout_queue_size = self.cfg.rollout.get("rollout_queue_size", 0)
-        self._fastwam_kv_store = None
 
-    def _load_fastwam_eval_checkpoint_payload(
-        self,
-        rollout_model_config: DictConfig,
-    ) -> dict[str, Any]:
-        """Load and validate the default adaptive FastWAM eval checkpoint."""
-
-        from rlinf.models.embodiment.wam_policy import (
-            resolve_fastwam_adaptive_eval_checkpoint,
-        )
-
-        checkpoint_path = resolve_fastwam_adaptive_eval_checkpoint(
-            self.cfg.runner.ckpt_path,
-            rank=self._rank,
-        )
-        payload = torch.load(
-            checkpoint_path,
-            map_location="cpu",
-            weights_only=False,
-        )
-        validate_fastwam_eval_checkpoint_contract(
-            payload,
-            rollout_model_config,
-            expected_parent_checkpoint_sha256=str(
-                self.model_cfg.actor_checkpoint_sha256
-            ),
-            load_critic=bool(rollout_model_config.critic.get("load_for_eval", False)),
-        )
-        return payload
-
-    def _restore_fastwam_eval_checkpoint_payload(
-        self,
-        payload: dict[str, Any],
-    ) -> int:
-        """Restore the default adaptive FastWAM policy payload."""
-
-        return self.hf_model.load_eval_checkpoint(
-            payload,
-            expected_parent_checkpoint_sha256=str(
-                self.model_cfg.actor_checkpoint_sha256
-            ),
-            expected_critic_parent_checkpoint_sha256=(
-                critic_parent_checkpoint_sha256(self.model_cfg.critic)
-            ),
-        )
+    @property
+    def collect_raw_transition_obs(self) -> bool:
+        """Return whether Actor training requires raw transition observations."""
+        return self.collect_transitions and not self.enable_rlt
 
     def init_worker(self):
-        rollout_model_config = copy.deepcopy(self.model_cfg)
-        with open_dict(rollout_model_config):
-            rollout_model_config.precision = self.cfg.rollout.model.precision
-            rollout_model_config.model_path = self.cfg.rollout.model.model_path
-
-        fastwam_eval_payload = None
-        if self.cfg.runner.get("ckpt_path", None) and (
-            SupportedModel(self.model_cfg.model_type) is SupportedModel.FASTWAM_ADAPTIVE
-        ):
-            fastwam_eval_payload = self._load_fastwam_eval_checkpoint_payload(
-                rollout_model_config
-            )
+        # Train uses actor.model as the architecture source; overlay rollout.model
+        # (path, precision, and nested inference knobs). Eval-only is a no-op merge.
+        rollout_model_config = OmegaConf.merge(self.model_cfg, self.cfg.rollout.model)
 
         self.hf_model: BasePolicy = get_model(rollout_model_config)
 
         if self.cfg.runner.get("ckpt_path", None):
-            if fastwam_eval_payload is not None:
-                self.version = self._restore_fastwam_eval_checkpoint_payload(
-                    fastwam_eval_payload
-                )
-                if not self.only_eval:
-                    self._restore_fastwam_step0_training_runtime(fastwam_eval_payload)
-            else:
-                model_dict = torch.load(self.cfg.runner.ckpt_path)
-                self.hf_model.load_state_dict(model_dict)
+            model_dict = torch.load(self.cfg.runner.ckpt_path)
+            self.hf_model.load_state_dict(model_dict)
 
         rlt_feature_model_config = OmegaConf.select(
             self.cfg, "rollout.rlt_feature_model", default=None
@@ -300,334 +203,8 @@ class MultiStepRolloutWorker(Worker):
             )
 
         self.setup_sample_params()
-        if (
-            SupportedModel(self.model_cfg.model_type) is SupportedModel.FASTWAM_ADAPTIVE
-            and str(self.model_cfg.kv_replay.backend) == "stored"
-            and not self.only_eval
-        ):
-            from rlinf.models.embodiment.wam_policy.tiered_kv_store import (
-                TieredGateKVStore,
-            )
-
-            actor_world_size = self.placement.get_world_size("actor")
-            if actor_world_size != 1:
-                raise ValueError(
-                    "Handle-based stored Gate K/V replay currently requires one "
-                    f"logical actor rank, got {actor_world_size}."
-                )
-            self._fastwam_kv_store = TieredGateKVStore(
-                source_rank=self._rank,
-                device=self.device,
-                config=self.hf_model.config.kv_replay,
-                expected_global_samples=(
-                    self.total_num_train_envs
-                    * self.rollout_epoch
-                    * self.n_train_chunk_steps
-                ),
-                expected_local_samples=(
-                    self.per_node_train_batch_size
-                    * self.num_pipeline_stages
-                    * self.rollout_epoch
-                    * self.n_train_chunk_steps
-                ),
-            )
         if self.enable_offload:
             self.offload_model()
-
-    def _fastwam_checkpoint_contract(self) -> dict[str, Any]:
-        return build_fastwam_checkpoint_contract(
-            self.cfg,
-            world_size=int(self._world_size),
-        )
-
-    def _restore_fastwam_step0_training_runtime(
-        self,
-        payload: dict[str, Any],
-    ) -> None:
-        """Restore rollout RNG/routes from a native training bootstrap.
-
-        A fresh training rollout loads trainable tensors through the standalone
-        evaluation loader before the actor performs its first weight sync.  The
-        project checkpoint also owns the RNG state that generated that exact
-        initialization.  Restoring it here keeps the first rollout paired
-        across cost cells; nonzero resumes continue to use the dedicated
-        rollout-runtime checkpoint path.
-        """
-
-        step = payload.get("step")
-        if isinstance(step, bool) or int(step) != 0:
-            raise ValueError(
-                "FastWAM training ckpt_path requires a native step-zero "
-                f"checkpoint, got step={step}."
-            )
-        if int(self.version) != 0:
-            raise ValueError(
-                "FastWAM step-zero rollout bootstrap restored a nonzero "
-                f"policy version: {self.version}."
-            )
-        policy_payload = payload.get("policy")
-        if (
-            not isinstance(policy_payload, dict)
-            or "route_tracker" not in policy_payload
-        ):
-            raise ValueError("FastWAM step-zero checkpoint omits rollout route state.")
-        checkpoint_rng = payload.get("rng")
-        if not isinstance(checkpoint_rng, dict):
-            raise ValueError("FastWAM step-zero checkpoint omits RNG state.")
-
-        expected_route_sha256 = checkpoint_state_sha256(policy_payload["route_tracker"])
-        runtime = self.hf_model.rollout_runtime_state_dict()
-        restored_route_sha256 = checkpoint_state_sha256(runtime["route_tracker"])
-        if restored_route_sha256 != expected_route_sha256:
-            raise ValueError(
-                "FastWAM rollout route state changed during step-zero bootstrap."
-            )
-
-        expected_rng_sha256 = checkpoint_state_sha256(checkpoint_rng)
-        set_rng_state(checkpoint_rng)
-        restored_rng_sha256 = checkpoint_state_sha256(get_rng_state())
-        if restored_rng_sha256 != expected_rng_sha256:
-            raise ValueError(
-                "FastWAM rollout RNG state changed during step-zero bootstrap."
-            )
-        print(
-            f"{FASTWAM_ROLLOUT_RESUME_AUDIT_SENTINEL} "
-            + json.dumps(
-                {
-                    "schema": FASTWAM_RESUME_AUDIT_SCHEMA,
-                    "owner": "rollout",
-                    "rank": int(self._rank),
-                    "step": 0,
-                    "actor_version": 0,
-                    "route_state_sha256": restored_route_sha256,
-                    "rng_sha256": restored_rng_sha256,
-                    "status": "PASS",
-                },
-                sort_keys=True,
-            ),
-            flush=True,
-        )
-
-    def save_checkpoint(self, save_path: str, step: int = 0) -> None:
-        """Save rollout-owned RNG and delayed-route state for exact resume."""
-
-        if (
-            SupportedModel(self.model_cfg.model_type)
-            is not SupportedModel.FASTWAM_ADAPTIVE
-        ):
-            raise TypeError(
-                "Rollout runtime checkpointing is implemented only for "
-                "FastWAM adaptive."
-            )
-        if not hasattr(self.hf_model, "rollout_runtime_state_dict"):
-            raise TypeError("FastWAM rollout policy has no runtime-state API.")
-        step = int(step)
-        rollout_actor_version = int(self.version)
-        minimum_step = (
-            0 if getattr(self.model_cfg, "uncond_rl", None) is not None else 1
-        )
-        if step < minimum_step or rollout_actor_version not in {max(0, step - 1), step}:
-            raise ValueError(
-                "FastWAM rollout checkpoint version must be the checkpoint step "
-                f"or its immediately preceding behavior version, got "
-                f"step={step}, version={rollout_actor_version}."
-            )
-        policy_runtime = self.hf_model.rollout_runtime_state_dict()
-        if int(policy_runtime.get("actor_version", -1)) != rollout_actor_version:
-            raise ValueError(
-                "FastWAM rollout worker and policy versions disagree at save."
-            )
-        payload = {
-            "schema": "fastwam-adaptive-rollout-runtime-v1",
-            "rank": int(self._rank),
-            "world_size": int(self._world_size),
-            "step": step,
-            "rollout_actor_version": rollout_actor_version,
-            "parent_checkpoint_sha256": str(
-                self.model_cfg.actor_checkpoint_sha256
-            ).lower(),
-            "critic_parent_checkpoint_sha256": critic_parent_checkpoint_sha256(
-                self.model_cfg.critic
-            ),
-            "contract": self._fastwam_checkpoint_contract(),
-            "policy_runtime": policy_runtime,
-            "rng": get_rng_state(),
-        }
-        payload = _fastwam_checkpoint_cpu_clone(payload)
-        os.makedirs(save_path, exist_ok=True)
-        target = os.path.join(save_path, f"rank_{self._rank}.pt")
-        temporary = f"{target}.tmp"
-        try:
-            torch.save(payload, temporary)
-            os.replace(temporary, target)
-        finally:
-            if os.path.exists(temporary):
-                os.unlink(temporary)
-
-    def load_checkpoint(self, load_path: str) -> int:
-        """Restore rollout RNG/routes before the first post-resume sync."""
-
-        if (
-            SupportedModel(self.model_cfg.model_type)
-            is not SupportedModel.FASTWAM_ADAPTIVE
-        ):
-            raise TypeError(
-                "Rollout runtime checkpointing is implemented only for "
-                "FastWAM adaptive."
-            )
-        if not hasattr(self.hf_model, "load_rollout_runtime_state_dict"):
-            raise TypeError("FastWAM rollout policy has no runtime-state loader.")
-        allow_capacity_expansion = bool(
-            getattr(
-                self.cfg.runner,
-                "fastwam_n4_to_three_rollout_resume",
-                False,
-            )
-        )
-        checkpoint_rank = 0 if allow_capacity_expansion else int(self._rank)
-        checkpoint_path = os.path.join(load_path, f"rank_{checkpoint_rank}.pt")
-        payload = torch.load(
-            checkpoint_path,
-            map_location="cpu",
-            weights_only=False,
-        )
-        expected_keys = {
-            "schema",
-            "rank",
-            "world_size",
-            "step",
-            "rollout_actor_version",
-            "parent_checkpoint_sha256",
-            "critic_parent_checkpoint_sha256",
-            "contract",
-            "policy_runtime",
-            "rng",
-        }
-        if set(payload) != expected_keys:
-            raise ValueError(
-                f"FastWAM rollout-runtime checkpoint keys changed: {sorted(payload)}."
-            )
-        if payload.get("schema") != "fastwam-adaptive-rollout-runtime-v1":
-            raise ValueError("Unsupported FastWAM rollout-runtime schema.")
-        expected_parent = str(self.model_cfg.actor_checkpoint_sha256).lower()
-        if payload.get("parent_checkpoint_sha256") != expected_parent:
-            raise ValueError("FastWAM rollout-runtime parent hash mismatch.")
-        expected_critic_parent = critic_parent_checkpoint_sha256(self.model_cfg.critic)
-        if payload.get("critic_parent_checkpoint_sha256") != expected_critic_parent:
-            raise ValueError("FastWAM rollout-runtime critic parent mismatch.")
-        resume_contract = validate_fastwam_training_checkpoint_contract(
-            payload.get("contract"),
-            self._fastwam_checkpoint_contract(),
-            allow_n4_to_three_rollout_expansion=allow_capacity_expansion,
-            owner="rollout",
-        )
-        is_capacity_expansion = (
-            resume_contract["mode"] == FASTWAM_RESUME_MODE_N4_TO_THREE_ROLLOUT
-        )
-        if is_capacity_expansion:
-            if (
-                int(payload.get("rank", -1)) != 0
-                or int(payload.get("world_size", -1)) != 1
-                or int(payload.get("step", -1)) != 100
-            ):
-                raise ValueError(
-                    "FastWAM N=4 capacity resume requires rollout rank 0 / "
-                    "world-size 1 at step 100."
-                )
-        elif int(payload.get("rank", -1)) != int(self._rank) or int(
-            payload.get("world_size", -1)
-        ) != int(self._world_size):
-            raise ValueError("FastWAM rollout-runtime rank/world-size mismatch.")
-        step = int(payload.get("step", -1))
-        rollout_actor_version = int(payload.get("rollout_actor_version", -1))
-        minimum_step = (
-            0 if getattr(self.model_cfg, "uncond_rl", None) is not None else 1
-        )
-        if step < minimum_step or rollout_actor_version not in {max(0, step - 1), step}:
-            raise ValueError(
-                "FastWAM rollout-runtime checkpoint step/version mismatch."
-            )
-        policy_runtime = payload.get("policy_runtime")
-        if (
-            not isinstance(policy_runtime, dict)
-            or int(policy_runtime.get("actor_version", -1)) != rollout_actor_version
-        ):
-            raise ValueError("FastWAM rollout-runtime policy/worker version mismatch.")
-        if "route_tracker" not in policy_runtime:
-            raise ValueError("FastWAM rollout checkpoint omits delayed-route state.")
-        source_route_sha256 = checkpoint_state_sha256(policy_runtime["route_tracker"])
-        source_rng_sha256 = checkpoint_state_sha256(payload["rng"])
-        restored_policy_runtime = policy_runtime
-        if is_capacity_expansion:
-            restored_policy_runtime = copy.deepcopy(policy_runtime)
-            restored_policy_runtime["route_tracker"] = {
-                "next_episode_id": 0,
-                "next_episode_ids": {},
-                "states": {},
-            }
-        expected_route_sha256 = checkpoint_state_sha256(
-            restored_policy_runtime["route_tracker"]
-        )
-        self.hf_model.load_rollout_runtime_state_dict(restored_policy_runtime)
-        self.version = rollout_actor_version
-        restored_runtime = self.hf_model.rollout_runtime_state_dict()
-        restored_route_sha256 = checkpoint_state_sha256(
-            restored_runtime["route_tracker"]
-        )
-        if restored_route_sha256 != expected_route_sha256:
-            raise ValueError("FastWAM rollout delayed-route state changed during load.")
-        expanded_rng_seed = None
-        if is_capacity_expansion and int(self._rank) > 0:
-            expanded_rng_seed = (
-                int(self.cfg.actor.seed)
-                + step * int(self._world_size)
-                + int(self._rank)
-            )
-            seed_everything(expanded_rng_seed)
-            rng_mode = "deterministic_new_rank"
-        else:
-            set_rng_state(payload["rng"])
-            rng_mode = "source_exact"
-        restored_rng_sha256 = checkpoint_state_sha256(get_rng_state())
-        if rng_mode == "source_exact" and restored_rng_sha256 != source_rng_sha256:
-            raise ValueError("FastWAM rollout RNG state changed during load.")
-        resume_audit = {
-            "schema": FASTWAM_RESUME_AUDIT_SCHEMA,
-            "owner": "rollout",
-            "rank": int(self._rank),
-            "step": step,
-            "actor_version": rollout_actor_version,
-            "route_state_sha256": restored_route_sha256,
-            "rng_sha256": restored_rng_sha256,
-            "status": "PASS",
-        }
-        if is_capacity_expansion:
-            resume_audit.update(
-                {
-                    "resume_mode": resume_contract["mode"],
-                    "source_rank": 0,
-                    "source_world_size": resume_contract["source_world_size"],
-                    "target_world_size": resume_contract["target_world_size"],
-                    "source_environment_count": resume_contract[
-                        "source_environment_count"
-                    ],
-                    "target_environment_count": resume_contract[
-                        "target_environment_count"
-                    ],
-                    "source_route_state_sha256": source_route_sha256,
-                    "source_rng_sha256": source_rng_sha256,
-                    "route_state_mode": "reset_for_topology_expansion",
-                    "rng_mode": rng_mode,
-                }
-            )
-            if expanded_rng_seed is not None:
-                resume_audit["rng_seed"] = expanded_rng_seed
-        print(
-            f"{FASTWAM_ROLLOUT_RESUME_AUDIT_SENTINEL} "
-            + json.dumps(resume_audit, sort_keys=True),
-            flush=True,
-        )
-        return step
 
     def setup_sample_params(self):
         # sampling parameters for rollout
@@ -914,9 +491,11 @@ class MultiStepRolloutWorker(Worker):
             else self._eval_sampling_params
         )
 
-        if SupportedModel(self.model_cfg.model_type) in [
+        model_type = SupportedModel(self.model_cfg.model_type)
+        if model_type in [
             SupportedModel.OPENPI,
-            SupportedModel.OPENPI_PYTORCH,
+            SupportedModel.PI0_FAST,
+            SupportedModel.EVO1,
             SupportedModel.MLP_POLICY,
             SupportedModel.GR00T,
             SupportedModel.GR00T_N1D6,
@@ -925,14 +504,17 @@ class MultiStepRolloutWorker(Worker):
             SupportedModel.DREAMZERO,
             SupportedModel.CNN_POLICY,
             SupportedModel.CFG_MODEL,
-            SupportedModel.FASTWAM_ADAPTIVE,
+            SupportedModel.MOLMOACT2,
         ]:
             if self.enable_dagger:
                 kwargs = {"mode": "eval"}
+            elif model_type == SupportedModel.PI0_FAST:
+                kwargs = dict(kwargs)
+                kwargs["mode"] = mode
             else:
                 kwargs = {"mode": mode}
 
-        if SupportedModel(self.model_cfg.model_type) in [
+        if model_type in [
             SupportedModel.CNN_POLICY,
             SupportedModel.FLOW_POLICY,
             SupportedModel.MLP_POLICY,
@@ -987,99 +569,8 @@ class MultiStepRolloutWorker(Worker):
         if isinstance(actions, np.ndarray):
             actions = torch.from_numpy(actions)
 
-        if (
-            mode == "train"
-            and SupportedModel(self.model_cfg.model_type)
-            is SupportedModel.FASTWAM_ADAPTIVE
-            and self._fastwam_kv_store is not None
-        ):
-            forward_inputs, references = self._fastwam_kv_store.register_forward_inputs(
-                result["forward_inputs"]
-            )
-            emitted_gate = result.get("emitted_gate")
-            if emitted_gate is None or emitted_gate.kv_metadata is None:
-                raise ValueError(
-                    "Handle-based stored replay requires emitted Gate K/V metadata."
-                )
-            if emitted_gate.kv_metadata.payload_reference_ids is not None:
-                raise RuntimeError("Gate K/V payload references were already assigned.")
-            result["forward_inputs"] = forward_inputs
-            result["emitted_gate"] = replace(
-                emitted_gate,
-                kv_metadata=replace(
-                    emitted_gate.kv_metadata,
-                    payload_reference_ids=references,
-                ),
-            )
-
         result["expert_label_flag"] = bool(expert_label_flag)
         return actions, result
-
-    @Worker.timer("rollout/serve_gate_kv")
-    async def serve_gate_kv_requests(
-        self,
-        request_channel: Channel,
-        response_channel: Channel,
-    ) -> dict[str, float]:
-        """Serve bounded actor requests while keeping K/V rollout-resident."""
-
-        if self._fastwam_kv_store is None:
-            raise RuntimeError("This rollout rank has no stored Gate K/V owner.")
-        from rlinf.models.embodiment.wam_policy.tiered_kv_store import (
-            GateKVStoreRequest,
-            decode_gate_kv_handle,
-            gate_kv_request_key,
-            gate_kv_response_key,
-        )
-
-        request_key = gate_kv_request_key(self._rank)
-        while True:
-            request = await request_channel.get(
-                key=request_key,
-                async_op=True,
-            ).async_wait()
-            if not isinstance(request, GateKVStoreRequest):
-                raise TypeError("Gate K/V service received an untyped request.")
-            if any(
-                decode_gate_kv_handle(handle)[0] != self._rank
-                for handle in request.handles
-            ):
-                raise ValueError("Gate K/V request was routed to the wrong rank.")
-            response_key = gate_kv_response_key(
-                actor_rank=request.actor_rank,
-                request_id=request.request_id,
-            )
-            if request.command == "retain":
-                self._fastwam_kv_store.retain(request.handles)
-                response = {"retained": len(request.handles)}
-            elif request.command == "fetch":
-                response = self._fastwam_kv_store.fetch(request.handles)
-            elif request.command == "release":
-                self._fastwam_kv_store.release(request.handles)
-                continue
-            elif request.command == "stop":
-                if self._fastwam_kv_store.entry_count:
-                    raise RuntimeError(
-                        "Gate K/V service stopped before last-consumption release: "
-                        f"rank={self._rank}, entries="
-                        f"{self._fastwam_kv_store.entry_count}."
-                    )
-                break
-            else:  # pragma: no cover - dataclass validation owns this branch.
-                raise AssertionError(request.command)
-            if request.command == "retain":
-                response_channel.put_via_ray(
-                    response,
-                    key=response_key,
-                    async_op=False,
-                )
-            else:
-                response_channel.put(
-                    response,
-                    key=response_key,
-                    async_op=False,
-                )
-        return self._fastwam_kv_store.metrics()
 
     def _predict_rollout_actions(
         self,
@@ -1088,8 +579,6 @@ class MultiStepRolloutWorker(Worker):
         final_obs: dict[str, Any] | None = None,
         rlt_switch_flags: torch.Tensor | None = None,
         intervene_requested: torch.Tensor | None = None,
-        fastwam_env_ids: torch.Tensor | None = None,
-        fastwam_reset_mask: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, dict[str, Any]]:
         if self.rlt_feature_model is not None:
             return predict_rlt_actions(
@@ -1104,102 +593,33 @@ class MultiStepRolloutWorker(Worker):
                 intervene_requested=intervene_requested,
                 expert_model=self.expert_model,
             )
-        if SupportedModel(self.model_cfg.model_type) is SupportedModel.FASTWAM_ADAPTIVE:
-            env_obs = dict(env_obs)
-            if fastwam_env_ids is not None:
-                env_obs["_fastwam_env_ids"] = fastwam_env_ids
-            if fastwam_reset_mask is not None:
-                env_obs["_fastwam_reset_mask"] = fastwam_reset_mask
         return self.predict(env_obs, mode=mode)
 
-    def _build_rollout_result(
-        self,
-        actions: torch.Tensor,
-        result: dict[str, Any],
-        *,
-        final_obs: dict[str, Any] | None = None,
-    ) -> RolloutResult:
+    def _build_policy_output(
+        self, actions: torch.Tensor, result: dict[str, Any]
+    ) -> PolicyOutput:
+        """Keep inference metadata locally until its environment result arrives."""
         intervene_flags = result.get("intervene_flags")
-        if intervene_flags is None and result.get("expert_label_flag", False):
-            intervene_flags = torch.full(
+        if (
+            intervene_flags is None
+            and self.enable_dagger
+            and result.get("expert_label_flag", False)
+        ):
+            intervene_flags = torch.ones(
                 (actions.shape[0], self.model_cfg.num_action_chunks),
-                True,
                 dtype=torch.bool,
                 device=actions.device,
             )
-        return RolloutResult(
-            actions=actions,
+        return PolicyOutput(
             prev_logprobs=result["prev_logprobs"] if self.collect_prev_infos else None,
             prev_values=result["prev_values"] if self.collect_prev_infos else None,
-            bootstrap_values=self.get_bootstrap_values(final_obs),
             intervene_flags=intervene_flags,
             forward_inputs=result["forward_inputs"],
             versions=torch.full_like(
-                result["prev_logprobs"],
-                float(self.version),
-                dtype=torch.float32,
-            ),
-            route_info=result.get("route_info"),
-            emitted_gate=result.get("emitted_gate"),
-            action_execution_trace=result.get("action_execution_trace"),
-        )
-
-    def get_bootstrap_values(
-        self, final_obs: dict[str, Any] | None
-    ) -> torch.Tensor | None:
-        if final_obs is None:
-            return None
-        if not (
-            hasattr(self.hf_model, "value_head") or hasattr(self.hf_model, "q_head")
-        ):
-            return None
-        if SupportedModel(self.model_cfg.model_type) is SupportedModel.FASTWAM_ADAPTIVE:
-            with torch.no_grad():
-                final_values = self.hf_model.predict_value_batch(final_obs)
-            if final_values.ndim == 1:
-                final_values = final_values[:, None]
-            if final_values.ndim != 2 or final_values.shape[1] != 1:
-                raise ValueError(
-                    "FastWAM bootstrap values must have shape [B] or [B, 1], "
-                    f"got {tuple(final_values.shape)}."
-                )
-            return final_values.cpu().contiguous()
-        with torch.no_grad():
-            actions, result = self._predict_rollout_actions(final_obs)
-            if "prev_values" in result and result["prev_values"] is not None:
-                final_values = result["prev_values"]
-            else:
-                final_values = torch.zeros_like(actions[:, :1], dtype=torch.float32)
-        return final_values[:, :1].cpu().contiguous()
-
-    def _fastwam_value_only_rollout_result(
-        self,
-        env_obs: dict[str, Any],
-        final_obs: dict[str, Any] | None,
-    ) -> RolloutResult:
-        """Evaluate the bootstrap critic without advancing delayed routing state."""
-
-        if (
-            SupportedModel(self.model_cfg.model_type)
-            is not SupportedModel.FASTWAM_ADAPTIVE
-        ):
-            raise RuntimeError(
-                "FastWAM value-only rollout requested for another model."
+                result["prev_logprobs"], float(self.version), dtype=torch.float32
             )
-        with torch.no_grad():
-            values = self.hf_model.predict_value_batch(env_obs)
-        if values.ndim == 1:
-            values = values[:, None]
-        if values.ndim != 2 or values.shape[1] != 1:
-            raise ValueError(
-                "FastWAM rollout values must have shape [B] or [B, 1], "
-                f"got {tuple(values.shape)}."
-            )
-        return RolloutResult(
-            prev_values=(
-                values.cpu().contiguous() if self.collect_prev_infos else None
-            ),
-            bootstrap_values=self.get_bootstrap_values(final_obs),
+            if self.collect_prev_infos
+            else None,
         )
 
     @Worker.timer("sync_model_from_actor")
@@ -1250,111 +670,248 @@ class MultiStepRolloutWorker(Worker):
         gc.collect()
         self.torch_platform.empty_cache()
 
+    @classmethod
+    def _infer_policy_input_batch_size(cls, policy_input: PolicyInput) -> int:
+        """Infer the batch size of a routed policy input."""
+        return cls._infer_env_batch_size(policy_input.obs)
+
+    @staticmethod
+    def _decompress_policy_input(policy_input: PolicyInput) -> PolicyInput:
+        """Restore compressed current and transition observations in place."""
+        policy_input.obs = decompress_obs(policy_input.obs)
+        for env_part in policy_input.env_parts:
+            if env_part is not None and env_part.next_obs is not None:
+                env_part.next_obs = decompress_obs(env_part.next_obs)
+        return policy_input
+
+    @classmethod
+    def _merge_policy_inputs(cls, policy_inputs: list[PolicyInput]) -> PolicyInput:
+        """Decompress routed requests before merging their tensor batches."""
+        return PolicyInput.merge(
+            [cls._decompress_policy_input(item) for item in policy_inputs]
+        )
+
+    async def _receive_policy_input(
+        self,
+        channel: Channel,
+        tag: str,
+        stage_id: int,
+    ) -> tuple[PolicyInput, list[int] | None]:
+        if self.env_decoupled_mode:
+            (
+                policy_input,
+                split_sizes,
+            ) = await self.recv_from_and_record_batch_routes_with_timeout(
+                group_name=self.cfg.env.group_name,
+                channel=channel,
+                tag=tag,
+                batch_size=self.train_batch_size,
+                merge_fn=self._merge_policy_inputs,
+                infer_batch_size_fn=self._infer_policy_input_batch_size,
+                timeout_time=0.02,
+                recv_queue_size=self.rollout_queue_size,
+            )
+            return policy_input, split_sizes
+        policy_input = await self.recv_from(
+            group_name=self.cfg.env.group_name,
+            channel=channel,
+            tag=f"train_{tag}",
+            route_key=stage_id,
+            async_op=True,
+            batch_size=self.train_batch_size,
+            merge_fn=self._merge_policy_inputs,
+            infer_batch_size_fn=self._infer_policy_input_batch_size,
+        ).async_wait()
+        return policy_input, None
+
+    def _publish_env_part(
+        self,
+        env_part: EnvPart,
+        policy_obs: dict[str, Any] | None,
+        next_rlt_obs: dict[str, Any] | None,
+        actor_channel: Channel,
+    ) -> None:
+        next_obs = env_part.next_obs if env_part.next_obs is not None else policy_obs
+        final_prev_values = None
+        # Terminal inference contributes values or transition features only.
+        if env_part.requires_inference:
+            if next_obs is None:
+                raise ValueError(
+                    "Terminal inference requires a post-action observation."
+                )
+            _, result = self._predict_rollout_actions(next_obs)
+            values = result.get("prev_values")
+            if values is not None:
+                final_prev_values = values.cpu().contiguous()
+            if self.enable_rlt:
+                next_rlt_obs = extract_rlt_obs_from_forward_inputs(
+                    result.get("forward_inputs"), transition=True
+                )
+        # Republish environment-owned data here to keep one Actor-channel writer.
+        actor_channel.put(
+            env_part.complete(
+                next_obs=(next_obs if self.collect_raw_transition_obs else None),
+                next_rlt_obs=next_rlt_obs if self.enable_rlt else None,
+                final_prev_values=final_prev_values,
+            ),
+            async_op=True,
+        )
+
+    def _publish_env_parts(
+        self,
+        policy_input: PolicyInput,
+        forward_inputs: dict[str, Any] | None,
+        actor_channel: Channel,
+    ) -> None:
+        """Complete attached environment parts without duplicating request data."""
+        if not policy_input.env_parts:
+            return
+        if len(policy_input.env_parts) != len(policy_input.request_sizes):
+            raise ValueError("Environment parts and request sizes must align.")
+
+        part_count = len(policy_input.env_parts)
+        next_rlt_obs = (
+            extract_rlt_obs_from_forward_inputs(forward_inputs, transition=True)
+            if self.enable_rlt and forward_inputs is not None
+            else None
+        )
+        next_rlt_observations = (
+            split_batch_value(next_rlt_obs, policy_input.request_sizes)
+            if next_rlt_obs is not None
+            else [None] * part_count
+        )
+        needs_policy_obs = any(
+            part is not None
+            and (
+                self.collect_raw_transition_obs
+                or (part.requires_inference and part.next_obs is None)
+            )
+            for part in policy_input.env_parts
+        )
+        policy_observations = (
+            split_batch_value(policy_input.obs, policy_input.request_sizes)
+            if needs_policy_obs
+            else [None] * part_count
+        )
+        for env_part, policy_obs, next_features in zip(
+            policy_input.env_parts,
+            policy_observations,
+            next_rlt_observations,
+        ):
+            if env_part is not None:
+                self._publish_env_part(
+                    env_part,
+                    policy_obs,
+                    next_features,
+                    actor_channel,
+                )
+
+    def _send_actions(
+        self,
+        channel: Channel,
+        actions: torch.Tensor,
+        stage_id: int,
+        split_sizes: list[int] | None,
+    ) -> None:
+        # Send by value on CPU: a device-resident tensor reaches a same-device env
+        # as a CUDA IPC handle aliasing the buffer the next forward pass reuses.
+        actions = actions.detach().cpu().contiguous()
+        if self.env_decoupled_mode:
+            if split_sizes is None:
+                raise ValueError("Decoupled policy output requires recorded routes.")
+            self.send_to_recorded_batch_routes(
+                group_name=self.cfg.env.group_name,
+                channel=channel,
+                data=actions,
+                tag="policy",
+                split_fn=self._split_actions,
+                split_sizes=split_sizes,
+            )
+            return
+        self.send_to(
+            group_name=self.cfg.env.group_name,
+            channel=channel,
+            data=actions,
+            tag="policy",
+            route_key=stage_id,
+            async_op=True,
+            batch_size=self.train_batch_size,
+            split_fn=self._split_actions,
+        )
+
     @Worker.timer("generate_one_epoch")
-    async def generate_one_epoch(self, input_channel: Channel, output_channel: Channel):
+    async def generate_one_epoch(
+        self,
+        input_channel: Channel,
+        output_channel: Channel,
+        actor_channel: Channel,
+    ) -> None:
         self.update_dagger_beta()
         for _ in range(self.n_train_chunk_steps):
             for stage_id in range(self.num_pipeline_stages):
-                env_output = await self.recv_from(
-                    group_name=self.cfg.env.group_name,
-                    channel=input_channel,
-                    tag="train_rollout_results",
-                    route_key=stage_id,
-                    async_op=True,
-                    batch_size=self.train_batch_size,
-                    merge_fn=self._merge_obs_batches,
-                    infer_batch_size_fn=self._infer_env_batch_size,
-                ).async_wait()
-                actions, result = self._predict_rollout_actions(
-                    env_output["obs"],
-                    final_obs=env_output.get("final_obs", None),
-                    rlt_switch_flags=env_output.get("rlt_switch_flags", None),
-                    intervene_requested=env_output.get("intervene_flags", None),
-                    fastwam_env_ids=env_output.get("fastwam_env_ids"),
-                    fastwam_reset_mask=env_output.get("fastwam_reset_mask"),
+                policy_input, split_sizes = await self._receive_policy_input(
+                    input_channel, "policy", stage_id
                 )
-
-                rollout_result = self._build_rollout_result(
-                    actions,
-                    result,
-                    final_obs=env_output.get("final_obs", None),
+                if policy_input.is_last:
+                    raise ValueError("Received a final input in the policy stream.")
+                if not policy_input.requires_inference:
+                    actions = policy_input.external_actions
+                    forward_inputs = None
+                    policy_output = None
+                else:
+                    actions, result = self._predict_rollout_actions(
+                        policy_input.obs,
+                        rlt_switch_flags=policy_input.rlt_switch_flags,
+                        intervene_requested=policy_input.intervene_flags,
+                    )
+                    forward_inputs = result.get("forward_inputs")
+                    policy_output = self._build_policy_output(actions, result)
+                self._send_actions(
+                    output_channel,
+                    actions.contiguous(),
+                    stage_id,
+                    split_sizes,
                 )
-                self.send_to(
-                    group_name=self.cfg.env.group_name,
-                    channel=output_channel,
-                    data=rollout_result,
-                    tag="train_rollout_results",
-                    route_key=stage_id,
-                    async_op=True,
-                    batch_size=self.train_batch_size,
-                    split_fn=self._split_rollout_result,
+                # Omit raw observations when the collector does not consume them.
+                transition_obs = (
+                    policy_input.obs if self.collect_raw_transition_obs else {}
                 )
-        for stage_id in range(self.num_pipeline_stages):
-            env_output = await self.recv_from(
-                group_name=self.cfg.env.group_name,
-                channel=input_channel,
-                tag="train_rollout_results",
-                route_key=stage_id,
-                async_op=True,
-                batch_size=self.train_batch_size,
-                merge_fn=self._merge_obs_batches,
-                infer_batch_size_fn=self._infer_env_batch_size,
-            ).async_wait()
-            if (
-                SupportedModel(self.model_cfg.model_type)
-                is SupportedModel.FASTWAM_ADAPTIVE
-            ):
-                rollout_result = self._fastwam_value_only_rollout_result(
-                    env_output["obs"],
-                    env_output.get("final_obs", None),
-                )
-            else:
-                actions, result = self._predict_rollout_actions(
-                    env_output["obs"],
-                    final_obs=env_output.get("final_obs", None),
-                    rlt_switch_flags=env_output.get("rlt_switch_flags", None),
-                    intervene_requested=env_output.get("intervene_flags", None),
-                    fastwam_env_ids=env_output.get("fastwam_env_ids"),
-                    fastwam_reset_mask=env_output.get("fastwam_reset_mask"),
-                )
-                if self.enable_opd:
-                    # OPD keeps this path separate to retain student action tokens for post-rollout teacher logprobs.
-                    rollout_result = self._build_rollout_result(
-                        actions,
-                        result,
-                        final_obs=env_output.get("final_obs", None),
+                if not policy_input.requires_inference:
+                    trajectory_part = PolicyPart(
+                        sources=policy_input.sources,
+                        obs=transition_obs,
+                        external_actions=actions,
                     )
                 else:
-                    rollout_result = RolloutResult(
-                        actions=actions,
-                        prev_values=(
-                            result["prev_values"] if self.collect_prev_infos else None
-                        ),
-                        bootstrap_values=self.get_bootstrap_values(
-                            env_output.get("final_obs", None)
-                        ),
-                        forward_inputs=(
-                            result["forward_inputs"]
-                            if self.rlt_feature_model is not None
-                            else {}
-                        ),
+                    trajectory_part = PolicyPart(
+                        sources=policy_input.sources,
+                        obs=transition_obs,
+                        output=policy_output,
                     )
-            self.send_to(
-                group_name=self.cfg.env.group_name,
-                channel=output_channel,
-                data=rollout_result,
-                tag="train_rollout_results",
-                route_key=stage_id,
-                async_op=True,
-                batch_size=self.train_batch_size,
-                split_fn=self._split_rollout_result,
+                # Publish model-owned data immediately; its environment half
+                # arrives later through an EnvPart with the same key.
+                actor_channel.put(trajectory_part, async_op=True)
+                # Attached parts close previously executed chunks.
+                self._publish_env_parts(policy_input, forward_inputs, actor_channel)
+
+        if self.env_decoupled_mode:
+            return
+
+        for stage_id in range(self.num_pipeline_stages):
+            policy_input, _ = await self._receive_policy_input(
+                input_channel, "policy_final", stage_id
             )
+            if not policy_input.is_last:
+                raise ValueError("Expected a final policy input at epoch end.")
+            # The final message closes the last chunk without requesting actions.
+            self._publish_env_parts(policy_input, None, actor_channel)
 
     @Worker.timer("rollout/generate")
     async def generate(
         self,
         input_channel: Channel,
         output_channel: Channel,
+        actor_channel: Channel,
     ):
         if self.enable_offload:
             self.reload_model()
@@ -1364,8 +921,11 @@ class MultiStepRolloutWorker(Worker):
             desc="Generating Rollout Epochs",
             disable=(self._rank != 0),
         ):
-            await self.generate_one_epoch(input_channel, output_channel)
-
+            await self.generate_one_epoch(
+                input_channel,
+                output_channel,
+                actor_channel,
+            )
         if self.enable_offload:
             self.offload_model()
 
@@ -1388,35 +948,23 @@ class MultiStepRolloutWorker(Worker):
                     timeout_time=0.02,
                     recv_queue_size=self.rollout_queue_size,
                 )
-                actions, result = self._predict_rollout_actions(
+                actions, _ = self._predict_rollout_actions(
                     env_output["obs"],
                     mode="eval",
                     final_obs=env_output.get("final_obs", None),
                     rlt_switch_flags=env_output.get("rlt_switch_flags", None),
                     intervene_requested=env_output.get("intervene_flags", None),
-                    fastwam_env_ids=env_output.get("fastwam_env_ids"),
-                    fastwam_reset_mask=env_output.get("fastwam_reset_mask"),
                 )
                 if isinstance(actions, torch.Tensor):
                     actions = actions.detach().cpu().contiguous()
-                split_fn = None
-                payload = actions
-                if (
-                    SupportedModel(self.model_cfg.model_type)
-                    is SupportedModel.FASTWAM_ADAPTIVE
-                ):
-                    payload = _build_evaluation_rollout_result(actions, result)
-                    split_fn = self._split_rollout_result
                 self.send_to_recorded_batch_routes(
                     group_name=self.cfg.env.group_name,
                     channel=output_channel,
-                    data=payload,
+                    data=actions,
                     tag="rollout_results",
-                    split_fn=split_fn,
                     split_sizes=split_sizes,
                 )
         else:
-            evaluation_complete = False
             for _ in tqdm(
                 range(self.eval_rollout_epoch),
                 desc="Evaluating Rollout Epochs",
@@ -1431,60 +979,27 @@ class MultiStepRolloutWorker(Worker):
                             route_key=stage_id,
                             async_op=True,
                             batch_size=self.eval_batch_size,
-                            merge_fn=self._merge_evaluation_env_inputs,
-                            infer_batch_size_fn=(
-                                self._infer_evaluation_env_input_batch_size
-                            ),
+                            merge_fn=self._merge_obs_batches,
+                            infer_batch_size_fn=self._infer_env_batch_size,
                         ).async_wait()
-                        if isinstance(env_output, EvaluationRolloutControl):
-                            if (
-                                SupportedModel(self.model_cfg.model_type)
-                                is not SupportedModel.FASTWAM_ADAPTIVE
-                            ):
-                                raise RuntimeError(
-                                    "Only FastWAM evaluation may consume a ledger "
-                                    "stop control."
-                                )
-                            evaluation_complete = True
-                            break
-                        if not isinstance(env_output, dict):
-                            raise TypeError(
-                                "Evaluation rollout input must be observations or "
-                                "a typed stop control."
-                            )
-                        actions, result = self._predict_rollout_actions(
+                        actions, _ = self._predict_rollout_actions(
                             env_output["obs"],
                             mode="eval",
                             final_obs=env_output.get("final_obs", None),
                             rlt_switch_flags=env_output.get("rlt_switch_flags", None),
                             intervene_requested=env_output.get("intervene_flags", None),
-                            fastwam_env_ids=env_output.get("fastwam_env_ids"),
-                            fastwam_reset_mask=env_output.get("fastwam_reset_mask"),
                         )
                         if isinstance(actions, torch.Tensor):
                             actions = actions.detach().cpu().contiguous()
-                        split_fn = None
-                        payload = actions
-                        if (
-                            SupportedModel(self.model_cfg.model_type)
-                            is SupportedModel.FASTWAM_ADAPTIVE
-                        ):
-                            payload = _build_evaluation_rollout_result(actions, result)
-                            split_fn = self._split_rollout_result
                         self.send_to(
                             group_name=self.cfg.env.group_name,
                             channel=output_channel,
-                            data=payload,
+                            data=actions,
                             tag="eval_rollout_results",
                             route_key=stage_id,
                             async_op=True,
                             batch_size=self.eval_batch_size,
-                            split_fn=split_fn,
                         )
-                    if evaluation_complete:
-                        break
-                if evaluation_complete:
-                    break
 
             if self.enable_offload:
                 self.offload_model()
@@ -1512,41 +1027,10 @@ class MultiStepRolloutWorker(Worker):
             )
 
     @staticmethod
-    def _infer_evaluation_env_input_batch_size(value: Any) -> int:
-        if isinstance(value, EvaluationRolloutControl):
-            return value.logical_batch_size
-        if not isinstance(value, dict):
-            raise TypeError(
-                "Evaluation input must be observations or typed stop control."
-            )
-        return MultiStepRolloutWorker._infer_env_batch_size(value)
-
-    def _merge_evaluation_env_inputs(self, items: list[Any]) -> Any:
-        if not items:
-            raise ValueError("At least one evaluation input shard is required.")
-        controls = [isinstance(item, EvaluationRolloutControl) for item in items]
-        if any(controls) and not all(controls):
-            raise TypeError(
-                "Cannot merge mixed observation and evaluation-control shards."
-            )
-        if all(controls):
-            return EvaluationRolloutControl.merge(items)
-        if not all(isinstance(item, dict) for item in items):
-            raise TypeError(
-                "Evaluation input shards must be observations or typed controls."
-            )
-        return self._merge_obs_batches(items)
-
-    @staticmethod
     def _infer_env_batch_size(obs_batch: dict[str, Any]) -> int:
-        obs = obs_batch["obs"] if "obs" in obs_batch else obs_batch
-        for key in ("states", "main_images", "task_descriptions"):
-            value = obs.get(key)
-            if isinstance(value, torch.Tensor):
-                return value.shape[0]
-            if isinstance(value, list):
-                return len(value)
-        raise ValueError("Cannot infer batch size from env obs.")
+        # Delegates to the shared helper, which also understands compressed
+        # image markers (inference runs before decompression on the recv path).
+        return infer_obs_batch_size(obs_batch)
 
     def _merge_optional_flag_tensors(
         self,
@@ -1569,6 +1053,9 @@ class MultiStepRolloutWorker(Worker):
     def _merge_obs_batches(self, obs_batches: list[dict[str, Any]]) -> dict[str, Any]:
         if not obs_batches:
             return {}
+        # Reconstruct any image tensors compressed by the env workers. This is a
+        # no-op when `env.obs_compression` is disabled (no compression markers).
+        obs_batches = [decompress_obs(obs_batch) for obs_batch in obs_batches]
         obs_dicts = [
             obs_batch["obs"] if "obs" in obs_batch else obs_batch
             for obs_batch in obs_batches
@@ -1579,12 +1066,6 @@ class MultiStepRolloutWorker(Worker):
         ]
         intervene_flags_list = [
             obs_batch.get("intervene_flags", None) for obs_batch in obs_batches
-        ]
-        fastwam_env_ids_list = [
-            obs_batch.get("fastwam_env_ids", None) for obs_batch in obs_batches
-        ]
-        fastwam_reset_mask_list = [
-            obs_batch.get("fastwam_reset_mask", None) for obs_batch in obs_batches
         ]
 
         def _merge_obs_dicts(dicts: list[dict[str, Any]]) -> dict[str, Any]:
@@ -1622,86 +1103,14 @@ class MultiStepRolloutWorker(Worker):
             "intervene_flags": self._merge_optional_flag_tensors(
                 obs_dicts, intervene_flags_list
             ),
-            "fastwam_env_ids": self._merge_optional_flag_tensors(
-                obs_dicts, fastwam_env_ids_list
-            ),
-            "fastwam_reset_mask": self._merge_optional_flag_tensors(
-                obs_dicts, fastwam_reset_mask_list
-            ),
         }
 
-    def _split_rollout_result(
-        self, rollout_result: RolloutResult, sizes: list[int]
-    ) -> list[RolloutResult]:
-        def _split_optional_tensor(
-            tensor: torch.Tensor | None,
-        ) -> tuple[torch.Tensor | None, ...]:
-            if tensor is None:
-                return tuple(None for _ in sizes)
-            return tuple(torch.split(tensor, sizes, dim=0))
-
-        split_actions = _split_optional_tensor(rollout_result.actions)
-        split_prev_logprobs = _split_optional_tensor(rollout_result.prev_logprobs)
-        split_prev_values = _split_optional_tensor(rollout_result.prev_values)
-        split_bootstrap_values = _split_optional_tensor(rollout_result.bootstrap_values)
-        split_intervene_flags = _split_optional_tensor(rollout_result.intervene_flags)
-        split_versions = _split_optional_tensor(rollout_result.versions)
-        split_gate_latency = _split_optional_tensor(rollout_result.gate_latency_seconds)
-        split_gate_h2d = _split_optional_tensor(rollout_result.gate_h2d_seconds)
-        split_action_execution_trace = (
-            (None,) * len(sizes)
-            if rollout_result.action_execution_trace is None
-            else rollout_result.action_execution_trace.split(sizes, dim=0)
-        )
-        split_route_info = (
-            (None,) * len(sizes)
-            if rollout_result.route_info is None
-            else rollout_result.route_info.split(sizes, dim=0)
-        )
-        split_emitted_gate = (
-            (None,) * len(sizes)
-            if rollout_result.emitted_gate is None
-            else rollout_result.emitted_gate.split(sizes, dim=0)
-        )
-        split_evaluation_selection = (
-            (None,) * len(sizes)
-            if rollout_result.evaluation_selection is None
-            else rollout_result.evaluation_selection.split(sizes, dim=0)
-        )
-        split_forward_inputs = (
-            [{} for _ in sizes]
-            if not rollout_result.forward_inputs
-            else [
-                {
-                    key: torch.split(value, sizes, dim=0)[idx]
-                    for key, value in rollout_result.forward_inputs.items()
-                    if value is not None
-                }
-                for idx in range(len(sizes))
-            ]
-        )
-
-        return [
-            RolloutResult(
-                actions=split_actions[idx],
-                prev_logprobs=split_prev_logprobs[idx],
-                prev_values=split_prev_values[idx],
-                bootstrap_values=split_bootstrap_values[idx],
-                intervene_flags=split_intervene_flags[idx],
-                forward_inputs=split_forward_inputs[idx],
-                versions=split_versions[idx],
-                route_info=split_route_info[idx],
-                emitted_gate=split_emitted_gate[idx],
-                evaluation_selection=split_evaluation_selection[idx],
-                gate_latency_seconds=split_gate_latency[idx],
-                gate_h2d_seconds=split_gate_h2d[idx],
-                action_execution_trace=(split_action_execution_trace[idx]),
-            )
-            for idx in range(len(sizes))
-        ]
+    @staticmethod
+    def _split_actions(actions: torch.Tensor, sizes: list[int]) -> list[torch.Tensor]:
+        """Split policy actions for the environment workers that requested them."""
+        return [shard.contiguous() for shard in torch.split(actions, sizes, dim=0)]
 
     def set_global_step(self, global_step: int):
-        if self._fastwam_kv_store is not None:
-            self._fastwam_kv_store.begin_generation(global_step)
+        self.global_step = global_step
         if hasattr(self.hf_model, "set_global_step"):
             self.hf_model.set_global_step(global_step)

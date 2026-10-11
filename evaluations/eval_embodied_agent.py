@@ -18,9 +18,10 @@ import hydra
 import torch.multiprocessing as mp
 from omegaconf.omegaconf import OmegaConf
 
-from rlinf.config import validate_cfg
+from rlinf.config import SupportedModel, validate_cfg
 from rlinf.runners.embodied_eval_runner import EmbodiedEvalRunner
 from rlinf.scheduler import Cluster
+from rlinf.utils.logging import get_logger
 from rlinf.utils.placement import HybridComponentPlacement
 from rlinf.workers.env.env_worker import EnvWorker
 from rlinf.workers.rollout.hf.huggingface_worker import MultiStepRolloutWorker
@@ -41,25 +42,105 @@ def main(cfg) -> None:
     cluster = Cluster(cluster_cfg=cfg.cluster)
     component_placement = HybridComponentPlacement(cfg, cluster)
 
-    # Create rollout worker group
+    # Create rollout worker group. Select the worker by ``rollout_backend``:
+    # ``apxinf`` is an eval-only in-process backend. vLLM is intentionally not
+    # wired into embodied evaluation.
     rollout_placement = component_placement.get_strategy("rollout")
-    rollout_worker = MultiStepRolloutWorker
-    if cfg.rollout.model.get("uncond_rl") is not None:
-        from rlinf.models.embodiment.wam_policy.uncond_rl_lifecycle import (
-            UncondRLRolloutWorker,
+    rollout_backend = cfg.rollout.get("rollout_backend", "huggingface")
+    # Default env worker; RTC on the huggingface path overrides it below.
+    env_worker_cls = EnvWorker
+    runner_cls = EmbodiedEvalRunner
+    if cfg.rollout.model.model_type == SupportedModel.FASTWAM_ADAPTIVE.value:
+        from rlinf.models.embodiment.wam_policy.execution.env import (
+            EnvWorker as FastWAMEnvWorker,
+        )
+        from rlinf.models.embodiment.wam_policy.execution.eval_runner import (
+            EmbodiedEvalRunner as FastWAMEvalRunner,
+        )
+        from rlinf.models.embodiment.wam_policy.execution.rollout import (
+            MultiStepRolloutWorker as FastWAMRolloutWorker,
         )
 
-        rollout_worker = UncondRLRolloutWorker
-    rollout_group = rollout_worker.create_group(cfg).launch(
-        cluster, name=cfg.rollout.group_name, placement_strategy=rollout_placement
-    )
+        if rollout_backend != "huggingface":
+            raise ValueError(
+                "FastWAM adaptive evaluation requires the huggingface backend."
+            )
+        runner_cls = FastWAMEvalRunner
+        env_worker_cls = FastWAMEnvWorker
+        rollout_worker_cls = FastWAMRolloutWorker
+        if cfg.rollout.model.get("uncond_rl") is not None:
+            from rlinf.models.embodiment.wam_policy.uncond_rl_lifecycle import (
+                UncondRLRolloutWorker,
+            )
+
+            rollout_worker_cls = UncondRLRolloutWorker
+        rollout_group = rollout_worker_cls.create_group(cfg).launch(
+            cluster, name=cfg.rollout.group_name, placement_strategy=rollout_placement
+        )
+    elif rollout_backend == "apxinf":
+        from rlinf.workers.rollout.apxinf import ApxInfRolloutWorker
+
+        rollout_group = ApxInfRolloutWorker.create_group(cfg).launch(
+            cluster,
+            name=cfg.rollout.group_name,
+            placement_strategy=rollout_placement,
+        )
+    elif rollout_backend == "sglang":
+        from rlinf.workers.rollout.utils import get_rollout_backend_worker
+
+        rollout_group = (
+            get_rollout_backend_worker(cfg)
+            .create_group(cfg, component_placement)
+            .launch(
+                cluster,
+                name=cfg.rollout.group_name,
+                placement_strategy=rollout_placement,
+            )
+        )
+    elif rollout_backend == "huggingface":
+        if cfg.runner.get("rtc", {}).get("enabled", False):
+            from rlinf.workers.env.rtc_env_worker import RTCEnvWorker
+            from rlinf.workers.rollout.hf.rtc_huggingface_worker import (
+                RTCMultiStepRolloutWorker,
+            )
+
+            env_worker_cls = RTCEnvWorker
+            rollout_worker_cls = RTCMultiStepRolloutWorker
+        else:
+            rollout_worker_cls = MultiStepRolloutWorker
+
+        # Create rollout worker group
+        rollout_placement = component_placement.get_strategy("rollout")
+        rollout_group = rollout_worker_cls.create_group(cfg).launch(
+            cluster, name=cfg.rollout.group_name, placement_strategy=rollout_placement
+        )
+    else:
+        raise ValueError(f"Unsupported rollout backend: {rollout_backend}")
     # Create env worker group
     env_placement = component_placement.get_strategy("env")
-    env_group = EnvWorker.create_group(cfg).launch(
+    env_group = env_worker_cls.create_group(cfg).launch(
         cluster, name=cfg.env.group_name, placement_strategy=env_placement
     )
 
-    runner = EmbodiedEvalRunner(
+    # launch the sglang server
+    if rollout_backend == "sglang":
+        from rlinf.workers.rollout.sglang_server import (
+            launch_sglang_router_and_server,
+        )
+
+        server_group, _ = launch_sglang_router_and_server(
+            cfg,
+            cluster,
+            rollout_hardware_ranks=component_placement.get_hardware_ranks("rollout"),
+            router_server_args=cfg.rollout.sglang,
+        )
+        _server_urls = list(server_group.get_server_url().wait())
+        get_logger().info(
+            f"[eval] launched {len(_server_urls)} sglang server(s): {_server_urls}"
+        )
+        rollout_group.set_sglang_server_urls(_server_urls).wait()
+
+    runner = runner_cls(
         cfg=cfg,
         rollout=rollout_group,
         env=env_group,

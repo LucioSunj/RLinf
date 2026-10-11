@@ -23,7 +23,7 @@ from types import SimpleNamespace
 import pytest
 from omegaconf import OmegaConf
 
-from rlinf.runners.embodied_runner import EmbodiedRunner
+from rlinf.models.embodiment.wam_policy.execution.runner import EmbodiedRunner
 from rlinf.runners.fastwam_fair_cost import FastWAMFairCostController
 from rlinf.runners.fastwam_training_guard import FastWAMTrainingGuard
 

@@ -11,7 +11,7 @@ import torch
 from fastwam.models.wan22.adaptive_sampler import sample_action_flow_sde
 from test_fastwam_uncond_rl import _obs, _policy
 
-from rlinf.envs.libero.action_protocol import (
+from rlinf.envs.sim.libero.action_protocol import (
     select_executed_action_prefix,
     select_executed_flow_statistics,
 )

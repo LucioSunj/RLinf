@@ -21,9 +21,11 @@ import pytest
 import torch
 from omegaconf import OmegaConf
 
-from rlinf.envs.libero.action_contract import LiberoActionContract
-from rlinf.envs.libero.libero_env import LiberoEnv
-from rlinf.workers.env.env_worker import summarize_fastwam_training_episode_outcomes
+from rlinf.envs.sim.libero.action_contract import LiberoActionContract
+from rlinf.envs.sim.libero.libero_env import LiberoEnv
+from rlinf.models.embodiment.wam_policy.execution.env import (
+    summarize_fastwam_training_episode_outcomes,
+)
 
 
 class _SubsetVectorEnv:
@@ -61,6 +63,8 @@ def _libero_env() -> LiberoEnv:
             "reward_coef": 1.0,
         }
     )
+    env.is_eval = False
+    env.skip_intermediate_renders = False
     env.auto_reset = False
     env.ignore_terminations = False
     env.use_rel_reward = False

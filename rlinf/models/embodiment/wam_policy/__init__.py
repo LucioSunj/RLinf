@@ -599,7 +599,9 @@ def get_model(cfg, torch_dtype):
         activation = str(cfg.critic.get("activation", "relu"))
         bias_last = bool(cfg.critic.get("bias_last", True))
         if critic_kind is CriticKind.PI0_5_VALUE_AFTER_VLM:
-            from rlinf.models.embodiment.openpi import get_model as get_openpi_model
+            from rlinf.models.embodiment.wam_policy.pi05_backbone import (
+                get_model as get_openpi_model,
+            )
 
             critic_backbone = get_openpi_model(cfg.critic.backbone, torch_dtype)
             critic = Pi05ValueAfterVLMCritic(

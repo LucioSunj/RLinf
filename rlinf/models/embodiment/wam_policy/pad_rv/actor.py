@@ -21,6 +21,12 @@ from torch.optim import Optimizer
 
 from rlinf.algorithms.advantages import summarize_fastwam_counterfactual_costs
 from rlinf.algorithms.losses import compute_ppo_critic_loss
+from rlinf.models.embodiment.wam_policy.execution.actor import (
+    EmbodiedFSDPActor,
+    _raise_fastwam_collective_checkpoint_error,
+    _restore_fastwam_fsdp_lazy_root_state,
+    _snapshot_fastwam_fsdp_lazy_root_state,
+)
 from rlinf.models.embodiment.wam_policy.pad_rv.config import PadFrozenConfig
 from rlinf.scheduler import Worker
 from rlinf.utils.checkpoint_state import (
@@ -30,12 +36,6 @@ from rlinf.utils.checkpoint_state import (
 )
 from rlinf.utils.utils import get_rng_state, seed_everything, set_rng_state
 from rlinf.workers.actor.fastwam_selective_sync import prepare_fastwam_sync_tensors
-from rlinf.workers.actor.fsdp_actor_worker import (
-    EmbodiedFSDPActor,
-    _raise_fastwam_collective_checkpoint_error,
-    _restore_fastwam_fsdp_lazy_root_state,
-    _snapshot_fastwam_fsdp_lazy_root_state,
-)
 
 from .audit import summarize_pad_frozen_rollout_state
 from .checkpoint import (

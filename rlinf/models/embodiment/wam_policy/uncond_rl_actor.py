@@ -11,8 +11,8 @@ from typing import Any
 
 import torch
 
+from rlinf.models.embodiment.wam_policy.execution.actor import EmbodiedFSDPActor
 from rlinf.scheduler import Channel
-from rlinf.workers.actor.fsdp_actor_worker import EmbodiedFSDPActor
 
 from .pad_rv.memory import release_pad_host_memory
 from .uncond_rl_helpers import (

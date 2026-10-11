@@ -20,7 +20,7 @@ import pytest
 import torch
 from omegaconf import OmegaConf
 
-from rlinf.envs.libero.action_protocol import (
+from rlinf.envs.sim.libero.action_protocol import (
     LiberoActionProtocol,
     select_executed_action_prefix,
     select_executed_flow_statistics,

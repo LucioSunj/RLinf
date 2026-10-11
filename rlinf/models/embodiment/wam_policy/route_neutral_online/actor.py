@@ -24,6 +24,10 @@ from rlinf.algorithms.fastwam_dual_ppo import (
 )
 from rlinf.algorithms.losses import compute_ppo_critic_loss
 from rlinf.models.embodiment.wam_policy.contracts import WAMRoute
+from rlinf.models.embodiment.wam_policy.execution.actor import (
+    EmbodiedFSDPActor,
+    fastwam_effective_gate_kv_mask,
+)
 from rlinf.models.embodiment.wam_policy.online_idm_bc.actor import (
     OnlineIDMBCFSDPActor,
 )
@@ -39,10 +43,6 @@ from rlinf.models.embodiment.wam_policy.pad_rv.route_neutral_contracts import (
     PadCriticWarmupConfig,
 )
 from rlinf.utils.nested_dict_process import map_nested_tensors
-from rlinf.workers.actor.fsdp_actor_worker import (
-    EmbodiedFSDPActor,
-    fastwam_effective_gate_kv_mask,
-)
 
 from .policy import RouteNeutralOnlineIDMBCFastWAMPolicy
 from .replay import REPLAY_ROW, RouteNeutralReplayStore

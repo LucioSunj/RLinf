@@ -24,8 +24,8 @@ import pytest
 import torch
 from omegaconf import OmegaConf
 
-from rlinf.workers.rollout.hf import huggingface_worker as worker_module
-from rlinf.workers.rollout.hf.huggingface_worker import MultiStepRolloutWorker
+from rlinf.models.embodiment.wam_policy.execution import rollout as worker_module
+from rlinf.models.embodiment.wam_policy.execution.rollout import MultiStepRolloutWorker
 
 
 class _Policy:

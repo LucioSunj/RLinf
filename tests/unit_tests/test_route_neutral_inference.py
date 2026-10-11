@@ -489,7 +489,7 @@ def test_dual_latent_replay_matches_pixels_without_vae_reencoding(
 
 
 def test_training_policy_replays_packed_mixed_rows_with_masked_padding(monkeypatch):
-    from rlinf.data.embodied_io_struct import ChunkStepResult
+    from rlinf.models.embodiment.wam_policy.execution.io_struct import ChunkStepResult
     from rlinf.models.embodiment.wam_policy.route_neutral_online.replay import (
         RouteNeutralReplayStore,
         RouteNeutralRolloutResult,
@@ -667,7 +667,7 @@ def test_finished_rollout_rows_skip_models_and_preserve_next_episode_seeds(
     monkeypatch, microbatch, dtype, partially_active
 ):
     from rlinf.algorithms.advantages import compute_gae_advantages_and_returns
-    from rlinf.data.embodied_io_struct import ChunkStepResult
+    from rlinf.models.embodiment.wam_policy.execution.io_struct import ChunkStepResult
     from rlinf.models.embodiment.wam_policy.route_neutral_online.replay import (
         RouteNeutralReplayStore,
         RouteNeutralRolloutResult,

@@ -16,9 +16,13 @@ from typing import Any
 
 import torch
 
-from rlinf.data.embodied_io_struct import RolloutResult
 from rlinf.models.embodiment.wam_policy import (
     resolve_fastwam_adaptive_eval_checkpoint,
+)
+from rlinf.models.embodiment.wam_policy.execution.io_struct import RolloutResult
+from rlinf.models.embodiment.wam_policy.execution.rollout import (
+    MultiStepRolloutWorker,
+    _fastwam_checkpoint_cpu_clone,
 )
 from rlinf.utils.checkpoint_state import (
     FASTWAM_RESUME_AUDIT_SCHEMA,
@@ -26,10 +30,6 @@ from rlinf.utils.checkpoint_state import (
     checkpoint_state_sha256,
 )
 from rlinf.utils.utils import get_rng_state, set_rng_state
-from rlinf.workers.rollout.hf.huggingface_worker import (
-    MultiStepRolloutWorker,
-    _fastwam_checkpoint_cpu_clone,
-)
 
 from .checkpoint import (
     PAD_FROZEN_CHECKPOINT_SCHEMA,

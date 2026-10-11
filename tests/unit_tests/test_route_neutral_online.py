@@ -23,12 +23,13 @@ from hydra import compose, initialize_config_dir
 
 from rlinf.algorithms.fastwam_dual_ppo import compute_gate_ppo_loss
 from rlinf.algorithms.losses import compute_ppo_critic_loss
-from rlinf.envs.libero.action_protocol import LiberoActionProtocol
+from rlinf.envs.sim.libero.action_protocol import LiberoActionProtocol
 from rlinf.models.embodiment.wam_policy.contracts import (
     ChunkRouteRecord,
     GateDecisionRecord,
     WAMRoute,
 )
+from rlinf.models.embodiment.wam_policy.execution.actor import EmbodiedFSDPActor
 from rlinf.models.embodiment.wam_policy.kv_replay import GateKVReplayBackend
 from rlinf.models.embodiment.wam_policy.online_idm_bc.actor import (
     OnlineIDMBCFSDPActor,
@@ -76,7 +77,6 @@ from rlinf.models.embodiment.wam_policy.route_neutral_online.runtime import (
     RouteNeutralOnlineIDMTeacherLiberoRuntime,
     RouteNeutralPreparedStep,
 )
-from rlinf.workers.actor.fsdp_actor_worker import EmbodiedFSDPActor
 
 
 def _compose(
@@ -456,10 +456,12 @@ def test_config_rejects_rollout_size_not_divisible_by_global_batch(
 def test_shared_gpu_config_and_rank_local_offload(
     monkeypatch, micro_batch_size, rollout_placement
 ) -> None:
+    from rlinf.models.embodiment.wam_policy.execution.rollout import (
+        MultiStepRolloutWorker,
+    )
     from rlinf.models.embodiment.wam_policy.route_neutral_online.lifecycle import (
         RouteNeutralOnlineRolloutWorker,
     )
-    from rlinf.workers.rollout.hf.huggingface_worker import MultiStepRolloutWorker
 
     cfg = _compose(monkeypatch)
     cfg.cluster.component_placement.env = rollout_placement
@@ -797,10 +799,10 @@ def test_recompute_backend_enum_preserves_runtime_boundary() -> None:
 def test_rollout_active_mask_is_sticky_and_resets_at_epoch_bootstrap(
     monkeypatch, auto_reset, ignore_terminations
 ):
+    from rlinf.models.embodiment.wam_policy.execution.env import EnvWorker
     from rlinf.models.embodiment.wam_policy.route_neutral_online.lifecycle import (
         RouteNeutralOnlineEnvWorker,
     )
-    from rlinf.workers.env.env_worker import EnvWorker
 
     monkeypatch.setattr(
         EnvWorker,

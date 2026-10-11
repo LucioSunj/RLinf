@@ -12,26 +12,23 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import json
 import logging
 import os
 import queue
 import threading
 import time
 from collections import defaultdict
-from pathlib import Path
 from typing import TYPE_CHECKING, Union
 
 from omegaconf.dictconfig import DictConfig
 
-from rlinf.config_contracts import validate_fastwam_resume_steps
-from rlinf.runners.fastwam_fair_cost import FastWAMFairCostController
-from rlinf.runners.fastwam_idm_cost_control import (
-    FastWAMIDMCostControlRuntime,
+from rlinf.data.schema.embodied_trajectory import (
+    select_trajectory_collector,
+    select_trajectory_dispatcher,
 )
-from rlinf.runners.fastwam_training_guard import FastWAMTrainingGuard
 from rlinf.scheduler import Channel
 from rlinf.scheduler import WorkerGroupFuncResult as Handle
+from rlinf.utils.checkpoint import parse_global_step_from_checkpoint_path
 from rlinf.utils.distributed import ScopedTimer
 from rlinf.utils.logging import get_logger
 from rlinf.utils.metric_logger import MetricLogger
@@ -45,7 +42,7 @@ if TYPE_CHECKING:
     from rlinf.workers.actor.async_fsdp_sac_policy_worker import (
         AsyncEmbodiedSACFSDPPolicy,
     )
-    from rlinf.workers.actor.fsdp_actor_worker import EmbodiedFSDPActor
+    from rlinf.workers.actor.embodied_fsdp_actor_worker import EmbodiedFSDPActor
     from rlinf.workers.actor.fsdp_nft_policy_worker import EmbodiedNFTFSDPPolicy
     from rlinf.workers.actor.fsdp_sac_policy_worker import EmbodiedSACFSDPPolicy
     from rlinf.workers.env.async_env_worker import AsyncEnvWorker
@@ -82,18 +79,6 @@ class EmbodiedRunner:
         self.overlap_env_bootstrap = bool(
             self.cfg.runner.get("overlap_env_bootstrap", False)
         )
-        self.fastwam_training_guard = FastWAMTrainingGuard(
-            self.cfg.runner.get("fastwam_training_guard", None)
-        )
-        self.fastwam_idm_cost_control = FastWAMIDMCostControlRuntime.from_config(
-            self.cfg
-        )
-        self._fastwam_fair_cost_compat = (
-            self.fastwam_idm_cost_control.legacy_fair_controller
-            or FastWAMFairCostController.from_branch_cost_config(
-                self.cfg.get("algorithm", {}).get("fixed_branch_cost", {})
-            )
-        )
 
         # Step-gated profiling: ``cluster.profiling.steps`` lists the global step
         profiling_raw = self.cfg.cluster.get("profiling", None)
@@ -113,25 +98,16 @@ class EmbodiedRunner:
         # Data channels
         self.env_channel = Channel.create("Env")
         self.rollout_channel = Channel.create("Rollout")
-        self.actor_channel = Channel.create("Actor")
-        self.gate_kv_request_channel = None
-        self.gate_kv_response_channel = None
-        if (
-            str(self.cfg.actor.model.model_type) == "fastwam_adaptive"
-            and str(self.cfg.actor.model.kv_replay.backend) == "stored"
-        ):
-            rollout_world_size = int(self.cfg.rollout.get("world_size", 1))
-            prefetch_depth = int(self.cfg.actor.model.kv_replay.prefetch_depth)
-            channel_size = max(8, rollout_world_size * (prefetch_depth + 3))
-            self.gate_kv_request_channel = Channel.create(
-                "GateKVRequest",
-                maxsize=channel_size,
-            )
-            self.gate_kv_response_channel = Channel.create(
-                "GateKVResponse",
-                maxsize=channel_size,
-            )
-
+        # Trajectory assembly runs on the channel worker, so neither the env
+        # nor the rollout worker has to hold partial trajectory state.
+        self.actor_channel = Channel.create(
+            "Actor",
+            collector=select_trajectory_collector(self.cfg),
+            dispatcher=select_trajectory_dispatcher(self.cfg),
+            cfg=self.cfg,
+            producers=[self.rollout],
+            consumers=[self.actor],
+        )
         if self.reward is not None:
             self.reward_channel = Channel.create("Reward")
         else:
@@ -156,44 +132,23 @@ class EmbodiedRunner:
         )
 
         # Async logging setup
-        self.stop_logging = False
         self.log_queue = queue.Queue()
         self.log_thread = threading.Thread(target=self._log_worker, daemon=True)
         self.log_thread.start()
 
-    @property
-    def fastwam_fair_cost_controller(self) -> FastWAMFairCostController:
-        """Compatibility view retained for legacy tests and checkpoint tooling."""
-
-        legacy = self.fastwam_idm_cost_control.legacy_fair_controller
-        return legacy or self._fastwam_fair_cost_compat
-
-    @fastwam_fair_cost_controller.setter
-    def fastwam_fair_cost_controller(
-        self,
-        controller: FastWAMFairCostController,
-    ) -> None:
-        self._fastwam_fair_cost_compat = controller
-        self.fastwam_idm_cost_control = (
-            FastWAMIDMCostControlRuntime.from_legacy_controller(
-                self.cfg,
-                controller,
-            )
-        )
-
     def _log_worker(self):
         """Background thread for processing log messages."""
-        while not self.stop_logging:
+        while True:
+            task = self.log_queue.get()
             try:
-                # Wait for log message with timeout
-                log_func, args = self.log_queue.get(timeout=0.1)
+                if task is None:
+                    return
+                log_func, args = task
                 log_func(*args)
+            except Exception:
+                self.logger.exception("Logging callback failed.")
+            finally:
                 self.log_queue.task_done()
-            except queue.Empty:
-                continue
-            except Exception as e:
-                print(f"Logging error: {e}")
-                continue
 
     def print_metrics_table_async(
         self,
@@ -218,20 +173,15 @@ class EmbodiedRunner:
             )
         )
 
-    def _init_rollout_workers(self) -> Handle | None:
-        """Start rollout initialization; specialized runners may wait serially."""
-        return self.rollout.init_worker()
-
     def init_workers(self):
         # create worker in order to decrease the maximum memory usage
-        rollout_handle = self._init_rollout_workers()
+        rollout_handle = self.rollout.init_worker()
         env_handle = self.env.init_worker()
 
         if self.reward is not None:
             self.reward.init_worker().wait()
 
-        if rollout_handle is not None:
-            rollout_handle.wait()
+        rollout_handle.wait()
         env_handle.wait()
         self.actor.init_worker().wait()
 
@@ -240,83 +190,18 @@ class EmbodiedRunner:
             return
 
         self.logger.info(f"Resuming training from checkpoint directory {resume_dir}.")
+        self.global_step = parse_global_step_from_checkpoint_path(resume_dir)
         actor_checkpoint_path = os.path.join(resume_dir, "actor")
-        if not os.path.exists(actor_checkpoint_path):
-            raise FileNotFoundError(
-                f"resume_dir {actor_checkpoint_path} does not exist."
-            )
-        loaded_steps = self.actor.load_checkpoint(actor_checkpoint_path).wait()
-        if str(self.cfg.actor.model.model_type) == "fastwam_adaptive":
-            actor_step = validate_fastwam_resume_steps(
-                loaded_steps,
-                resume_dir,
-            )
-            rollout_checkpoint_path = os.path.join(resume_dir, "rollout")
-            if not os.path.exists(rollout_checkpoint_path):
-                raise FileNotFoundError(
-                    "FastWAM resume requires rollout runtime checkpoints at "
-                    f"{rollout_checkpoint_path}."
-                )
-            rollout_loaded_steps = self.rollout.load_checkpoint(
-                rollout_checkpoint_path
-            ).wait()
-            rollout_step = validate_fastwam_resume_steps(
-                rollout_loaded_steps,
-                resume_dir,
-            )
-            if rollout_step != actor_step:
-                raise ValueError(
-                    "FastWAM actor and rollout checkpoints disagree on step: "
-                    f"actor={actor_step}, rollout={rollout_step}."
-                )
-            self.global_step = actor_step
-        else:
-            self.global_step = int(resume_dir.split("global_step_")[-1])
-        self._load_fastwam_training_guard(resume_dir)
+        assert os.path.exists(actor_checkpoint_path), (
+            f"resume_dir {actor_checkpoint_path} does not exist."
+        )
+        self.actor.load_checkpoint(actor_checkpoint_path).wait()
 
     def update_rollout_weights(self):
         rollout_handle: Handle = self.rollout.sync_model_from_actor()
         actor_handle: Handle = self.actor.sync_model_to_rollout()
         actor_handle.wait()
         rollout_handle.wait()
-
-    def _set_worker_global_step(self) -> None:
-        """Publish the runner step before weight sync or rollout generation."""
-
-        actor_handle: Handle = self.actor.set_global_step(self.global_step)
-        rollout_handle: Handle = self.rollout.set_global_step(self.global_step)
-        actor_handle.wait()
-        rollout_handle.wait()
-
-    def _set_fastwam_runtime_cost(self) -> None:
-        """Publish a cost computed strictly from earlier rollout audits."""
-
-        self.fastwam_idm_cost_control.before_rollout(
-            actor=self.actor,
-            runner_step=self.global_step,
-        )
-
-    def _observe_fastwam_idm_cost(
-        self,
-        actor_rollout_metrics: list[dict],
-        guard_result: dict,
-    ) -> dict | None:
-        """Update the next-step controller only after this rollout is complete."""
-
-        return self.fastwam_idm_cost_control.after_rollout(
-            runner_step=self.global_step,
-            actor_rollout_metrics=actor_rollout_metrics,
-            guard_result=guard_result,
-        )
-
-    def _observe_fastwam_fair_cost(
-        self,
-        actor_rollout_metrics: list[dict],
-        guard_result: dict,
-    ) -> dict | None:
-        """Compatibility alias for the generic post-rollout lifecycle."""
-
-        return self._observe_fastwam_idm_cost(actor_rollout_metrics, guard_result)
 
     def evaluate(self):
         env_handle: Handle = self.env.evaluate(
@@ -372,112 +257,6 @@ class EmbodiedRunner:
             for key, values in merged_metrics.items()
             if values
         }
-
-    @staticmethod
-    def _merge_gate_kv_service_metrics(
-        actor_training_metrics: list[dict],
-        service_metrics: list[dict] | None,
-    ) -> None:
-        """Attach aggregate and per-rollout-rank cache metrics to train logs."""
-
-        if not service_metrics:
-            return
-        if not actor_training_metrics:
-            actor_training_metrics.append({})
-        destination = actor_training_metrics[0]
-        sum_fields = {
-            "gpu_bytes",
-            "cpu_bytes",
-            "nvme_bytes",
-            "peak_gpu_bytes",
-            "peak_cpu_bytes",
-            "peak_nvme_bytes",
-            "emitted_samples",
-            "emitted_bytes",
-            "sampled_samples",
-            "sampled_bytes",
-            "unsampled_samples",
-            "unsampled_bytes",
-            "eligible_samples",
-            "eligible_bytes",
-            "discarded_samples",
-            "discarded_bytes",
-            "fetched_samples",
-            "gpu_hit_samples",
-            "transfer_bytes",
-            "d2h_bytes",
-            "nvme_read_bytes",
-            "nvme_write_bytes",
-            "rollout_rss_bytes",
-            "rollout_uss_bytes",
-        }
-        max_fields = {
-            "transfer_seconds",
-            "d2h_seconds",
-            "nvme_read_seconds",
-            "nvme_write_seconds",
-            "mig_peak_used_bytes",
-            "mig_peak_allocated_bytes",
-        }
-        min_fields = {
-            "mig_free_bytes",
-            "mig_min_free_bytes",
-            "node_available_bytes",
-            "node_min_available_bytes",
-        }
-        for rank, metrics in enumerate(service_metrics):
-            for key, value in metrics.items():
-                destination[f"kv_cache/rollout_rank_{rank}/{key}"] = value
-            destination[f"kv_cache/gpu_bytes_rank_{rank}"] = metrics.get(
-                "peak_gpu_bytes", 0.0
-            )
-            destination[f"kv_cache/cpu_bytes_rank_{rank}"] = metrics.get(
-                "peak_cpu_bytes", 0.0
-            )
-            destination[f"kv_cache/nvme_bytes_rank_{rank}"] = metrics.get(
-                "peak_nvme_bytes", 0.0
-            )
-            destination[f"kv_cache/mig_min_free_bytes_rank_{rank}"] = metrics.get(
-                "mig_min_free_bytes", 0.0
-            )
-            destination[f"kv_cache/mig_peak_used_bytes_rank_{rank}"] = metrics.get(
-                "mig_peak_used_bytes", 0.0
-            )
-        all_keys = set().union(*(metrics.keys() for metrics in service_metrics))
-        for key in all_keys:
-            values = [
-                float(metrics[key]) for metrics in service_metrics if key in metrics
-            ]
-            if key in sum_fields:
-                reduced = sum(values)
-            elif key in max_fields:
-                reduced = max(values)
-            elif key in min_fields:
-                reduced = min(values)
-            else:
-                reduced = sum(values) / len(values)
-            destination[f"kv_cache/{key}"] = reduced
-        destination["kv_cache/discarded_ineligible_bytes"] = destination.get(
-            "kv_cache/discarded_bytes", 0.0
-        )
-        emitted = destination.get("kv_cache/emitted_samples", 0.0)
-        destination["kv_cache/actual_sample_rate"] = (
-            destination.get("kv_cache/sampled_samples", 0.0) / emitted
-            if emitted
-            else 0.0
-        )
-        fetched = destination.get("kv_cache/fetched_samples", 0.0)
-        destination["kv_cache/hit_fraction"] = (
-            destination.get("kv_cache/gpu_hit_samples", 0.0) / fetched
-            if fetched
-            else 0.0
-        )
-        destination["kv_cache/transfer_time"] = destination.get(
-            "kv_cache/transfer_seconds", 0.0
-        )
-        destination["kv_cache/node_physical_min_available_bytes"] = destination.get(
-            "kv_cache/node_min_available_bytes", 0.0
-        )
 
     def _process_ranked_numeric_results(
         self, results: list[dict], metric_field: str
@@ -681,14 +460,12 @@ class EmbodiedRunner:
         self.print_metrics_table_async(
             step, self.max_steps, start_time, logging_metrics, start_step
         )
-        self.metric_logger.commit_step(step)
 
     def _finish_run(self) -> None:
         self.metric_logger.finish()
 
-        # Stop logging thread
-        self.stop_logging = True
-        self.log_queue.join()  # Wait for all queued logs to be processed
+        self.log_queue.put(None)
+        self.log_queue.join()
         self.log_thread.join(timeout=1.0)
 
     def _should_profile_step(self, step_idx: int) -> bool:
@@ -710,39 +487,6 @@ class EmbodiedRunner:
         self.env.stop_profile().wait()
         self.logger.info(f"Closed profiling window at step {step_idx}")
 
-    def _run_actor_training(
-        self, *, next_step: bool
-    ) -> tuple[list[dict], Handle, Handle | None]:
-        """Execute one training phase and retain the existing bootstrap overlap."""
-
-        gate_kv_service_handle: Handle | None = None
-        if self.gate_kv_request_channel is not None:
-            gate_kv_service_handle = self.rollout.serve_gate_kv_requests(
-                request_channel=self.gate_kv_request_channel,
-                response_channel=self.gate_kv_response_channel,
-            )
-            actor_training_handle = self.actor.run_training(
-                kv_request_channel=self.gate_kv_request_channel,
-                kv_response_channel=self.gate_kv_response_channel,
-            )
-        else:
-            actor_training_handle = self.actor.run_training()
-        env_bootstrap_handle: Handle | None = None
-        if self.overlap_env_bootstrap and next_step:
-            env_bootstrap_handle = self.env.prefetch_train_bootstrap(
-                rollout_channel=self.rollout_channel,
-                runner_step=self.global_step + 1,
-            )
-
-        actor_training_metrics = actor_training_handle.wait()
-        if gate_kv_service_handle is not None:
-            gate_kv_service_metrics = gate_kv_service_handle.wait()
-            self._merge_gate_kv_service_metrics(
-                actor_training_metrics,
-                gate_kv_service_metrics,
-            )
-        return actor_training_metrics, actor_training_handle, env_bootstrap_handle
-
     def run(self):
         if self.cfg.runner.get("use_training_pipeline", False):
             return self.run_pipeline()
@@ -751,8 +495,9 @@ class EmbodiedRunner:
         start_time = time.time()
         for _step in range(start_step, self.max_steps):
             # set global step
-            self._set_worker_global_step()
-            self._set_fastwam_runtime_cost()
+            self.actor.set_global_step(self.global_step).wait()
+            self.rollout.set_global_step(self.global_step).wait()
+            self.env.set_global_step(self.global_step).wait()
 
             profiled_step = (
                 self.global_step
@@ -771,12 +516,11 @@ class EmbodiedRunner:
                         input_channel=self.env_channel,
                         rollout_channel=self.rollout_channel,
                         reward_channel=self.reward_channel,
-                        actor_channel=self.actor_channel,
-                        runner_step=self.global_step,
                     )
                     rollout_handle: Handle = self.rollout.generate(
                         input_channel=self.rollout_channel,
                         output_channel=self.env_channel,
+                        actor_channel=self.actor_channel,
                     )
                     reward_handle = None
                     if self.reward is not None:
@@ -796,22 +540,17 @@ class EmbodiedRunner:
                     actor_rollout_metrics = (
                         self.actor.compute_advantages_and_returns().wait()
                     )
-                    guard_result = self.fastwam_training_guard.observe_rollout(
-                        actor_rollout_metrics
-                    )
-                    self._observe_fastwam_idm_cost(
-                        actor_rollout_metrics,
-                        guard_result,
-                    )
 
                 # actor training.
                 with self.timer("actor_training"):
-                    (
-                        actor_training_metrics,
-                        actor_training_handle,
-                        env_bootstrap_handle,
-                    ) = self._run_actor_training(next_step=_step + 1 < self.max_steps)
-                    self.fastwam_training_guard.observe_training(actor_training_metrics)
+                    actor_training_handle: Handle = self.actor.run_training()
+                    env_bootstrap_handle: Handle | None = None
+                    if self.overlap_env_bootstrap and _step + 1 < self.max_steps:
+                        env_bootstrap_handle = self.env.prefetch_train_bootstrap(
+                            rollout_channel=self.rollout_channel,
+                        )
+
+                    actor_training_metrics = actor_training_handle.wait()
                     if env_bootstrap_handle is not None:
                         env_bootstrap_handle.wait()
 
@@ -841,7 +580,9 @@ class EmbodiedRunner:
         start_time = time.time()
         for _step in range(start_step, self.max_steps):
             # set global step
-            self._set_worker_global_step()
+            self.actor.set_global_step(self.global_step).wait()
+            self.rollout.set_global_step(self.global_step).wait()
+            self.env.set_global_step(self.global_step).wait()
 
             profiled_step = (
                 self.global_step
@@ -859,12 +600,11 @@ class EmbodiedRunner:
                     input_channel=self.env_channel,
                     rollout_channel=self.rollout_channel,
                     reward_channel=self.reward_channel,
-                    actor_channel=self.actor_channel,
-                    runner_step=self.global_step,
                 )
                 rollout_handle: Handle = self.rollout.generate(
                     input_channel=self.rollout_channel,
                     output_channel=self.env_channel,
+                    actor_channel=self.actor_channel,
                 )
                 reward_handle = None
                 if self.reward is not None:
@@ -885,7 +625,6 @@ class EmbodiedRunner:
                 if self.overlap_env_bootstrap and _step + 1 < self.max_steps:
                     env_bootstrap_handle = self.env.prefetch_train_bootstrap(
                         rollout_channel=self.rollout_channel,
-                        runner_step=self.global_step + 1,
                     )
 
                 actor_results = actor_training_handle.wait()
@@ -924,13 +663,8 @@ class EmbodiedRunner:
             f"checkpoints/global_step_{self.global_step}",
         )
         actor_save_path = os.path.join(base_output_dir, "actor")
-        rollout_save_path = os.path.join(base_output_dir, "rollout")
         os.makedirs(actor_save_path, exist_ok=True)
-        os.makedirs(rollout_save_path, exist_ok=True)
         self.actor.save_checkpoint(actor_save_path, self.global_step).wait()
-        if str(self.cfg.actor.model.model_type) == "fastwam_adaptive":
-            self.rollout.save_checkpoint(rollout_save_path, self.global_step).wait()
-        self._save_fastwam_training_guard(base_output_dir)
 
     def set_max_steps(self):
         self.num_steps_per_epoch = 1
@@ -942,99 +676,3 @@ class EmbodiedRunner:
     @property
     def epoch(self):
         return self.global_step // self.num_steps_per_epoch
-
-    def _save_fastwam_training_guard(self, checkpoint_dir: str) -> None:
-        if (
-            not self.fastwam_training_guard.enabled
-            and not self.fastwam_idm_cost_control.enabled
-        ):
-            return
-        path = Path(checkpoint_dir) / "training_guard.json"
-        temporary = path.with_name(f".{path.name}.tmp")
-        schema = self.fastwam_idm_cost_control.checkpoint_schema
-        if schema == "fastwam-training-guard-checkpoint-v3":
-            payload = {
-                "schema": schema,
-                "global_step": int(self.global_step),
-                "state": (
-                    self.fastwam_training_guard.state_dict()
-                    if self.fastwam_training_guard.enabled
-                    else {}
-                ),
-                "idm_cost_controller": self.fastwam_idm_cost_control.state_dict(),
-            }
-        elif schema == "fastwam-training-guard-checkpoint-v2":
-            legacy = self.fastwam_idm_cost_control.legacy_fair_controller
-            if legacy is None:
-                raise RuntimeError("Legacy FastWAM checkpoint controller is missing.")
-            payload = {
-                "schema": schema,
-                "global_step": int(self.global_step),
-                "state": self.fastwam_training_guard.state_dict(),
-                "fair_cost_controller": legacy.state_dict(),
-            }
-        else:
-            # Preserve the exact checkpoint schema used by existing fixed-cost
-            # runs; the v2 payload is selected only with fair-cost control.
-            payload = {
-                "schema": "fastwam-training-guard-checkpoint-v1",
-                "global_step": int(self.global_step),
-                "state": self.fastwam_training_guard.state_dict(),
-            }
-        try:
-            with temporary.open("w", encoding="utf-8") as stream:
-                json.dump(payload, stream, sort_keys=True, indent=2)
-                stream.write("\n")
-                stream.flush()
-                os.fsync(stream.fileno())
-            os.replace(temporary, path)
-        finally:
-            if temporary.exists():
-                temporary.unlink()
-
-    def _load_fastwam_training_guard(self, checkpoint_dir: str) -> None:
-        if (
-            not self.fastwam_training_guard.enabled
-            and not self.fastwam_idm_cost_control.enabled
-        ):
-            return
-        path = Path(checkpoint_dir) / "training_guard.json"
-        if not path.is_file():
-            raise FileNotFoundError(
-                f"FastWAM guarded resume requires training_guard.json at {path}."
-            )
-        with path.open("r", encoding="utf-8") as stream:
-            payload = json.load(stream)
-        expected_schema = self.fastwam_idm_cost_control.checkpoint_schema
-        if payload.get("schema") != expected_schema:
-            raise ValueError("FastWAM training guard checkpoint schema mismatch.")
-        if int(payload.get("global_step", -1)) != int(self.global_step):
-            raise ValueError(
-                "FastWAM training guard checkpoint step does not match the "
-                "actor/rollout checkpoint."
-            )
-        state = payload.get("state")
-        if self.fastwam_training_guard.enabled and not isinstance(state, dict):
-            raise TypeError("FastWAM training guard checkpoint state is malformed.")
-        if self.fastwam_training_guard.enabled:
-            self.fastwam_training_guard.load_state_dict(state)
-        if expected_schema == "fastwam-training-guard-checkpoint-v2":
-            fair_cost_state = payload.get("fair_cost_controller")
-            if not isinstance(fair_cost_state, dict):
-                raise TypeError(
-                    "FastWAM fair-cost controller checkpoint state is malformed."
-                )
-            legacy = self.fastwam_idm_cost_control.legacy_fair_controller
-            if legacy is None:
-                raise RuntimeError("Legacy FastWAM checkpoint controller is missing.")
-            legacy.load_state_dict(fair_cost_state)
-        elif expected_schema == "fastwam-training-guard-checkpoint-v3":
-            controller_state = payload.get("idm_cost_controller")
-            if not isinstance(controller_state, dict):
-                raise TypeError(
-                    "FastWAM IDM cost controller checkpoint state is malformed."
-                )
-            self.fastwam_idm_cost_control.load_state_dict(
-                controller_state,
-                global_step=self.global_step,
-            )

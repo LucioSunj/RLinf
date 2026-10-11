@@ -14,7 +14,11 @@
 
 import torch
 
-from rlinf.data.embodied_io_struct import EnvOutput, RolloutResult
+from rlinf.models.embodiment.wam_policy.execution.io_struct import (
+    EnvOutput,
+    RolloutResult,
+)
+from rlinf.models.embodiment.wam_policy.execution.rollout import MultiStepRolloutWorker
 from rlinf.scheduler import (
     build_recv_plan,
     build_route_channel_key,
@@ -22,7 +26,6 @@ from rlinf.scheduler import (
     merge_batches,
     split_batch,
 )
-from rlinf.workers.rollout.hf.huggingface_worker import MultiStepRolloutWorker
 
 
 def _make_obs(start: int, batch_size: int) -> dict:

@@ -19,11 +19,11 @@ from omegaconf import OmegaConf
 from test_fastwam_runner_checkpoint import _bare_runner, _runner_cfg, _WorkerGroup
 from test_fastwam_uncond_rl import _compose
 
+from rlinf.models.embodiment.wam_policy.execution.runner import EmbodiedRunner
 from rlinf.models.embodiment.wam_policy.uncond_rl_lifecycle import (
     UncondRLEnvWorker,
     UncondRLRunner,
 )
-from rlinf.runners.embodied_runner import EmbodiedRunner
 
 
 class _Handle:
@@ -138,7 +138,7 @@ def test_dispatched_plans_cover_all_tasks_and_resume_next_reset_exactly(tmp_path
 
 
 def test_n84_sampler_rejects_n42_native_state(tmp_path):
-    from rlinf.envs.libero.task_sampler import BalancedLiberoTaskSampler
+    from rlinf.envs.sim.libero.task_sampler import BalancedLiberoTaskSampler
 
     previous = BalancedLiberoTaskSampler(
         total_envs=42, reset_pool_sizes=[50] * 10, seed=42, num_ranks=6
@@ -331,7 +331,7 @@ def test_pure_native_zero_rollout_restores_sampling_and_rng(tmp_path, monkeypatc
 
 
 def test_terminal_mask_is_cumulative_and_resets_without_shortening_rollout(monkeypatch):
-    from rlinf.workers.env.env_worker import EnvWorker
+    from rlinf.models.embodiment.wam_policy.execution.env import EnvWorker
 
     worker = object.__new__(UncondRLEnvWorker)
     worker.cfg = OmegaConf.create(

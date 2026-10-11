@@ -7,7 +7,7 @@
 
 from __future__ import annotations
 
-from rlinf.runners.embodied_runner import EmbodiedRunner
+from rlinf.models.embodiment.wam_policy.execution.runner import EmbodiedRunner
 
 from . import route_neutral_budget as _route_neutral_budget_registration  # noqa: F401
 from .runner import PadFrozenRunner

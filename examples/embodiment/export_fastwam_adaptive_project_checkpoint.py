@@ -21,13 +21,13 @@ import torch.multiprocessing as mp
 from omegaconf import OmegaConf
 
 from rlinf.config import validate_cfg
+from rlinf.models.embodiment.wam_policy.execution.actor import EmbodiedFSDPActor
 from rlinf.runners.fastwam_checkpoint_export import (
     export_initial_actor_checkpoint,
     validate_initial_checkpoint_export_config,
 )
 from rlinf.scheduler import Cluster
 from rlinf.utils.placement import HybridComponentPlacement
-from rlinf.workers.actor.fsdp_actor_worker import EmbodiedFSDPActor
 
 mp.set_start_method("spawn", force=True)
 

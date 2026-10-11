@@ -84,6 +84,7 @@ def mixed_precision_from_config(mixed_precision_config) -> MixedPrecision:
         param_dtype=torch_dtype_from_precision(mixed_precision_config.param_dtype),
         reduce_dtype=torch_dtype_from_precision(mixed_precision_config.reduce_dtype),
         buffer_dtype=torch_dtype_from_precision(mixed_precision_config.buffer_dtype),
+        cast_forward_inputs=bool(mixed_precision_config.get("cast_forward_inputs", True)),
         cast_root_forward_inputs=bool(
             mixed_precision_config.get("cast_root_forward_inputs", True)
         ),

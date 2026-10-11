@@ -529,7 +529,7 @@ def test_pad_validator_rejects_default_logical_zero_egl_factory(monkeypatch) -> 
     cfg = _compose_pad_config(monkeypatch)
     with open_dict(cfg):
         cfg.env.train.egl_instantiation_target = (
-            "rlinf.envs.libero.egl.instantiate_with_isolated_egl"
+            "rlinf.envs.sim.libero.egl.instantiate_with_isolated_egl"
         )
 
     with pytest.raises(ValueError, match="env.train.egl_instantiation_target"):
@@ -1058,8 +1058,8 @@ def test_pad_ownership_audit_separates_moving_and_frozen_families() -> None:
 
 
 def test_pad_actor_uses_versions_as_batch_reference() -> None:
+    from rlinf.models.embodiment.wam_policy.execution.actor import EmbodiedFSDPActor
     from rlinf.models.embodiment.wam_policy.pad_rv.actor import PadFrozenFSDPActor
-    from rlinf.workers.actor.fsdp_actor_worker import EmbodiedFSDPActor
 
     pad_actor = object.__new__(PadFrozenFSDPActor)
     versions = torch.zeros(10, 6, 1)
@@ -1219,9 +1219,9 @@ def test_pad_actor_checkpoint_is_stage_owned_and_omits_frozen_experts(
     tmp_path,
     monkeypatch,
 ) -> None:
+    from rlinf.models.embodiment.wam_policy.execution.actor import EmbodiedFSDPActor
     from rlinf.models.embodiment.wam_policy.pad_rv import actor as actor_module
     from rlinf.models.embodiment.wam_policy.pad_rv.actor import PadFrozenFSDPActor
-    from rlinf.workers.actor.fsdp_actor_worker import EmbodiedFSDPActor
 
     class _ActorWorker:
         _checkpoint_cpu_clone = staticmethod(EmbodiedFSDPActor._checkpoint_cpu_clone)
@@ -1340,14 +1340,16 @@ def test_pad_rollout_checkpoint_rejects_legacy_schema(tmp_path, monkeypatch) -> 
 
 
 def test_pad_runtime_targets_subclass_legacy_interfaces() -> None:
+    from rlinf.models.embodiment.wam_policy.execution.env import EnvWorker
+    from rlinf.models.embodiment.wam_policy.execution.rollout import (
+        MultiStepRolloutWorker,
+    )
+    from rlinf.models.embodiment.wam_policy.execution.runner import EmbodiedRunner
     from rlinf.models.embodiment.wam_policy.pad_rv.env import PadFrozenEnvWorker
     from rlinf.models.embodiment.wam_policy.pad_rv.rollout import (
         PadFrozenRolloutWorker,
     )
     from rlinf.models.embodiment.wam_policy.pad_rv.runner import PadFrozenRunner
-    from rlinf.runners.embodied_runner import EmbodiedRunner
-    from rlinf.workers.env.env_worker import EnvWorker
-    from rlinf.workers.rollout.hf.huggingface_worker import MultiStepRolloutWorker
 
     assert issubclass(PadFrozenRunner, EmbodiedRunner)
     assert issubclass(PadFrozenRolloutWorker, MultiStepRolloutWorker)
@@ -1355,9 +1357,9 @@ def test_pad_runtime_targets_subclass_legacy_interfaces() -> None:
 
 
 def test_pad_actor_seeds_fresh_genesis_before_model_construction(monkeypatch) -> None:
+    from rlinf.models.embodiment.wam_policy.execution.actor import EmbodiedFSDPActor
     from rlinf.models.embodiment.wam_policy.pad_rv import actor as actor_module
     from rlinf.models.embodiment.wam_policy.pad_rv.actor import PadFrozenFSDPActor
-    from rlinf.workers.actor.fsdp_actor_worker import EmbodiedFSDPActor
 
     events = []
 
@@ -1380,9 +1382,9 @@ def test_pad_actor_seeds_fresh_genesis_before_model_construction(monkeypatch) ->
 
 
 def test_pad_env_releases_host_pages_only_after_trajectory_send(monkeypatch) -> None:
+    from rlinf.models.embodiment.wam_policy.execution.env import EnvWorker
     from rlinf.models.embodiment.wam_policy.pad_rv import env as env_module
     from rlinf.models.embodiment.wam_policy.pad_rv.env import PadFrozenEnvWorker
-    from rlinf.workers.env.env_worker import EnvWorker
 
     events = []
 
@@ -1418,9 +1420,9 @@ def test_pad_env_releases_host_pages_only_after_trajectory_send(monkeypatch) -> 
 
 
 def test_pad_env_serializes_large_trajectory_sends(tmp_path, monkeypatch) -> None:
+    from rlinf.models.embodiment.wam_policy.execution.env import EnvWorker
     from rlinf.models.embodiment.wam_policy.pad_rv import env as env_module
     from rlinf.models.embodiment.wam_policy.pad_rv.env import PadFrozenEnvWorker
-    from rlinf.workers.env.env_worker import EnvWorker
 
     active_sends = 0
     maximum_active_sends = 0
@@ -1475,9 +1477,9 @@ def test_pad_env_serializes_large_trajectory_sends(tmp_path, monkeypatch) -> Non
 
 
 def test_pad_actor_releases_host_pages_after_batch_assembly(monkeypatch) -> None:
+    from rlinf.models.embodiment.wam_policy.execution.actor import EmbodiedFSDPActor
     from rlinf.models.embodiment.wam_policy.pad_rv import actor as actor_module
     from rlinf.models.embodiment.wam_policy.pad_rv.actor import PadFrozenFSDPActor
-    from rlinf.workers.actor.fsdp_actor_worker import EmbodiedFSDPActor
 
     events = []
 
@@ -1546,7 +1548,7 @@ def test_pad_actor_releases_consumed_batch_before_next_receive(monkeypatch) -> N
 
 
 def test_legacy_actor_consumed_batch_release_hook_is_noop() -> None:
-    from rlinf.workers.actor.fsdp_actor_worker import EmbodiedFSDPActor
+    from rlinf.models.embodiment.wam_policy.execution.actor import EmbodiedFSDPActor
 
     worker = object.__new__(EmbodiedFSDPActor)
     sentinel = {"legacy": torch.ones(1)}
@@ -1558,7 +1560,7 @@ def test_legacy_actor_consumed_batch_release_hook_is_noop() -> None:
 
 
 def test_legacy_env_policy_metadata_hook_preserves_flow_audit() -> None:
-    from rlinf.workers.env.env_worker import EnvWorker
+    from rlinf.models.embodiment.wam_policy.execution.env import EnvWorker
 
     worker = object.__new__(EnvWorker)
     worker.model_cfg = OmegaConf.create(
@@ -1613,10 +1615,10 @@ def test_pad_env_policy_metadata_hook_requires_zero_flow() -> None:
 
 
 def test_pad_env_failure_audit_omits_only_flow_index_requirement(monkeypatch) -> None:
+    from rlinf.models.embodiment.wam_policy.execution import env as env_worker_module
+    from rlinf.models.embodiment.wam_policy.execution.env import EnvWorker
     from rlinf.models.embodiment.wam_policy.pad_rv import env as pad_env_module
     from rlinf.models.embodiment.wam_policy.pad_rv.env import PadFrozenEnvWorker
-    from rlinf.workers.env import env_worker as env_worker_module
-    from rlinf.workers.env.env_worker import EnvWorker
 
     monkeypatch.setattr(
         env_worker_module,

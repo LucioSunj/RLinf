@@ -23,10 +23,6 @@ import pytest
 import torch
 from omegaconf import OmegaConf
 
-from rlinf.data.embodied_io_struct import (
-    EvaluationRolloutControl,
-    RolloutResult,
-)
 from rlinf.envs.action_contract import (
     DENORMALIZED_ACTION_STAGE,
     GRIPPER_CONVERTED_ACTION_STAGE,
@@ -35,7 +31,7 @@ from rlinf.envs.action_contract import (
     ActionExecutionTrace,
     ActionStageStatistics,
 )
-from rlinf.envs.libero.action_contract import LiberoActionContract
+from rlinf.envs.sim.libero.action_contract import LiberoActionContract
 from rlinf.models.embodiment.wam_policy.contracts import (
     ChunkRouteRecord,
     GateDecisionRecord,
@@ -44,19 +40,23 @@ from rlinf.models.embodiment.wam_policy.evaluation import (
     EvaluationRouteSelection,
     EvaluationRoutingMode,
 )
-from rlinf.models.embodiment.wam_policy.routing_state import PendingRouteTracker
-from rlinf.runners.fastwam_libero_eval_collector import EvaluationArtifactShard
-from rlinf.workers.env import env_worker as env_worker_module
-from rlinf.workers.env.env_worker import (
+from rlinf.models.embodiment.wam_policy.execution import env as env_worker_module
+from rlinf.models.embodiment.wam_policy.execution.env import (
     EnvWorker,
     FastWAMEvaluationActionContractViolation,
     _mark_terminal_gate_unused,
     _merge_evaluation_rollout_results,
 )
-from rlinf.workers.rollout.hf.huggingface_worker import (
+from rlinf.models.embodiment.wam_policy.execution.io_struct import (
+    EvaluationRolloutControl,
+    RolloutResult,
+)
+from rlinf.models.embodiment.wam_policy.execution.rollout import (
     MultiStepRolloutWorker,
     _build_evaluation_rollout_result,
 )
+from rlinf.models.embodiment.wam_policy.routing_state import PendingRouteTracker
+from rlinf.runners.fastwam_libero_eval_collector import EvaluationArtifactShard
 
 
 def test_eval_collector_runtime_identity_is_not_hydra_instantiated(

@@ -35,7 +35,7 @@ from fastwam.uncond_bc import (
 )
 
 from rlinf.envs.action_contract import ActionExecutionTrace
-from rlinf.envs.libero.action_protocol import (
+from rlinf.envs.sim.libero.action_protocol import (
     select_executed_action_prefix,
     select_executed_flow_statistics,
 )

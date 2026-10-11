@@ -24,7 +24,7 @@ import pytest
 from hydra import compose, initialize_config_dir
 from omegaconf import OmegaConf
 
-from rlinf.runners.embodied_runner import EmbodiedRunner
+from rlinf.models.embodiment.wam_policy.execution.runner import EmbodiedRunner
 from rlinf.runners.fastwam_idm_cost_control import (
     FastWAMIDMCostControlRuntime,
     validate_fastwam_idm_cost_control_config,

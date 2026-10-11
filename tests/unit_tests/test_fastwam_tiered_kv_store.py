@@ -22,6 +22,12 @@ import torch
 FASTWAM_SRC = Path(__file__).resolve().parents[3] / "FastWAM/src"
 sys.path.insert(0, str(FASTWAM_SRC))
 
+from rlinf.models.embodiment.wam_policy.execution.rollout import (  # noqa: E402
+    MultiStepRolloutWorker,
+)
+from rlinf.models.embodiment.wam_policy.execution.runner import (  # noqa: E402
+    EmbodiedRunner,
+)
 from rlinf.models.embodiment.wam_policy.kv_replay import (  # noqa: E402
     GateKVReplayConfig,
 )
@@ -33,12 +39,9 @@ from rlinf.models.embodiment.wam_policy.tiered_kv_store import (  # noqa: E402
     decode_gate_kv_handle,
     encode_gate_kv_handle,
 )
-from rlinf.runners.embodied_runner import EmbodiedRunner  # noqa: E402
 from rlinf.scheduler.cluster.utils import (  # noqa: E402
-    extract_dataclass_tensor_fields,
-)
-from rlinf.workers.rollout.hf.huggingface_worker import (  # noqa: E402
-    MultiStepRolloutWorker,
+    pack_dataclass_tensors,
+    unpack_dataclass_tensors,
 )
 
 
@@ -70,11 +73,10 @@ def test_handle_encoding_round_trips_owner_and_generation():
 def test_stop_request_empty_handles_are_not_classified_as_tensor_field():
     request = GateKVStoreRequest("stop", actor_rank=0, request_id=3)
 
-    tensor_fields, flat_tensors, metadata = extract_dataclass_tensor_fields(request)
+    skeleton, flat_tensors = pack_dataclass_tensors(request)
 
-    assert tensor_fields == {}
     assert flat_tensors == []
-    assert metadata == []
+    assert unpack_dataclass_tensors(skeleton, flat_tensors) == request
 
 
 def test_cpu_tier_register_retain_fetch_release_round_trip():

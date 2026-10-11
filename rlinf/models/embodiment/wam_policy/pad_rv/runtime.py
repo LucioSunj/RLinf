@@ -20,7 +20,7 @@ from fastwam.models.wan22.adaptive_action import (
 )
 from fastwam.models.wan22.adaptive_sampler import sample_action_flow_sde
 
-from rlinf.envs.libero.action_protocol import select_executed_action_prefix
+from rlinf.envs.sim.libero.action_protocol import select_executed_action_prefix
 from rlinf.models.embodiment.wam_policy.contracts import WAMRoute
 from rlinf.models.embodiment.wam_policy.critic import (
     FastWAMValueFeatures,

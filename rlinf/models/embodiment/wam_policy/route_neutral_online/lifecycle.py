@@ -18,9 +18,11 @@ from typing import Any
 import numpy as np
 import torch
 
-from rlinf.data.embodied_io_struct import EmbodiedRolloutResult
-from rlinf.envs.libero.task_sampler import BalancedLiberoTaskSampler
+from rlinf.envs.sim.libero.task_sampler import BalancedLiberoTaskSampler
 from rlinf.envs.utils import get_env_attr
+from rlinf.models.embodiment.wam_policy.execution.env import EnvWorker
+from rlinf.models.embodiment.wam_policy.execution.io_struct import EmbodiedRolloutResult
+from rlinf.models.embodiment.wam_policy.execution.rollout import MultiStepRolloutWorker
 from rlinf.models.embodiment.wam_policy.pad_rv.memory import release_pad_host_memory
 from rlinf.models.embodiment.wam_policy.pad_rv.route_neutral_runner import (
     PadRouteNeutralRunner,
@@ -29,8 +31,6 @@ from rlinf.models.embodiment.wam_policy.route_neutral_online.config import (
     rollout_initialization_batch_size,
 )
 from rlinf.scheduler import Channel
-from rlinf.workers.env.env_worker import EnvWorker
-from rlinf.workers.rollout.hf.huggingface_worker import MultiStepRolloutWorker
 
 
 def _lifecycle_cfg(cfg: Any) -> Any:

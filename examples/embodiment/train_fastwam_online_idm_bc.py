@@ -22,15 +22,15 @@ from hydra.utils import get_class
 from omegaconf import OmegaConf
 
 from rlinf.config import validate_cfg
+from rlinf.models.embodiment.wam_policy.execution.env import EnvWorker
+from rlinf.models.embodiment.wam_policy.execution.rollout import MultiStepRolloutWorker
+from rlinf.models.embodiment.wam_policy.execution.runner import EmbodiedRunner
 from rlinf.models.embodiment.wam_policy.online_idm_bc import (
     validate_online_idm_bc_training_config,
 )
 from rlinf.models.embodiment.wam_policy.online_idm_bc.actor import OnlineIDMBCFSDPActor
-from rlinf.runners.embodied_runner import EmbodiedRunner
 from rlinf.scheduler import Cluster
 from rlinf.utils.placement import HybridComponentPlacement
-from rlinf.workers.env.env_worker import EnvWorker
-from rlinf.workers.rollout.hf.huggingface_worker import MultiStepRolloutWorker
 
 mp.set_start_method("spawn", force=True)
 

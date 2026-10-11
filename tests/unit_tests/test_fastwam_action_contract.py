@@ -37,26 +37,26 @@ from rlinf.envs.action_contract import (
     ActionStageStatistics,
 )
 from rlinf.envs.action_utils import prepare_actions_for_libero
-from rlinf.envs.libero.action_contract import (
+from rlinf.envs.sim.libero.action_contract import (
     LIBERO_ACTION_CONTRACT_SCHEMA_V1,
     LiberoActionContract,
     inspect_libero_action_contract,
     merge_libero_action_contracts,
 )
-from rlinf.envs.libero.image_preprocessing import (
+from rlinf.envs.sim.libero.image_preprocessing import (
     OFFICIAL_LIBERO_CAMERA_RESIZE_MODE,
     prepare_libero_camera_batch,
 )
 from rlinf.models.embodiment.wam_policy.contracts import ChunkRouteRecord, WAMRoute
-from rlinf.models.embodiment.wam_policy.libero_runtime import (
-    _convert_fastwam_gripper_to_libero,
-    _seeded_randn,
-)
-from rlinf.workers.env.env_worker import (
+from rlinf.models.embodiment.wam_policy.execution.env import (
     EnvWorker,
     build_fastwam_episode_identity_sha256,
     build_fastwam_episode_identity_sha256_by_environment,
     summarize_fastwam_flow_sde_denoise_indices,
+)
+from rlinf.models.embodiment.wam_policy.libero_runtime import (
+    _convert_fastwam_gripper_to_libero,
+    _seeded_randn,
 )
 
 
@@ -466,11 +466,11 @@ def test_eval_worker_execute_mode_passes_raw_outlier_to_traced_environment(
     worker.eval_prev_done = [torch.zeros(1, dtype=torch.bool)]
     worker.use_external_reward_model = False
     monkeypatch.setattr(
-        "rlinf.workers.env.env_worker.prepare_actions",
+        "rlinf.models.embodiment.wam_policy.execution.env.prepare_actions",
         lambda *, raw_chunk_actions, **_: raw_chunk_actions,
     )
     monkeypatch.setattr(
-        "rlinf.workers.env.env_worker.get_env_attr",
+        "rlinf.models.embodiment.wam_policy.execution.env.get_env_attr",
         lambda owner, name: getattr(owner, name),
     )
     actions = torch.zeros(1, 10, 7)
@@ -517,11 +517,11 @@ def test_guarded_env_step_combines_exact_five_stage_trace_without_clamp(
     worker.env_list = [environment]
     worker.use_external_reward_model = False
     monkeypatch.setattr(
-        "rlinf.workers.env.env_worker.prepare_actions",
+        "rlinf.models.embodiment.wam_policy.execution.env.prepare_actions",
         lambda *, raw_chunk_actions, **_: raw_chunk_actions,
     )
     monkeypatch.setattr(
-        "rlinf.workers.env.env_worker.get_env_attr",
+        "rlinf.models.embodiment.wam_policy.execution.env.get_env_attr",
         lambda owner, name: getattr(owner, name),
     )
     actions = torch.linspace(-0.75, 0.75, 70).reshape(1, 10, 7)
@@ -561,7 +561,7 @@ def test_guarded_env_step_requires_typed_model_action_trace(
     )
     worker.env_list = [_TrainingActionTraceEnv(contract)]
     monkeypatch.setattr(
-        "rlinf.workers.env.env_worker.prepare_actions",
+        "rlinf.models.embodiment.wam_policy.execution.env.prepare_actions",
         lambda *, raw_chunk_actions, **_: raw_chunk_actions,
     )
     actions = torch.zeros(1, 10, 7)
@@ -645,11 +645,11 @@ def test_guarded_env_step_reports_route_and_first_action_violation_stage(
         actor_versions=torch.tensor([4]),
     )
     monkeypatch.setattr(
-        "rlinf.workers.env.env_worker.prepare_actions",
+        "rlinf.models.embodiment.wam_policy.execution.env.prepare_actions",
         lambda *, raw_chunk_actions, **_: raw_chunk_actions,
     )
     monkeypatch.setattr(
-        "rlinf.workers.env.env_worker.get_env_attr",
+        "rlinf.models.embodiment.wam_policy.execution.env.get_env_attr",
         lambda owner, name: getattr(owner, name),
     )
 
@@ -719,11 +719,11 @@ def test_guarded_env_step_turns_rejected_slot_into_unbootstrapped_failure(
         actor_versions=torch.tensor([4, 4]),
     )
     monkeypatch.setattr(
-        "rlinf.workers.env.env_worker.prepare_actions",
+        "rlinf.models.embodiment.wam_policy.execution.env.prepare_actions",
         lambda *, raw_chunk_actions, **_: raw_chunk_actions,
     )
     monkeypatch.setattr(
-        "rlinf.workers.env.env_worker.get_env_attr",
+        "rlinf.models.embodiment.wam_policy.execution.env.get_env_attr",
         lambda owner, name: getattr(owner, name),
     )
 

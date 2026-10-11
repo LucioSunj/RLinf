@@ -400,7 +400,8 @@ def test_reported_policy_metrics_are_weighted_by_selected_sample_count():
 
 def test_preupdate_log_ratio_audit_precedes_first_optimizer_step():
     worker_source = (
-        Path(__file__).resolve().parents[2] / "rlinf/workers/actor/fsdp_actor_worker.py"
+        Path(__file__).resolve().parents[2]
+        / "rlinf/models/embodiment/wam_policy/execution/actor.py"
     ).read_text(encoding="utf-8")
     run_training = worker_source.index("    def run_training(")
     audit = worker_source.index("if preupdate_log_ratio_audit_pending:", run_training)

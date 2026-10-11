@@ -8,7 +8,7 @@
 
 """PAD-Frozen evaluation runner with bounded rank-serial model construction."""
 
-from rlinf.runners.embodied_eval_runner import EmbodiedEvalRunner
+from rlinf.models.embodiment.wam_policy.execution.eval_runner import EmbodiedEvalRunner
 
 
 class PadFrozenEvalRunner(EmbodiedEvalRunner):

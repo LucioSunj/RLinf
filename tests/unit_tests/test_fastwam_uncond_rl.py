@@ -32,6 +32,7 @@ from torch import nn
 from rlinf.models.embodiment.wam_policy.adaptive_policy import (
     FastWAMAdaptivePolicyConfig,
 )
+from rlinf.models.embodiment.wam_policy.execution.actor import EmbodiedFSDPActor
 from rlinf.models.embodiment.wam_policy.kv_replay import GateKVReplayConfig
 from rlinf.models.embodiment.wam_policy.optimizer import (
     assert_fastwam_optimizer_update_resolution,
@@ -46,7 +47,6 @@ from rlinf.models.embodiment.wam_policy.uncond_rl_config import (
     validate_uncond_rl_config,
 )
 from rlinf.models.embodiment.wam_policy.uncond_rl_runtime import UncondRLLiberoRuntime
-from rlinf.workers.actor.fsdp_actor_worker import EmbodiedFSDPActor
 
 
 def _compose(monkeypatch):

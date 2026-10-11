@@ -23,19 +23,19 @@ import torch
 import torch.nn as nn
 from omegaconf import OmegaConf
 
+import rlinf.models.embodiment.wam_policy.execution.actor as actor_worker
 import rlinf.workers.actor.fastwam_selective_sync as selective_sync
-import rlinf.workers.actor.fsdp_actor_worker as actor_worker
 from rlinf.config import SupportedModel
 from rlinf.models.embodiment.wam_policy.critic import (
     FastWAMCurrentFrameValueCritic,
     FastWAMValueTransformerConfig,
 )
+from rlinf.models.embodiment.wam_policy.execution.actor import EmbodiedFSDPActor
 from rlinf.workers.actor.fastwam_selective_sync import (
     CapturedSyncTensor,
     capture_fastwam_sync_tensors,
     materialize_fastwam_sync_state,
 )
-from rlinf.workers.actor.fsdp_actor_worker import EmbodiedFSDPActor
 
 
 class _SelectiveModule(nn.Module):

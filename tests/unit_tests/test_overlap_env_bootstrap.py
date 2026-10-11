@@ -19,7 +19,7 @@ from unittest.mock import MagicMock
 import torch
 from omegaconf import OmegaConf
 
-from rlinf.data.embodied_io_struct import EnvOutput
+from rlinf.models.embodiment.wam_policy.execution.io_struct import EnvOutput
 
 # Mock gymnasium and rlinf.envs.wrappers before importing EnvWorker
 # to avoid ModuleNotFoundError when gymnasium is not installed.
@@ -31,8 +31,8 @@ if "gymnasium" not in sys.modules:
 if "rlinf.envs.wrappers" not in sys.modules:
     sys.modules["rlinf.envs.wrappers"] = MagicMock()
 
+from rlinf.models.embodiment.wam_policy.execution.env import EnvWorker  # noqa: E402
 from rlinf.scheduler.hardware.accelerators.accelerator import AcceleratorType
-from rlinf.workers.env.env_worker import EnvWorker  # noqa: E402
 
 
 class TestOverlapEnvBootstrap(unittest.TestCase):

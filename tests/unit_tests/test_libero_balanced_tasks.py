@@ -11,7 +11,10 @@ import pytest
 import torch
 from test_route_neutral_online import _compose
 
-from rlinf.envs.libero.task_sampler import BalancedLiberoTaskSampler
+from rlinf.envs.sim.libero.task_sampler import BalancedLiberoTaskSampler
+from rlinf.models.embodiment.wam_policy.execution.actor import (
+    flatten_nested_tensor_time_batch,
+)
 from rlinf.models.embodiment.wam_policy.route_neutral_online.config import (
     validate_route_neutral_online_idm_bc_training_config,
     validate_shared_gpu_device_plan,
@@ -20,7 +23,6 @@ from rlinf.models.embodiment.wam_policy.route_neutral_online.task_metrics import
     summarize_task_rollout,
 )
 from rlinf.utils.nested_dict_process import map_nested_tensors
-from rlinf.workers.actor.fsdp_actor_worker import flatten_nested_tensor_time_batch
 
 
 @pytest.mark.parametrize(
@@ -295,7 +297,10 @@ def test_task_rollout_uses_valid_masks_and_original_episode_counts():
     }
     batch = {
         "forward_inputs": forward,
-        "route_info": SimpleNamespace(route_used=routes),
+        "route_info": SimpleNamespace(
+            route_used=routes,
+            route_was_forced=torch.zeros_like(routes, dtype=torch.bool),
+        ),
         "emitted_gate": SimpleNamespace(behavior_probability=torch.full((3, 10), 0.5)),
         "loss_mask": valid,
         "gate_valid_mask": valid[..., 0],

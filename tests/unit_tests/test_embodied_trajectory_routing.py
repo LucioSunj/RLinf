@@ -20,14 +20,16 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-import rlinf.workers.actor.fsdp_actor_worker as actor_worker_module
-from rlinf.data.embodied_io_struct import ACTOR_TRAJECTORY_CHANNEL_TAG
-from rlinf.scheduler.worker.routing import CommMapper
-from rlinf.workers.actor.fsdp_actor_worker import (
+import rlinf.models.embodiment.wam_policy.execution.actor as actor_worker_module
+from rlinf.models.embodiment.wam_policy.execution.actor import (
     EmbodiedFSDPActor,
     summarize_fastwam_gate_kv_episode_contributions,
 )
-from rlinf.workers.env.env_worker import EnvWorker
+from rlinf.models.embodiment.wam_policy.execution.env import EnvWorker
+from rlinf.models.embodiment.wam_policy.execution.io_struct import (
+    ACTOR_TRAJECTORY_CHANNEL_TAG,
+)
+from rlinf.scheduler.worker.routing import CommMapper
 
 
 class _Placement:
@@ -223,12 +225,11 @@ def test_env_trajectory_send_uses_logical_stage_rank_and_keyed_fanout() -> None:
 
 
 def test_actor_trajectory_receive_uses_stable_logical_source_order(monkeypatch) -> None:
-    worker = SimpleNamespace(
-        _component_placement=_Placement(env_world_size=2, actor_world_size=2),
-        _rank=0,
-        stage_num=2,
-        cfg=_cfg(total_num_envs=8),
-    )
+    worker = object.__new__(EmbodiedFSDPActor)
+    worker._component_placement = _Placement(env_world_size=2, actor_world_size=2)
+    worker._rank = 0
+    worker.stage_num = 2
+    worker.cfg = _cfg(total_num_envs=8)
     worker._process_received_rollout_batch = lambda batch: {
         "processed": batch["received"]
     }

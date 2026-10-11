@@ -13,7 +13,7 @@ from __future__ import annotations
 import os
 
 from rlinf.config_contracts import validate_fastwam_resume_steps
-from rlinf.runners.embodied_runner import EmbodiedRunner
+from rlinf.models.embodiment.wam_policy.execution.runner import EmbodiedRunner
 
 from .budget import PadPredictionBudgetController
 

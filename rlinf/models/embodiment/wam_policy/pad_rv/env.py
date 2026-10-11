@@ -18,12 +18,12 @@ import time
 from pathlib import Path
 from typing import Any
 
-from rlinf.data.embodied_io_struct import EmbodiedRolloutResult
-from rlinf.scheduler import Channel
-from rlinf.workers.env.env_worker import (
+from rlinf.models.embodiment.wam_policy.execution.env import (
     EnvWorker,
     build_fastwam_action_failure_audit,
 )
+from rlinf.models.embodiment.wam_policy.execution.io_struct import EmbodiedRolloutResult
+from rlinf.scheduler import Channel
 
 from .memory import release_pad_host_memory
 

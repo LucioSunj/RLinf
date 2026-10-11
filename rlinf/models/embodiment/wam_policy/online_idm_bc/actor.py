@@ -25,11 +25,11 @@ from hydra.utils import get_class
 
 from rlinf.models.embodiment.wam_policy.adaptive_policy import FastWAMAdaptivePolicy
 from rlinf.models.embodiment.wam_policy.contracts import WAMRoute
+from rlinf.models.embodiment.wam_policy.execution.actor import EmbodiedFSDPActor
 from rlinf.scheduler import Worker
 from rlinf.utils.nested_dict_process import put_tensor_device
 from rlinf.utils.utils import get_rng_state, set_rng_state
 from rlinf.workers.actor.fastwam_selective_sync import prepare_fastwam_sync_tensors
-from rlinf.workers.actor.fsdp_actor_worker import EmbodiedFSDPActor
 
 from .config import (
     ONLINE_IDM_BC_FLOW_VALID,

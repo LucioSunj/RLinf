@@ -107,6 +107,7 @@ def test_plus_eval_preset_accepts_perturbed_long_task_ids(monkeypatch):
 def test_eval_entrypoint_validates_and_dispatches_pure_worker(monkeypatch):
     import rlinf.config as config_module
     import rlinf.models.embodiment.wam_policy.uncond_rl_lifecycle as lifecycle
+    from rlinf.models.embodiment.wam_policy.execution import env, eval_runner
 
     _compose(monkeypatch)
     for name in ("OUTPUT_DIR", "RUN_ID", "LEDGER"):
@@ -157,12 +158,12 @@ def test_eval_entrypoint_validates_and_dispatches_pure_worker(monkeypatch):
         monkeypatch.setattr(module, "HybridComponentPlacement", Placement)
     for worker, owner in (
         (lifecycle.UncondRLRolloutWorker, "uncond_rollout"),
-        (entry.EnvWorker, "env"),
+        (env.EnvWorker, "env"),
     ):
         monkeypatch.setattr(
             worker, "create_group", lambda _cfg, name=owner: Group(name)
         )
-    monkeypatch.setattr(entry, "EmbodiedEvalRunner", Runner)
+    monkeypatch.setattr(eval_runner, "EmbodiedEvalRunner", Runner)
     entry.main.__wrapped__(cfg)
     assert launched == ["uncond_rollout", "env", "init", "run"]
 
