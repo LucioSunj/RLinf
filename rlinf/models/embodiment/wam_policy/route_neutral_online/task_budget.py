@@ -35,17 +35,21 @@ from rlinf.runners.fastwam_idm_cost_control import (
 
 
 def validate_task_budget_config(cfg: Any) -> dict[str, Any]:
-    """Resolve the fixed ten-task table under the existing Long training profile."""
+    """Resolve the fixed ten-task table for a supported LIBERO training suite."""
     value = OmegaConf.to_container(
         cfg.algorithm.fixed_branch_cost.task_budget, resolve=True
     )
     if not isinstance(value, dict):
         raise TypeError("Task budget must resolve to a mapping.")
-    if (
-        value.get("suite") != cfg.env.train.task_suite_name
-        or value["suite"] != "libero_10"
-    ):
-        raise ValueError("Offline task budgets must match the LIBERO-Long suite.")
+    if value.get("suite") != cfg.env.train.task_suite_name or value["suite"] not in {
+        "libero_10",
+        "libero_spatial",
+        "libero_object",
+        "libero_goal",
+    }:
+        raise ValueError(
+            "Offline task budgets must match a supported ten-task LIBERO training suite."
+        )
     targets = value.get("targets", {})
     if set(targets) != {str(i) for i in range(10)}:
         raise ValueError("Offline task budgets require exactly task IDs 0 through 9.")

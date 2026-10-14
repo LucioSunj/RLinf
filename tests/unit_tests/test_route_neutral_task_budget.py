@@ -187,8 +187,13 @@ def test_uniform_targets_reproduce_original_controller_exactly():
         )
 
 
-def test_native_runtime_roundtrip_and_changed_table_rejection(tmp_path):
+@pytest.mark.parametrize(
+    "suite", ("libero_10", "libero_spatial", "libero_object", "libero_goal")
+)
+def test_native_runtime_roundtrip_and_changed_table_rejection(tmp_path, suite):
     cfg = config(tmp_path)
+    cfg.env.train.task_suite_name = suite
+    cfg.algorithm.fixed_branch_cost.task_budget.suite = suite
     runtime = FastWAMIDMCostControlRuntime.from_config(cfg)
     assert isinstance(runtime, TaskBudgetRuntime)
     published = []
@@ -214,7 +219,31 @@ def test_native_runtime_roundtrip_and_changed_table_rejection(tmp_path):
     cfg.algorithm.fixed_branch_cost.task_budget.targets["0"] = 0.4
     with pytest.raises(ValueError, match="config hash"):
         TaskBudgetRuntime.from_config(cfg).load_state_dict(state, global_step=3)
+    cfg.algorithm.fixed_branch_cost.task_budget.targets["0"] = 0.3
+    other_suite = "libero_goal" if suite != "libero_goal" else "libero_10"
+    cfg.env.train.task_suite_name = other_suite
+    cfg.algorithm.fixed_branch_cost.task_budget.suite = other_suite
+    with pytest.raises(ValueError, match="config hash"):
+        TaskBudgetRuntime.from_config(cfg).load_state_dict(state, global_step=3)
     assert len(published) == 5
+
+
+@pytest.mark.parametrize(
+    "training_suite,budget_suite",
+    (
+        ("libero_spatial", "libero_10"),
+        ("libero_goal", "libero_object"),
+        ("libero_90", "libero_90"),
+    ),
+)
+def test_budget_suite_must_match_supported_training_suite(
+    tmp_path, training_suite, budget_suite
+):
+    cfg = config(tmp_path)
+    cfg.env.train.task_suite_name = training_suite
+    cfg.algorithm.fixed_branch_cost.task_budget.suite = budget_suite
+    with pytest.raises(ValueError, match="supported ten-task LIBERO training suite"):
+        FastWAMIDMCostControlRuntime.from_config(cfg)
 
 
 def cost_fixture():
