@@ -25,7 +25,7 @@ from fastwam.models.wan22.adaptive_sampler import (
 )
 from fastwam.models.wan22.batch_linear import install_batch_invariant_linears
 
-from rlinf.envs.sim.libero.action_protocol import (
+from rlinf.envs.action_protocol import (
     select_executed_action_prefix,
     select_executed_flow_statistics,
 )

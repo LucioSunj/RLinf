@@ -1,0 +1,7 @@
+defaults:
+  - realworld_fr3_fastwam_base
+  - _self_
+fr3:
+  task_name: drawer
+  task_id: 0
+  prompt: "Turn the lock to unlock the drawer, pull it open, place all the test tubes from the table inside, then close the drawer."

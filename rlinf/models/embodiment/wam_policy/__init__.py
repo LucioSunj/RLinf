@@ -483,9 +483,15 @@ def get_model(cfg, torch_dtype):
         )
     has_processor = cfg.runtime.get("processor") is not None
     has_processor_stats = bool(cfg.runtime.get("processor_stats_path"))
-    if has_processor != has_processor_stats:
+    fr3_runtime = str(cfg.runtime.get("_target_", "")) == (
+        "rlinf.models.embodiment.wam_policy.fr3_runtime.Fr3RouteNeutralRuntime"
+    )
+    if (not fr3_runtime and has_processor != has_processor_stats) or (
+        fr3_runtime and (has_processor or not has_processor_stats)
+    ):
         raise ValueError(
-            "FastWAM runtime processor and processor stats must be configured together."
+            "FastWAM requires paired processor/statistics; FR3 constructs its "
+            "processor from training_config and requires processor_stats_path."
         )
     policy_config = FastWAMAdaptivePolicyConfig(
         gate_epsilon=float(cfg.get("gate_epsilon", 0.1)),

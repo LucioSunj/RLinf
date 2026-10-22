@@ -1,0 +1,7 @@
+defaults:
+  - realworld_fr3_fastwam_base
+  - _self_
+fr3:
+  task_name: insert_tubes
+  task_id: 1
+  prompt: "Insert the tubes into the rack one by one."

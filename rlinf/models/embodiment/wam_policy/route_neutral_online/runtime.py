@@ -35,7 +35,7 @@ from fastwam.uncond_bc import (
 )
 
 from rlinf.envs.action_contract import ActionExecutionTrace
-from rlinf.envs.sim.libero.action_protocol import (
+from rlinf.envs.action_protocol import (
     select_executed_action_prefix,
     select_executed_flow_statistics,
 )
@@ -1535,7 +1535,7 @@ class RouteNeutralOnlineIDMTeacherLiberoRuntime(OnlineIDMTeacherLiberoRuntime):
                 timestep=timestep,
                 action_is_pad=None,
                 scheduler=self.actor.train_action_scheduler,
-                gripper_dimension=6,
+                gripper_dimension=self.gripper_dimension,
                 timestep_bins=timestep_bins,
             )
             loss_sum = bc_result.loss_action_bc * selected_count

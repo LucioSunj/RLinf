@@ -1,0 +1,54 @@
+defaults:
+  - fastwam_route_neutral_online
+  - _self_
+
+builder_target: rlinf.models.embodiment.wam_policy.fr3_policy.build_fr3_mixed_model
+config_validator_target: rlinf.models.embodiment.wam_policy.fr3_config.validate_fr3_training_config
+action_dim: 8
+num_action_chunks: 16
+actor_checkpoint: ???
+actor_checkpoint_sha256: ???
+model_path: ???
+formal_training_sampling_seed: ${actor.seed}
+fastwam:
+  text_padding: masked
+  load_text_encoder: false
+  proprio_dim: 8
+uncond_lora:
+  rank: 128
+  alpha: 128
+  dropout: 0
+  freeze_base: true
+video_lora:
+  rank: 128
+  alpha: 128
+  dropout: 0
+  freeze_base: true
+  target_groups: [self_attention_qkvo, cross_attention_qkvo, ffn]
+  strict_target_discovery: true
+route_neutral_online:
+  critic_warmup:
+    runner_updates: ${fr3.warmup_updates}
+runtime:
+  _target_: rlinf.models.embodiment.wam_policy.fr3_runtime.Fr3RouteNeutralRuntime
+  processor: null
+  processor_stats_path: ???
+  training_config: ???
+  easywam_root: ???
+  task_name: ???
+  task_prompt: ???
+  action_dt: 0.1
+  generation_horizon: 16
+  execution_horizon: 16
+  num_video_frames: 5
+  reset_wait_steps: 0
+  max_episode_steps: ${fr3.max_episode_actions}
+  camera_resize_mode: fr3_training_processor
+  binarize_gripper: false
+critic:
+  backbone:
+    action_dim: 8
+    num_action_chunks: 16
+    openpi_data:
+      profile: fr3
+      statistics: ${fr3.statistics}

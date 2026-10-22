@@ -17,9 +17,13 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import TypeVar
 
-TensorLike = TypeVar("TensorLike")
+from rlinf.envs.action_protocol import (
+    select_executed_action_prefix as select_executed_action_prefix,
+)
+from rlinf.envs.action_protocol import (
+    select_executed_flow_statistics as select_executed_flow_statistics,
+)
 
 
 def _positive_integer(value: int, *, name: str) -> int:
@@ -74,36 +78,3 @@ class LiberoActionProtocol:
         object.__setattr__(self, "prediction_video_frames", prediction_frames)
         object.__setattr__(self, "reset_wait_steps", int(self.reset_wait_steps))
         object.__setattr__(self, "max_episode_steps", max_steps)
-
-
-def select_executed_action_prefix(
-    values: TensorLike,
-    *,
-    protocol: LiberoActionProtocol,
-) -> TensorLike:
-    """Select exactly the official replan prefix without clipping or mutation."""
-
-    shape = getattr(values, "shape", None)
-    if shape is None or len(shape) < 2:
-        raise ValueError("FastWAM generated Actions must have shape [B, H, ...].")
-    if int(shape[1]) != protocol.generation_horizon:
-        raise ValueError(
-            "FastWAM generated horizon differs from the declared LIBERO protocol: "
-            f"{int(shape[1])} != {protocol.generation_horizon}."
-        )
-    return values[:, : protocol.execution_horizon]
-
-
-def select_executed_flow_statistics(
-    values: TensorLike,
-    *,
-    protocol: LiberoActionProtocol,
-) -> TensorLike:
-    """Select the executed prefix while preserving disabled eval replay state."""
-
-    shape = getattr(values, "shape", None)
-    if shape is None or len(shape) < 2:
-        raise ValueError("FastWAM Flow statistics must have shape [B, H, ...].")
-    if int(shape[1]) == 0:
-        return values
-    return select_executed_action_prefix(values, protocol=protocol)

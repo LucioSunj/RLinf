@@ -46,8 +46,7 @@ from rlinf.envs.action_contract import (
     ActionExecutionTrace,
     ActionStageStatistics,
 )
-from rlinf.envs.sim.libero.action_protocol import (
-    LiberoActionProtocol,
+from rlinf.envs.action_protocol import (
     select_executed_action_prefix,
     select_executed_flow_statistics,
 )
@@ -433,7 +432,7 @@ class LiberoFastWAMRuntime:
         self.num_video_frames = int(num_video_frames)
         self.num_inference_steps = int(num_inference_steps)
         self.seeded_noise_device = str(seeded_noise_device)
-        self.action_protocol = LiberoActionProtocol(
+        self.action_protocol = self._make_action_protocol(
             generation_horizon=generation_horizon,
             execution_horizon=execution_horizon,
             prediction_video_frames=num_video_frames,
@@ -491,10 +490,7 @@ class LiberoFastWAMRuntime:
             raise ValueError("`gate_denoise_last_n` must be positive.")
         if self.camera_concat not in {"horizontal", "vertical", "main_only"}:
             raise ValueError("Unsupported camera concatenation.")
-        if self.camera_resize_mode != OFFICIAL_LIBERO_CAMERA_RESIZE_MODE:
-            raise ValueError(
-                f"Unsupported LIBERO camera resize mode: {self.camera_resize_mode!r}."
-            )
+        self._validate_camera_contract()
         if (self.processor is None) != (self.processor_stats_path is None):
             raise ValueError(
                 "FastWAM processor and `processor_stats_path` must be configured together."
@@ -514,6 +510,23 @@ class LiberoFastWAMRuntime:
             stats = load_dataset_stats_from_json(str(self.processor_stats_path))
             self.processor.eval()
             self.processor.set_normalizer_from_stats(stats)
+
+    @staticmethod
+    def _make_action_protocol(**kwargs):
+        from rlinf.envs.sim.libero.action_protocol import LiberoActionProtocol
+
+        return LiberoActionProtocol(**kwargs)
+
+    def _validate_camera_contract(self) -> None:
+        if self.camera_resize_mode != OFFICIAL_LIBERO_CAMERA_RESIZE_MODE:
+            raise ValueError(
+                f"Unsupported LIBERO camera resize mode: {self.camera_resize_mode!r}."
+            )
+
+    @property
+    def gripper_dimension(self) -> int:
+        """Return the final action coordinate for task-aware BC diagnostics."""
+        return int(self.actor.action_expert.action_dim) - 1
 
     @property
     def device(self) -> torch.device:

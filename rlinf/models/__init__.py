@@ -184,6 +184,11 @@ def _register_builtin_models():
 
         return get_model(cfg, torch_dtype)
 
+    def _build_fastwam_idm_fr3(cfg: DictConfig, torch_dtype):
+        from rlinf.models.embodiment.wam_policy.fr3_idm import get_model
+
+        return get_model(cfg, torch_dtype)
+
     def _build_sd3(cfg: DictConfig, torch_dtype):
         from rlinf.models.diffusion.sd3 import get_model
 
@@ -357,6 +362,12 @@ def _register_builtin_models():
         force=True,
     )
     register_model(
+        "fastwam_idm_fr3",
+        _build_fastwam_idm_fr3,
+        category="embodied",
+        force=True,
+    )
+    register_model(
         SupportedModel.EVO1.value,
         _build_evo1,
         category="embodied",
@@ -383,9 +394,9 @@ def get_model(cfg: DictConfig):
     model = model_builder(cfg, torch_dtype)
 
     if (
-        Worker.torch_platform is not None
+        cfg.get("load_to_device", True)
+        and Worker.torch_platform is not None
         and Worker.torch_platform.is_available()
-        and cfg.get("load_to_device", True)
     ):
         model = model.to(Worker.torch_device_type)
 

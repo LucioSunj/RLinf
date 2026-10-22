@@ -1,0 +1,140 @@
+defaults:
+  - model/fastwam_fr3_mixed@actor.model
+  - _self_
+
+hydra:
+  run:
+    dir: .
+  output_subdir: null
+
+fr3:
+  task_name: ???
+  task_id: ???
+  prompt: ???
+  device: ???
+  updates: ???
+  episodes_per_update: 1
+  warmup_updates: ???
+  max_episode_actions: ???
+  max_episode_seconds: ???
+  output_dir: ???
+  checkpoint_every: 1
+  request_timeout_s: 120
+  poll_interval_s: 0.5
+  action_dt: 0.1
+  data_contract_confirmed: false
+  ready: false
+  statistics: ???
+  training_config: ???
+  parent_checkpoint: ???
+  parent_checkpoint_sha256: ???
+
+env:
+  train:
+    env_type: real
+    backend: fr3_polymetis
+    num_envs: 1
+    auto_reset: false
+    ignore_terminations: false
+    bridge_url: ws://127.0.0.1:8003
+    request_timeout_s: ${fr3.request_timeout_s}
+    task_name: ${fr3.task_name}
+    task_id_filter: ["${fr3.task_id}"]
+    action_dt: ${fr3.action_dt}
+    max_episode_actions: ${fr3.max_episode_actions}
+    max_episode_seconds: ${fr3.max_episode_seconds}
+
+runner:
+  task_type: embodied
+  bootstrap_uncond_lora_sidecar: ???
+  bootstrap_uncond_lora_sidecar_sha256: ???
+  resume_dir: null
+  fastwam_training_guard:
+    enabled: true
+    cost_audit:
+      enabled: true
+      break_even_guard_enabled: false
+
+actor:
+  seed: 42
+  model:
+    formal_training_sampling_seed: ${actor.seed}
+  training_backend: local
+  micro_batch_size: 1
+  enable_offload: false
+  fsdp_config: {}
+  optim:
+    gate_lr: 3.0e-5
+    lora_lr: 1.0e-5
+    value_lr: 1.0e-4
+    adam_beta1: 0.9
+    adam_beta2: 0.95
+    adam_eps: 1.0e-8
+    weight_decay: 0
+    clip_grad: 1
+
+algorithm:
+  gamma: 0.99
+  gae_lambda: 0.95
+  update_epoch: 1
+  gate_ppo:
+    clip_ratio_low: 0.2
+    clip_ratio_high: 0.2
+    entropy_coefficient: 0.01
+    entropy_metric_source: base
+    entropy_loss_source: base
+    loss_weight: 1
+  uncond_flow_ppo:
+    clip_ratio_low: 0.2
+    clip_ratio_high: 0.2
+    entropy_coefficient: 0
+    loss_weight: 1
+  uncond_idm_bc:
+    enabled: true
+    loss_weight: 0.2
+  critic_loss:
+    value_clip: 0.2
+    huber_delta: 10
+    loss_weight: 1
+  fixed_branch_cost:
+    enabled: true
+    idm_cost: 0
+    uncond_cost: 0
+    task_budget: ???
+    controller:
+      type: pad_critic_warmup_reversal_damped
+      constraint: two_sided_band
+      charge_scope: eligible_nonforced
+      rate:
+        scope: eligible_gate_decisions
+        feedback: expected_behavior_probability
+        target_idm_fraction: null
+        half_width: 0.03
+      signed_price:
+        initial_value: 0
+        learning_rate: 0.0025
+        ema_beta: 0
+        update_interval: 1
+        max_abs_value: 0.1
+        max_delta_per_update: 0.005
+        reversal:
+          mode: opposing_decay
+          factor: 0.5
+      critic_warmup:
+        runner_updates: ${fr3.warmup_updates}
+        route_behavior: independent_random
+        idm_probability: 0.5
+        freeze_gate: true
+        freeze_cost_controller: true
+
+# A single resident owner collects sealed episodes and then replays the same
+# policy; these fields also preserve native training-checkpoint contracts.
+rollout:
+  generation_backend: local
+  pipeline_stage_num: 1
+weight_syncer: {}
+cluster:
+  component_placement:
+    actor: local
+    rollout: local
+    env: local

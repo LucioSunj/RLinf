@@ -146,7 +146,13 @@ def get_model(cfg: DictConfig, torch_dtype=None):
     config_name = getattr(cfg.openpi, "config_name", None)
     data_kwargs = getattr(cfg, "openpi_data", None)
     actor_train_config = get_openpi_config(
-        config_name, model_path=cfg.model_path, data_kwargs=data_kwargs
+        config_name,
+        model_path=cfg.model_path,
+        data_kwargs=(
+            None
+            if data_kwargs is not None and data_kwargs.get("profile") == "fr3"
+            else data_kwargs
+        ),
     )
 
     actor_model_config = actor_train_config.model
@@ -227,6 +233,21 @@ def get_model(cfg: DictConfig, torch_dtype=None):
     model.paligemma_with_expert.to_bfloat16_for_selected_params("bfloat16")
     # fsdp replace
     # model.paligemma_with_expert.replace_gemma_decoder_layers()
+    if data_kwargs is not None and data_kwargs.get("profile") == "fr3":
+        from openpi.training.config import ModelTransformFactory
+
+        from rlinf.models.embodiment.wam_policy.fr3_critic import Fr3Pi05Inputs
+
+        model_transforms = ModelTransformFactory()(actor_model_config)
+        model.setup_wrappers(
+            transforms=[
+                Fr3Pi05Inputs(data_kwargs["statistics"]),
+                *model_transforms.inputs,
+            ],
+            output_transforms=[],
+        )
+        return model
+
     # load data stats
     data_config = actor_train_config.data.create(
         actor_train_config.assets_dirs, actor_model_config

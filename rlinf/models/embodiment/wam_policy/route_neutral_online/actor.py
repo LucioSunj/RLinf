@@ -723,9 +723,16 @@ class RouteNeutralOnlineIDMBCFSDPActor(OnlineIDMBCFSDPActor):
                 ("executed_prefix_mse_sum", "executed_prefix_mse"),
             )
         }
-        dimension_values = [
-            take(f"online/mse_dimension_sum_{index}") for index in range(7)
-        ]
+        dimension_prefix = f"{_COMPACTION_METRIC_PREFIX}online/mse_dimension_sum_"
+        dimension_indices = sorted(
+            int(name.removeprefix(dimension_prefix))
+            for name in metrics
+            if name.startswith(dimension_prefix)
+        )
+        dimension_values = {
+            index: take(f"online/mse_dimension_sum_{index}")
+            for index in dimension_indices
+        }
         timestep_values = [
             (
                 take(f"online/timestep_count_{index}"),
@@ -737,7 +744,7 @@ class RouteNeutralOnlineIDMBCFSDPActor(OnlineIDMBCFSDPActor):
             return
         for metric_name, values in detailed_values.items():
             metrics[f"online_idm_bc/{metric_name}"] = [sum(values) / total_selected]
-        for index, values in enumerate(dimension_values):
+        for index, values in dimension_values.items():
             metrics[f"online_idm_bc/mse_dimension_{index}"] = [
                 sum(values) / total_selected
             ]
@@ -764,12 +771,26 @@ class RouteNeutralOnlineIDMBCFSDPActor(OnlineIDMBCFSDPActor):
                 float(weighted)
             ) / max(abs(float(flow)), 1.0e-12)
         if getattr(self, "_task_loss_totals", None) is not None:
-            metrics.update(finalize_task_losses(self._task_loss_totals))
+            metrics.update(
+                finalize_task_losses(
+                    self._task_loss_totals, active_task_ids=self._active_task_ids()
+                )
+            )
+
+    def _active_task_ids(self) -> tuple[int, ...] | None:
+        table = self.cfg.algorithm.fixed_branch_cost.get("task_budget")
+        if table is not None and table.get("profile") == "fr3":
+            return tuple(sorted(int(task) for task in table.targets))
+        return None
 
     def compute_advantages_and_returns(self) -> dict[str, Any]:
         metrics = super().compute_advantages_and_returns()
         if "multitask_task_id" in self.rollout_batch.get("forward_inputs", {}):
-            metrics.update(summarize_task_rollout(self.rollout_batch))
+            metrics.update(
+                summarize_task_rollout(
+                    self.rollout_batch, active_task_ids=self._active_task_ids()
+                )
+            )
             self._task_loss_totals = {}
         return metrics
 
@@ -817,7 +838,11 @@ class RouteNeutralOnlineIDMBCFSDPActor(OnlineIDMBCFSDPActor):
         self._route_neutral_warmup_active = warmup
         if "multitask_task_id" in micro_batch.get("forward_inputs", {}):
             accumulate_task_losses(
-                self._task_loss_totals, micro_batch, output_dict, self.cfg
+                self._task_loss_totals,
+                micro_batch,
+                output_dict,
+                self.cfg,
+                active_task_ids=self._active_task_ids(),
             )
         if not warmup:
             loss, metrics = super()._compute_fastwam_loss(
@@ -878,6 +903,7 @@ class RouteNeutralOnlineIDMBCFSDPActor(OnlineIDMBCFSDPActor):
             flow_advantages=micro_batch["flow_advantages"].float(),
             route_used=route.route_used,
             flow_valid_mask=micro_batch["flow_valid_mask"].bool(),
+            flow_execution_mask=micro_batch.get("flow_execution_mask"),
             flow_clip_ratio_low=float(flow_cfg.clip_ratio_low),
             flow_clip_ratio_high=float(flow_cfg.clip_ratio_high),
             flow_entropy=output_dict.get("flow_entropy"),

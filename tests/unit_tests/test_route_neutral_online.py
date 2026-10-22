@@ -1699,7 +1699,10 @@ def test_mb4_compaction_reports_original_rollout_batch_means() -> None:
 
 
 @pytest.mark.parametrize("full_teacher_metrics", [False, True])
-def test_mb4_compaction_restores_mb1_metric_denominators(full_teacher_metrics) -> None:
+@pytest.mark.parametrize("action_dim", [7, 8])
+def test_mb4_compaction_restores_mb1_metric_denominators(
+    full_teacher_metrics, action_dim
+) -> None:
     prefix = "_route_neutral_compaction/"
     actor = SimpleNamespace(
         cfg=SimpleNamespace(
@@ -1741,7 +1744,7 @@ def test_mb4_compaction_restores_mb1_metric_denominators(full_teacher_metrics) -
                 f"{prefix}rollout_teacher/bytes": [300.0, 300.0],
             }
         )
-    for index in range(7):
+    for index in range(action_dim):
         value = float(index + 1)
         metrics[f"{prefix}online/mse_dimension_sum_{index}"] = [
             value,
@@ -1781,6 +1784,11 @@ def test_mb4_compaction_restores_mb1_metric_denominators(full_teacher_metrics) -
     )
     assert metrics["online_idm_bc/valid_action_count"] == pytest.approx([4.0])
     assert metrics["online_idm_bc/mse_pose"] == pytest.approx([3.0])
+    for index in range(action_dim):
+        assert metrics[f"online_idm_bc/mse_dimension_{index}"] == pytest.approx(
+            [float(index + 1)]
+        )
+    assert f"online_idm_bc/mse_dimension_{action_dim}" not in metrics
     assert metrics["online_idm_bc/mse_timestep_bin_0"] == pytest.approx([10.0 / 3.0])
     assert metrics["online_idm_bc/timestep_bin_count_0"] == [1.0]
     assert metrics[
@@ -1799,7 +1807,8 @@ def test_mb4_compaction_restores_mb1_metric_denominators(full_teacher_metrics) -
     assert reduced["online_idm_bc/weighted_to_flow_loss_ratio"] == pytest.approx(1.6)
 
 
-def test_mb4_dummy_batch_consumes_zero_selected_metric_state() -> None:
+@pytest.mark.parametrize("action_dim", [7, 8])
+def test_mb4_dummy_batch_consumes_zero_selected_metric_state(action_dim) -> None:
     prefix = "_route_neutral_compaction/"
     actor = SimpleNamespace(
         cfg=SimpleNamespace(
@@ -1826,7 +1835,7 @@ def test_mb4_dummy_batch_consumes_zero_selected_metric_state() -> None:
         f"{prefix}online/executed_prefix_mse_sum": [0.0],
         "online_idm_bc/loss_weight": [0.2],
     }
-    for index in range(7):
+    for index in range(action_dim):
         metrics[f"{prefix}online/mse_dimension_sum_{index}"] = [0.0]
     for index in range(10):
         metrics[f"{prefix}online/timestep_count_{index}"] = [0.0]

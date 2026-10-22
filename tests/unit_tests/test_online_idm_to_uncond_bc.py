@@ -86,6 +86,7 @@ def test_gate_gradient_diagnostic_preserves_online_bc_replay_inputs() -> None:
 class _TinyActor(nn.Module):
     def __init__(self) -> None:
         super().__init__()
+        self.action_expert = SimpleNamespace(action_dim=7)
         self.base = nn.Parameter(torch.tensor(1.0), requires_grad=False)
         self.lora = nn.Parameter(torch.tensor(0.5))
 

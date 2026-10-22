@@ -399,7 +399,7 @@ class OnlineIDMTeacherLiberoRuntime(LiberoFastWAMRuntime):
                 timestep=timestep,
                 action_is_pad=None,
                 scheduler=self.actor.train_action_scheduler,
-                gripper_dimension=6,
+                gripper_dimension=self.gripper_dimension,
                 timestep_bins=timestep_bins,
             )
             losses.append(result.loss_action_bc)

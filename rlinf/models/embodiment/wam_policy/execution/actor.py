@@ -3369,6 +3369,7 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
             flow_advantages=micro_batch["flow_advantages"].float(),
             route_used=route_info.route_used,
             flow_valid_mask=micro_batch["flow_valid_mask"].bool(),
+            flow_execution_mask=micro_batch.get("flow_execution_mask"),
             flow_clip_ratio_low=float(flow_cfg.clip_ratio_low),
             flow_clip_ratio_high=float(flow_cfg.clip_ratio_high),
             flow_entropy=output_dict.get("flow_entropy", None),

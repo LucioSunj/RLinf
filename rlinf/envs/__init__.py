@@ -146,6 +146,10 @@ def get_env_cls(env_type: str, env_cfg=None):
 
         return Robocasa365Env
     elif env_type == SupportedEnvType.REAL:
+        if env_cfg is not None and env_cfg.get("backend") == "fr3_polymetis":
+            from rlinf.envs.real.fr3_polymetis import Fr3PolymetisEnv
+
+            return Fr3PolymetisEnv
         from rlinf.envs.real import RealWorldEnv
 
         return RealWorldEnv

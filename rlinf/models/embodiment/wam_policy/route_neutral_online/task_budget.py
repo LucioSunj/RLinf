@@ -41,6 +41,8 @@ def validate_task_budget_config(cfg: Any) -> dict[str, Any]:
     )
     if not isinstance(value, dict):
         raise TypeError("Task budget must resolve to a mapping.")
+    if value.get("profile") == "fr3":
+        return validate_fr3_task_budget_config(cfg)
     if value.get("suite") != cfg.env.train.task_suite_name or value["suite"] not in {
         "libero_10",
         "libero_spatial",
@@ -61,6 +63,12 @@ def validate_task_budget_config(cfg: Any) -> dict[str, Any]:
         raise ValueError(
             "Task budgets require the balanced ten-task single-Actor profile."
         )
+    return _validate_controller_and_guard(cfg, value)
+
+
+def _validate_controller_and_guard(cfg: Any, value: dict[str, Any]) -> dict[str, Any]:
+    """Keep shared scientific controller and actual-cost audit constraints."""
+    targets = value["targets"]
     guard = cfg.runner.fastwam_training_guard
     if (
         not guard.enabled
@@ -99,6 +107,59 @@ def validate_task_budget_config(cfg: Any) -> dict[str, Any]:
     return value
 
 
+def validate_fr3_task_budget_config(cfg: Any) -> dict[str, Any]:
+    """Validate explicit active FR3 targets and their calibration provenance."""
+    value = OmegaConf.to_container(
+        cfg.algorithm.fixed_branch_cost.task_budget, resolve=True
+    )
+    if (
+        not isinstance(value, dict)
+        or value.get("profile") != "fr3"
+        or value.get("suite") != "fr3"
+    ):
+        raise ValueError("FR3 task budget requires profile=fr3 and suite=fr3.")
+    targets = value.get("targets", {})
+    identities = {"0": "drawer", "1": "insert_tubes"}
+    if not targets or not set(targets).issubset(identities):
+        raise ValueError(
+            "FR3 budgets require an explicit active subset of drawer=0, insert_tubes=1."
+        )
+    if value.get("task_names") != {key: identities[key] for key in targets}:
+        raise ValueError("FR3 budget task_names must match its active task IDs.")
+    calibration = value.get("calibration")
+    if (
+        not isinstance(calibration, dict)
+        or not calibration
+        or calibration.get("status") != "COMPLETE"
+    ):
+        raise ValueError(
+            "FR3 budgets require COMPLETE real-data calibration provenance."
+        )
+    expected = {
+        "awe_threshold": 0.005,
+        "sail_radius_m": 0.04,
+        "sail_min_samples": 3,
+        "execution_horizon": 16,
+    }
+    if calibration.get("parameters") != expected:
+        raise ValueError(
+            "FR3 calibration requires original AWE0.005, SAIL4cm/min3 and horizon16."
+        )
+    if not calibration.get("source") or not calibration.get("data_version"):
+        raise ValueError(
+            "FR3 calibration must bind its source artifact and data version."
+        )
+    active = sorted(int(key) for key in targets)
+    selected = OmegaConf.select(cfg, "env.train.task_id_filter")
+    if selected is None or sorted(selected) != active:
+        raise ValueError(
+            "FR3 environment task_id_filter must match the active calibrated tasks."
+        )
+    if OmegaConf.select(cfg, "env.train.num_envs", default=1) != 1:
+        raise ValueError("FR3 task budgets require one physical environment.")
+    return _validate_controller_and_guard(cfg, value)
+
+
 class TaskBudgetController:
     """Keep independent prices and original update equations for each task."""
 
@@ -111,7 +172,9 @@ class TaskBudgetController:
         self.config = copy.deepcopy(dict(controller_config))
         self.table = copy.deepcopy(dict(table))
         self.controllers = {}
-        for task in range(10):
+        if not self.table.get("targets"):
+            raise ValueError("Task budget table must contain active targets.")
+        for task in sorted(int(key) for key in self.table["targets"]):
             config = copy.deepcopy(self.config)
             config["rate"]["target_idm_fraction"] = self.table["targets"][str(task)]
             self.controllers[task] = PadCriticWarmupReversalDampedController(config)
@@ -247,7 +310,7 @@ class TaskBudgetRuntime(FastWAMIDMCostControlRuntime):
             )
         if len(actor_rollout_metrics) != 1:
             raise ValueError(
-                "The selected N84 profile has one Actor receiving the complete rollout."
+                "Task feedback requires one Actor receiving the complete rollout."
             )
         metrics = actor_rollout_metrics[0]
         record = self.controller.observe(runner_step, metrics)
@@ -310,14 +373,15 @@ def apply_task_chunk_costs(
         raise ValueError(
             "Task costs require integral task identities on the original T/B rollout."
         )
-    valid_mask = batch.get("loss_mask")
+    valid_mask = batch.get("chunk_valid", batch.get("loss_mask"))
     valid = _chunk_mask(
         valid_mask, shape=route.shape, name="loss_mask", device=ids.device
     )
     costs = torch.zeros_like(raw_rewards.sum(dim=-1, keepdim=True))
     covered = torch.zeros_like(valid)
     tasks = {}
-    for task in range(10):
+    active_tasks = sorted(int(key) for key in decision["tasks"])
+    for task in active_tasks:
         selected = valid & (ids == task)
         covered |= selected
         price = decision["tasks"][str(task)]
@@ -361,15 +425,17 @@ def apply_task_chunk_costs(
                 decision["tasks"][str(i)]["uncond_cost"],
                 decision["tasks"][str(i)]["idm_cost"],
             ]
-            for i in range(10)
+            for i in active_tasks
         ],
         dtype=costs.dtype,
         device=costs.device,
     )
     expected = torch.zeros_like(costs)
     selected = charge_mask & valid
+    task_keys = torch.tensor(active_tasks, dtype=ids.dtype, device=ids.device)
+    rows = torch.searchsorted(task_keys, ids[selected].contiguous())
     expected[..., 0][selected] = lookup[
-        ids[selected].long(), (route.route_used[selected] == int(WAMRoute.IDM)).long()
+        rows, (route.route_used[selected] == int(WAMRoute.IDM)).long()
     ]
     audit = TaskCostAudit(
         {

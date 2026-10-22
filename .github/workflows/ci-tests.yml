@@ -104,6 +104,7 @@ jobs:
               - 'rlinf/runners/*reward*.py'
               - 'examples/embodiment/*'
               - 'examples/embodiment/config/*/**'
+              - 'examples/embodiment/config/realworld_fr3_fastwam*.yaml'
               - 'examples/diffusion/**'
               - 'examples/reward/**'
               - 'tests/e2e_tests/embodied/**'

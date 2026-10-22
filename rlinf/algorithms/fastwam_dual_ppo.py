@@ -498,6 +498,23 @@ def compute_gate_ppo_loss(
     )
 
 
+def mask_executed_flow_statistics(
+    values: torch.Tensor, execution_mask: torch.Tensor
+) -> torch.Tensor:
+    """Remove unexecuted action coordinates before joint chunk reduction."""
+    if execution_mask.dtype != torch.bool:
+        raise TypeError("Flow execution_mask must use torch.bool.")
+    if (
+        values.ndim != execution_mask.ndim + 1
+        or values.shape[:-1] != execution_mask.shape
+    ):
+        raise ValueError(
+            "Flow execution_mask must match the leading batch and action-time "
+            f"axes: values={tuple(values.shape)}, mask={tuple(execution_mask.shape)}."
+        )
+    return torch.where(execution_mask.unsqueeze(-1), values, 0.0)
+
+
 def compute_uncond_flow_ppo_loss(
     *,
     logprobs: torch.Tensor,
@@ -510,6 +527,7 @@ def compute_uncond_flow_ppo_loss(
     entropy: torch.Tensor | None = None,
     entropy_coefficient: float = 0.0,
     selected_loss_scale: float | torch.Tensor | None = None,
+    execution_mask: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
     """Compute joint chunk-level Flow-SDE PPO only for executed UNCOND."""
 
@@ -529,6 +547,19 @@ def compute_uncond_flow_ppo_loss(
     if logprobs.shape[: route_used.ndim] != route_used.shape:
         raise ValueError(
             "Flow log-probability leading dimensions must match route_used."
+        )
+    if execution_mask is not None:
+        if execution_mask.shape[:-1] != route_used.shape:
+            raise ValueError("Flow execution_mask must have shape [*route_shape,H].")
+        logprobs = mask_executed_flow_statistics(logprobs, execution_mask)
+        old_logprobs = mask_executed_flow_statistics(old_logprobs, execution_mask)
+        if entropy is not None:
+            entropy = mask_executed_flow_statistics(entropy, execution_mask)
+        executed = execution_mask.any(dim=-1)
+        valid_mask = (
+            executed
+            if valid_mask is None
+            else valid_mask.reshape_as(executed) & executed
         )
     reduction_dims = tuple(range(route_used.ndim, logprobs.ndim))
     if reduction_dims:
@@ -596,6 +627,7 @@ def compute_fastwam_dual_ppo_loss(
     flow_loss_coefficient: float = 1.0,
     gate_selected_loss_scale: float | torch.Tensor | None = None,
     flow_selected_loss_scale: float | torch.Tensor | None = None,
+    flow_execution_mask: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
     """Assemble independently clipped Gate and UNCOND Flow-SDE PPO losses."""
 
@@ -624,6 +656,7 @@ def compute_fastwam_dual_ppo_loss(
         entropy=flow_entropy,
         entropy_coefficient=flow_entropy_coefficient,
         selected_loss_scale=flow_selected_loss_scale,
+        execution_mask=flow_execution_mask,
     )
     total_loss = gate_loss_coefficient * gate_loss + flow_loss_coefficient * flow_loss
     metrics = {
