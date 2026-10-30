@@ -100,6 +100,10 @@ class FastWAMFr3Policy(BasePolicy):
         """Load the native model only when the caller explicitly builds a policy."""
         training = OmegaConf.load(Path(config.training_config).expanduser())
         validate_training_config(training)
+        if training.data.train.num_frames != 17:
+            raise ValueError(
+                "Native FR3 IDM deployment currently requires 17 source steps."
+            )
         source = _easywam_source(config.easywam_root)
         checkpoint = Path(config.checkpoint).expanduser()
         if not checkpoint.is_file():

@@ -81,6 +81,12 @@ class Fr3InferenceSession:
     def __init__(self, policy: Any, contract: dict, *, mode: str, artifact_kind: str):
         if mode not in MODES:
             raise ValueError(f"Unsupported FR3 deployment mode {mode!r}.")
+        if contract["action_horizon"] == 32 and (
+            mode not in {"uncond_bc", "forced_uncond"} or artifact_kind != "bc"
+        ):
+            raise ValueError(
+                "The 32-step FR3 profile supports Uncond BC deployment only."
+            )
         if mode == "rl_mixed" and artifact_kind != "rl":
             raise ValueError("Learned mixed routing requires an RL Gate checkpoint.")
         if mode in {"uncond_bc", "forced_uncond"} and artifact_kind == "idm":
@@ -111,8 +117,8 @@ class Fr3InferenceSession:
             "camera_roles": ["left", "wrist"],
             "state_dim": 8,
             "action_dim": 8,
-            "action_horizon": 16,
-            "num_video_frames": 5,
+            "action_horizon": contract["action_horizon"],
+            "num_video_frames": policy.runtime.num_video_frames,
             "action_dt": contract["action_dt"],
             "action_space": "absolute_joint_position",
             "gripper_encoding": "closed_0_1",
@@ -203,6 +209,8 @@ def build_fr3_inference(config: Any) -> Fr3InferenceSession:
         raise ValueError(
             "Deployment model task/prompt/timing differs from its contract."
         )
+    if model.runtime.generation_horizon != contract["action_horizon"]:
+        raise ValueError("Deployment horizon differs from the task contract.")
     model.eval_without_critic = True
     payload = torch.load(Path(cfg.artifact), map_location="cpu", weights_only=True)
     dtype = {"fp32": torch.float32, "bf16": torch.bfloat16, "fp16": torch.float16}[

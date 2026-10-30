@@ -23,7 +23,7 @@ FR3_TASK_IDS = {"drawer": 0, "insert_tubes": 1}
 
 @dataclass(frozen=True)
 class Fr3ActionProtocol:
-    """FR3 generates sixteen joint targets and predicts five video frames."""
+    """FR3 action chunk and matching source-video horizon."""
 
     generation_horizon: int = 16
     execution_horizon: int = 16
@@ -36,10 +36,8 @@ class Fr3ActionProtocol:
             self.generation_horizon,
             self.execution_horizon,
             self.prediction_video_frames,
-        ) != (16, 16, 5):
-            raise ValueError(
-                "FR3 requires 16 generated/executed steps and 5 IDM frames."
-            )
+        ) not in {(16, 16, 5), (32, 32, 9)}:
+            raise ValueError("FR3 requires matching 16/16/5 or 32/32/9 horizons.")
         if self.reset_wait_steps != 0:
             raise ValueError(
                 "FR3 reset is an explicit operator operation, not simulator wait steps."
@@ -107,6 +105,8 @@ class Fr3RouteNeutralRuntime(RouteNeutralOnlineIDMTeacherLiberoRuntime):
             else training_config
         )
         self.fr3_processor = Fr3Processor(config, processor_stats_path, easywam_root)
+        if self.fr3_processor.action_horizon != generation_horizon:
+            raise ValueError("FR3 runtime horizon differs from its training recipe.")
         self.task_name, self.task_prompt = task_name, task_prompt
         self.task_id, self.action_dt = FR3_TASK_IDS[task_name], float(action_dt)
         super().__init__(

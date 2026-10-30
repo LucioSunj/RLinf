@@ -23,17 +23,20 @@ BUILDER = "rlinf.models.embodiment.wam_policy.fr3_policy.build_fr3_mixed_model"
 
 def validate_fr3_model_config(model: Any) -> None:
     """Check fixed scientific settings before loading the task parent."""
+    horizon = OmegaConf.select(model, "runtime.generation_horizon")
+    if horizon not in (16, 32):
+        raise ValueError("FR3 generation horizon must be 16 or 32.")
     expected = {
         "builder_target": BUILDER,
         "action_dim": 8,
-        "num_action_chunks": 16,
+        "num_action_chunks": horizon,
         "fastwam.proprio_dim": 8,
         "fastwam.action_dit_config.action_dim": 8,
         "fastwam.text_padding": "masked",
         "runtime._target_": RUNTIME,
-        "runtime.generation_horizon": 16,
-        "runtime.execution_horizon": 16,
-        "runtime.num_video_frames": 5,
+        "runtime.generation_horizon": horizon,
+        "runtime.execution_horizon": horizon,
+        "runtime.num_video_frames": horizon // 4 + 1,
         "runtime.reset_wait_steps": 0,
         "runtime.binarize_gripper": False,
         "gate.current_mode_embedding": False,
@@ -69,6 +72,8 @@ def validate_fr3_training_config(cfg: Any, *, only_eval: bool = False) -> None:
     """Require confirmed assets, finite run limits and calibrated task budgets."""
     model = cfg.actor.model
     validate_fr3_model_config(model)
+    if model.runtime.generation_horizon != 16:
+        raise ValueError("FR3 mixed RL requires its original 16-step profile.")
     fr3 = cfg.fr3
     identities = {"drawer": 0, "insert_tubes": 1}
     if isinstance(fr3.task_id, bool) or identities.get(fr3.task_name) != fr3.task_id:

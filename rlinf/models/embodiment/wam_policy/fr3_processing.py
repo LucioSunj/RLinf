@@ -44,13 +44,14 @@ def validate_training_config(config: DictConfig) -> None:
     """Reject a recipe that changes the FR3 checkpoint's observation contract."""
     model, data = config.model, config.data.train
     processor = data.processor
+    if data.num_frames not in (17, 33):
+        raise ValueError("FR3 requires 17 or 33 source observation steps.")
     required = {
         "model._target_": (model.get("_target_"), "runtime.create_fastwam_idm"),
         "backbone": (model.backbone.name, "wan22"),
         "state_position": (model.state_position, "context"),
         "state_dim": (model.state_dim, 8),
         "action_dim": (model.action_dit_config.action_dim, 8),
-        "num_frames": (data.num_frames, 17),
         "action_video_freq_ratio": (data.action_video_freq_ratio, 4),
         "global_sample_stride": (data.global_sample_stride, 1),
         "concat_multi_camera": (data.concat_multi_camera, "horizontal"),
@@ -58,7 +59,7 @@ def validate_training_config(config: DictConfig) -> None:
         "normalization": (processor.norm_default_mode, "z-score"),
         "stepwise normalization": (processor.use_stepwise_action_norm, False),
         "normalization exceptions": (processor.get("norm_exception_mode"), None),
-        "observation steps": (processor.num_obs_steps, 17),
+        "observation steps": (processor.num_obs_steps, data.num_frames),
         "delta_action_dim_mask": (processor.get("delta_action_dim_mask"), None),
         "action_output_dim": (processor.action_output_dim, 8),
         "proprio_output_dim": (processor.proprio_output_dim, 8),
@@ -104,7 +105,7 @@ def validate_training_config(config: DictConfig) -> None:
 
 
 class Fr3Processor:
-    """Apply training transforms and recover all sixteen absolute joint targets.
+    """Apply training transforms and recover absolute joint targets.
 
     Args:
         training_config: Resolved EasyWAM training configuration.
@@ -119,6 +120,7 @@ class Fr3Processor:
         easywam_root: str | Path,
     ) -> None:
         validate_training_config(training_config)
+        self.action_horizon = int(training_config.data.train.num_frames) - 1
         _easywam_source(easywam_root)
         from data.dataset_utils import (
             CenterCrop,
@@ -202,8 +204,13 @@ class Fr3Processor:
     ) -> np.ndarray:
         """Undo normalization and relative joints without the training time crop."""
         action = normalized_action.detach().to(device="cpu", dtype=torch.float32)
-        if action.shape != (1, ACTION_HORIZON, 8) or not torch.isfinite(action).all():
-            raise ValueError("Expected finite normalized actions [1,16,8].")
+        if (
+            action.shape != (1, self.action_horizon, 8)
+            or not torch.isfinite(action).all()
+        ):
+            raise ValueError(
+                f"Expected finite normalized actions [1,{self.action_horizon},8]."
+            )
         raw_state = raw_state.detach().to(device="cpu", dtype=torch.float32)
         if raw_state.shape != (1, 1, 8) or not torch.isfinite(raw_state).all():
             raise ValueError("Expected a finite raw state anchor [1,1,8].")
@@ -237,8 +244,13 @@ class Fr3Processor:
         self, normalized_action: torch.Tensor, raw_state: torch.Tensor
     ) -> np.ndarray:
         """Decode B independent chunks without storing mutable processor anchors."""
-        if normalized_action.ndim != 3 or normalized_action.shape[1:] != (16, 8):
-            raise ValueError("Expected normalized actions [B,16,8].")
+        if normalized_action.ndim != 3 or normalized_action.shape[1:] != (
+            self.action_horizon,
+            8,
+        ):
+            raise ValueError(
+                f"Expected normalized actions [B,{self.action_horizon},8]."
+            )
         if raw_state.shape != (normalized_action.shape[0], 1, 8):
             raise ValueError("Expected a separate raw state [B,1,8] for each chunk.")
         return np.stack(
