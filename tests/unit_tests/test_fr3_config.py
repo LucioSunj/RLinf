@@ -8,7 +8,7 @@ from pathlib import Path
 
 import pytest
 from hydra import compose, initialize_config_dir
-from omegaconf import OmegaConf
+from omegaconf import OmegaConf, open_dict
 
 from rlinf.models.embodiment.wam_policy.fr3_config import (
     validate_fr3_model_config,
@@ -123,8 +123,8 @@ def test_hydra_profiles_require_confirmation_and_keep_fr3_dimensions(config):
         ),
         (
             "algorithm.fixed_branch_cost.task_budget.calibration.parameters.sail_radius_m",
-            0.03,
-            "SAIL4cm",
+            0.02,
+            "SAIL2.5/3/4cm",
         ),
     ],
 )
@@ -155,4 +155,36 @@ def test_budget_horizon_cannot_cross_h16_h32(config):
     parameters = config.algorithm.fixed_branch_cost.task_budget.calibration.parameters
     parameters.execution_horizon = 32 if config.fr3.action_horizon == 16 else 16
     with pytest.raises(ValueError, match="execution horizon"):
+        validate_fr3_training_config(config)
+
+
+@pytest.mark.parametrize("limits", [(None, None), (35, None), (None, 60.0)])
+def test_explicit_optional_episode_limits_match_env_and_runtime(config, limits):
+    config.fr3.ready = config.fr3.data_contract_confirmed = True
+    config.fr3.max_episode_actions, config.fr3.max_episode_seconds = limits
+    validate_fr3_training_config(config)
+    assert config.env.train.max_episode_actions == limits[0]
+    assert config.env.train.max_episode_seconds == limits[1]
+    assert config.actor.model.runtime.max_episode_steps == limits[0]
+
+
+@pytest.mark.parametrize("key", ["max_episode_actions", "max_episode_seconds"])
+@pytest.mark.parametrize("value", [0, -1, True, "null", float("inf"), float("nan")])
+def test_episode_limits_reject_invalid_values(config, key, value):
+    config.fr3.ready = config.fr3.data_contract_confirmed = True
+    config.fr3[key] = value
+    with pytest.raises(ValueError, match=key):
+        validate_fr3_training_config(config)
+
+
+@pytest.mark.parametrize("key", ["max_episode_actions", "max_episode_seconds"])
+def test_unlimited_learner_rejects_missing_or_mismatched_limit(config, key):
+    config.fr3.ready = config.fr3.data_contract_confirmed = True
+    config.fr3[key] = None
+    config.env.train[key] = 60
+    with pytest.raises(ValueError, match=key):
+        validate_fr3_training_config(config)
+    with open_dict(config.fr3):
+        del config.fr3[key]
+    with pytest.raises(ValueError, match=key):
         validate_fr3_training_config(config)

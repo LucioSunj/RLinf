@@ -29,7 +29,7 @@ class Fr3ActionProtocol:
     execution_horizon: int = 16
     prediction_video_frames: int = 5
     reset_wait_steps: int = 0
-    max_episode_steps: int = 1
+    max_episode_steps: int | None = None
 
     def __post_init__(self) -> None:
         if (
@@ -42,12 +42,12 @@ class Fr3ActionProtocol:
             raise ValueError(
                 "FR3 reset is an explicit operator operation, not simulator wait steps."
             )
-        if (
-            isinstance(self.max_episode_steps, bool)
-            or int(self.max_episode_steps) != self.max_episode_steps
-            or self.max_episode_steps < 1
+        if self.max_episode_steps is not None and (
+            type(self.max_episode_steps) is not int or self.max_episode_steps < 1
         ):
-            raise ValueError("FR3 max_episode_steps must be a positive integer.")
+            raise ValueError(
+                "FR3 max_episode_steps must be null or a positive integer."
+            )
 
 
 def fr3_observation_batch(observation: dict[str, Any]) -> dict[str, Any]:

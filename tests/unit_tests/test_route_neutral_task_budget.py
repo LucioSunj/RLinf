@@ -393,9 +393,15 @@ def fr3_table(task_ids=(0, 1)):
 
 
 @pytest.mark.parametrize("active", [(0,), (1,), (0, 1)])
-def test_fr3_sparse_task_runtime_resume_and_calibration_contract(tmp_path, active):
+@pytest.mark.parametrize("radius", [0.025, 0.03, 0.04])
+def test_fr3_sparse_task_runtime_resume_and_calibration_contract(
+    tmp_path, active, radius
+):
     cfg = config(tmp_path)
     cfg.algorithm.fixed_branch_cost.task_budget = fr3_table(active)
+    cfg.algorithm.fixed_branch_cost.task_budget.calibration.parameters.sail_radius_m = (
+        radius
+    )
     cfg.env.train.task_suite_name = "fr3"
     cfg.env.train.task_id_filter = list(active)
     cfg.env.train.task_sampling = "sequential_episodes"
@@ -416,6 +422,12 @@ def test_fr3_sparse_task_runtime_resume_and_calibration_contract(tmp_path, activ
     restored = TaskBudgetRuntime.from_config(cfg)
     restored.load_state_dict(copy.deepcopy(state), global_step=3)
     assert restored.state_dict() == state
+    changed = copy.deepcopy(cfg)
+    changed.algorithm.fixed_branch_cost.task_budget.calibration.parameters.sail_radius_m = (
+        0.04 if radius != 0.04 else 0.025
+    )
+    with pytest.raises(ValueError, match="config hash"):
+        TaskBudgetRuntime.from_config(changed).load_state_dict(state, global_step=3)
     assert all(
         (runtime.controller.controllers[task].signed_price > 0) == (task == 0)
         for task in active

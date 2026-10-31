@@ -107,6 +107,37 @@ def _validate_controller_and_guard(cfg: Any, value: dict[str, Any]) -> dict[str,
     return value
 
 
+def validate_fr3_budget_provenance(calibration: Any, execution_horizon: int) -> None:
+    """Validate the selected FR3 geometry and distinguish estimates from calibration."""
+    if not isinstance(calibration, dict) or calibration.get("status") != "COMPLETE":
+        raise ValueError("FR3 budgets require COMPLETE real-data budget provenance.")
+    parameters = calibration.get("parameters", {})
+    radius = parameters.get("sail_radius_m")
+    expected = {
+        "awe_threshold": 0.005,
+        "sail_radius_m": radius,
+        "sail_min_samples": 3,
+        "execution_horizon": execution_horizon,
+    }
+    if radius not in (0.025, 0.03, 0.04) or parameters != expected:
+        raise ValueError(
+            "FR3 budget requires original AWE0.005, SAIL2.5/3/4cm/min3 "
+            f"and the model execution horizon{execution_horizon}."
+        )
+    if not calibration.get("source") or not calibration.get("data_version"):
+        raise ValueError("FR3 budget must bind its source artifact and data version.")
+    kind = calibration.get("evidence_kind", "measured_calibration")
+    if kind not in ("measured_calibration", "sampled_trajectory_estimate"):
+        raise ValueError(f"Unsupported FR3 budget evidence_kind: {kind!r}.")
+    if kind == "sampled_trajectory_estimate" and (
+        calibration.get("user_selected") is not True
+        or not calibration.get("assumptions")
+    ):
+        raise ValueError(
+            "FR3 estimated budgets require user_selected=true and assumptions."
+        )
+
+
 def validate_fr3_task_budget_config(cfg: Any) -> dict[str, Any]:
     """Validate explicit active FR3 targets and their calibration provenance."""
     value = OmegaConf.to_container(
@@ -126,31 +157,10 @@ def validate_fr3_task_budget_config(cfg: Any) -> dict[str, Any]:
         )
     if value.get("task_names") != {key: identities[key] for key in targets}:
         raise ValueError("FR3 budget task_names must match its active task IDs.")
-    calibration = value.get("calibration")
-    if (
-        not isinstance(calibration, dict)
-        or not calibration
-        or calibration.get("status") != "COMPLETE"
-    ):
-        raise ValueError(
-            "FR3 budgets require COMPLETE real-data calibration provenance."
-        )
-    expected = {
-        "awe_threshold": 0.005,
-        "sail_radius_m": 0.04,
-        "sail_min_samples": 3,
-        "execution_horizon": OmegaConf.select(
-            cfg, "actor.model.runtime.execution_horizon", default=16
-        ),
-    }
-    if calibration.get("parameters") != expected:
-        raise ValueError(
-            "FR3 calibration requires original AWE0.005, SAIL4cm/min3 and the model execution horizon."
-        )
-    if not calibration.get("source") or not calibration.get("data_version"):
-        raise ValueError(
-            "FR3 calibration must bind its source artifact and data version."
-        )
+    validate_fr3_budget_provenance(
+        value.get("calibration"),
+        OmegaConf.select(cfg, "actor.model.runtime.execution_horizon", default=16),
+    )
     active = sorted(int(key) for key in targets)
     selected = OmegaConf.select(cfg, "env.train.task_id_filter")
     if selected is None or sorted(selected) != active:

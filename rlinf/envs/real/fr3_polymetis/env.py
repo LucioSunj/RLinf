@@ -89,7 +89,7 @@ class Fr3PolymetisEnv:
         ):
             raise ValueError("bridge horizon/action_dt differs from training contract")
         for key in ("max_episode_actions", "max_episode_seconds"):
-            if self.cfg.get(key) is not None and result[key] != self.cfg[key]:
+            if key in self.cfg and (key not in result or result[key] != self.cfg[key]):
                 raise ValueError(
                     f"bridge {key} differs from configured training budget"
                 )

@@ -422,7 +422,23 @@ def test_transport_failure_seals_pre_action_fragment_without_retry(policy, tmp_p
 
 
 @pytest.mark.parametrize(
-    "outcome,reward", [("success", 1.0), ("failure", 0.0), ("stop", 0.0), (None, 0.0)]
+    "outcome,reward,unlimited",
+    [
+        ("success", 1.0, False),
+        ("failure", 0.0, False),
+        ("stop", 0.0, False),
+        (None, 0.0, False),
+    ]
+    + [
+        (outcome, float(outcome == "success"), True)
+        for outcome in (
+            "success",
+            "failure",
+            "stop",
+            "intervention",
+            "technical_interrupt",
+        )
+    ],
 )
 @pytest.mark.parametrize(
     "policy", ["insert_tubes", ("insert_tubes", 32)], indirect=True
@@ -432,10 +448,15 @@ def test_real_websocket_idle_outcome_seals_previous_transition(
     tmp_path,
     outcome,
     reward,  # noqa: F811
+    unlimited,
+    monkeypatch,
 ):
     import threading
+    import time
+    from types import SimpleNamespace
 
     from rlinf.envs.real.fr3_polymetis.env import Fr3PolymetisEnv
+    from rlinf.models.embodiment.wam_policy import fr3_runner
 
     scripts = ROOT / "deployments/fr3_wam/sources/irl_polymetis/polymetis/tests"
     spec = importlib.util.spec_from_file_location(
@@ -449,6 +470,15 @@ def test_real_websocket_idle_outcome_seals_previous_transition(
     parent, sidecar = _native_to_bc(policy, tmp_path)
     cfg = _config(policy, tmp_path, parent, sidecar)
     clock, hardware = hardware_helpers.Clock(), hardware_helpers.Hardware()
+    if unlimited:
+        cfg.fr3.max_episode_actions = cfg.fr3.max_episode_seconds = None
+        monkeypatch.setattr(
+            fr3_runner,
+            "time",
+            SimpleNamespace(
+                monotonic=clock, perf_counter=time.perf_counter, sleep=time.sleep
+            ),
+        )
     cameras = hardware_helpers.Cameras(clock)
     receipt_ready, operator_done = threading.Event(), threading.Event()
     events = []
@@ -458,8 +488,10 @@ def test_real_websocket_idle_outcome_seals_previous_transition(
         if (
             outcome is not None
             and event == "execution_receipt"
-            and data["chunk_id"] == 0
+            and data["chunk_id"] == (2 if unlimited else 0)
         ):
+            if unlimited:
+                clock.now += 1000
             receipt_ready.set()
             assert operator_done.wait(timeout=10)
 
@@ -474,7 +506,7 @@ def test_real_websocket_idle_outcome_seals_previous_transition(
                 },
                 "episode": {
                     "max_actions": cfg.fr3.max_episode_actions,
-                    "max_duration_s": 120,
+                    "max_duration_s": cfg.fr3.max_episode_seconds,
                     "success_definition": "Test operator confirms task complete.",
                     "manual_reset_procedure": "Test operator restores scene before confirming ready.",
                 },
@@ -508,6 +540,9 @@ def test_real_websocket_idle_outcome_seals_previous_transition(
         operator_thread.start()
     try:
         runner = Fr3SynchronousRunner(cfg, policy=policy, env=env)
+        if unlimited:
+            checkpoint = runner.save_checkpoint()
+            runner.load_checkpoint(checkpoint)
         decision = runner.controller.decisions(0)["tasks"][str(cfg.fr3.task_id)]
         rows = runner.collect_episode(decision)
         assert not errors
@@ -521,15 +556,25 @@ def test_real_websocket_idle_outcome_seals_previous_transition(
                 and bridge.next_chunk == 2
             )
             return
-        assert len(rows) == 1
-        assert rows[0]["reward_env"] == reward
-        assert rows[0]["flow_execution_mask"].sum() == cfg.fr3.action_horizon
-        assert rows[0]["episode_seal"]["bootstrap_allowed"] is False
-        assert rows[0]["episode_seal"]["stop_reason"] == outcome
-        assert rows[0]["returns"].item() == pytest.approx(rows[0]["reward_train"])
-        assert len(hardware.commands) == cfg.fr3.action_horizon
-        assert bridge.next_chunk == 1
+        count = 3 if unlimited else 1
+        assert len(rows) == count
+        assert sum(row["reward_env"] for row in rows) == reward
+        assert all(
+            row["flow_execution_mask"].sum() == cfg.fr3.action_horizon for row in rows
+        )
+        assert rows[-1]["episode_seal"]["bootstrap_allowed"] is False
+        assert rows[-1]["episode_seal"]["stop_reason"] == outcome
+        assert rows[-1]["returns"].item() == pytest.approx(rows[-1]["reward_train"])
+        assert len(hardware.commands) == cfg.fr3.action_horizon * count
+        assert bridge.next_chunk == count
         assert any(event == "episode_sealed" for event, _ in events)
+        if unlimited:
+            contract = runner.contract["fr3"]
+            assert (
+                contract["max_episode_actions"]
+                is contract["max_episode_seconds"]
+                is None
+            )
     finally:
         operator_done.set()
         if outcome is not None:

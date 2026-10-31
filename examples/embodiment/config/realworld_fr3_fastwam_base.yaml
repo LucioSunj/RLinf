@@ -15,6 +15,7 @@ fr3:
   updates: ???
   episodes_per_update: 1
   warmup_updates: ???
+  # Explicit null disables the corresponding episode cap; bridge must match.
   max_episode_actions: ???
   max_episode_seconds: ???
   output_dir: ???

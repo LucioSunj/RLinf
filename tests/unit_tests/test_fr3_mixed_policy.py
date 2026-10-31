@@ -212,7 +212,7 @@ def policy(tmp_path, request):
         critic_feature_config=critic_config,
         gate_layer_indices=(0, 1),
         num_inference_steps=3,
-        max_episode_steps=35,
+        max_episode_steps=None,
         text_embedding_cache_dir=str(cache),
         text_embedding_context_len=4,
     )
@@ -264,7 +264,7 @@ def test_fr3_runtime_native_image_state_action_and_session_contract(policy):
     )
     torch.testing.assert_close(decoded[..., 7], torch.ones((2, 16)))
     assert trace is None
-    assert runtime.action_protocol.max_episode_steps == 35
+    assert runtime.action_protocol.max_episode_steps is None
     assert runtime.action_protocol.reset_wait_steps == 0
     critic_observation = runtime.critic_observation(env_obs=obs)
     assert critic_observation["extra_view_images"] is None
@@ -478,8 +478,9 @@ def test_executed_prefix_ppo_masks_tail_before_ratio_without_masking_gate(execut
     assert gate.grad.item() == -1
 
 
-def test_fr3_prefix_protocol_has_no_libero_divisibility_or_reset_constraint():
-    protocol = Fr3ActionProtocol(max_episode_steps=35)
+@pytest.mark.parametrize("limit", [35, None])
+def test_fr3_prefix_protocol_has_no_libero_divisibility_or_reset_constraint(limit):
+    protocol = Fr3ActionProtocol(max_episode_steps=limit)
     actions = torch.randn(1, 16, 8)
     assert select_executed_action_prefix(actions, protocol=protocol).shape == (1, 16, 8)
     empty = torch.empty(1, 0, 8)

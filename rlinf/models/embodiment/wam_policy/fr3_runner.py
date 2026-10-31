@@ -281,13 +281,15 @@ class Fr3SynchronousRunner:
     def collect_episode(self, decision: dict) -> list[dict]:
         """Collect one sealed episode; never resume or retry uncertain actions."""
         status = self.env.status()
+        max_actions = self.cfg.fr3.max_episode_actions
+        max_seconds = self.cfg.fr3.max_episode_seconds
         for key, expected in {
             "action_dt": float(self.cfg.fr3.action_dt),
             "execution_horizon": self.action_horizon,
-            "max_episode_actions": int(self.cfg.fr3.max_episode_actions),
-            "max_episode_seconds": float(self.cfg.fr3.max_episode_seconds),
+            "max_episode_actions": max_actions,
+            "max_episode_seconds": max_seconds,
         }.items():
-            if status.get(key) != expected:
+            if key not in status or status[key] != expected:
                 raise ValueError(
                     f"FR3 bridge {key} differs from the training contract."
                 )
@@ -308,10 +310,12 @@ class Fr3SynchronousRunner:
         try:
             while True:
                 status = self.env.status()
-                if executed >= int(
-                    self.cfg.fr3.max_episode_actions
-                ) or time.monotonic() - start >= float(
-                    self.cfg.fr3.max_episode_seconds
+                if not status.get("stop_reason") and (
+                    (max_actions is not None and executed >= max_actions)
+                    or (
+                        max_seconds is not None
+                        and time.monotonic() - start >= max_seconds
+                    )
                 ):
                     self.env.outcome("time_limit")
                     status = self.env.status()

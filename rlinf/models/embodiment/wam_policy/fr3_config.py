@@ -69,7 +69,7 @@ def validate_fr3_model_config(model: Any) -> None:
 
 
 def validate_fr3_training_config(cfg: Any, *, only_eval: bool = False) -> None:
-    """Require confirmed assets, finite run limits and calibrated task budgets."""
+    """Require confirmed assets, explicit episode limits and calibrated budgets."""
     model = cfg.actor.model
     validate_fr3_model_config(model)
     fr3 = cfg.fr3
@@ -86,7 +86,11 @@ def validate_fr3_training_config(cfg: Any, *, only_eval: bool = False) -> None:
     identities = {"drawer": 0, "insert_tubes": 1}
     if isinstance(fr3.task_id, bool) or identities.get(fr3.task_name) != fr3.task_id:
         raise ValueError("FR3 task_id must bind drawer=0 or insert_tubes=1.")
-    if not fr3.get("data_contract_confirmed", False) or not fr3.get("ready", False):
+    if not fr3.get("data_contract_confirmed", False):
+        raise ValueError(
+            "FR3 pipeline is NOT_READY: data_contract_confirmed requires client/site verification."
+        )
+    if not fr3.get("ready", False):
         raise ValueError(
             "FR3 pipeline is NOT_READY: confirm data contract and bind BC/budget first."
         )
@@ -116,14 +120,12 @@ def validate_fr3_training_config(cfg: Any, *, only_eval: bool = False) -> None:
     for key in (
         "updates",
         "episodes_per_update",
-        "max_episode_actions",
         "checkpoint_every",
     ):
         value = fr3.get(key)
         if isinstance(value, bool) or not isinstance(value, int) or value < 1:
             raise ValueError(f"FR3 {key} must be an explicit positive integer.")
     for key in (
-        "max_episode_seconds",
         "request_timeout_s",
         "poll_interval_s",
         "action_dt",
@@ -135,6 +137,25 @@ def validate_fr3_training_config(cfg: Any, *, only_eval: bool = False) -> None:
             or value <= 0
         ):
             raise ValueError(f"FR3 {key} must be positive and finite.")
+    for key in ("max_episode_actions", "max_episode_seconds"):
+        if key not in fr3:
+            raise ValueError(f"FR3 {key} must be explicit; null means no limit.")
+        value = fr3[key]
+        if value is not None:
+            valid_type = (
+                type(value) is int
+                if key == "max_episode_actions"
+                else type(value) in (int, float)
+            )
+            if not valid_type or not math.isfinite(value) or value <= 0:
+                raise ValueError(
+                    f"FR3 {key} must be null or positive and finite"
+                    + (" (integer actions)." if key == "max_episode_actions" else ".")
+                )
+        if key not in cfg.env.train or cfg.env.train[key] != value:
+            raise ValueError(f"FR3 environment {key} differs from learner limit.")
+    if model.runtime.max_episode_steps != fr3.max_episode_actions:
+        raise ValueError("FR3 runtime max_episode_steps differs from learner limit.")
     warmup = PadCriticWarmupConfig.from_mapping(
         model.route_neutral_online.critic_warmup
     )
