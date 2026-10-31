@@ -1,0 +1,19 @@
+defaults:
+  - realworld_fr3_fastwam_insert_tubes
+  - _self_
+
+fr3:
+  action_horizon: 32
+env:
+  train:
+    execution_horizon: 32
+actor:
+  model:
+    num_action_chunks: 32
+    runtime:
+      generation_horizon: 32
+      execution_horizon: 32
+      num_video_frames: 9
+    critic:
+      backbone:
+        num_action_chunks: 32

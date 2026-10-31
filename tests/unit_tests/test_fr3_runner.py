@@ -37,6 +37,7 @@ class MeasuredRobot:
         self.prompt = mixed.runtime.task_prompt
         self.task = mixed.runtime.task_name
         self.task_id = mixed.runtime.task_id
+        self.horizon = mixed.runtime.action_protocol.generation_horizon
         self.episode_id = None
         self.episodes = []
         self.versions = []
@@ -48,8 +49,8 @@ class MeasuredRobot:
             "scene_ready": True,
             "state": "ready",
             "action_dt": 0.1,
-            "execution_horizon": 16,
-            "max_episode_actions": 21,
+            "execution_horizon": self.horizon,
+            "max_episode_actions": self.horizon + 5,
             "max_episode_seconds": 120.0,
         }
 
@@ -68,18 +69,18 @@ class MeasuredRobot:
         return self.observation(), {}
 
     def step_chunk(self, actions, *, policy_version, chunk_id, route, eligible, forced):
-        assert actions.shape == (1, 16, 8)
+        assert actions.shape == (1, self.horizon, 8)
         assert chunk_id == self.chunk and policy_version == self.version
         self.versions.append(policy_version)
         if self.interrupt and self.chunk == 1:
             raise ConnectionError("lost physical receipt; never retry")
         done = self.chunk == 1
-        count = 5 if done else 16
+        count = 5 if done else self.horizon
         info = {
             "episode_id": self.episode_id,
             "chunk_id": self.chunk,
             "policy_version": self.version,
-            "execution_mask": [True] * count + [False] * (16 - count),
+            "execution_mask": [True] * count + [False] * (self.horizon - count),
             "chunk_valid": True,
             "gate_valid": eligible and not forced,
             "final_observation_valid": True,
@@ -100,6 +101,7 @@ class MeasuredRobot:
 
 
 def _native_to_bc(mixed, path):
+    horizon = mixed.runtime.action_protocol.generation_horizon
     spec = importlib.util.spec_from_file_location(
         "runner_bc_helpers", ROOT / "tests/test_fr3_bc_pipeline.py"
     )
@@ -119,7 +121,7 @@ def _native_to_bc(mixed, path):
         lora_config=RegimeLoRAConfig(rank=128, alpha=128),
         video_lora_config=RegimeLoRAConfig(rank=128, alpha=128),
         config=FastWAMUncondBCConfig(
-            action_horizon=16,
+            action_horizon=horizon,
             action_dim=8,
             proprio_dim=8,
             gripper_dimension=7,
@@ -134,11 +136,13 @@ def _native_to_bc(mixed, path):
     )
     batch = {
         "video": prepared["input_image"][:, :, None],
-        "action": torch.randn(2, 16, 8),
+        "action": torch.randn(2, horizon, 8),
         "proprio": prepared["proprio"],
         "context": torch.randn(2, 4, 8),
         "context_mask": torch.tensor([[1, 1, 0, 0], [1, 1, 1, 0]], dtype=torch.bool),
-        "action_is_pad": torch.tensor([[False] * 11 + [True] * 5, [False] * 16]),
+        "action_is_pad": torch.tensor(
+            [[False] * (horizon - 5) + [True] * 5, [False] * horizon]
+        ),
     }
     optimizer = torch.optim.AdamW(bc.lora_parameters(), lr=1e-4)
     initial = {
@@ -170,6 +174,7 @@ def _native_to_bc(mixed, path):
         parent_checkpoint_sha256=sha256_file(parent),
         extra_metadata={
             "bc_step": 1,
+            "action_horizon": horizon,
             "bc_config_sha256": "b" * 64,
             "statistics_sha256": sha256_file(mixed.runtime.processor_stats_path),
         },
@@ -178,6 +183,7 @@ def _native_to_bc(mixed, path):
 
 
 def _config(mixed, path, parent, sidecar):
+    horizon = mixed.runtime.action_protocol.generation_horizon
     with initialize_config_dir(
         config_dir=str(ROOT / "RLinf/examples/embodiment/config"), version_base="1.3"
     ):
@@ -190,7 +196,8 @@ def _config(mixed, path, parent, sidecar):
                 "updates": 2,
                 "episodes_per_update": 1,
                 "warmup_updates": 1,
-                "max_episode_actions": 21,
+                "max_episode_actions": horizon + 5,
+                "action_horizon": horizon,
                 "max_episode_seconds": 120.0,
                 "output_dir": str(path / "run"),
                 "data_contract_confirmed": True,
@@ -208,6 +215,7 @@ def _config(mixed, path, parent, sidecar):
         cfg.actor.model.update(
             {
                 "precision": "fp32",
+                "num_action_chunks": horizon,
                 "actor_checkpoint": str(parent),
                 "actor_checkpoint_sha256": sha256_file(parent),
                 "model_path": str(parent),
@@ -215,6 +223,9 @@ def _config(mixed, path, parent, sidecar):
         )
         cfg.actor.model.runtime.update(
             {
+                "generation_horizon": horizon,
+                "execution_horizon": horizon,
+                "num_video_frames": horizon // 4 + 1,
                 "processor_stats_path": cfg.fr3.statistics,
                 "training_config": cfg.fr3.training_config,
                 "easywam_root": str(ROOT / "EasyWAM"),
@@ -225,6 +236,7 @@ def _config(mixed, path, parent, sidecar):
         cfg.actor.model.critic = {"kind": "fastwam_current_frame_value"}
         cfg.actor.model.fastwam.action_dit_config.action_dim = 8
         cfg.env.train.task_id_filter = [cfg.fr3.task_id]
+        cfg.env.train.execution_horizon = horizon
         cfg.runner.bootstrap_uncond_lora_sidecar = str(sidecar)
         cfg.runner.bootstrap_uncond_lora_sidecar_sha256 = sha256_file(sidecar)
         cfg.algorithm.fixed_branch_cost.task_budget = {
@@ -238,7 +250,7 @@ def _config(mixed, path, parent, sidecar):
                     "awe_threshold": 0.005,
                     "sail_radius_m": 0.04,
                     "sail_min_samples": 3,
-                    "execution_horizon": 16,
+                    "execution_horizon": horizon,
                 },
                 "source": "synthetic-test-calibration",
                 "data_version": "synthetic-test-only",
@@ -251,11 +263,25 @@ def _parameters(mixed):
     return {k: p.detach().clone() for k, p in mixed.named_parameters()}
 
 
+@pytest.mark.parametrize(
+    "policy", ["drawer", "insert_tubes", ("insert_tubes", 32)], indirect=True
+)
 def test_real_parent_bc_warmup_joint_resume_and_deploy(policy, tmp_path):  # noqa: F811
     parent, sidecar = _native_to_bc(policy, tmp_path)
     cfg = _config(policy, tmp_path, parent, sidecar)
     env = MeasuredRobot(policy)
     runner = Fr3SynchronousRunner(cfg, policy=policy, env=env)
+    if runner.action_horizon == 32:
+        original = torch.load(sidecar, weights_only=True)
+        wrong = copy.deepcopy(original)
+        for branch in ("action", "video"):
+            wrong[branch]["metadata"]["extra"]["action_horizon"] = 16
+        torch.save(wrong, sidecar)
+        cfg.runner.bootstrap_uncond_lora_sidecar_sha256 = sha256_file(sidecar)
+        with pytest.raises(ValueError, match="action horizon differs"):
+            runner.bootstrap_bc()
+        torch.save(original, sidecar)
+        cfg.runner.bootstrap_uncond_lora_sidecar_sha256 = sha256_file(sidecar)
     runner.bootstrap_bc()
     checkpoint0 = runner.save_checkpoint()
     assert checkpoint0.is_file()
@@ -296,7 +322,7 @@ def test_real_parent_bc_warmup_joint_resume_and_deploy(policy, tmp_path):  # noq
             assert parameter.grad is None and torch.equal(parameter, initial[name])
     assert env.versions == [0, 0, 1, 1]
     rows = torch.load(runner.output / "rollout_000002.pt", weights_only=False)
-    assert rows[0]["flow_execution_mask"].sum() == 16
+    assert rows[0]["flow_execution_mask"].sum() == cfg.fr3.action_horizon
     assert rows[-1]["flow_execution_mask"].sum() == 5
     assert rows[-1]["forward_inputs"]["fr3_execution_mask"].sum() == 5
     audit = rows[0]["task_cost_audit"]
@@ -371,7 +397,7 @@ def test_real_parent_bc_warmup_joint_resume_and_deploy(policy, tmp_path):  # noq
         policy_version=source["step"],
     )
     inference = session.infer(observation)
-    assert inference["actions"].shape == (16, 8)
+    assert inference["actions"].shape == (cfg.fr3.action_horizon, 8)
     assert inference["policy_version"] == source["step"]
     assert inference["route"] in {"idm", "uncond"}
     assert "forward_inputs" not in inference and policy.critic is None
@@ -397,6 +423,9 @@ def test_transport_failure_seals_pre_action_fragment_without_retry(policy, tmp_p
 
 @pytest.mark.parametrize(
     "outcome,reward", [("success", 1.0), ("failure", 0.0), ("stop", 0.0), (None, 0.0)]
+)
+@pytest.mark.parametrize(
+    "policy", ["insert_tubes", ("insert_tubes", 32)], indirect=True
 )
 def test_real_websocket_idle_outcome_seals_previous_transition(
     policy,
@@ -439,9 +468,12 @@ def test_real_websocket_idle_outcome_seals_previous_transition(
             {
                 "task_name": cfg.fr3.task_name,
                 "task": cfg.fr3.prompt,
-                "robot": {"data_contract_confirmed": True, "execution_horizon": 16},
+                "robot": {
+                    "data_contract_confirmed": True,
+                    "execution_horizon": cfg.fr3.action_horizon,
+                },
                 "episode": {
-                    "max_actions": 21,
+                    "max_actions": cfg.fr3.max_episode_actions,
                     "max_duration_s": 120,
                     "success_definition": "Test operator confirms task complete.",
                     "manual_reset_procedure": "Test operator restores scene before confirming ready.",
@@ -484,15 +516,18 @@ def test_real_websocket_idle_outcome_seals_previous_transition(
             assert rows[-1]["flow_execution_mask"].sum() == 5
             assert rows[-1]["receipt"]["bootstrap_allowed"] is True
             assert rows[-1]["receipt"]["stop_reason"] == "time_limit"
-            assert len(hardware.commands) == 21 and bridge.next_chunk == 2
+            assert (
+                len(hardware.commands) == cfg.fr3.max_episode_actions
+                and bridge.next_chunk == 2
+            )
             return
         assert len(rows) == 1
         assert rows[0]["reward_env"] == reward
-        assert rows[0]["flow_execution_mask"].sum() == 16
+        assert rows[0]["flow_execution_mask"].sum() == cfg.fr3.action_horizon
         assert rows[0]["episode_seal"]["bootstrap_allowed"] is False
         assert rows[0]["episode_seal"]["stop_reason"] == outcome
         assert rows[0]["returns"].item() == pytest.approx(rows[0]["reward_train"])
-        assert len(hardware.commands) == 16
+        assert len(hardware.commands) == cfg.fr3.action_horizon
         assert bridge.next_chunk == 1
         assert any(event == "episode_sealed" for event, _ in events)
     finally:

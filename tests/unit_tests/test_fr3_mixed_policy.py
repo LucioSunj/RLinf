@@ -23,7 +23,7 @@ from fastwam.adapters import (
     inject_video_bc_dit_lora,
 )
 from fastwam.models.wan22.gate_transformer import epsilon_mixture_bernoulli
-from omegaconf import OmegaConf
+from omegaconf import OmegaConf, open_dict
 from torch import nn
 
 from rlinf.algorithms.fastwam_dual_ppo import compute_fastwam_dual_ppo_loss
@@ -125,6 +125,9 @@ def _observation(task, *, batch_size=2):
 
 @pytest.fixture(params=["drawer", "insert_tubes"])
 def policy(tmp_path, request):
+    task_name, horizon = (
+        request.param if isinstance(request.param, tuple) else (request.param, 16)
+    )
     torch.set_num_threads(1)
     torch.manual_seed(42)
     spec = importlib.util.spec_from_file_location(
@@ -146,12 +149,22 @@ def policy(tmp_path, request):
         for adapter in (action, video):
             for parameter in adapter.lora_parameters():
                 parameter.normal_(std=0.01)
-    task = helpers.TASKS[request.param][1]
+    task = helpers.TASKS[task_name][1]
     stats = tmp_path / "stats.json"
     _statistics(stats)
     training = OmegaConf.load(
-        ROOT / f"deployments/fr3_wam/config_assets/{request.param}/config.yaml"
+        ROOT / f"deployments/fr3_wam/config_assets/{task_name}/config.yaml"
     )
+    if horizon == 32:
+        with open_dict(training):
+            training.data.train.num_frames = 33
+            training.data.train.processor.num_obs_steps = 33
+            training.data.train.processor.action_clip_range = None
+            training.data.train.processor.state_clip_range = None
+            training.data.train.processor.binary_dims = {
+                "state": {"default": [7]},
+                "action": {"default": [7]},
+            }
     source = OmegaConf.load(
         ROOT
         / "RLinf/examples/embodiment/config/model/fastwam_route_neutral_online.yaml"
@@ -186,7 +199,10 @@ def policy(tmp_path, request):
         training_config=training,
         easywam_root=ROOT / "EasyWAM",
         processor_stats_path=stats,
-        task_name=request.param,
+        task_name=task_name,
+        generation_horizon=horizon,
+        execution_horizon=horizon,
+        num_video_frames=horizon // 4 + 1,
         task_prompt=task,
         action_dt=0.1,
         route_neutral_input=OmegaConf.to_container(

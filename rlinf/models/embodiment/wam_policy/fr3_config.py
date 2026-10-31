@@ -72,9 +72,17 @@ def validate_fr3_training_config(cfg: Any, *, only_eval: bool = False) -> None:
     """Require confirmed assets, finite run limits and calibrated task budgets."""
     model = cfg.actor.model
     validate_fr3_model_config(model)
-    if model.runtime.generation_horizon != 16:
-        raise ValueError("FR3 mixed RL requires its original 16-step profile.")
     fr3 = cfg.fr3
+    horizon = model.runtime.generation_horizon
+    if fr3.action_horizon != horizon or cfg.env.train.execution_horizon != horizon:
+        raise ValueError("FR3 task, model and environment action horizons must match.")
+    if model.critic.kind == "pi0_5_value_after_vlm" and (
+        model.critic.backbone.num_action_chunks != horizon
+        or model.critic.backbone.action_dim != 8
+    ):
+        raise ValueError(
+            "FR3 critic action shape must match the task horizon and dimension."
+        )
     identities = {"drawer": 0, "insert_tubes": 1}
     if isinstance(fr3.task_id, bool) or identities.get(fr3.task_name) != fr3.task_id:
         raise ValueError("FR3 task_id must bind drawer=0 or insert_tubes=1.")
@@ -96,6 +104,13 @@ def validate_fr3_training_config(cfg: Any, *, only_eval: bool = False) -> None:
             raise ValueError(f"FR3 model {key} differs from its task contract.")
     if cfg.env.train.task_name != fr3.task_name or cfg.env.train.num_envs != 1:
         raise ValueError("FR3 environment must match the single task-bound policy.")
+    bridge_url = cfg.env.train.get("bridge_url")
+    if not isinstance(bridge_url, str) or not bridge_url.startswith(
+        ("ws://", "wss://")
+    ):
+        raise ValueError(
+            "FR3 bridge_url must name the robot client's WebSocket endpoint."
+        )
     if only_eval:
         return
     for key in (

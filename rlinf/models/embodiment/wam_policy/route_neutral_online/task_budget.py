@@ -139,11 +139,13 @@ def validate_fr3_task_budget_config(cfg: Any) -> dict[str, Any]:
         "awe_threshold": 0.005,
         "sail_radius_m": 0.04,
         "sail_min_samples": 3,
-        "execution_horizon": 16,
+        "execution_horizon": OmegaConf.select(
+            cfg, "actor.model.runtime.execution_horizon", default=16
+        ),
     }
     if calibration.get("parameters") != expected:
         raise ValueError(
-            "FR3 calibration requires original AWE0.005, SAIL4cm/min3 and horizon16."
+            "FR3 calibration requires original AWE0.005, SAIL4cm/min3 and the model execution horizon."
         )
     if not calibration.get("source") or not calibration.get("data_version"):
         raise ValueError(

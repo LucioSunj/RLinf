@@ -81,12 +81,6 @@ class Fr3InferenceSession:
     def __init__(self, policy: Any, contract: dict, *, mode: str, artifact_kind: str):
         if mode not in MODES:
             raise ValueError(f"Unsupported FR3 deployment mode {mode!r}.")
-        if contract["action_horizon"] == 32 and (
-            mode not in {"uncond_bc", "forced_uncond"} or artifact_kind != "bc"
-        ):
-            raise ValueError(
-                "The 32-step FR3 profile supports Uncond BC deployment only."
-            )
         if mode == "rl_mixed" and artifact_kind != "rl":
             raise ValueError("Learned mixed routing requires an RL Gate checkpoint.")
         if mode in {"uncond_bc", "forced_uncond"} and artifact_kind == "idm":

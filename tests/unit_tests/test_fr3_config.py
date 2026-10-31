@@ -18,11 +18,16 @@ from rlinf.models.embodiment.wam_policy.fr3_config import (
 CONFIGS = Path(__file__).resolve().parents[2] / "examples/embodiment/config"
 
 
-@pytest.fixture(params=[("drawer", 0), ("insert_tubes", 1)])
+@pytest.fixture(
+    params=[("drawer", 0, 16), ("insert_tubes", 1, 16), ("insert_tubes", 1, 32)]
+)
 def config(request, tmp_path):
-    task, task_id = request.param
+    task, task_id, horizon = request.param
     with initialize_config_dir(version_base=None, config_dir=str(CONFIGS)):
-        cfg = compose(config_name=f"realworld_fr3_fastwam_{task}")
+        cfg = compose(
+            config_name=f"realworld_fr3_fastwam_{task}"
+            + ("_h32" if horizon == 32 else "")
+        )
     assert cfg.fr3.ready is False
     assert cfg.fr3.data_contract_confirmed is False
     assert cfg.fr3.task_id == task_id
@@ -62,7 +67,7 @@ def config(request, tmp_path):
                 "awe_threshold": 0.005,
                 "sail_radius_m": 0.04,
                 "sail_min_samples": 3,
-                "execution_horizon": 16,
+                "execution_horizon": horizon,
             },
             "source": str(tmp_path / "budget_targets.json"),
             "data_version": "synthetic-fixture-v1",
@@ -81,7 +86,10 @@ def test_hydra_profiles_require_confirmation_and_keep_fr3_dimensions(config):
     assert config.actor.model.runtime.max_episode_steps == 35
     assert config.actor.model.runtime.processor is None
     assert config.actor.model.critic.backbone.action_dim == 8
-    assert config.actor.model.critic.backbone.num_action_chunks == 16
+    assert (
+        config.actor.model.critic.backbone.num_action_chunks
+        == config.fr3.action_horizon
+    )
     assert config.actor.model.critic.backbone.openpi_data.profile == "fr3"
 
 
@@ -104,6 +112,9 @@ def test_hydra_profiles_require_confirmation_and_keep_fr3_dimensions(config):
         ("env.train.num_envs", 2, "single task-bound"),
         ("env.train.task_id_filter", [0, 1], "task_id_filter"),
         ("fr3.updates", 0, "updates"),
+        ("env.train.execution_horizon", 8, "horizons"),
+        ("fr3.action_horizon", 8, "horizons"),
+        ("actor.model.critic.backbone.num_action_chunks", 8, "critic action shape"),
         ("fr3.max_episode_seconds", float("inf"), "max_episode_seconds"),
         (
             "algorithm.fixed_branch_cost.task_budget.calibration.status",
@@ -136,4 +147,12 @@ def test_hydra_profiles_reject_another_valid_task_budget(config):
         str(other_id): other_name
     }
     with pytest.raises(ValueError, match="task_id"):
+        validate_fr3_training_config(config)
+
+
+def test_budget_horizon_cannot_cross_h16_h32(config):
+    config.fr3.ready = config.fr3.data_contract_confirmed = True
+    parameters = config.algorithm.fixed_branch_cost.task_budget.calibration.parameters
+    parameters.execution_horizon = 32 if config.fr3.action_horizon == 16 else 16
+    with pytest.raises(ValueError, match="execution horizon"):
         validate_fr3_training_config(config)

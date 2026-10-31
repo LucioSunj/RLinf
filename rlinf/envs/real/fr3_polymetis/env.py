@@ -24,7 +24,7 @@ TASK_IDS = {"drawer": 0, "insert_tubes": 1}
 
 
 class Fr3PolymetisEnv:
-    """Exchange complete chunks and execution evidence over local WebSocket RPC.
+    """Exchange chunks and execution evidence with the robot host over WebSocket RPC.
 
     One physical robot is one environment. Reset requires an explicit operator
     scene confirmation at the bridge or ``options['scene_ready']``. Each RPC is
@@ -44,6 +44,9 @@ class Fr3PolymetisEnv:
         if self.task_name not in TASK_IDS:
             raise ValueError("task_name must be drawer or insert_tubes")
         self.task_id = TASK_IDS[self.task_name]
+        self.execution_horizon = cfg.get("execution_horizon", 16)
+        if self.execution_horizon not in (16, 32):
+            raise ValueError("FR3 execution_horizon must be 16 or 32")
         self.url = cfg.get("bridge_url", "ws://127.0.0.1:8003")
         self.timeout = float(cfg.get("request_timeout_s", 60.0))
         if not math.isfinite(self.timeout) or self.timeout <= 0:
@@ -81,7 +84,7 @@ class Fr3PolymetisEnv:
         result = self._rpc("status")
         if result["task_name"] != self.task_name or result["task_id"] != self.task_id:
             raise ValueError("bridge task differs from configured environment task")
-        if result["execution_horizon"] != 16 or not math.isclose(
+        if result["execution_horizon"] != self.execution_horizon or not math.isclose(
             result["action_dt"], float(self.cfg.get("action_dt", 0.1)), abs_tol=1e-9
         ):
             raise ValueError("bridge horizon/action_dt differs from training contract")
@@ -135,10 +138,15 @@ class Fr3PolymetisEnv:
         if hasattr(actions, "detach"):
             actions = actions.detach().cpu().numpy()
         actions = np.asarray(actions, dtype=np.float32)
-        if actions.shape == (1, 16, 8):
+        if actions.shape == (1, self.execution_horizon, 8):
             actions = actions[0]
-        if actions.shape != (16, 8) or not np.isfinite(actions).all():
-            raise ValueError("expected finite physical actions[16,8]")
+        if (
+            actions.shape != (self.execution_horizon, 8)
+            or not np.isfinite(actions).all()
+        ):
+            raise ValueError(
+                f"expected finite physical actions[{self.execution_horizon},8]"
+            )
         version = self.policy_version if policy_version is None else policy_version
         current = self.chunk_id if chunk_id is None else chunk_id
         if version != self.policy_version or current != self.chunk_id:

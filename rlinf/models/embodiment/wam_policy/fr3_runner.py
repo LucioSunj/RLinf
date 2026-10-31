@@ -73,6 +73,7 @@ class Fr3SynchronousRunner:
     def __init__(self, cfg: Any, *, policy: Any = None, env: Any = None) -> None:
         self.cfg = cfg
         validate_fr3_training_config(cfg)
+        self.action_horizon = int(cfg.actor.model.runtime.generation_horizon)
         self.device = torch.device(str(cfg.fr3.device))
         if self.device.type != "cpu":
             if (
@@ -149,7 +150,7 @@ class Fr3SynchronousRunner:
                 "statistics_sha256",
                 "action_dt",
             )
-        } | {"action_horizon": 16, "action_dim": 8}
+        } | {"action_horizon": self.action_horizon, "action_dim": 8}
         if sha256_file(cfg.fr3.statistics) != self.fr3_contract["statistics_sha256"]:
             raise ValueError(
                 "FR3 normalization statistics differ from the confirmed contract."
@@ -180,10 +181,13 @@ class Fr3SynchronousRunner:
             weights_only=True,
         )
         for branch in ("action", "video"):
-            if (
-                sidecar[branch]["metadata"].get("extra", {}).get("statistics_sha256")
-                != self.fr3_contract["statistics_sha256"]
-            ):
+            extra = sidecar[branch]["metadata"].get("extra", {})
+            # Earlier H16 sidecars predate the explicit horizon metadata.
+            if extra.get("action_horizon", 16) != self.action_horizon:
+                raise ValueError(
+                    "FR3 BC sidecar action horizon differs from the task contract."
+                )
+            if extra.get("statistics_sha256") != self.fr3_contract["statistics_sha256"]:
                 raise ValueError(
                     "FR3 BC sidecar normalization statistics differ from its task contract."
                 )
@@ -237,7 +241,7 @@ class Fr3SynchronousRunner:
     ) -> dict:
         mask = torch.from_numpy(
             np.array(info["execution_mask"], dtype=bool, copy=True)
-        ).reshape(1, 16)
+        ).reshape(1, self.action_horizon)
         if bool((mask[:, 1:] & ~mask[:, :-1]).any()):
             raise ValueError("FR3 execution receipt must be one contiguous prefix.")
         if (
@@ -279,7 +283,7 @@ class Fr3SynchronousRunner:
         status = self.env.status()
         for key, expected in {
             "action_dt": float(self.cfg.fr3.action_dt),
-            "execution_horizon": 16,
+            "execution_horizon": self.action_horizon,
             "max_episode_actions": int(self.cfg.fr3.max_episode_actions),
             "max_episode_seconds": float(self.cfg.fr3.max_episode_seconds),
         }.items():
